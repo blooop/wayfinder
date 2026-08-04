@@ -1,0 +1,98 @@
+# The conda recipe for `wf`, built with rattler-build.
+#
+# One recipe, one builder — there is deliberately no second copy and no second
+# workflow. `.github/workflows/package.yml` builds this file on every pull
+# request, every push to main, and every `v*` tag, and only the *last* of those
+# goes on to publish. A tag therefore cannot discover a packaging problem for
+# the first time: it runs the identical steps main has been running all along.
+#
+# The source is this checkout, not a release tarball, so the recipe can never
+# lag the code it packages. A feedstock recipe for prefix.dev/blooop points at
+# the tagged tarball instead — see blooop/wayfinder#12.
+schema_version: 1
+
+context:
+  # Must equal Cargo.toml's version — CI fails the build if they drift.
+  version: "0.1.0"
+
+package:
+  name: wf
+  version: ${{ version }}
+
+source:
+  # The checkout itself, one level up from this recipe. `use_gitignore` defaults
+  # to true, so `target/` and `output/` never reach the work directory.
+  path: ..
+
+build:
+  number: 0
+  script:
+    env:
+      # rattler-build hands the build script a *clean* environment — even HOME is
+      # rewritten to $SRC_DIR — so cargo re-downloads and recompiles the world on
+      # every build unless a persistent path is passed in deliberately. CI sets
+      # this to a cached directory; empty (the default) keeps the old behaviour of
+      # building entirely inside the throwaway work directory.
+      WF_CARGO_CACHE: ${{ env.get("WF_CARGO_CACHE", default="") }}
+    content:
+      # `install` and `$PREFIX/bin` are Unix; the `else` fails loudly rather
+      # than letting a Windows build quietly produce a package with no binary
+      # in it. Adding Windows means adding a `then` here, not deleting this.
+      - if: unix
+        then:
+          - if [ -n "$WF_CARGO_CACHE" ]; then export CARGO_HOME="$WF_CARGO_CACHE/home" CARGO_TARGET_DIR="$WF_CARGO_CACHE/target"; fi
+          # --locked: build exactly the committed Cargo.lock, so a package built
+          # from a tag is reproducible and no build can silently pick up a newer
+          # dep than the one that was tested.
+          - cargo build --release --locked --bin wf
+          - install -Dm755 "${CARGO_TARGET_DIR:-target}/release/wf" "$PREFIX/bin/wf"
+        else:
+          - echo "wf has no Windows build script yet" >&2 && exit 1
+
+requirements:
+  build:
+    - rust >=1.75
+    # Rust links libgcc_s, so without a C compiler's run_exports the package
+    # would ship an undeclared dependency on it (rattler-build says so:
+    # "Overlinking against libgcc_s.so.1"). This is what puts `libgcc` in the
+    # run requirements, so the only run dep `wf` has is one it genuinely needs.
+    - ${{ compiler('c') }}
+
+  # No *declared* run requirements, on purpose — the only one the package has is
+  # the `libgcc` that the C compiler's run_exports adds above. `wf` shells out to
+  # `gh`, `zellij` and the agent CLI, but it discovers them on PATH and degrades
+  # with a readable error when they are missing, which is the same call the
+  # sibling `zjsh` recipe makes. Declaring them would clone zellij and gh into
+  # this environment on every machine that already installs both as their own
+  # pixi-global tools, and would still not guarantee the agent CLI, which does
+  # not come from this channel at all.
+
+tests:
+  - script:
+      - if: unix
+        then:
+          # The only thing testable without a tty, `gh` auth or a multiplexer:
+          # `wf --version` answers on stdout and exits without touching any of
+          # them. That is exactly why the flag exists.
+          - wf --version
+          - wf --help
+  - package_contents:
+      bin:
+        - wf
+
+about:
+  homepage: https://github.com/blooop/wayfinder
+  repository: https://github.com/blooop/wayfinder
+  license: MIT
+  license_file: LICENSE
+  summary: A multi-project wayfinder manager TUI over agentic planning maps
+  description: |
+    `wf` is a fuzzy-find picker and terminal starmap over the wayfinder planning
+    maps of every project on the machine. Projects accrete as you use it, each
+    mapped repo's tickets are read live from GitHub Issues via `gh`, and picking
+    a ticket creates or focuses a zellij tab named `<repo>#<n>` running an agent
+    on it — `enter` to work it interactively, `ctrl-a` to spawn it headless.
+
+extra:
+  recipe-maintainers:
+    - blooop

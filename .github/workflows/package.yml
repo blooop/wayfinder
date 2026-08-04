@@ -1,0 +1,157 @@
+name: Package
+
+# One workflow for the whole life of the package. Every pull request and every
+# push to main builds `recipe/recipe.yaml` and installs what comes out, so a tag
+# is a rebuild of something already known good rather than the first real test of
+# the recipe. Only a `v*` tag reaches the `release` job, which is the only job
+# that can write anything — releases and channel uploads can never happen from a
+# pull request, because the job that does them does not run on one.
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: build + install-test (linux-64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The recipe carries the version literally (rattler-build can only read it
+      # out of Cargo.toml under --experimental), so the two can drift. Catch it
+      # on every pull request rather than halfway through a release.
+      - name: Recipe version tracks Cargo.toml
+        run: |
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          recipe="$(sed -n 's/^  version: "\(.*\)"$/\1/p' recipe/recipe.yaml | head -1)"
+          echo "Cargo.toml=$crate recipe/recipe.yaml=$recipe"
+          if [ -z "$crate" ] || [ "$crate" != "$recipe" ]; then
+            echo "::error file=recipe/recipe.yaml::recipe version '$recipe' does not match Cargo.toml '$crate'"
+            exit 1
+          fi
+
+      - name: A tag must name the version it packages
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          echo "tag=$GITHUB_REF_NAME Cargo.toml=$crate"
+          if [ "$GITHUB_REF_NAME" != "v$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml $crate (expected v$crate)"
+            exit 1
+          fi
+
+      # rattler-build runs build scripts in a clean environment — even HOME is
+      # rewritten to the throwaway work directory — so cargo caches nothing
+      # between runs unless a persistent path is handed to it. $GITHUB_ENV, not a
+      # step `env:`, because this has to reach inside the build action below.
+      - name: Point cargo at a cacheable directory
+        run: echo "WF_CARGO_CACHE=$RUNNER_TEMP/wf-cargo" >> "$GITHUB_ENV"
+
+      # cargo's registry and target directory. Compiling the dependencies is
+      # nearly all of the build and only changes when Cargo.lock does, so the key
+      # is the lockfile: ~17s of compiling becomes ~5s on a hit.
+      - name: Cache cargo's registry and target directory
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/wf-cargo
+          key: wf-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: wf-cargo-${{ runner.os }}-
+
+      # rattler-build's own package cache — mostly the Rust and C toolchains it
+      # downloads to populate the build environment.
+      - name: Cache the rattler package cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/rattler
+          key: wf-rattler-${{ runner.os }}-${{ hashFiles('recipe/recipe.yaml') }}
+          restore-keys: wf-rattler-${{ runner.os }}-
+
+      # Builds the recipe and runs the tests declared in it (a fresh environment
+      # containing the freshly built package, then `wf --version`). Also leaves
+      # rattler-build on PATH for the steps below, and uploads the package as a
+      # build artifact — which is how the release job gets it without rebuilding.
+      - name: Build the package
+        uses: prefix-dev/rattler-build-action@v0.2.39
+        with:
+          recipe-path: recipe/recipe.yaml
+          build-args: --channel conda-forge
+          artifact-name: wf-conda-package
+
+      - name: Locate the package
+        id: locate
+        run: |
+          pkg="$(find output -name 'wf-*.conda' -print -quit)"
+          if [ -z "$pkg" ]; then
+            echo "::error::rattler-build produced no .conda package under output/"
+            exit 1
+          fi
+          echo "built $pkg"
+          echo "package-file=$pkg" >> "$GITHUB_OUTPUT"
+
+      # The same tests, but re-run from the artifact itself — the file that would
+      # actually be published. It proves that file installs into a throwaway
+      # environment on its own and that the `wf` inside it executes.
+      - name: Install the artifact into a throwaway environment and run it
+        run: |
+          rattler-build test \
+            --package-file "${{ steps.locate.outputs.package-file }}" \
+            --channel conda-forge
+
+  release:
+    name: GitHub release + prefix.dev/blooop
+    # Tags only. A pull request never reaches this job, so a fork can never get
+    # near the token even if it rewrites the workflow in its branch.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and attach the package to it
+    env:
+      # Job-level so the publish step can test for it in `if:`. Empty until the
+      # repository has the secret, which makes publishing skip itself rather than
+      # fail the release.
+      PIXI_TOKEN: ${{ secrets.PIXI_TOKEN }}
+    steps:
+      - name: Download the package the build job tested
+        uses: actions/download-artifact@v8
+        with:
+          name: wf-conda-package
+          path: package
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pkg="$(find package -name 'wf-*.conda' -print -quit)"
+          test -n "$pkg"
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "$pkg"
+
+      - name: Publish to prefix.dev/blooop
+        if: env.PIXI_TOKEN != ''
+        env:
+          # rattler-build reads the key from here, so the token never appears in
+          # a command line. Same secret name blooop-feedstock uses.
+          PREFIX_API_KEY: ${{ secrets.PIXI_TOKEN }}
+        run: |
+          pkg="$(find package -name 'wf-*.conda' -print -quit)"
+          pixi exec rattler-build upload prefix \
+            --channel blooop \
+            --skip-existing \
+            "$pkg"
+
+      - name: Say why nothing was published
+        if: env.PIXI_TOKEN == ''
+        run: |
+          echo "::notice::PIXI_TOKEN is not set on this repository, so the package was attached to the release but not published to prefix.dev/blooop. Add the secret, or publish via blooop-feedstock — see blooop/wayfinder#12."

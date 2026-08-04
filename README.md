@@ -1,6 +1,32 @@
 # wayfinder
 wf: a multi-project wayfinder manager TUI — fuzzy-find picker and terminal starmap over agentic planning maps
 
+## Installing
+
+`wf` ships as a conda package on the `blooop` channel (published by the release
+below — until the first tag lands, build it with `cargo install --path .`):
+
+```
+pixi global install -c https://prefix.dev/blooop -c conda-forge wf
+```
+
+The package declares no run dependencies. `wf` finds `gh` (authenticated),
+`zellij` and the agent CLI on PATH and says so plainly when one is missing,
+rather than dragging second copies of them into its own environment.
+
+`wf --version` and `wf --help` are the only arguments; everything else is keys
+in the TUI.
+
+## Releasing
+
+`recipe/recipe.yaml` builds the binary straight from the checkout, and
+`.github/workflows/package.yml` is the only thing that builds it: on every pull
+request and push to main it builds the recipe and re-installs the resulting
+package into a throwaway environment to run `wf --version`. Pushing a
+`v<version>` tag that matches `Cargo.toml` runs the identical build, then
+attaches the package to a GitHub release and — if the repository has a
+`PIXI_TOKEN` secret — publishes it to prefix.dev/blooop.
+
 ## Discovery
 
 Projects accrete: running `wf` inside a git checkout with a GitHub `origin`

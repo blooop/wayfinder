@@ -33,8 +33,68 @@ use wf::model::{merge_maps, Map};
 use wf::projects::{self, ProjectsCache};
 use wf::refresh::{Freshness, Poller, RefreshEvent};
 
+/// Everything `wf`'s argv can mean. Only one shape opens the TUI; the others
+/// answer on a stream and exit, touching neither the terminal, `gh`, nor
+/// zellij — which is what makes `wf --version` a usable packaging smoke test
+/// on a CI runner that has no tty, no auth and no multiplexer.
+#[derive(Debug, PartialEq, Eq)]
+enum Invocation {
+    Tui,
+    /// Print to stdout, exit 0.
+    Print(String),
+    /// Print to stderr, exit 2.
+    Reject(String),
+}
+
+const USAGE: &str = "\
+wf — the multi-project wayfinder manager TUI
+
+usage: wf [--version | --help]
+
+With no arguments: opens the picker over every mapped project, focused on the
+checkout you are standing in. enter launches (or focuses) a ticket's agent tab,
+ctrl-a spawns it headless, ctrl-f/ctrl-g narrow and widen the scope,
+ctrl-r refreshes, esc quits.";
+
+/// Parse argv (without the program name). `wf` takes at most one argument, and
+/// anything it does not recognise is rejected rather than ignored, so a typo
+/// can never silently open the TUI instead.
+///
+/// Matched on the argument *slice* rather than on a pair of `next()` calls: a
+/// `(first, second)` tuple can hold `(None, Some(_))` — no first argument but a
+/// second one — which argv cannot produce, and absorbing it with a wildcard
+/// would also let a future third position slip through unhandled. The three
+/// slice patterns below are exhaustive over every possible argv with no
+/// wildcard, so the compiler is what keeps this total.
+fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Invocation {
+    let args: Vec<String> = args.into_iter().collect();
+    match args.as_slice() {
+        [] => Invocation::Tui,
+        [flag] => match flag.as_str() {
+            "--version" | "-V" => Invocation::Print(format!("wf {}", env!("CARGO_PKG_VERSION"))),
+            "--help" | "-h" => Invocation::Print(USAGE.to_string()),
+            other => Invocation::Reject(format!("wf: unknown argument {other:?}\n{USAGE}")),
+        },
+        [_, second, ..] => Invocation::Reject(format!(
+            "wf: too many arguments (unexpected {second:?})\n{USAGE}"
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    match parse_args(std::env::args().skip(1)) {
+        Invocation::Print(text) => {
+            println!("{text}");
+            return Ok(());
+        }
+        Invocation::Reject(text) => {
+            eprintln!("{text}");
+            std::process::exit(2);
+        }
+        Invocation::Tui => {}
+    }
+
     // Accretive registration: running wf here is what makes this checkout
     // a project. Non-checkouts and non-GitHub remotes are simply None.
     let cwd = std::env::current_dir().context("cannot resolve the working directory")?;
@@ -273,6 +333,51 @@ async fn run(
                     Outcome::Continue => {}
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_arguments_opens_the_tui() {
+        assert_eq!(parse_args(argv(&[])), Invocation::Tui);
+    }
+
+    #[test]
+    fn version_prints_the_crate_version_and_nothing_else() {
+        let expected = Invocation::Print(format!("wf {}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(parse_args(argv(&["--version"])), expected);
+        assert_eq!(parse_args(argv(&["-V"])), expected);
+    }
+
+    #[test]
+    fn help_prints_the_usage() {
+        assert_eq!(
+            parse_args(argv(&["--help"])),
+            Invocation::Print(USAGE.to_string())
+        );
+    }
+
+    #[test]
+    fn an_unknown_flag_is_rejected_not_ignored() {
+        match parse_args(argv(&["--versoin"])) {
+            Invocation::Reject(message) => assert!(message.contains("--versoin")),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_second_argument_is_rejected() {
+        match parse_args(argv(&["--version", "--help"])) {
+            Invocation::Reject(message) => assert!(message.contains("too many")),
+            other => panic!("expected a rejection, got {other:?}"),
         }
     }
 }
