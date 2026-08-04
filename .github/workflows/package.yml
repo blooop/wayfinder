@@ -17,7 +17,9 @@ permissions:
 
 concurrency:
   group: package-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push to a branch makes the older build irrelevant. A tag build is
+  # never cancelled: its artifact is the release.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   package:
@@ -51,20 +53,27 @@ jobs:
 
       # rattler-build runs build scripts in a clean environment — even HOME is
       # rewritten to the throwaway work directory — so cargo caches nothing
-      # between runs unless a persistent path is handed to it. $GITHUB_ENV, not a
-      # step `env:`, because this has to reach inside the build action below.
-      - name: Point cargo at a cacheable directory
-        run: echo "WF_CARGO_CACHE=$RUNNER_TEMP/wf-cargo" >> "$GITHUB_ENV"
+      # between runs unless a persistent path is handed to it. The recipe reads
+      # this one variable and exports it as CARGO_HOME. $GITHUB_ENV, not a step
+      # `env:`, because it has to reach inside the build action below.
+      - name: Point cargo's registry at a cacheable directory
+        run: echo "WF_CARGO_HOME=$RUNNER_TEMP/wf-cargo-registry" >> "$GITHUB_ENV"
 
-      # cargo's registry and target directory. Compiling the dependencies is
-      # nearly all of the build and only changes when Cargo.lock does, so the key
-      # is the lockfile: ~17s of compiling becomes ~5s on a hit.
-      - name: Cache cargo's registry and target directory
+      # The crates.io registry only — deliberately not a target directory.
+      # Measured locally (see recipe/recipe.yaml): a reused target dir does not
+      # survive between rattler-build runs at all, because $SRC_DIR is a freshly
+      # timestamped work path each time and cargo's fingerprints are
+      # path-sensitive, so every crate recompiles regardless (17.95s cold vs
+      # 15.73s with both caches warm — the entire gain was the skipped index
+      # update). Caching it would add ~160 MB of upload/download to every run to
+      # buy nothing. What this key does save is the index fetch and the crate
+      # downloads, which is why it is keyed on the lockfile.
+      - name: Cache cargo's registry
         uses: actions/cache@v6
         with:
-          path: ${{ runner.temp }}/wf-cargo
-          key: wf-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: wf-cargo-${{ runner.os }}-
+          path: ${{ runner.temp }}/wf-cargo-registry
+          key: wf-cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: wf-cargo-registry-${{ runner.os }}-
 
       # rattler-build's own package cache — mostly the Rust and C toolchains it
       # downloads to populate the build environment.
@@ -83,7 +92,11 @@ jobs:
         uses: prefix-dev/rattler-build-action@v0.2.39
         with:
           recipe-path: recipe/recipe.yaml
-          build-args: --channel conda-forge
+          # --no-config: rattler-build otherwise discovers any pixi or
+          # rattler-build config file in the tree and adopts its default-channels,
+          # so this keeps the build resolving against conda-forge alone no matter
+          # what configuration later lands in the repo.
+          build-args: --channel conda-forge --no-config
           artifact-name: wf-conda-package
 
       - name: Locate the package
@@ -138,15 +151,25 @@ jobs:
             --generate-notes \
             "$pkg"
 
+      # Only reached when there is something to publish. `setup-only` installs
+      # the same rattler-build the build job used and puts it on PATH — the
+      # release runner has no pixi and no conda tooling of its own.
+      - name: Install rattler-build
+        if: env.PIXI_TOKEN != ''
+        uses: prefix-dev/rattler-build-action@v0.2.39
+        with:
+          setup-only: true
+
       - name: Publish to prefix.dev/blooop
         if: env.PIXI_TOKEN != ''
         env:
-          # rattler-build reads the key from here, so the token never appears in
-          # a command line. Same secret name blooop-feedstock uses.
+          # rattler-build's documented env var for --api-key, so the token never
+          # appears in a command line or a process listing. Fed from the same
+          # secret name blooop-feedstock uses.
           PREFIX_API_KEY: ${{ secrets.PIXI_TOKEN }}
         run: |
           pkg="$(find package -name 'wf-*.conda' -print -quit)"
-          pixi exec rattler-build upload prefix \
+          rattler-build upload prefix \
             --channel blooop \
             --skip-existing \
             "$pkg"

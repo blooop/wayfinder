@@ -28,24 +28,36 @@ build:
   number: 0
   script:
     env:
-      # rattler-build hands the build script a *clean* environment — even HOME is
-      # rewritten to $SRC_DIR — so cargo re-downloads and recompiles the world on
-      # every build unless a persistent path is passed in deliberately. CI sets
-      # this to a cached directory; empty (the default) keeps the old behaviour of
-      # building entirely inside the throwaway work directory.
-      WF_CARGO_CACHE: ${{ env.get("WF_CARGO_CACHE", default="") }}
+      # rattler-build runs the build script with a *cleared* environment (strict
+      # env isolation, the default) and rewrites even HOME to $SRC_DIR, so
+      # CARGO_HOME is not inherited and cargo re-fetches the crates.io index and
+      # every crate on each build. This one env entry is the deliberate hole:
+      # `package.yml` points it at a restored cache directory. Left empty (the
+      # default) the build stays entirely inside the throwaway work directory,
+      # which is what makes a local `rattler-build build` hermetic.
+      #
+      # Deliberately *only* the registry, never CARGO_TARGET_DIR. Measured on
+      # this recipe: reusing a target dir across builds saves nothing, because
+      # $SRC_DIR is a freshly timestamped work path every time and cargo's
+      # fingerprints are path-sensitive, so it recompiles from scratch regardless
+      # (17.95s "cold" vs 15.73s with both caches warm — the whole gain was the
+      # skipped index update) while adding ~160 MB to the CI cache.
+      WF_CARGO_HOME: ${{ env.get("WF_CARGO_HOME", default="") }}
     content:
       # `install` and `$PREFIX/bin` are Unix; the `else` fails loudly rather
       # than letting a Windows build quietly produce a package with no binary
       # in it. Adding Windows means adding a `then` here, not deleting this.
       - if: unix
         then:
-          - if [ -n "$WF_CARGO_CACHE" ]; then export CARGO_HOME="$WF_CARGO_CACHE/home" CARGO_TARGET_DIR="$WF_CARGO_CACHE/target"; fi
+          # Guarded rather than assigned straight from `env.get`: an *empty*
+          # CARGO_HOME is not the same as an unset one, and cargo would take it
+          # literally.
+          - if [ -n "$WF_CARGO_HOME" ]; then export CARGO_HOME="$WF_CARGO_HOME"; fi
           # --locked: build exactly the committed Cargo.lock, so a package built
           # from a tag is reproducible and no build can silently pick up a newer
           # dep than the one that was tested.
           - cargo build --release --locked --bin wf
-          - install -Dm755 "${CARGO_TARGET_DIR:-target}/release/wf" "$PREFIX/bin/wf"
+          - install -Dm755 target/release/wf "$PREFIX/bin/wf"
         else:
           - echo "wf has no Windows build script yet" >&2 && exit 1
 
