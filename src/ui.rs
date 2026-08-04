@@ -63,8 +63,9 @@ pub fn body_lines(map: &Map) -> Vec<Line<'static>> {
 
 /// Draw the full screen: bordered frame with the repo in the title, grouped
 /// list body, then the anchored bottom chrome — the reserved (empty) AFK
-/// slot line, the ticket count line, and the key hints.
-pub fn draw(frame: &mut Frame, map: &Map) {
+/// slot line, the ticket count line (with the subtle last-refreshed
+/// indicator, empty before the first background poll), and the key hints.
+pub fn draw(frame: &mut Frame, map: &Map, refresh_indicator: &str) {
     let block = Block::bordered().title(format!(" wf · {} ", map.repo));
     let inner = block.inner(frame.area());
     frame.render_widget(block, frame.area());
@@ -79,7 +80,13 @@ pub fn draw(frame: &mut Frame, map: &Map) {
 
     frame.render_widget(Paragraph::new(body_lines(map)), body_area);
     frame.render_widget(
-        Paragraph::new(format!("  {}/{}", map.tickets.len(), map.tickets.len())),
+        Paragraph::new(Line::from(vec![
+            Span::raw(format!("  {}/{}", map.tickets.len(), map.tickets.len())),
+            Span::styled(
+                format!("  {refresh_indicator}"),
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+        ])),
         count_area,
     );
     frame.render_widget(
@@ -117,9 +124,13 @@ mod tests {
 
     /// Render the fixture through TestBackend and return the screen as text.
     fn render(map: &Map) -> String {
+        render_with_indicator(map, "")
+    }
+
+    fn render_with_indicator(map: &Map, indicator: &str) -> String {
         let backend = TestBackend::new(90, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| draw(f, map)).expect("draw");
+        terminal.draw(|f| draw(f, map, indicator)).expect("draw");
         let buf = terminal.backend().buffer();
         let mut out = String::new();
         for y in 0..buf.area.height {
@@ -163,5 +174,11 @@ mod tests {
         assert!(screen.contains("5/5"));
         assert!(screen.contains("q/esc quit"));
         assert!(screen.contains("wf · blooop/wayfinder"));
+    }
+
+    #[test]
+    fn count_line_carries_the_refresh_indicator() {
+        let screen = render_with_indicator(&fixture_map(), "· ↻ 3s ago");
+        assert!(screen.contains("5/5  · ↻ 3s ago"));
     }
 }
