@@ -1,0 +1,11 @@
+[package]
+name = "starmap-proto"
+version = "0.1.0"
+edition = "2021"
+
+# Throwaway prototype for wayfinder issue #8: starmap legibility.
+# Renders the real wayfinder map + a synthetic 25-ticket map in three forms
+# (indented tree, layered DAG, grouped flat list) via ratatui's TestBackend.
+
+[dependencies]
+ratatui = "0.29"
