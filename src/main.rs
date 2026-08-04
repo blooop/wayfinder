@@ -1,38 +1,105 @@
-//! `wf` binary — fetch this repo's map live on startup, then run the main
-//! screen: nucleo fuzzy query over the grouped list with the Build 2
-//! keybinding skeleton (#14), kept fresh by the background refresh loop
-//! (Build 5, #17). `ctrl-r` force-refreshes; `esc` clears the query then
-//! quits; `q` quits on an empty query.
+//! `wf` binary — accretive multi-project startup (Build 3, #15):
+//!
+//! 1. If the cwd is inside a git checkout with a GitHub `origin`, register
+//!    it in the per-machine cache (`~/.cache/wf/projects.json`) — explicit
+//!    use *is* the registration act (the zoxide model, per #4).
+//! 2. One `wayfinder:map` label search across every cached repo finds
+//!    which have maps; repos without maps stay cached but hidden.
+//! 3. Every map is fetched and merged into one grouped list; one poller
+//!    per repo keeps it fresh (Build 5's two-tier poll, tagged by slug).
+//! 4. Inside a checkout whose repo has a map, the screen opens focused on
+//!    it (`Scope::Project`, repo column dropped); `ctrl-g` widens to all
+//!    projects, `ctrl-f` re-focuses. Outside any checkout: all projects.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use wf::app::{App, Outcome};
+use wf::app::{App, Outcome, Scope};
+use wf::model::{merge_maps, Map};
+use wf::projects::{self, ProjectsCache};
 use wf::refresh::{Freshness, Poller, RefreshEvent};
-
-// Build 1 hardcodes the one repo and its map issue; discovery is Build 3.
-const OWNER: &str = "blooop";
-const REPO: &str = "wayfinder";
-const MAP_ISSUE: u64 = 1;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    eprintln!("wf: fetching {OWNER}/{REPO} map (#{MAP_ISSUE})…");
-    let map = wf::fetch::fetch_map(OWNER, REPO, MAP_ISSUE).await?;
-    let updates = wf::refresh::spawn(Poller::new(OWNER, REPO, MAP_ISSUE));
+    // Accretive registration: running wf here is what makes this checkout
+    // a project. Non-checkouts and non-GitHub remotes are simply None.
+    let cwd = std::env::current_dir().context("cannot resolve the working directory")?;
+    let here = projects::discover_checkout(&cwd).await;
+    let cache_path =
+        projects::default_cache_path().context("cannot resolve the XDG cache directory")?;
+    let mut cache = ProjectsCache::load_or_default(&cache_path);
+    if let Some((path, slug)) = &here {
+        cache.register(path.clone(), slug.clone());
+        cache.save(&cache_path)?;
+    }
+
+    // Map detection: one label search intersected with the cached remotes.
+    let repos = cache.repos();
+    eprintln!("wf: {} cached repo(s); searching for maps…", repos.len());
+    let map_issues: BTreeMap<String, u64> = wf::fetch::find_maps(&repos)
+        .await?
+        .into_iter()
+        .collect();
+
+    // Initial fetch of every map, merged into the one list the screen shows.
+    let mut maps: BTreeMap<String, Map> = BTreeMap::new();
+    let mut startup_notice = None;
+    for (slug, &number) in &map_issues {
+        let (owner, name) = slug.split_once('/').expect("slug is owner/name");
+        eprintln!("wf: fetching {slug} map (#{number})…");
+        match wf::fetch::fetch_map(owner, name, number).await {
+            Ok(map) => {
+                maps.insert(slug.clone(), map);
+            }
+            Err(err) => {
+                eprintln!("wf: {slug}: {err}");
+                startup_notice = Some(format!("{slug}: initial fetch failed"));
+            }
+        }
+    }
+    if maps.is_empty() && !map_issues.is_empty() {
+        anyhow::bail!("every map fetch failed — check network and `gh auth status`");
+    }
+
+    let mut app = App::new(merge_maps(&maps));
+    app.notice = startup_notice;
+    match &here {
+        // cwd-open focuses the project (lazygit-style) when its repo has a
+        // map; the repo column drops because the header names the project.
+        Some((_, slug)) if maps.contains_key(slug) => {
+            app.scope = Scope::Project(slug.clone());
+        }
+        Some((_, slug)) => {
+            app.notice = Some(format!("{slug} has no wayfinder:map — showing all projects"));
+        }
+        None => {}
+    }
+
+    // One poller per repo-with-map, all feeding one slug-tagged channel.
+    let pollers: Vec<Poller> = map_issues
+        .iter()
+        .map(|(slug, &number)| {
+            let (owner, name) = slug.split_once('/').expect("slug is owner/name");
+            Poller::new(owner, name, number)
+        })
+        .collect();
+    let updates = wf::refresh::spawn_all(pollers);
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, App::new(map), updates).await;
+    let result = run(&mut terminal, app, maps, map_issues, updates).await;
     ratatui::restore();
     result
 }
 
 /// Poll outcomes folded into displayable state: when data was last verified
-/// fresh, and whether the latest poll failed.
+/// fresh, and whether the latest poll failed. With several repos this is an
+/// aggregate: any success bumps the timestamp, any failure marks stale
+/// until the next success — coarse, but honest enough for a count-line hint.
 struct RefreshState {
     last_verified: Option<Instant>,
     failing: bool,
@@ -62,20 +129,23 @@ impl RefreshState {
 async fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
-    mut updates: UnboundedReceiver<RefreshEvent>,
+    mut maps: BTreeMap<String, Map>,
+    map_issues: BTreeMap<String, u64>,
+    mut updates: UnboundedReceiver<(String, RefreshEvent)>,
 ) -> Result<()> {
     let mut refresh = RefreshState {
         last_verified: None,
         failing: false,
     };
     loop {
-        // Drain every pending poll outcome before drawing. Data swaps in
-        // place via App::replace_map, which keeps the cursor pinned to
-        // ticket identity; query and scope are never reset.
-        while let Ok(event) = updates.try_recv() {
+        // Drain every pending poll outcome before drawing. An update swaps
+        // one repo's map in the merged view; App::replace_map keeps the
+        // cursor pinned to ticket identity, query and scope untouched.
+        while let Ok((slug, event)) = updates.try_recv() {
             refresh.apply(&event);
             if let RefreshEvent::Updated(new_map) = event {
-                app.replace_map(new_map);
+                maps.insert(slug, new_map);
+                app.replace_map(merge_maps(&maps));
             }
         }
 
@@ -89,18 +159,25 @@ async fn run(
                 match app.handle_key(key) {
                     Outcome::Quit => return Ok(()),
                     Outcome::Refresh => {
-                        // Force refresh (ctrl-r): refetch in place, without
-                        // waiting for the background poll cycle.
-                        match wf::fetch::fetch_map(OWNER, REPO, MAP_ISSUE).await {
-                            Ok(map) => {
-                                app.replace_map(map);
-                                refresh.apply(&RefreshEvent::Unchanged);
-                                app.notice = Some("refreshed".to_string());
+                        // Force refresh (ctrl-r): refetch every map in
+                        // place, without waiting for the poll cycles.
+                        let mut failed = false;
+                        for (slug, &number) in &map_issues {
+                            let (owner, name) = slug.split_once('/').expect("slug is owner/name");
+                            match wf::fetch::fetch_map(owner, name, number).await {
+                                Ok(map) => {
+                                    maps.insert(slug.clone(), map);
+                                }
+                                Err(_) => failed = true,
                             }
-                            Err(err) => {
-                                refresh.apply(&RefreshEvent::Failed);
-                                app.notice = Some(format!("refresh failed: {err}"));
-                            }
+                        }
+                        app.replace_map(merge_maps(&maps));
+                        if failed {
+                            refresh.apply(&RefreshEvent::Failed);
+                            app.notice = Some("refresh failed for some projects".to_string());
+                        } else {
+                            refresh.apply(&RefreshEvent::Unchanged);
+                            app.notice = Some("refreshed".to_string());
                         }
                     }
                     Outcome::Continue => {}

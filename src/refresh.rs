@@ -66,6 +66,12 @@ pub struct Poller {
 }
 
 impl Poller {
+    /// The full repo slug this poller watches (e.g. "blooop/wayfinder") —
+    /// the tag on every event it emits.
+    pub fn slug(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+
     pub fn new(owner: &str, repo: &str, number: u64) -> Self {
         Self {
             owner: owner.to_string(),
@@ -140,20 +146,27 @@ fn parse_probe(response_head: &str, exit_ok: bool) -> Result<Probe> {
     bail!("probe failed: {status_line}");
 }
 
-/// Spawn the poll loop on the tokio runtime; the UI drains the returned
-/// channel with `try_recv` between frames. The task ends when the receiver
-/// is dropped (quit).
-pub fn spawn(mut poller: Poller) -> mpsc::UnboundedReceiver<RefreshEvent> {
+/// Spawn one poll loop per map on the tokio runtime, all feeding a single
+/// channel; every event is tagged with the emitting poller's repo slug so
+/// the UI loop knows which repo's map to swap. The UI drains the channel
+/// with `try_recv` between frames; the tasks end when the receiver is
+/// dropped (quit). Probes are conditional 304s, so N repos cost nothing
+/// extra at rest.
+pub fn spawn_all(pollers: Vec<Poller>) -> mpsc::UnboundedReceiver<(String, RefreshEvent)> {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            let event = poller.poll_once().await;
-            if tx.send(event).is_err() {
-                return; // UI is gone
+    for mut poller in pollers {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let slug = poller.slug();
+            loop {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                let event = poller.poll_once().await;
+                if tx.send((slug.clone(), event)).is_err() {
+                    return; // UI is gone
+                }
             }
-        }
-    });
+        });
+    }
     rx
 }
 

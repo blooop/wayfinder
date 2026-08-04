@@ -10,9 +10,12 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::model::Ticket;
 
-/// The haystack a ticket is matched against.
+/// The haystack a ticket is matched against: the short repo name (what the
+/// row shows) plus the number and title. The owner is left out — typing an
+/// owner name is not how projects are picked, and including it would let
+/// unrelated repos match on a shared owner.
 fn haystack(ticket: &Ticket) -> String {
-    format!("{} #{} {}", ticket.repo, ticket.number, ticket.title)
+    format!("{} #{} {}", ticket.short_repo(), ticket.number, ticket.title)
 }
 
 /// Indices into `tickets` of the rows matching `query`, in input order.
@@ -52,9 +55,9 @@ mod tests {
 
     fn fixture() -> Vec<Ticket> {
         vec![
-            ticket("wayfinder", 6, "Re-entry breadcrumbs"),
-            ticket("wayfinder", 9, "Main screen design"),
-            ticket("dotfiles", 103, "Prune legacy bash aliases"),
+            ticket("blooop/wayfinder", 6, "Re-entry breadcrumbs"),
+            ticket("blooop/wayfinder", 9, "Main screen design"),
+            ticket("blooop/dotfiles", 103, "Prune legacy bash aliases"),
         ]
     }
 
@@ -72,6 +75,13 @@ mod tests {
     fn repo_name_and_number_are_matchable() {
         assert_eq!(matching_indices(&fixture(), "dotf"), vec![2]);
         assert_eq!(matching_indices(&fixture(), "#9"), vec![1]);
+    }
+
+    #[test]
+    fn the_owner_half_of_the_slug_is_not_matched() {
+        // Every fixture ticket is owned by blooop; matching on the owner
+        // would make a shared owner narrow to nothing useful.
+        assert!(matching_indices(&fixture(), "blooop").is_empty());
     }
 
     #[test]

@@ -65,7 +65,9 @@ pub fn body_lines(app: &App) -> Vec<Line<'static>> {
             if show_repo {
                 spans.push(Span::raw(format!(
                     " {:<10} #{:<4} {}",
-                    ticket.repo, ticket.number, ticket.title
+                    ticket.short_repo(),
+                    ticket.number,
+                    ticket.title
                 )));
             } else {
                 spans.push(Span::raw(format!(" #{:<4} {}", ticket.number, ticket.title)));
@@ -104,6 +106,8 @@ const KEY_HINTS: &str =
 pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
     let mut block = match &app.scope {
         Scope::All => Block::bordered().title(format!(" wf · {} ", app.map.repo)),
+        // The focused title names the project by its full slug — with one
+        // project on screen there is room, and it disambiguates forks.
         Scope::Project(repo) => Block::bordered().title(format!(" wf · {repo} — focused ")),
     };
     if app.scope != Scope::All {
@@ -162,7 +166,7 @@ mod tests {
 
     fn fixture_map() -> Map {
         let t = |number: u64, title: &str, open: bool, assigned: bool, needs: Vec<u64>| Ticket {
-            repo: "wayfinder".to_string(),
+            repo: "blooop/wayfinder".to_string(),
             number,
             title: title.to_string(),
             status: classify(open, assigned, needs),
@@ -294,7 +298,7 @@ mod tests {
         let mut app = App::new(fixture_map());
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let screen = render(&app);
-        assert!(screen.contains("launch wayfinder#6 — wired in Build 4"));
+        assert!(screen.contains("launch blooop/wayfinder#6 — wired in Build 4"));
     }
 
     #[test]
@@ -308,7 +312,7 @@ mod tests {
         let mut app = App::new(fixture_map());
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         let screen = render(&app);
-        assert!(screen.contains("wf · wayfinder — focused"));
+        assert!(screen.contains("wf · blooop/wayfinder — focused"));
         assert!(screen.contains("ctrl-g all projects"));
         assert!(screen.contains("▶ ○ #6    Re-entry breadcrumbs"));
         assert!(!screen.contains("○ wayfinder  #6"));

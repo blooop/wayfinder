@@ -240,11 +240,11 @@ mod tests {
             repo: "blooop/wayfinder".to_string(),
             title: "Map: wf".to_string(),
             tickets: vec![
-                t("wayfinder", 2, "Choose the stack", false, true, vec![]),
-                t("wayfinder", 6, "Re-entry breadcrumbs", true, false, vec![]),
-                t("wayfinder", 7, "Supervising AFK agents", true, false, vec![6]),
-                t("wayfinder", 9, "Main screen design", true, true, vec![]),
-                t("dotfiles", 103, "Prune legacy bash aliases", true, false, vec![]),
+                t("blooop/wayfinder", 2, "Choose the stack", false, true, vec![]),
+                t("blooop/wayfinder", 6, "Re-entry breadcrumbs", true, false, vec![]),
+                t("blooop/wayfinder", 7, "Supervising AFK agents", true, false, vec![6]),
+                t("blooop/wayfinder", 9, "Main screen design", true, true, vec![]),
+                t("blooop/dotfiles", 103, "Prune legacy bash aliases", true, false, vec![]),
             ],
         })
     }
@@ -321,7 +321,7 @@ mod tests {
         let mut app = fixture_app();
         app.handle_key(key(KeyCode::Down)); // cursor on dotfiles #103
         app.handle_key(ctrl('f'));
-        assert_eq!(app.scope, Scope::Project("dotfiles".to_string()));
+        assert_eq!(app.scope, Scope::Project("blooop/dotfiles".to_string()));
         assert_eq!(app.visible().len(), 1);
         assert_eq!(app.cursor_ticket().unwrap().number, 103);
         app.handle_key(ctrl('g'));
@@ -351,6 +351,29 @@ mod tests {
         // Identity gone: cursor stays at the same position, clamped.
         assert_eq!(app.cursor_pos(), 1);
         assert_eq!(app.cursor_ticket().unwrap().number, 9);
+    }
+
+    #[test]
+    fn focus_separates_a_fork_from_its_upstream() {
+        // Two repos sharing a short name: identity and scope are the slug,
+        // so focusing one must not drag the other's rows in.
+        let t = |repo: &str, number: u64| Ticket {
+            repo: repo.to_string(),
+            number,
+            title: "Prune legacy bash aliases".to_string(),
+            status: classify(true, false, vec![]),
+        };
+        let mut app = App::new(Map {
+            repo: "2 projects".to_string(),
+            title: "wf".to_string(),
+            tickets: vec![t("blooop/dotfiles", 5), t("upstream/dotfiles", 5)],
+        });
+        app.handle_key(key(KeyCode::Down)); // cursor on upstream/dotfiles#5
+        assert_eq!(app.cursor_ticket().unwrap().repo, "upstream/dotfiles");
+        app.handle_key(ctrl('f'));
+        assert_eq!(app.scope, Scope::Project("upstream/dotfiles".to_string()));
+        assert_eq!(app.visible().len(), 1, "the fork's identically-numbered row must not show");
+        assert_eq!(app.cursor_ticket().unwrap().repo, "upstream/dotfiles");
     }
 
     #[test]

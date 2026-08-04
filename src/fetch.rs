@@ -4,6 +4,8 @@
 //! issue, its sub-issues, and each sub-issue's `blockedBy` edges with the
 //! blocker's state, so open-blocker classification needs no further calls.
 
+use std::collections::HashMap;
+
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
@@ -137,7 +139,7 @@ pub async fn fetch_map(owner: &str, name: &str, number: u64) -> Result<Map> {
                 .map(|b| b.number)
                 .collect();
             Ticket {
-                repo: name.to_string(),
+                repo: format!("{owner}/{name}"),
                 number: sub.number,
                 title: sub.title,
                 status: classify(
@@ -155,4 +157,94 @@ pub async fn fetch_map(owner: &str, name: &str, number: u64) -> Result<Map> {
         title: issue.title,
         tickets,
     })
+}
+
+/// One item of a `search/issues` response — just what map detection needs.
+#[derive(Deserialize)]
+struct SearchItem {
+    number: u64,
+    repository_url: String,
+}
+
+#[derive(Deserialize)]
+struct SearchResponse {
+    items: Vec<SearchItem>,
+}
+
+/// Which of `repos` have a `wayfinder:map` issue — one label-scoped search
+/// (per the #4 resolution: one query intersected with cached remotes, never
+/// N probes). Returns `repo slug → map issue number`; repos without maps
+/// are simply absent. Only open map issues count (a closed map is a
+/// finished map), and if a repo somehow has several, the lowest issue
+/// number wins — deterministic and almost always the original.
+pub async fn find_maps(repos: &[String]) -> Result<HashMap<String, u64>> {
+    if repos.is_empty() {
+        return Ok(HashMap::new());
+    }
+    // Multiple `repo:` qualifiers OR together in GitHub issue search, so
+    // the whole cached set is one query.
+    let scope: Vec<String> = repos.iter().map(|r| format!("repo:{r}")).collect();
+    let query = format!("label:\"wayfinder:map\" is:issue is:open {}", scope.join(" "));
+
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "-X",
+            "GET",
+            "search/issues",
+            "-f",
+            &format!("q={query}"),
+            "-F",
+            "per_page=100",
+        ])
+        .output()
+        .await
+        .context("failed to run `gh` for the map search")?;
+    if !output.status.success() {
+        bail!(
+            "`gh api search/issues` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_map_search(&output.stdout)
+}
+
+/// Parse a `search/issues` response into `repo slug → lowest map issue`.
+fn parse_map_search(body: &[u8]) -> Result<HashMap<String, u64>> {
+    let resp: SearchResponse =
+        serde_json::from_slice(body).context("unparseable search response from gh")?;
+    let mut maps = HashMap::new();
+    for item in resp.items {
+        // repository_url is "https://api.github.com/repos/<owner>/<name>".
+        let Some(slug) = item.repository_url.split("/repos/").nth(1) else {
+            continue;
+        };
+        let entry = maps.entry(slug.to_string()).or_insert(item.number);
+        *entry = (*entry).min(item.number);
+    }
+    Ok(maps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_search_parses_slug_and_keeps_lowest_number_per_repo() {
+        let body = r#"{"items": [
+            {"number": 9, "repository_url": "https://api.github.com/repos/blooop/wayfinder"},
+            {"number": 1, "repository_url": "https://api.github.com/repos/blooop/wayfinder"},
+            {"number": 4, "repository_url": "https://api.github.com/repos/kinisi/kinisi_ros"}
+        ]}"#;
+        let maps = parse_map_search(body.as_bytes()).expect("parse");
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps["blooop/wayfinder"], 1);
+        assert_eq!(maps["kinisi/kinisi_ros"], 4);
+    }
+
+    #[test]
+    fn empty_search_result_means_no_maps() {
+        let maps = parse_map_search(br#"{"items": []}"#).expect("parse");
+        assert!(maps.is_empty());
+    }
 }
