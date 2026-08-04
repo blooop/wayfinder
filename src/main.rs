@@ -10,16 +10,25 @@
 //! 4. Inside a checkout whose repo has a map, the screen opens focused on
 //!    it (`Scope::Project`, repo column dropped); `ctrl-g` widens to all
 //!    projects, `ctrl-f` re-focuses. Outside any checkout: all projects.
+//! 5. `enter` / `ctrl-a` launch the picked ticket through the Build 4 seam
+//!    (#16): this loop is the only place that may suspend the TUI, so it
+//!    performs what [`wf::launch`] decides.
 
 use std::collections::BTreeMap;
+use std::io::stdout;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use wf::app::{App, Outcome, Scope};
+use wf::launch::{self, Handoff, Launch, TabOutcome};
 use wf::model::{merge_maps, Map};
 use wf::projects::{self, ProjectsCache};
 use wf::refresh::{Freshness, Poller, RefreshEvent};
@@ -66,7 +75,8 @@ async fn main() -> Result<()> {
         anyhow::bail!("every map fetch failed — check network and `gh auth status`");
     }
 
-    let mut app = App::new(merge_maps(&maps));
+    let mut app = App::new(merge_maps(&maps))
+        .with_projects(cache.checkouts.clone(), map_issues.clone());
     app.notice = startup_notice;
     match &here {
         // cwd-open focuses the project (lazygit-style) when its repo has a
@@ -90,10 +100,87 @@ async fn main() -> Result<()> {
         .collect();
     let updates = wf::refresh::spawn_all(pollers);
 
+    // Agent tabs already open from earlier sessions: the AFK line is honest
+    // from the first frame (#7 — the tab is the supervision, and it outlives
+    // any one `wf`).
+    let sessions = launch::sessions_of(&cache.checkouts);
+    app.agent_tabs = launch::agent_tab_count(&sessions).await;
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, app, maps, map_issues, updates).await;
+    let result = run(&mut terminal, app, maps, map_issues, sessions, updates).await;
     ratatui::restore();
     result
+}
+
+/// Leave the TUI's grip on the terminal so a child process can own it. Paired
+/// with [`resume`] — the child is *never* `exec`ed, so detaching from it comes
+/// back here (#5).
+fn suspend(terminal: &mut DefaultTerminal) -> Result<()> {
+    terminal.show_cursor()?;
+    disable_raw_mode()?;
+    execute!(stdout(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+/// Retake the terminal after the child exited, and force a full redraw.
+fn resume(terminal: &mut DefaultTerminal) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(stdout(), EnterAlternateScreen)?;
+    terminal.hide_cursor()?;
+    terminal.clear()?;
+    Ok(())
+}
+
+/// Refetch every map in place (`ctrl-r`, and after returning from a session —
+/// a claim or a close landed while we were away). True if any fetch failed.
+async fn refetch_all(maps: &mut BTreeMap<String, Map>, map_issues: &BTreeMap<String, u64>) -> bool {
+    let mut failed = false;
+    for (slug, &number) in map_issues {
+        let (owner, name) = slug.split_once('/').expect("slug is owner/name");
+        match wf::fetch::fetch_map(owner, name, number).await {
+            Ok(map) => {
+                maps.insert(slug.clone(), map);
+            }
+            Err(_) => failed = true,
+        }
+    }
+    failed
+}
+
+/// Perform one launch (#16): create-or-focus the tab, then hand over as this
+/// host requires — suspending the TUI around `zellij attach` when `wf` owns
+/// the terminal, staying up when zellij's own navigation does the moving.
+/// Returns the notice to show.
+async fn perform_launch(
+    terminal: &mut DefaultTerminal,
+    launch: &Launch,
+    maps: &mut BTreeMap<String, Map>,
+    map_issues: &BTreeMap<String, u64>,
+) -> Result<String> {
+    let host = launch::detect_host();
+    let (tab, handoff) = match launch::execute(launch, &host).await {
+        Ok(result) => result,
+        Err(err) => return Ok(format!("launch failed: {err}")),
+    };
+    let verb = match tab {
+        TabOutcome::Created => "started",
+        TabOutcome::Existed => "focused",
+    };
+    match handoff {
+        Handoff::Stay => Ok(format!("{verb} {}", launch.describe())),
+        Handoff::Suspend(argv) => {
+            let (program, args) = argv.split_first().expect("attach argv is non-empty");
+            suspend(terminal)?;
+            let status = tokio::process::Command::new(program).args(args).status().await;
+            resume(terminal)?;
+            // Away for a while: the tracker moved (a claim, maybe a close).
+            refetch_all(maps, map_issues).await;
+            Ok(match status {
+                Ok(_) => format!("back from {}", launch.session),
+                Err(err) => format!("could not attach to {}: {err}", launch.session),
+            })
+        }
+    }
 }
 
 /// Poll outcomes folded into displayable state: when data was last verified
@@ -131,6 +218,7 @@ async fn run(
     mut app: App,
     mut maps: BTreeMap<String, Map>,
     map_issues: BTreeMap<String, u64>,
+    sessions: Vec<String>,
     mut updates: UnboundedReceiver<(String, RefreshEvent)>,
 ) -> Result<()> {
     let mut refresh = RefreshState {
@@ -160,18 +248,11 @@ async fn run(
                     Outcome::Quit => return Ok(()),
                     Outcome::Refresh => {
                         // Force refresh (ctrl-r): refetch every map in
-                        // place, without waiting for the poll cycles.
-                        let mut failed = false;
-                        for (slug, &number) in &map_issues {
-                            let (owner, name) = slug.split_once('/').expect("slug is owner/name");
-                            match wf::fetch::fetch_map(owner, name, number).await {
-                                Ok(map) => {
-                                    maps.insert(slug.clone(), map);
-                                }
-                                Err(_) => failed = true,
-                            }
-                        }
+                        // place, without waiting for the poll cycles, and
+                        // recount the agent tabs while we are at it.
+                        let failed = refetch_all(&mut maps, &map_issues).await;
                         app.replace_map(merge_maps(&maps));
+                        app.agent_tabs = launch::agent_tab_count(&sessions).await;
                         if failed {
                             refresh.apply(&RefreshEvent::Failed);
                             app.notice = Some("refresh failed for some projects".to_string());
@@ -179,6 +260,15 @@ async fn run(
                             refresh.apply(&RefreshEvent::Unchanged);
                             app.notice = Some("refreshed".to_string());
                         }
+                    }
+                    Outcome::Launch(launch) => {
+                        let notice =
+                            perform_launch(terminal, &launch, &mut maps, &map_issues).await?;
+                        app.replace_map(merge_maps(&maps));
+                        app.notice = Some(notice);
+                        // The new tab counts towards the AFK line; this also
+                        // reaps tabs closed by hand since the last check.
+                        app.agent_tabs = launch::agent_tab_count(&sessions).await;
                     }
                     Outcome::Continue => {}
                 }

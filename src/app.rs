@@ -3,13 +3,17 @@
 //! [`App`] owns everything the screen needs between keypresses: the map, the
 //! fuzzy query, the cursor over *visible* rows, the project scope, and a
 //! one-shot notice line. Key handling returns an [`Outcome`] so the event
-//! loop owns side effects (quit, refetch) — the `Refresh` outcome is the
-//! same seam a background poller can drive later (#17).
+//! loop owns side effects (quit, refetch, launch) — the `Refresh` outcome is
+//! the same seam the background poller drives (#17), and `Launch` is the
+//! Build 4 seam (#16): the app decides *what* to launch, the loop performs
+//! it (it is the only thing that can suspend the TUI).
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::filter::matching_indices;
+use crate::launch::{self, Launch, MapIssues, Mode, Targets};
 use crate::model::{Map, Ticket, GROUP_LABELS};
+use crate::projects::Checkout;
 
 /// Project scope: everything, or one repo focused via `ctrl-f`.
 /// With a single repo synced this is a near-no-op, but the state is wired
@@ -28,6 +32,20 @@ pub enum Outcome {
     /// Force a refetch (`ctrl-r`). The loop performs it and puts the result
     /// back via [`App::replace_map`].
     Refresh,
+    /// Launch this agent session (#16): the loop creates-or-focuses the tab
+    /// and, for a HITL launch outside zellij, suspends the TUI to attach.
+    Launch(Launch),
+}
+
+/// A modal layer over the main screen. Only one thing needs one in v1: a
+/// repo with several registered checkouts (the k1–k5 pattern) must be asked
+/// which project hosts the ticket's tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Overlay {
+    None,
+    /// Candidates are complete launches, so the pick cannot produce an
+    /// inconsistent one.
+    PickCheckout { launches: Vec<Launch>, cursor: usize },
 }
 
 pub struct App {
@@ -35,8 +53,17 @@ pub struct App {
     pub query: String,
     pub scope: Scope,
     /// One-shot status message shown on the count line; cleared on the next
-    /// keypress. Carries the visible no-op for `enter` until Build 4.
+    /// keypress.
     pub notice: Option<String>,
+    /// Launch input from the projects cache (#15 handoff): which checkouts
+    /// exist and which zellij session each one uses.
+    pub checkouts: Vec<Checkout>,
+    /// Each repo's map issue number — `/wayfinder`'s first argument.
+    pub map_issues: MapIssues,
+    /// `<repo>#<n>` tabs counted at the last check, shown in the reserved
+    /// AFK slot (#7: the tab *is* the supervision).
+    pub agent_tabs: usize,
+    pub overlay: Overlay,
     cursor: usize,
 }
 
@@ -47,8 +74,20 @@ impl App {
             query: String::new(),
             scope: Scope::All,
             notice: None,
+            checkouts: Vec::new(),
+            map_issues: MapIssues::new(),
+            agent_tabs: 0,
+            overlay: Overlay::None,
             cursor: 0,
         }
+    }
+
+    /// Attach the launch inputs: the cached checkouts (candidate hosts and
+    /// their session names) and the per-repo map issue numbers.
+    pub fn with_projects(mut self, checkouts: Vec<Checkout>, map_issues: MapIssues) -> Self {
+        self.checkouts = checkouts;
+        self.map_issues = map_issues;
+        self
     }
 
     fn in_scope(&self, ticket: &Ticket) -> bool {
@@ -136,11 +175,93 @@ impl App {
         );
     }
 
+    /// Resolve a launch of the cursor's ticket: straight to the loop when
+    /// there is one candidate checkout, through the picker when there are
+    /// several, and a notice when there is none to launch into.
+    fn request_launch(&mut self, mode: Mode) -> Outcome {
+        let Some(ticket) = self.cursor_ticket().cloned() else {
+            self.notice = Some("nothing selected".to_string());
+            return Outcome::Continue;
+        };
+        let (repo, number) = (&ticket.repo, ticket.number);
+        let Some(&map_issue) = self.map_issues.get(repo) else {
+            self.notice = Some(format!("{repo} has no map — nothing to hand /wayfinder"));
+            return Outcome::Continue;
+        };
+        match launch::plan(&self.checkouts, &ticket, map_issue, mode) {
+            Targets::Unregistered => {
+                self.notice = Some(format!(
+                    "no registered checkout of {repo} on this machine — run wf inside one"
+                ));
+                Outcome::Continue
+            }
+            Targets::One(launch) => {
+                self.notice = Some(format!("{} → {}", mode.label(), launch.describe()));
+                Outcome::Launch(launch)
+            }
+            Targets::Many(launches) => {
+                self.notice = Some(format!("{repo}#{number}: which checkout?"));
+                self.overlay = Overlay::PickCheckout { launches, cursor: 0 };
+                Outcome::Continue
+            }
+        }
+    }
+
+    /// Keys while the checkout picker is up. The modal owns every key: no
+    /// typing leaks into the query behind it.
+    fn handle_overlay_key(&mut self, key: KeyEvent, launches: Vec<Launch>, cursor: usize) -> Outcome {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let last = launches.len().saturating_sub(1);
+        let moved = |cursor: usize, delta: isize| {
+            (cursor as isize + delta).clamp(0, last as isize) as usize
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.overlay = Overlay::None;
+                self.notice = Some("launch cancelled".to_string());
+                Outcome::Continue
+            }
+            KeyCode::Char('c') if ctrl => Outcome::Quit,
+            KeyCode::Enter => {
+                self.overlay = Overlay::None;
+                let launch = launches
+                    .into_iter()
+                    .nth(cursor)
+                    .expect("picker cursor stays in range");
+                self.notice = Some(format!("{} → {}", launch.mode.label(), launch.describe()));
+                Outcome::Launch(launch)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.overlay = Overlay::PickCheckout {
+                    launches,
+                    cursor: moved(cursor, 1),
+                };
+                Outcome::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.overlay = Overlay::PickCheckout {
+                    launches,
+                    cursor: moved(cursor, -1),
+                };
+                Outcome::Continue
+            }
+            _ => {
+                self.overlay = Overlay::PickCheckout { launches, cursor };
+                Outcome::Continue
+            }
+        }
+    }
+
     /// Handle one keypress. Typing edits the query (rows re-filter, cursor
     /// jumps to the first visible row); see the ticket #14 skeleton for the
     /// chord bindings.
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
         self.notice = None;
+        if let Overlay::PickCheckout { launches, cursor } =
+            std::mem::replace(&mut self.overlay, Overlay::None)
+        {
+            return self.handle_overlay_key(key, launches, cursor);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => Outcome::Quit,
@@ -180,14 +301,10 @@ impl App {
                 self.move_cursor(-1);
                 Outcome::Continue
             }
-            KeyCode::Enter => {
-                // Visible no-op until the launch seam lands (Build 4).
-                self.notice = Some(match self.cursor_ticket() {
-                    Some(t) => format!("enter → launch {}#{} — wired in Build 4", t.repo, t.number),
-                    None => "nothing selected".to_string(),
-                });
-                Outcome::Continue
-            }
+            // The launch seam (#16): enter takes you into the agent session,
+            // ctrl-a fires the same tab headless and leaves you here.
+            KeyCode::Enter => self.request_launch(Mode::Hitl),
+            KeyCode::Char('a') if ctrl => self.request_launch(Mode::Afk),
             KeyCode::Esc => {
                 if self.query.is_empty() {
                     Outcome::Quit
@@ -307,13 +424,126 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Outcome::Quit);
     }
 
+    /// The fixture app plus launch inputs: one checkout of wayfinder, two of
+    /// a multi-checkout repo, and map issues for both.
+    fn launchable_app() -> App {
+        let checkout = |path: &str, repo: &str, session: &str| Checkout {
+            path: std::path::PathBuf::from(path),
+            repo: repo.to_string(),
+            session: session.to_string(),
+        };
+        let mut map_issues = MapIssues::new();
+        map_issues.insert("blooop/wayfinder".to_string(), 1);
+        map_issues.insert("blooop/dotfiles".to_string(), 4);
+        fixture_app().with_projects(
+            vec![
+                checkout("/data/proj/wayfinder", "blooop/wayfinder", "wayfinder"),
+                checkout("/data/k1/dotfiles", "blooop/dotfiles", "k1"),
+                checkout("/data/k2/dotfiles", "blooop/dotfiles", "k2"),
+            ],
+            map_issues,
+        )
+    }
+
     #[test]
-    fn enter_is_a_visible_noop_stub() {
+    fn enter_launches_the_cursors_ticket_hitl_without_prompting() {
+        let mut app = launchable_app();
+        // Cursor starts on frontier wayfinder#6, whose repo has one checkout.
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.mode, Mode::Hitl);
+        assert_eq!(launch.tab, "wayfinder#6");
+        assert_eq!(launch.session, "wayfinder");
+        assert_eq!(launch.map_issue, 1);
+        assert_eq!(app.overlay, Overlay::None, "one candidate must not prompt");
+        assert!(app.notice.as_deref().unwrap().contains("wayfinder#6 in wayfinder"));
+    }
+
+    #[test]
+    fn ctrl_a_launches_the_same_ticket_afk() {
+        let mut app = launchable_app();
+        let launch = match app.handle_key(ctrl('a')) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.mode, Mode::Afk);
+        assert_eq!(launch.tab, "wayfinder#6");
+        assert!(app.notice.as_deref().unwrap().contains("afk agent"));
+    }
+
+    #[test]
+    fn several_checkouts_open_the_picker_and_enter_launches_the_pick() {
+        let mut app = launchable_app();
+        app.handle_key(key(KeyCode::Down)); // dotfiles#103 — two checkouts
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        match &app.overlay {
+            Overlay::PickCheckout { launches, cursor } => {
+                assert_eq!(launches.len(), 2);
+                assert_eq!(*cursor, 0);
+            }
+            other => panic!("expected the picker, got {other:?}"),
+        }
+        // The picker owns every key: typing must not leak into the query.
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(app.query, "");
+        app.handle_key(key(KeyCode::Down));
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.session, "k2");
+        assert_eq!(launch.cwd, std::path::PathBuf::from("/data/k2/dotfiles"));
+        assert_eq!(launch.tab, "dotfiles#103");
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn the_picker_clamps_and_esc_cancels_it() {
+        let mut app = launchable_app();
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(ctrl('a')); // AFK launch also prompts
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        match &app.overlay {
+            Overlay::PickCheckout { cursor, .. } => assert_eq!(*cursor, 1),
+            other => panic!("expected the picker, got {other:?}"),
+        }
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Outcome::Continue);
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.notice.as_deref(), Some("launch cancelled"));
+        // Esc after cancelling behaves normally again (empty query → quit).
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Outcome::Quit);
+    }
+
+    #[test]
+    fn a_repo_with_no_checkout_or_no_map_says_so_instead_of_launching() {
+        // No launch inputs at all: every ticket is unlaunchable, and the
+        // reason is the missing map (nothing to hand /wayfinder).
         let mut app = fixture_app();
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert!(app.notice.as_deref().unwrap().contains("has no map"));
+
+        // Map known, checkout gone from the cache: the other failure.
+        let mut map_issues = MapIssues::new();
+        map_issues.insert("blooop/wayfinder".to_string(), 1);
+        let mut app = fixture_app().with_projects(Vec::new(), map_issues);
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         let notice = app.notice.as_deref().unwrap();
-        assert!(notice.contains("wayfinder#6"), "notice was: {notice}");
-        assert!(notice.contains("Build 4"), "notice was: {notice}");
+        assert!(notice.contains("no registered checkout"), "notice: {notice}");
+    }
+
+    #[test]
+    fn launching_with_nothing_visible_is_a_notice_not_a_panic() {
+        let mut app = launchable_app();
+        type_str(&mut app, "zzzz");
+        assert!(app.cursor_ticket().is_none());
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert_eq!(app.notice.as_deref(), Some("nothing selected"));
+        assert_eq!(app.handle_key(ctrl('a')), Outcome::Continue);
+        assert_eq!(app.notice.as_deref(), Some("nothing selected"));
     }
 
     #[test]

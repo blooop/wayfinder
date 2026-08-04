@@ -3,13 +3,13 @@
 //! blocked rows — per the #8 and #9 resolutions. Build 2 adds the fuzzy
 //! query (2a: groups survive typing), the cursor, and the bottom prompt.
 
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Scope};
+use crate::app::{App, Overlay, Scope};
 use crate::model::{Status, GROUP_LABELS};
 
 fn glyph_style(status: &Status) -> Style {
@@ -91,18 +91,84 @@ pub fn body_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-/// The keybinding skeleton (#14): `tab` peek is deferred from v1; `enter` is
-/// a visible no-op until the launch seam (Build 4); `esc` clears the query
-/// first and quits on an empty one, and `q` only quits when the query is
-/// empty (mid-query it types).
+/// The keybinding skeleton (#14): `tab` peek is deferred from v1; `enter`
+/// enters the ticket's agent session and `ctrl-a` spawns it AFK (#16); `esc`
+/// clears the query first and quits on an empty one, and `q` only quits when
+/// the query is empty (mid-query it types).
 const KEY_HINTS: &str =
-    "  enter launch · ctrl-f focus row's project · ctrl-g all · ctrl-r refresh · esc quit";
+    "  enter launch · ctrl-a afk · ctrl-f focus · ctrl-g all · ctrl-r refresh · esc quit";
+
+/// The reserved AFK line (#1/#11): a count of the `<repo>#<n>` agent tabs
+/// zellij is holding, as of the last check. Empty when there are none —
+/// including before anything has been launched.
+pub fn afk_line(app: &App) -> String {
+    match app.agent_tabs {
+        0 => String::new(),
+        1 => "  agents: 1 tab".to_string(),
+        n => format!("  agents: {n} tabs"),
+    }
+}
+
+/// A centered box `width`×`height` (clamped) inside `area`.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let [area] = Layout::horizontal([Constraint::Length(width.min(area.width))])
+        .flex(Flex::Center)
+        .areas(area);
+    let [area] = Layout::vertical([Constraint::Length(height.min(area.height))])
+        .flex(Flex::Center)
+        .areas(area);
+    area
+}
+
+/// The which-checkout modal: one row per registered checkout of the repo
+/// (session name + path), because several checkouts of one repo each have
+/// their own session and the human must say which hosts the tab.
+fn draw_overlay(frame: &mut Frame, app: &App) {
+    let Overlay::PickCheckout { launches, cursor } = &app.overlay else {
+        return;
+    };
+    let mut lines = vec![Line::default()];
+    for (i, launch) in launches.iter().enumerate() {
+        let marker = if i == *cursor { '▶' } else { ' ' };
+        lines.push(Line::from(vec![
+            Span::raw(format!("  {marker} ")),
+            Span::styled(
+                format!("{:<12}", launch.session),
+                Style::new().fg(Color::Cyan),
+            ),
+            Span::raw(format!(" {}", launch.cwd.display())),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "  enter launch here · ↑/↓ pick · esc cancel",
+        Style::new().add_modifier(Modifier::DIM),
+    ));
+    let tab = launches.first().map(|l| l.tab.as_str()).unwrap_or_default();
+    let width = lines
+        .iter()
+        .map(|l| l.width() as u16 + 4)
+        .chain(std::iter::once(tab.len() as u16 + 32))
+        .max()
+        .unwrap_or(40);
+    let area = centered(frame.area(), width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(format!(" which checkout hosts {tab}? "))
+                .border_style(Style::new().fg(Color::Cyan)),
+        ),
+        area,
+    );
+}
 
 /// Draw the full screen: bordered frame with the scope in the title, grouped
-/// list body, then the anchored bottom chrome — the reserved (empty) AFK
-/// slot line, the match-count line (with the subtle last-refreshed indicator
-/// from the background poll, empty before the first cycle, plus any one-shot
-/// notice), the fzf-style prompt, and the key hints.
+/// list body, then the anchored bottom chrome — the AFK slot line (a count of
+/// live agent tabs, empty when there are none), the match-count line (with
+/// the subtle last-refreshed indicator from the background poll, empty before
+/// the first cycle, plus any one-shot notice), the fzf-style prompt, and the
+/// key hints. The which-checkout picker, when open, floats over all of it.
 pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
     let mut block = match &app.scope {
         Scope::All => Block::bordered().title(format!(" wf · {} ", app.map.repo)),
@@ -116,9 +182,9 @@ pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
     let inner = block.inner(frame.area());
     frame.render_widget(block, frame.area());
 
-    let [body_area, _afk_slot, count_area, prompt_area, hint_area] = Layout::vertical([
+    let [body_area, afk_area, count_area, prompt_area, hint_area] = Layout::vertical([
         Constraint::Min(0),
-        Constraint::Length(1), // AFK agents slot — reserved, deliberately empty (see #7/#11)
+        Constraint::Length(1), // AFK agents slot (see #7/#11)
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -126,6 +192,10 @@ pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
     .areas(inner);
 
     frame.render_widget(Paragraph::new(body_lines(app)), body_area);
+    frame.render_widget(
+        Paragraph::new(afk_line(app)).style(Style::new().fg(Color::Magenta)),
+        afk_area,
+    );
 
     let mut count_spans = vec![
         Span::raw(format!("  {}/{}", app.visible().len(), app.scoped().len())),
@@ -154,6 +224,7 @@ pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
         Paragraph::new(KEY_HINTS).style(Style::new().add_modifier(Modifier::DIM)),
         hint_area,
     );
+    draw_overlay(frame, app);
 }
 
 #[cfg(test)]
@@ -293,12 +364,55 @@ mod tests {
         assert!(screen.contains("▶ ⊘ wayfinder  #14   Breadcrumb markers"));
     }
 
+    /// The fixture map plus Build 4 launch inputs: two checkouts of the repo,
+    /// so `enter` opens the which-checkout picker.
+    fn launchable_app() -> App {
+        let checkout = |path: &str, session: &str| crate::projects::Checkout {
+            path: std::path::PathBuf::from(path),
+            repo: "blooop/wayfinder".to_string(),
+            session: session.to_string(),
+        };
+        let mut map_issues = crate::launch::MapIssues::new();
+        map_issues.insert("blooop/wayfinder".to_string(), 1);
+        App::new(fixture_map()).with_projects(
+            vec![
+                checkout("/data/k1/wayfinder", "k1"),
+                checkout("/data/k2/wayfinder", "k2"),
+            ],
+            map_issues,
+        )
+    }
+
     #[test]
-    fn enter_shows_the_build4_stub_notice() {
+    fn the_hint_line_advertises_both_launch_keys() {
+        let screen = render(&App::new(fixture_map()));
+        assert!(screen.contains("enter launch"));
+        assert!(screen.contains("ctrl-a afk"));
+    }
+
+    #[test]
+    fn the_afk_slot_is_empty_until_agent_tabs_exist() {
         let mut app = App::new(fixture_map());
+        assert_eq!(afk_line(&app), "");
+        assert!(!render(&app).contains("agents:"));
+        app.agent_tabs = 1;
+        assert_eq!(afk_line(&app), "  agents: 1 tab");
+        app.agent_tabs = 3;
+        assert!(render(&app).contains("agents: 3 tabs"));
+    }
+
+    #[test]
+    fn the_checkout_picker_floats_over_the_list_with_one_row_per_session() {
+        let mut app = launchable_app();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let screen = render(&app);
-        assert!(screen.contains("launch blooop/wayfinder#6 — wired in Build 4"));
+        assert!(screen.contains("which checkout hosts wayfinder#6?"), "{screen}");
+        assert!(screen.contains("▶ k1"));
+        assert!(screen.contains("/data/k1/wayfinder"));
+        assert!(screen.contains("  k2"));
+        assert!(screen.contains("esc cancel"));
+        // It is a modal: the rows it covers are overwritten, not blended.
+        assert!(!screen.contains("Supervising AFK agents"), "{screen}");
     }
 
     #[test]

@@ -6,10 +6,15 @@
 //! `gh api graphql`, merged into one grouped list behind a nucleo fuzzy
 //! query (groups survive typing per #9), and kept fresh by one poller per
 //! repo (#17). cwd-open focuses that project; `ctrl-g` widens.
+//!
+//! Build 4: the launch seam (see #16/#5/#7) — `enter` creates or focuses the
+//! `<repo>#<n>` zellij tab in the project's session and hands the terminal
+//! over to a HITL agent; `ctrl-a` spawns the same tab headless (AFK).
 
 pub mod app;
 pub mod fetch;
 pub mod filter;
+pub mod launch;
 pub mod model;
 pub mod projects;
 pub mod refresh;
