@@ -235,7 +235,7 @@ pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{classify, Map, Ticket};
+    use crate::model::{classify, Map, Ticket, TicketType};
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -246,6 +246,7 @@ mod tests {
             number,
             title: title.to_string(),
             status: classify(open, assigned, needs),
+            ticket_type: TicketType::Task,
         };
         Map {
             repo: "blooop/wayfinder".to_string(),

@@ -485,12 +485,13 @@ pub fn find_tab<'a>(names: &'a [String], key: &TabKey) -> Option<&'a str> {
 ///
 /// ```
 /// # use wf::launch::{tab_exists, tab_key};
-/// # use wf::model::{classify, Ticket};
+/// # use wf::model::{classify, Ticket, TicketType};
 /// let ticket = Ticket {
 ///     repo: "blooop/wayfinder".to_string(),
 ///     number: 20,
 ///     title: "Readable agent tab names".to_string(),
 ///     status: classify(true, false, vec![]),
+///     ticket_type: TicketType::Task,
 /// };
 /// let names = vec!["wayfinder#20 Readable agent".to_string()];
 /// assert!(tab_exists(&names, &tab_key(&ticket)));
@@ -500,12 +501,13 @@ pub fn find_tab<'a>(names: &'a [String], key: &TabKey) -> Option<&'a str> {
 ///
 /// ```compile_fail
 /// # use wf::launch::{tab_exists, tab_label};
-/// # use wf::model::{classify, Ticket};
+/// # use wf::model::{classify, Ticket, TicketType};
 /// let ticket = Ticket {
 ///     repo: "blooop/wayfinder".to_string(),
 ///     number: 20,
 ///     title: "Readable agent tab names".to_string(),
 ///     status: classify(true, false, vec![]),
+///     ticket_type: TicketType::Task,
 /// };
 /// let names = vec!["wayfinder#20 Readable agent".to_string()];
 /// tab_exists(&names, &tab_label(&ticket));
@@ -795,7 +797,7 @@ pub type MapIssues = BTreeMap<String, u64>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{classify, Status};
+    use crate::model::{classify, Status, TicketType};
 
     fn titled(repo: &str, number: u64, title: &str) -> Ticket {
         Ticket {
@@ -803,6 +805,7 @@ mod tests {
             number,
             title: title.to_string(),
             status: classify(true, false, vec![]),
+            ticket_type: TicketType::Task,
         }
     }
 
@@ -1309,6 +1312,7 @@ kinisi [Created 1h ago] \n";
             number: 2,
             title: "done".to_string(),
             status: Status::Done,
+            ticket_type: TicketType::Task,
         };
         assert_eq!(tab_key(&done).to_string(), "wayfinder#2");
         assert_eq!(tab_label(&done).to_string(), "wayfinder#2 done");

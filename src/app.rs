@@ -334,7 +334,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{classify, Map, Ticket};
+    use crate::model::{classify, Map, Ticket, TicketType};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -351,6 +351,7 @@ mod tests {
                 number,
                 title: title.to_string(),
                 status: classify(open, assigned, needs),
+                ticket_type: TicketType::Task,
             }
         };
         App::new(Map {
@@ -596,6 +597,7 @@ mod tests {
             number,
             title: "Prune legacy bash aliases".to_string(),
             status: classify(true, false, vec![]),
+            ticket_type: TicketType::Task,
         };
         let mut app = App::new(Map {
             repo: "2 projects".to_string(),

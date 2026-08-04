@@ -23,7 +23,7 @@ use wf::launch::{
     count_agent_tabs, create_or_focus_tab, ensure_session, find_tab, query_tab_names,
     session_state, tab_exists, tab_key, tab_label, SessionState, TabKey, TabOutcome,
 };
-use wf::model::{classify, Ticket};
+use wf::model::{classify, Ticket, TicketType};
 
 /// Does this displayed tab name belong to this ticket? Duplicate tab names are
 /// legal in zellij, so *counting* the ones with this key is how the test proves
@@ -40,6 +40,7 @@ fn ticket(number: u64, title: &str) -> Ticket {
         number,
         title: title.to_string(),
         status: classify(true, false, vec![]),
+        ticket_type: TicketType::Task,
     }
 }
 

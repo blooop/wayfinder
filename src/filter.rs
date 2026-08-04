@@ -42,7 +42,7 @@ pub fn matching_indices(tickets: &[Ticket], query: &str) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Status;
+    use crate::model::{Status, TicketType};
 
     fn ticket(repo: &str, number: u64, title: &str) -> Ticket {
         Ticket {
@@ -50,6 +50,7 @@ mod tests {
             number,
             title: title.to_string(),
             status: Status::Frontier,
+            ticket_type: TicketType::Task,
         }
     }
 

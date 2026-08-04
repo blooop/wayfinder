@@ -3,6 +3,11 @@
 //! One GraphQL query per map (per the #3 data-plane resolution): the map
 //! issue, its sub-issues, and each sub-issue's `blockedBy` edges with the
 //! blocker's state, so open-blocker classification needs no further calls.
+//!
+//! Labels ride along in the same selection (#19) at the same 2 rate-limit
+//! points, and this is the one place they are ever looked at as strings: a
+//! sub-issue's labels become a [`TicketType`] here and nothing inward re-sniffs
+//! them (parse, don't validate).
 
 use std::collections::HashMap;
 
@@ -10,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
 
-use crate::model::{classify, Map, Ticket};
+use crate::model::{classify, Map, Ticket, TicketType};
 
 const MAP_QUERY: &str = "\
 query($owner: String!, $name: String!, $number: Int!) {
@@ -20,6 +25,7 @@ query($owner: String!, $name: String!, $number: Int!) {
       subIssues(first: 100) {
         nodes {
           number title state
+          labels(first: 10) { nodes { name } }
           assignees(first: 5) { nodes { login } }
           blockedBy(first: 50) { nodes { number state } }
         }
@@ -67,9 +73,15 @@ struct SubIssue {
     number: u64,
     title: String,
     state: String,
+    labels: Nodes<Label>,
     assignees: Nodes<Assignee>,
     #[serde(rename = "blockedBy")]
     blocked_by: Nodes<Blocker>,
+}
+
+#[derive(Deserialize)]
+struct Label {
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -115,8 +127,16 @@ pub async fn fetch_map(owner: &str, name: &str, number: u64) -> Result<Map> {
         );
     }
 
+    parse_map(&output.stdout, owner, name, number)
+}
+
+/// Turn one `gh api graphql` response body into a [`Map`] — the whole parse
+/// boundary, kept apart from the process call so it is testable without the
+/// network. Every raw tracker string a ticket is derived from (state,
+/// assignees, blocker states, labels) is interpreted exactly here.
+fn parse_map(body: &[u8], owner: &str, name: &str, number: u64) -> Result<Map> {
     let resp: GraphQlResponse =
-        serde_json::from_slice(&output.stdout).context("unparseable GraphQL response from gh")?;
+        serde_json::from_slice(body).context("unparseable GraphQL response from gh")?;
     if let Some(err) = resp.errors.first() {
         bail!("GraphQL error: {}", err.message);
     }
@@ -146,6 +166,9 @@ pub async fn fetch_map(owner: &str, name: &str, number: u64) -> Result<Map> {
                     is_open(&sub.state),
                     !sub.assignees.nodes.is_empty(),
                     open_blockers,
+                ),
+                ticket_type: TicketType::from_labels(
+                    sub.labels.nodes.iter().map(|l| l.name.as_str()),
                 ),
             }
         })
@@ -240,6 +263,50 @@ mod tests {
         assert_eq!(maps.len(), 2);
         assert_eq!(maps["blooop/wayfinder"], 1);
         assert_eq!(maps["kinisi/kinisi_ros"], 4);
+    }
+
+    /// A response shaped exactly like the live one, with the `labels` selection
+    /// #19 added — the sub-issue types wf now reads.
+    const MAP_RESPONSE: &str = r#"{"data": {"repository": {"issue": {
+        "title": "Map: wf",
+        "subIssues": {"nodes": [
+            {"number": 19, "title": "Build 6", "state": "OPEN",
+             "labels": {"nodes": [{"name": "wayfinder:task"}]},
+             "assignees": {"nodes": []},
+             "blockedBy": {"nodes": [{"number": 18, "state": "CLOSED"}]}},
+            {"number": 3, "title": "GitHub Issues as the live data plane", "state": "OPEN",
+             "labels": {"nodes": [{"name": "enhancement"}, {"name": "wayfinder:research"}]},
+             "assignees": {"nodes": []},
+             "blockedBy": {"nodes": []}},
+            {"number": 21, "title": "Unlabelled fog", "state": "OPEN",
+             "labels": {"nodes": []},
+             "assignees": {"nodes": []},
+             "blockedBy": {"nodes": []}}
+        ]}
+    }}}}"#;
+
+    #[test]
+    fn the_map_parse_carries_each_sub_issues_type_through_from_its_labels() {
+        let map = parse_map(MAP_RESPONSE.as_bytes(), "blooop", "wayfinder", 1).expect("parse");
+        assert_eq!(map.repo, "blooop/wayfinder");
+        assert_eq!(map.title, "Map: wf");
+        let types: Vec<(u64, TicketType)> =
+            map.tickets.iter().map(|t| (t.number, t.ticket_type)).collect();
+        assert_eq!(
+            types,
+            vec![
+                (3, TicketType::Research),
+                (19, TicketType::Task),
+                // No labels at all is Untyped, and Untyped is not startable —
+                // fog graduated without a type is never picked up by itself.
+                (21, TicketType::Untyped),
+            ]
+        );
+        // The type is a *separate* axis from derived status: #3 is a frontier
+        // research ticket, which is exactly what auto-start acts on.
+        let research = map.tickets.iter().find(|t| t.number == 3).expect("#3");
+        assert_eq!(research.status, crate::model::Status::Frontier);
+        assert!(research.ticket_type.auto_startable());
     }
 
     #[test]

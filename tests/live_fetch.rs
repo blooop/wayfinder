@@ -2,7 +2,7 @@
 //! blooop/wayfinder's live map (#1) through `gh api graphql`. Needs network
 //! and an authenticated `gh`.
 
-use wf::model::Status;
+use wf::model::{Status, TicketType};
 
 #[tokio::test]
 async fn fetches_the_live_wayfinder_map() {
@@ -29,6 +29,27 @@ async fn fetches_the_live_wayfinder_map() {
     assert!(
         map.tickets.iter().any(|t| t.status == Status::Done),
         "the live map has closed tickets; none classified as done"
+    );
+
+    // #19's addition: the `labels` selection is accepted by the real API and
+    // every ticket's `wayfinder:*` type comes back parsed. This map's types are
+    // known facts — #3 is research, #19 is the build task, #18 is a grilling —
+    // so a query GitHub silently dropped labels from would show up as Untyped.
+    let typed = |n: u64| map.tickets.iter().find(|t| t.number == n).map(|t| t.ticket_type);
+    assert_eq!(typed(3), Some(TicketType::Research), "#3 is wayfinder:research");
+    assert_eq!(typed(19), Some(TicketType::Task), "#19 is wayfinder:task");
+    assert_eq!(typed(18), Some(TicketType::Grilling), "#18 is wayfinder:grilling");
+    assert_eq!(typed(9), Some(TicketType::Prototype), "#9 is wayfinder:prototype");
+    // The map issue itself is not a sub-issue, so nothing on the map carries
+    // `wayfinder:map`; every ticket here is one of the four real types.
+    assert!(
+        map.tickets.iter().all(|t| t.ticket_type != TicketType::Untyped),
+        "every ticket on this map is labelled: {:?}",
+        map.tickets
+            .iter()
+            .filter(|t| t.ticket_type == TicketType::Untyped)
+            .map(|t| t.number)
+            .collect::<Vec<_>>()
     );
 
     // Build 5 (#17) is blocked only by Build 1 (#13): while #13 is open it
