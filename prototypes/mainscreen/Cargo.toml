@@ -1,0 +1,12 @@
+[package]
+name = "mainscreen-proto"
+version = "0.1.0"
+edition = "2021"
+
+# Throwaway prototype for wayfinder issue #9: main screen design.
+# Renders static screens of the fuzzy picker over the grouped multi-project
+# list via ratatui's TestBackend; fuzzy ranking uses real nucleo scores.
+
+[dependencies]
+ratatui = "0.29"
+nucleo-matcher = "0.3"
