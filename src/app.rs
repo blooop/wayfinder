@@ -114,17 +114,26 @@ impl App {
         self.cursor = pos.clamp(0, len as isize - 1) as usize;
     }
 
-    /// Swap in freshly fetched data, keeping query/scope/cursor sensible.
+    /// Swap in freshly fetched data, keeping query/scope intact and the
+    /// cursor pinned to ticket identity (falling back to the same position,
+    /// clamped, if the ticket vanished — see `refresh::preserve_cursor`).
     pub fn replace_map(&mut self, map: Map) {
-        let anchor = self
-            .cursor_ticket()
-            .map(|t| (t.repo.clone(), t.number));
+        let anchor = self.cursor_ticket().map(|t| (t.repo.clone(), t.number));
+        let old_index = self.cursor_pos();
         self.map = map;
-        if let Some((repo, number)) = anchor {
-            self.point_at(&repo, number);
-        } else {
-            self.cursor = 0;
-        }
+        let visible = self.visible();
+        let new_order: Vec<(&str, u64)> = visible
+            .iter()
+            .map(|&i| {
+                let t = &self.map.tickets[i];
+                (t.repo.as_str(), t.number)
+            })
+            .collect();
+        self.cursor = crate::refresh::preserve_cursor(
+            anchor.as_ref().map(|(repo, number)| (repo.as_str(), *number)),
+            old_index,
+            &new_order,
+        );
     }
 
     /// Handle one keypress. Typing edits the query (rows re-filter, cursor
@@ -330,6 +339,18 @@ mod tests {
         let same = app.map.clone();
         app.replace_map(same);
         assert_eq!(app.cursor_ticket().unwrap().number, 103);
+    }
+
+    #[test]
+    fn replace_map_does_not_teleport_when_cursor_ticket_vanishes() {
+        let mut app = fixture_app();
+        app.handle_key(key(KeyCode::Down)); // cursor on #103, position 1
+        let mut smaller = app.map.clone();
+        smaller.tickets.retain(|t| t.number != 103);
+        app.replace_map(smaller);
+        // Identity gone: cursor stays at the same position, clamped.
+        assert_eq!(app.cursor_pos(), 1);
+        assert_eq!(app.cursor_ticket().unwrap().number, 9);
     }
 
     #[test]
