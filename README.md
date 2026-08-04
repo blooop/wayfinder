@@ -48,12 +48,20 @@ checkouts stay cached but hidden.
 
 ## Launching
 
-Picking a ticket creates or focuses a zellij tab named `<repo>#<n>` (e.g.
-`wayfinder#16`) in that project's session, with the checkout as its cwd,
-running the `/wayfinder` skill on the ticket. The tab is the unit of work and
-the unit of supervision: it survives `wf` exiting, it is reachable by normal
-zellij navigation, and re-picking a ticket focuses its existing tab instead of
-starting a second agent on it.
+Picking a ticket creates or focuses a zellij tab in that project's session,
+with the checkout as its cwd, running the `/wayfinder` skill on the ticket. The
+tab is the unit of work and the unit of supervision: it survives `wf` exiting,
+it is reachable by normal zellij navigation, and re-picking a ticket focuses its
+existing tab instead of starting a second agent on it.
+
+The tab is named `<repo>#<n> <short title>` — e.g.
+`wayfinder#16 Build 4 — launch…` — with the title capped at 18 characters on a
+word boundary, since zellij truncates the strip anyway. The `<repo>#<n>` half
+is the tab's *identity*: it is what `wf` looks tabs up by, so retitling an issue
+renames nothing and still finds the tab it already has. Everything that
+recognises an agent tab (including the count in the AFK slot) reads that leading
+key and ignores whatever follows it — the title, zellij's activity markers, or
+both.
 
 | key | what it does |
 | --- | --- |
@@ -80,5 +88,5 @@ first so a stale layout cannot be resurrected).
 
 A finished or crashed agent's tab lingers with an EXITED banner — that is the
 post-mortem, and closing it is yours to do. The line above the match count
-counts the `<repo>#<n>` tabs zellij is holding, as of the last launch or
-`ctrl-r`; it stays empty when there are none.
+counts the agent tabs zellij is holding, as of the last launch or `ctrl-r`; it
+stays empty when there are none.
