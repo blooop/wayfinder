@@ -222,7 +222,7 @@ async fn perform_launch(
         Ok(result) => result,
         Err(err) => return Ok(format!("launch failed: {err}")),
     };
-    let verb = match tab {
+    let verb = match tab.outcome() {
         TabOutcome::Created => "started",
         TabOutcome::Existed => "focused",
     };

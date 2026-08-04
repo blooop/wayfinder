@@ -144,7 +144,12 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
         "  enter launch here · ↑/↓ pick · esc cancel",
         Style::new().add_modifier(Modifier::DIM),
     ));
-    let tab = launches.first().map(|l| l.tab.as_str()).unwrap_or_default();
+    // The key, not the label: this asks *which checkout*, so the ticket only
+    // needs identifying, and the title is already on the row behind the prompt.
+    let tab = launches
+        .first()
+        .map(|l| l.key().to_string())
+        .unwrap_or_default();
     let width = lines
         .iter()
         .map(|l| l.width() as u16 + 4)

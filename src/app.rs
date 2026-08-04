@@ -454,7 +454,10 @@ mod tests {
             other => panic!("expected a launch, got {other:?}"),
         };
         assert_eq!(launch.mode, Mode::Hitl);
-        assert_eq!(launch.tab, "wayfinder#6");
+        assert_eq!(launch.key().to_string(), "wayfinder#6");
+        // The tab a human reads carries the capped title (#20); the identity
+        // the seam looks up does not.
+        assert_eq!(launch.label.to_string(), "wayfinder#6 Re-entry…");
         assert_eq!(launch.session, "wayfinder");
         assert_eq!(launch.map_issue, 1);
         assert_eq!(app.overlay, Overlay::None, "one candidate must not prompt");
@@ -469,7 +472,7 @@ mod tests {
             other => panic!("expected a launch, got {other:?}"),
         };
         assert_eq!(launch.mode, Mode::Afk);
-        assert_eq!(launch.tab, "wayfinder#6");
+        assert_eq!(launch.key().to_string(), "wayfinder#6");
         assert!(app.notice.as_deref().unwrap().contains("afk agent"));
     }
 
@@ -495,7 +498,8 @@ mod tests {
         };
         assert_eq!(launch.session, "k2");
         assert_eq!(launch.cwd, std::path::PathBuf::from("/data/k2/dotfiles"));
-        assert_eq!(launch.tab, "dotfiles#103");
+        assert_eq!(launch.key().to_string(), "dotfiles#103");
+        assert_eq!(launch.label.to_string(), "dotfiles#103 Prune legacy bash…");
         assert_eq!(app.overlay, Overlay::None);
     }
 

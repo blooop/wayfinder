@@ -1,8 +1,13 @@
 //! The launch seam (Build 4, #16) — the daily-use line.
 //!
-//! One picked ticket becomes a zellij tab named `<short_repo>#<number>`
-//! (per the #7 naming amendment) in that project's session, cwd set to the
-//! checkout, running the `/wayfinder` skill. Topology and semantics come
+//! One picked ticket becomes a zellij tab in that project's session, cwd set
+//! to the checkout, running the `/wayfinder` skill. The tab has two names and
+//! the difference is load-bearing (#20): its **key** [`TabKey`] —
+//! `<short_repo>#<number>`, per the #7 naming amendment — is its identity, and
+//! its **label** [`TabLabel`] is the key plus a capped title, which is what a
+//! human reads in the tab strip. Only the label reaches `new-tab --name`; only
+//! the key is ever looked up, so retitling an issue cannot make a ticket miss
+//! its own tab. Topology and semantics come
 //! from the #5 resolution: session per project, tab per ticket, create or
 //! *focus* by name, no `--close-on-exit` (an EXITED tab is the post-mortem),
 //! and no new navigation keybindings — HITL hands the terminal over by
@@ -23,6 +28,7 @@
 //!   session found EXITED is `delete-session`d before being recreated.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -98,18 +104,157 @@ pub struct Launch {
     pub session: String,
     /// The checkout the agent works in: the tab's cwd.
     pub cwd: PathBuf,
-    /// Tab name: `<short_repo>#<number>` (#7 amendment).
-    pub tab: String,
+    /// What the tab is called. Stored as the *label* because a label always
+    /// contains its key ([`Launch::key`]), never the other way round — so no
+    /// caller can reach for the mutable half when it wanted the stable one.
+    pub label: TabLabel,
     /// The repo's map issue — the first argument to `/wayfinder`.
     pub map_issue: u64,
     /// The ticket being worked.
     pub ticket: u64,
 }
 
-/// The tab name for a ticket: `<short_repo>#<number>` — the same key the
-/// picker's rows show, so tab strip and picker share one identity (#7).
-pub fn tab_name(ticket: &Ticket) -> String {
-    format!("{}#{}", ticket.short_repo(), ticket.number)
+/// A ticket's tab **identity**: `<short_repo>#<number>` (#7 amendment) — the
+/// same key the picker's rows show, so tab strip and picker share one identity.
+///
+/// Deliberately cannot hold a title: this is what focus-or-create looks up and
+/// what [`is_agent_tab`] recognises, so it must be a function of the ticket's
+/// identity alone. Retitling issue 20 leaves `wayfinder#20` unchanged, which is
+/// the whole point (#20).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TabKey {
+    repo: String,
+    number: u64,
+}
+
+impl TabKey {
+    /// Recover a key from a zellij tab name — the parse at the zellij
+    /// boundary. Tolerates everything a displayed name may carry *after* the
+    /// key: a label's title, an activity marker, or both.
+    pub fn parse(tab_name: &str) -> Option<TabKey> {
+        let head = tab_name.trim().split(' ').next()?;
+        let (repo, number) = head.split_once('#')?;
+        // Digits only: `u64::from_str` would also take `+16`, and a tab named
+        // `wayfinder#+16` is not one of ours.
+        if repo.is_empty() || number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        Some(TabKey {
+            repo: repo.to_string(),
+            number: number.parse().ok()?,
+        })
+    }
+
+    /// The short repo name (display half of the slug — see [`Ticket::short_repo`]).
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    /// The ticket number.
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+}
+
+impl fmt::Display for TabKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}#{}", self.repo, self.number)
+    }
+}
+
+/// How many characters of a ticket's title a label may carry. Zellij truncates
+/// the tab strip anyway, so a name that only reads well untruncated does not
+/// read at all (#20).
+const TITLE_CAP: usize = 18;
+
+/// A ticket's tab **label**: its key plus a capped short title — what a human
+/// reads in the tab strip, and the *only* string that reaches
+/// `new-tab --name`.
+///
+/// Built from a [`TabKey`] rather than from a string, so "a label starts with
+/// its key" is an invariant of the type instead of a comment, and
+/// [`TabLabel::key`] is total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabLabel {
+    key: TabKey,
+    /// `None` for a ticket whose title is empty once normalised — then the
+    /// label simply *is* the key. Not a sentinel: both cases render.
+    short_title: Option<String>,
+}
+
+impl TabLabel {
+    /// The stable identity inside this label. The only bridge between the two,
+    /// and it only runs this way: a key can never be widened into a label.
+    pub fn key(&self) -> &TabKey {
+        &self.key
+    }
+
+    /// The capped title, if the ticket had one.
+    pub fn short_title(&self) -> Option<&str> {
+        self.short_title.as_deref()
+    }
+}
+
+impl fmt::Display for TabLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.short_title {
+            Some(title) => write!(f, "{} {}", self.key, title),
+            None => write!(f, "{}", self.key),
+        }
+    }
+}
+
+/// The stable tab identity for a ticket.
+pub fn tab_key(ticket: &Ticket) -> TabKey {
+    TabKey {
+        repo: ticket.short_repo().to_string(),
+        number: ticket.number,
+    }
+}
+
+/// The readable tab name for a ticket: key + capped title.
+pub fn tab_label(ticket: &Ticket) -> TabLabel {
+    TabLabel {
+        key: tab_key(ticket),
+        short_title: short_title(&ticket.title),
+    }
+}
+
+/// Normalise and cap a ticket title for a tab label: whitespace collapsed to
+/// single spaces (a tab name is one line), control characters dropped, then cut
+/// to [`TITLE_CAP`] characters **on a word boundary** with `…` marking the cut.
+/// A first word longer than the cap is broken mid-word — better a stub than
+/// nothing.
+fn short_title(title: &str) -> Option<String> {
+    let words: Vec<String> = title
+        .split_whitespace()
+        .map(|w| w.chars().filter(|c| !c.is_control()).collect::<String>())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let full = words.join(" ");
+    if full.is_empty() {
+        return None;
+    }
+    if full.chars().count() <= TITLE_CAP {
+        return Some(full);
+    }
+    let mut capped = String::new();
+    for word in &words {
+        let extra = word.chars().count() + usize::from(!capped.is_empty());
+        if capped.chars().count() + extra > TITLE_CAP {
+            break;
+        }
+        if !capped.is_empty() {
+            capped.push(' ');
+        }
+        capped.push_str(word);
+    }
+    if capped.is_empty() {
+        // One long word: no boundary to break on, so break inside it.
+        capped = full.chars().take(TITLE_CAP).collect();
+    }
+    capped.push('…');
+    Some(capped)
 }
 
 /// The checkouts that could host a ticket's tab: every registered checkout
@@ -137,14 +282,14 @@ pub enum Targets {
 /// Resolve a launch request against the projects cache. Zero or one
 /// candidate never prompts.
 pub fn plan(checkouts: &[Checkout], ticket: &Ticket, map_issue: u64, mode: Mode) -> Targets {
-    let tab = tab_name(ticket);
+    let label = tab_label(ticket);
     let launches: Vec<Launch> = candidate_checkouts(checkouts, &ticket.repo)
         .into_iter()
         .map(|c| Launch {
             mode,
             session: c.session.clone(),
             cwd: c.path.clone(),
-            tab: tab.clone(),
+            label: label.clone(),
             map_issue,
             ticket: ticket.number,
         })
@@ -164,6 +309,11 @@ fn prompt(map_issue: u64, ticket: u64) -> String {
 }
 
 impl Launch {
+    /// This launch's stable tab identity — what every lookup uses.
+    pub fn key(&self) -> &TabKey {
+        self.label.key()
+    }
+
     /// The command the tab runs: interactive `claude` for HITL, headless
     /// `claude -p` for AFK (#7).
     pub fn agent_argv(&self) -> Vec<String> {
@@ -176,12 +326,13 @@ impl Launch {
 
     /// The invocation that creates this launch's tab.
     pub fn new_tab_argv(&self) -> Vec<String> {
-        new_tab_argv(&self.session, &self.tab, &self.cwd, &self.agent_argv())
+        new_tab_argv(&self.session, &self.label, &self.cwd, &self.agent_argv())
     }
 
-    /// One-line description for notices and the picker.
+    /// One-line description for notices and the picker. The **key**, not the
+    /// label: notices are about identity and share a line with other chrome.
     pub fn describe(&self) -> String {
-        format!("{} in {}", self.tab, self.session)
+        format!("{} in {}", self.key(), self.session)
     }
 }
 
@@ -202,12 +353,27 @@ fn action_argv(session: &str, args: &[&str]) -> Vec<String> {
 
 /// Create a named tab running `command` in `cwd`.
 ///
+/// The one place a [`TabLabel`] is spent (#20): the human-readable name exists
+/// to be *displayed*, and taking the label by type here means nothing else can
+/// accidentally be handed one.
+///
 /// Deliberately **without** `--close-on-exit`: per the #5 resolution the
 /// EXITED tab is the post-mortem.
-pub fn new_tab_argv(session: &str, tab: &str, cwd: &Path, command: &[String]) -> Vec<String> {
+pub fn new_tab_argv(
+    session: &str,
+    label: &TabLabel,
+    cwd: &Path,
+    command: &[String],
+) -> Vec<String> {
     let mut argv = action_argv(
         session,
-        &["new-tab", "--name", tab, "--cwd", &cwd.to_string_lossy()],
+        &[
+            "new-tab",
+            "--name",
+            &label.to_string(),
+            "--cwd",
+            &cwd.to_string_lossy(),
+        ],
     );
     argv.push("--".to_string());
     argv.extend(command.iter().cloned());
@@ -293,34 +459,70 @@ pub fn session_state(list_sessions_stdout: &str, session: &str) -> SessionState 
     SessionState::Missing
 }
 
-/// Does a tab with this name already exist?
+/// Find this ticket's tab among a session's tab names, returning the name
+/// zellij reported for it — which is what `go-to-tab-name` answers to, and is
+/// *not* necessarily the label this ticket would generate now (the tab may have
+/// been created before the issue was retitled).
 ///
-/// Matching tolerates a decoration suffix (zellij appends activity markers
-/// to a tab's displayed name), but the prefix must be the whole name — so
-/// `wayfinder#1` never matches `wayfinder#16`.
-pub fn tab_exists(names: &[String], tab: &str) -> bool {
-    names.iter().any(|n| {
-        let n = n.trim();
-        n == tab
-            || n.strip_prefix(tab)
+/// Lookup is by **key**, never by label. Matching tolerates anything after the
+/// key — the title in a label, zellij's activity markers, or both — but the key
+/// must be a whole leading token, so `wayfinder#1` never matches `wayfinder#16`.
+pub fn find_tab<'a>(names: &'a [String], key: &TabKey) -> Option<&'a str> {
+    let key = key.to_string();
+    names.iter().map(|n| n.trim()).find(|n| {
+        **n == key
+            || n.strip_prefix(key.as_str())
                 .is_some_and(|rest| rest.starts_with(' '))
     })
 }
 
-/// Is this tab name one of ours, i.e. `<repo>#<number>`?
-pub fn is_agent_tab(name: &str) -> bool {
-    let name = name.trim().split(' ').next().unwrap_or_default();
-    match name.split_once('#') {
-        Some((repo, number)) => {
-            !repo.is_empty() && !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
-        }
-        None => false,
-    }
+/// Does this ticket's tab already exist? [`find_tab`], for callers that only
+/// need the answer.
+///
+/// Takes a [`TabKey`], which is the whole point of there being two types — a
+/// label carries a title that changes under the tab, so it must not be
+/// admissible here:
+///
+/// ```
+/// # use wf::launch::{tab_exists, tab_key};
+/// # use wf::model::{classify, Ticket};
+/// let ticket = Ticket {
+///     repo: "blooop/wayfinder".to_string(),
+///     number: 20,
+///     title: "Readable agent tab names".to_string(),
+///     status: classify(true, false, vec![]),
+/// };
+/// let names = vec!["wayfinder#20 Readable agent".to_string()];
+/// assert!(tab_exists(&names, &tab_key(&ticket)));
+/// ```
+///
+/// The same call with the label does not compile:
+///
+/// ```compile_fail
+/// # use wf::launch::{tab_exists, tab_label};
+/// # use wf::model::{classify, Ticket};
+/// let ticket = Ticket {
+///     repo: "blooop/wayfinder".to_string(),
+///     number: 20,
+///     title: "Readable agent tab names".to_string(),
+///     status: classify(true, false, vec![]),
+/// };
+/// let names = vec!["wayfinder#20 Readable agent".to_string()];
+/// tab_exists(&names, &tab_label(&ticket));
+/// ```
+pub fn tab_exists(names: &[String], key: &TabKey) -> bool {
+    find_tab(names, key).is_some()
 }
 
-/// How many `<repo>#<n>` agent tabs these names contain — the AFK slot's
-/// count (#1's reserved line, filled in per #7's "the tab is the
-/// supervision").
+/// Is this tab name one of ours, i.e. does it start with a `<repo>#<number>`
+/// key? True of a bare key and of a full label alike.
+pub fn is_agent_tab(name: &str) -> bool {
+    TabKey::parse(name).is_some()
+}
+
+/// How many agent tabs these names contain — the AFK slot's count (#1's
+/// reserved line, filled in per #7's "the tab is the supervision"). Counts by
+/// leading key, so a labelled tab counts exactly like a bare-key one.
 pub fn count_agent_tabs(names: &[String]) -> usize {
     names.iter().filter(|n| is_agent_tab(n)).count()
 }
@@ -349,18 +551,23 @@ pub fn handoff(mode: Mode, host: &Host, session: &str) -> Handoff {
 /// The invocations that move the current zellij client onto the launched
 /// tab, in order. Empty for AFK (no focus steal — #7) and outside zellij
 /// (the attach in [`handoff`] does the moving).
-pub fn focus_steps(host: &Host, launch: &Launch) -> Vec<Vec<String>> {
+///
+/// Targets the [`OpenTab`] the seam actually opened, not a name regenerated
+/// from the ticket: `go-to-tab-name` is an exact match and a silent no-op when
+/// it misses (measured on zellij 0.44.3, #20), so a ticket retitled after its
+/// tab was created would otherwise dedupe correctly and then fail to focus.
+pub fn focus_steps(host: &Host, launch: &Launch, tab: &OpenTab) -> Vec<Vec<String>> {
     match (launch.mode, host) {
         (Mode::Afk, _) => Vec::new(),
         (Mode::Hitl, Host::Outside) => Vec::new(),
-        (Mode::Hitl, Host::InsideUnnamed) => vec![go_to_tab_argv(&launch.session, &launch.tab)],
+        (Mode::Hitl, Host::InsideUnnamed) => vec![go_to_tab_argv(&launch.session, &tab.name)],
         (Mode::Hitl, Host::Inside(current)) if *current == launch.session => {
-            vec![go_to_tab_argv(&launch.session, &launch.tab)]
+            vec![go_to_tab_argv(&launch.session, &tab.name)]
         }
         (Mode::Hitl, Host::Inside(current)) => vec![
             // Point the target session at the tab first, then move this
             // client over — the session-switcher gesture, no new binding.
-            go_to_tab_argv(&launch.session, &launch.tab),
+            go_to_tab_argv(&launch.session, &tab.name),
             switch_session_argv(current, &launch.session),
         ],
     }
@@ -390,6 +597,32 @@ pub fn parse_current_tab_name(stdout: &str) -> Option<String> {
 pub enum TabOutcome {
     Created,
     Existed,
+}
+
+/// The tab a launch resolved to: whether it had to be created, **and** the name
+/// zellij knows it by.
+///
+/// Both fields are always meaningful, so this is a product and not a sum: what
+/// varies is only where the name came from — the label just written for a
+/// `Created` tab, the tab's own (possibly older) label for an `Existed` one.
+/// Producible only by [`create_or_focus_tab`], so a focus target can never be a
+/// name nobody looked up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTab {
+    outcome: TabOutcome,
+    name: String,
+}
+
+impl OpenTab {
+    /// Was the tab created just now, or already there?
+    pub fn outcome(&self) -> TabOutcome {
+        self.outcome
+    }
+
+    /// The name zellij will answer to for this tab.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// Run a zellij invocation, scrubbing the inherited zellij variables so it
@@ -458,28 +691,39 @@ pub async fn ensure_session(session: &str, cwd: &Path) -> Result<()> {
 /// Create the ticket's tab if it is absent, leaving an existing one alone —
 /// the create-**or-focus** half of the seam. `command` is what the tab
 /// runs; the caller keeps focus decisions to itself.
+///
+/// The existence check is by [`TabKey`] (#20): a tab found under an older
+/// label is still this ticket's tab, and its reported name comes back in the
+/// [`OpenTab`] so the caller focuses the tab that is there rather than the name
+/// it would write today.
 pub async fn create_or_focus_tab(
     session: &str,
-    tab: &str,
+    label: &TabLabel,
     cwd: &Path,
     command: &[String],
-) -> Result<TabOutcome> {
-    if tab_exists(&query_tab_names(session).await?, tab) {
-        return Ok(TabOutcome::Existed);
+) -> Result<OpenTab> {
+    let key = label.key();
+    if let Some(name) = find_tab(&query_tab_names(session).await?, key) {
+        return Ok(OpenTab {
+            outcome: TabOutcome::Existed,
+            name: name.to_string(),
+        });
     }
-    run(&new_tab_argv(session, tab, cwd, command), None).await?;
+    run(&new_tab_argv(session, label, cwd, command), None).await?;
     // Again: verify by name, never by exit code.
-    if tab_exists(&query_tab_names(session).await?, tab) {
-        Ok(TabOutcome::Created)
-    } else {
-        bail!("zellij did not create tab `{tab}` in session `{session}`")
+    match find_tab(&query_tab_names(session).await?, key) {
+        Some(name) => Ok(OpenTab {
+            outcome: TabOutcome::Created,
+            name: name.to_string(),
+        }),
+        None => bail!("zellij did not create tab `{label}` in session `{session}`"),
     }
 }
 
-/// Perform a launch: ensure the session, create-or-focus the `<repo>#<n>`
-/// tab, move the zellij client if that is this host's handoff, and report
-/// what the caller must still do (suspend-and-attach, or nothing).
-pub async fn execute(launch: &Launch, host: &Host) -> Result<(TabOutcome, Handoff)> {
+/// Perform a launch: ensure the session, create-or-focus the ticket's tab,
+/// move the zellij client if that is this host's handoff, and report what the
+/// caller must still do (suspend-and-attach, or nothing).
+pub async fn execute(launch: &Launch, host: &Host) -> Result<(OpenTab, Handoff)> {
     ensure_session(&launch.session, &launch.cwd).await?;
 
     // An AFK tab must not steal focus; remember where focus is so it can be
@@ -492,27 +736,31 @@ pub async fn execute(launch: &Launch, host: &Host) -> Result<(TabOutcome, Handof
         None
     };
 
-    let outcome = create_or_focus_tab(
+    let opened = create_or_focus_tab(
         &launch.session,
-        &launch.tab,
+        &launch.label,
         &launch.cwd,
         &launch.agent_argv(),
     )
     .await?;
 
-    for step in focus_steps(host, launch) {
+    for step in focus_steps(host, launch, &opened) {
         run(&step, None).await?;
     }
     if let Some(tab) = restore_to {
         run(&go_to_tab_argv(&launch.session, &tab), None).await?;
     }
 
-    Ok((outcome, handoff(launch.mode, host, &launch.session)))
+    Ok((opened, handoff(launch.mode, host, &launch.session)))
 }
 
-/// Count the `<repo>#<n>` agent tabs across the projects' sessions — the
-/// AFK status line. Only *live* sessions are queried (a missing one would
-/// merely print an error, but there is no reason to ask).
+/// Count the agent tabs across the projects' sessions — the AFK status line.
+/// Only *live* sessions are queried (a missing one would merely print an error,
+/// but there is no reason to ask).
+///
+/// Unchanged by the key/label split (#20): it counts tab *shapes* per session
+/// rather than looking any ticket up, and [`is_agent_tab`] recognises a key at
+/// the head of a name whatever follows it.
 pub async fn agent_tab_count(sessions: &[String]) -> usize {
     let listing = match list_sessions().await {
         Ok(listing) => listing,
@@ -549,13 +797,17 @@ mod tests {
     use super::*;
     use crate::model::{classify, Status};
 
-    fn ticket(repo: &str, number: u64) -> Ticket {
+    fn titled(repo: &str, number: u64, title: &str) -> Ticket {
         Ticket {
             repo: repo.to_string(),
             number,
-            title: "t".to_string(),
+            title: title.to_string(),
             status: classify(true, false, vec![]),
         }
+    }
+
+    fn ticket(repo: &str, number: u64) -> Ticket {
+        titled(repo, number, "the ticket")
     }
 
     fn checkout(path: &str, repo: &str, session: &str) -> Checkout {
@@ -576,10 +828,79 @@ mod tests {
     }
 
     #[test]
-    fn tab_name_is_short_repo_hash_number() {
-        assert_eq!(tab_name(&ticket("blooop/wayfinder", 16)), "wayfinder#16");
+    fn the_key_is_short_repo_hash_number_and_carries_no_title() {
+        assert_eq!(
+            tab_key(&ticket("blooop/wayfinder", 16)).to_string(),
+            "wayfinder#16"
+        );
         // The short name, not the slug — but identity stays the full slug.
-        assert_eq!(tab_name(&ticket("upstream/dotfiles", 5)), "dotfiles#5");
+        assert_eq!(
+            tab_key(&ticket("upstream/dotfiles", 5)).to_string(),
+            "dotfiles#5"
+        );
+    }
+
+    #[test]
+    fn the_key_survives_a_retitle_but_the_label_does_not() {
+        let before = titled("blooop/wayfinder", 20, "Tab names are unreadable");
+        let after = titled("blooop/wayfinder", 20, "Readable agent tab names");
+        // The defect this ticket exists to prevent: identity must not move
+        // when the title does, or a retitled issue misses its own tab.
+        assert_eq!(tab_key(&before), tab_key(&after));
+        assert_eq!(tab_key(&after).to_string(), "wayfinder#20");
+        assert_ne!(tab_label(&before), tab_label(&after));
+        // …and a label always still answers with its own key.
+        assert_eq!(tab_label(&before).key(), &tab_key(&after));
+        // Even an emptied title leaves the key intact and the label usable.
+        let untitled = titled("blooop/wayfinder", 20, "   ");
+        assert_eq!(tab_key(&untitled), tab_key(&after));
+        assert_eq!(tab_label(&untitled).short_title(), None);
+        assert_eq!(tab_label(&untitled).to_string(), "wayfinder#20");
+    }
+
+    #[test]
+    fn the_label_caps_the_title_on_a_word_boundary() {
+        let label = |title: &str| tab_label(&titled("blooop/wayfinder", 20, title)).to_string();
+        // Short enough: verbatim, no ellipsis.
+        assert_eq!(label("Prove the seam"), "wayfinder#20 Prove the seam");
+        // Exactly at the cap (18 chars) is not truncated.
+        assert_eq!(
+            label("123456789012345678"),
+            "wayfinder#20 123456789012345678"
+        );
+        // Over the cap: cut at the last word that fits, marked with `…`.
+        assert_eq!(
+            label("Readable agent tab names: title in the label"),
+            "wayfinder#20 Readable agent tab…"
+        );
+        assert_eq!(
+            label("Auto-start AFK frontier tickets"),
+            "wayfinder#20 Auto-start AFK…"
+        );
+        // Whitespace is collapsed — a tab name is one line.
+        assert_eq!(
+            label("  many\n\tspaces  here "),
+            "wayfinder#20 many spaces here"
+        );
+        // No word boundary to break on: break inside the word rather than
+        // dropping the title entirely.
+        assert_eq!(
+            label("Unsplittableverylongword tail"),
+            "wayfinder#20 Unsplittableverylo…"
+        );
+        // Every capped title fits the budget (cap + the one ellipsis char).
+        for title in [
+            "Readable agent tab names: title in the label",
+            "Unsplittableverylongword tail",
+            "a b c d e f g h i j k l m n o p q r s t",
+        ] {
+            let short = tab_label(&titled("blooop/wayfinder", 20, title))
+                .short_title()
+                .expect("a title")
+                .chars()
+                .count();
+            assert!(short <= TITLE_CAP + 1, "{title:?} capped to {short} chars");
+        }
     }
 
     #[test]
@@ -606,7 +927,8 @@ mod tests {
             Targets::One(launch) => {
                 assert_eq!(launch.session, "wayfinder");
                 assert_eq!(launch.cwd, PathBuf::from("/data/proj/wayfinder"));
-                assert_eq!(launch.tab, "wayfinder#16");
+                assert_eq!(launch.key().to_string(), "wayfinder#16");
+                assert_eq!(launch.label.to_string(), "wayfinder#16 the ticket");
                 assert_eq!(launch.map_issue, 1);
                 assert_eq!(launch.ticket, 16);
             }
@@ -636,8 +958,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["k1", "k2"]
         );
-        // Same ticket, same tab name, different hosting session/cwd.
-        assert!(launches.iter().all(|l| l.tab == "kinisi_ros#42"));
+        // Same ticket, same tab identity, different hosting session/cwd.
+        assert!(launches
+            .iter()
+            .all(|l| l.key().to_string() == "kinisi_ros#42"));
         assert_eq!(launches[1].cwd, PathBuf::from("/data/k2/kinisi_ros"));
     }
 
@@ -671,10 +995,12 @@ mod tests {
 
     #[test]
     fn new_tab_names_the_session_carries_cwd_and_keeps_the_corpse() {
-        let launch = match plan(&cache(), &ticket("blooop/wayfinder", 16), 1, Mode::Hitl) {
+        let ticket = titled("blooop/wayfinder", 16, "Build 4 — launch seam");
+        let launch = match plan(&cache(), &ticket, 1, Mode::Hitl) {
             Targets::One(l) => l,
             other => panic!("{other:?}"),
         };
+        // The label — the *only* place it is spent — carries the title.
         assert_eq!(
             launch.new_tab_argv(),
             vec![
@@ -684,7 +1010,7 @@ mod tests {
                 "action",
                 "new-tab",
                 "--name",
-                "wayfinder#16",
+                "wayfinder#16 Build 4 — launch…",
                 "--cwd",
                 "/data/proj/wayfinder",
                 "--",
@@ -750,9 +1076,17 @@ mod tests {
             mode,
             session: session.to_string(),
             cwd: PathBuf::from("/data/proj/wayfinder"),
-            tab: "wayfinder#16".to_string(),
+            label: tab_label(&titled("blooop/wayfinder", 16, "launch seam")),
             map_issue: 1,
             ticket: 16,
+        }
+    }
+
+    /// The tab as the seam reported it — what focus must target.
+    fn opened(outcome: TabOutcome, name: &str) -> OpenTab {
+        OpenTab {
+            outcome,
+            name: name.to_string(),
         }
     }
 
@@ -768,29 +1102,48 @@ mod tests {
             ])
         );
         // Nothing else moves the client: the attach does it.
-        assert!(focus_steps(&Host::Outside, &launch).is_empty());
+        let tab = opened(TabOutcome::Created, "wayfinder#16 launch seam");
+        assert!(focus_steps(&Host::Outside, &launch, &tab).is_empty());
     }
 
     #[test]
     fn inside_the_same_session_hitl_just_focuses_the_tab() {
         let launch = launch_for(Mode::Hitl, "wayfinder");
         let host = Host::Inside("wayfinder".to_string());
+        let tab = opened(TabOutcome::Created, "wayfinder#16 launch seam");
         assert_eq!(handoff(Mode::Hitl, &host, "wayfinder"), Handoff::Stay);
         assert_eq!(
-            focus_steps(&host, &launch),
-            vec![go_to_tab_argv("wayfinder", "wayfinder#16")]
+            focus_steps(&host, &launch, &tab),
+            vec![go_to_tab_argv("wayfinder", "wayfinder#16 launch seam")]
         );
+    }
+
+    #[test]
+    fn focus_targets_the_tab_that_is_there_not_the_label_regenerated_now() {
+        // The tab was created before the issue was retitled, so it still wears
+        // the old label. `go-to-tab-name` is an exact match and a silent no-op
+        // when it misses (measured, zellij 0.44.3), so focusing the *current*
+        // label would leave the client where it was.
+        let launch = launch_for(Mode::Hitl, "wayfinder");
+        let host = Host::Inside("wayfinder".to_string());
+        let stale = opened(TabOutcome::Existed, "wayfinder#16 prove the seam");
+        assert_eq!(
+            focus_steps(&host, &launch, &stale),
+            vec![go_to_tab_argv("wayfinder", "wayfinder#16 prove the seam")]
+        );
+        assert_ne!(stale.name(), launch.label.to_string());
     }
 
     #[test]
     fn inside_another_session_hitl_switches_sessions_natively() {
         let launch = launch_for(Mode::Hitl, "k1");
         let host = Host::Inside("wayfinder".to_string());
+        let tab = opened(TabOutcome::Created, "wayfinder#16 launch seam");
         assert_eq!(handoff(Mode::Hitl, &host, "k1"), Handoff::Stay);
         assert_eq!(
-            focus_steps(&host, &launch),
+            focus_steps(&host, &launch, &tab),
             vec![
-                go_to_tab_argv("k1", "wayfinder#16"),
+                go_to_tab_argv("k1", "wayfinder#16 launch seam"),
                 switch_session_argv("wayfinder", "k1")
             ]
         );
@@ -805,8 +1158,12 @@ mod tests {
             Host::Inside("other".to_string()),
         ] {
             let launch = launch_for(Mode::Afk, "wayfinder");
+            let tab = opened(TabOutcome::Created, "wayfinder#16 launch seam");
             assert_eq!(handoff(Mode::Afk, &host, "wayfinder"), Handoff::Stay);
-            assert!(focus_steps(&host, &launch).is_empty(), "host {host:?}");
+            assert!(
+                focus_steps(&host, &launch, &tab).is_empty(),
+                "host {host:?}"
+            );
         }
         // Only a spawn into wf's own session can steal focus, so only that
         // case restores it.
@@ -844,38 +1201,81 @@ kinisi [Created 1h ago] \n";
         assert_eq!(session_state(listing, "way"), SessionState::Missing);
     }
 
+    fn tab_names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn tab_lookup_is_exact_but_tolerates_a_decoration_suffix() {
-        let names: Vec<String> = ["Tab #1", "wayfinder#16", "kinisi_ros#42 ⏳"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(tab_exists(&names, "wayfinder#16"));
-        assert!(tab_exists(&names, "kinisi_ros#42"));
-        assert!(!tab_exists(&names, "wayfinder#1"), "#1 must not match #16");
-        assert!(!tab_exists(&names, "wayfinder#166"));
-        assert!(!tab_exists(&names, "dotfiles#5"));
+    fn tab_lookup_is_by_key_and_tolerates_a_title_and_a_decoration_suffix() {
+        let names = tab_names(&["Tab #1", "wayfinder#16", "kinisi_ros#42 ⏳"]);
+        let key = |repo: &str, n: u64| tab_key(&ticket(repo, n));
+        assert!(tab_exists(&names, &key("blooop/wayfinder", 16)));
+        assert!(tab_exists(&names, &key("kinisi/kinisi_ros", 42)));
+        assert!(
+            !tab_exists(&names, &key("blooop/wayfinder", 1)),
+            "#1 must not match #16"
+        );
+        assert!(!tab_exists(&names, &key("blooop/wayfinder", 166)));
+        assert!(!tab_exists(&names, &key("upstream/dotfiles", 5)));
+
+        // The point of #20: a labelled tab — with zellij's activity marker on
+        // top of the title — is still found by the ticket's key, and found by
+        // the key the ticket generates *now*, not the one in the name.
+        let labelled = tab_names(&[
+            "Tab #1",
+            "wayfinder#16 Build 4 — launch… ⏳",
+            "kinisi_ros#42 old title",
+        ]);
+        let retitled = titled("blooop/wayfinder", 16, "something else entirely");
+        assert!(tab_exists(&labelled, &tab_key(&retitled)));
+        assert_eq!(
+            find_tab(&labelled, &tab_key(&retitled)),
+            Some("wayfinder#16 Build 4 — launch… ⏳"),
+            "the found name is what go-to-tab-name must be given"
+        );
+        // Still no partial-number matching once titles are in play.
+        assert!(!tab_exists(&labelled, &key("blooop/wayfinder", 1)));
+        assert_eq!(find_tab(&labelled, &key("blooop/wayfinder", 7)), None);
     }
 
     #[test]
     fn agent_tabs_are_counted_by_the_repo_hash_number_shape() {
-        let names: Vec<String> = [
+        let names = tab_names(&[
             "Tab #1",
             "wayfinder#16",
             "kinisi_ros#42 ⏳",
             "wayfinder#",
             "#5",
             "notes",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        ]);
         assert_eq!(count_agent_tabs(&names), 2);
         assert!(is_agent_tab("wayfinder#16"));
         assert!(
             !is_agent_tab("Tab #1"),
             "zellij's default tab names are not ours"
         );
+        assert!(!is_agent_tab("wayfinder#+16"), "digits only");
+    }
+
+    #[test]
+    fn counting_needs_no_change_for_labels_titles_ride_behind_the_key() {
+        // Why `agent_tab_count` is untouched by #20: it counts shapes per
+        // session, and the shape test reads the leading key whatever follows.
+        let labelled = tab_names(&[
+            "Tab #1",
+            "wayfinder#16 Build 4 — launch…",
+            "kinisi_ros#42 Auto-start AFK… ⏳",
+            "wayfinder#20 Readable agent tab…",
+            "notes on the release",
+        ]);
+        assert_eq!(count_agent_tabs(&labelled), 3);
+        assert_eq!(
+            TabKey::parse("wayfinder#20 Readable agent tab… ⏳"),
+            Some(tab_key(&ticket("blooop/wayfinder", 20))),
+            "parsing a displayed name back gives the ticket's key"
+        );
+        assert_eq!(TabKey::parse("notes on the release"), None);
+        assert_eq!(TabKey::parse(""), None);
     }
 
     #[test]
@@ -900,17 +1300,17 @@ kinisi [Created 1h ago] \n";
     }
 
     #[test]
-    fn describe_names_the_tab_and_its_session() {
+    fn describe_names_the_tab_by_key_and_its_session() {
+        // The notice line stays short: the key, not the label.
         assert_eq!(launch_for(Mode::Afk, "k1").describe(), "wayfinder#16 in k1");
         // Status is irrelevant to launching: a done ticket still gets a tab.
-        assert_eq!(
-            tab_name(&Ticket {
-                repo: "blooop/wayfinder".to_string(),
-                number: 2,
-                title: "done".to_string(),
-                status: Status::Done,
-            }),
-            "wayfinder#2"
-        );
+        let done = Ticket {
+            repo: "blooop/wayfinder".to_string(),
+            number: 2,
+            title: "done".to_string(),
+            status: Status::Done,
+        };
+        assert_eq!(tab_key(&done).to_string(), "wayfinder#2");
+        assert_eq!(tab_label(&done).to_string(), "wayfinder#2 done");
     }
 }

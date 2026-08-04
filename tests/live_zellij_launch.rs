@@ -20,9 +20,28 @@ use std::path::Path;
 use std::process::Command;
 
 use wf::launch::{
-    count_agent_tabs, create_or_focus_tab, ensure_session, query_tab_names, session_state,
-    tab_exists, SessionState, TabOutcome,
+    count_agent_tabs, create_or_focus_tab, ensure_session, find_tab, query_tab_names,
+    session_state, tab_exists, tab_key, tab_label, SessionState, TabKey, TabOutcome,
 };
+use wf::model::{classify, Ticket};
+
+/// Does this displayed tab name belong to this ticket? Duplicate tab names are
+/// legal in zellij, so *counting* the ones with this key is how the test proves
+/// the seam deduplicates.
+fn is_ours(name: &str, key: &TabKey) -> bool {
+    TabKey::parse(name).as_ref() == Some(key)
+}
+
+/// A ticket, so the test goes through the real `tab_key` / `tab_label` split
+/// (#20) rather than hand-written tab names.
+fn ticket(number: u64, title: &str) -> Ticket {
+    Ticket {
+        repo: "blooop/wayfinder".to_string(),
+        number,
+        title: title.to_string(),
+        status: classify(true, false, vec![]),
+    }
+}
 
 /// Kills and deletes the throwaway session on drop, panic or not.
 struct Throwaway(String);
@@ -62,7 +81,9 @@ fn sessions() -> String {
 async fn create_then_focus_by_name_is_idempotent() {
     let session = format!("wf-it-{}", std::process::id());
     let guard = Throwaway(session.clone());
-    let tab = "wayfinder#16";
+    let ticket16 = ticket(16, "Build 4 — launch seam");
+    let label = tab_label(&ticket16);
+    let key = tab_key(&ticket16);
     // The stand-in agent. Never a real claude session.
     let command: Vec<String> = ["bash", "-c", "sleep 30"]
         .iter()
@@ -91,36 +112,71 @@ async fn create_then_focus_by_name_is_idempotent() {
     assert_eq!(session_state(&sessions(), &session), SessionState::Live);
 
     // 2. First launch creates the tab.
-    let first = create_or_focus_tab(&session, tab, cwd, &command)
+    let first = create_or_focus_tab(&session, &label, cwd, &command)
         .await
         .expect("first create_or_focus_tab");
-    assert_eq!(first, TabOutcome::Created);
+    assert_eq!(first.outcome(), TabOutcome::Created);
+    // The tab wears the readable label; the key is what found it.
+    assert_eq!(first.name(), label.to_string());
+    assert!(
+        first.name().contains("Build 4"),
+        "name was {}",
+        first.name()
+    );
     let names = query_tab_names(&session).await.expect("tab names");
-    assert!(tab_exists(&names, tab), "tab names were {names:?}");
+    assert!(tab_exists(&names, &key), "tab names were {names:?}");
     assert_eq!(count_agent_tabs(&names), 1, "tab names were {names:?}");
 
     // 3. Second launch of the same ticket focuses, never duplicates —
     //    zellij happily allows duplicate tab names, so this is on us.
-    let second = create_or_focus_tab(&session, tab, cwd, &command)
+    let second = create_or_focus_tab(&session, &label, cwd, &command)
         .await
         .expect("second create_or_focus_tab");
-    assert_eq!(second, TabOutcome::Existed);
+    assert_eq!(second.outcome(), TabOutcome::Existed);
     let names = query_tab_names(&session).await.expect("tab names");
     assert_eq!(
-        names.iter().filter(|n| n.trim() == tab).count(),
+        names.iter().filter(|n| is_ours(n, &key)).count(),
         1,
-        "exactly one {tab} tab expected, names were {names:?}"
+        "exactly one {key} tab expected, names were {names:?}"
     );
     assert_eq!(count_agent_tabs(&names), 1);
 
+    // 2b. The same ticket **retitled**: a different label, the same key, so it
+    //     still focuses the tab that is there instead of duplicating it — the
+    //     #20 defect, proven against real zellij. The name handed back is the
+    //     existing tab's, which is what `go-to-tab-name` answers to.
+    let retitled = tab_label(&ticket(16, "Prove the seam again"));
+    assert_ne!(retitled.to_string(), label.to_string());
+    let third = create_or_focus_tab(&session, &retitled, cwd, &command)
+        .await
+        .expect("retitled create_or_focus_tab");
+    assert_eq!(
+        third.outcome(),
+        TabOutcome::Existed,
+        "a retitled ticket must find its own tab"
+    );
+    assert_eq!(
+        third.name(),
+        label.to_string(),
+        "the tab keeps its old name"
+    );
+    let names = query_tab_names(&session).await.expect("tab names");
+    assert_eq!(
+        names.iter().filter(|n| is_ours(n, &key)).count(),
+        1,
+        "no duplicate after a retitle, names were {names:?}"
+    );
+    assert_eq!(find_tab(&names, &key), Some(label.to_string().as_str()));
+
     // A second ticket in the same project is a second tab, not a replacement.
-    let other = create_or_focus_tab(&session, "wayfinder#7", cwd, &command)
+    let ticket7 = ticket(7, "Supervising detached AFK agents");
+    let other = create_or_focus_tab(&session, &tab_label(&ticket7), cwd, &command)
         .await
         .expect("second ticket");
-    assert_eq!(other, TabOutcome::Created);
+    assert_eq!(other.outcome(), TabOutcome::Created);
     let names = query_tab_names(&session).await.expect("tab names");
     assert_eq!(count_agent_tabs(&names), 2, "tab names were {names:?}");
-    assert!(tab_exists(&names, tab) && tab_exists(&names, "wayfinder#7"));
+    assert!(tab_exists(&names, &key) && tab_exists(&names, &tab_key(&ticket7)));
 
     drop(guard);
     // kill-session reaps the tabs' commands (#5 findings §5b): no orphans.
