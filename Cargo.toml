@@ -8,6 +8,7 @@ repository = "https://github.com/blooop/wayfinder"
 
 [dependencies]
 anyhow = "1"
+nucleo-matcher = "0.3"
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

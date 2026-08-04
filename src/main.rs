@@ -1,15 +1,17 @@
-//! `wf` binary — fetch this repo's map live on startup, show the grouped
-//! list, and keep it fresh via the background refresh loop (Build 5, #17).
-//! `q`/`esc` quits.
+//! `wf` binary — fetch this repo's map live on startup, then run the main
+//! screen: nucleo fuzzy query over the grouped list with the Build 2
+//! keybinding skeleton (#14), kept fresh by the background refresh loop
+//! (Build 5, #17). `ctrl-r` force-refreshes; `esc` clears the query then
+//! quits; `q` quits on an empty query.
 
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use wf::model::Map;
+use wf::app::{App, Outcome};
 use wf::refresh::{Freshness, Poller, RefreshEvent};
 
 // Build 1 hardcodes the one repo and its map issue; discovery is Build 3.
@@ -24,7 +26,7 @@ async fn main() -> Result<()> {
     let updates = wf::refresh::spawn(Poller::new(OWNER, REPO, MAP_ISSUE));
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, map, updates);
+    let result = run(&mut terminal, App::new(map), updates).await;
     ratatui::restore();
     result
 }
@@ -57,9 +59,9 @@ impl RefreshState {
     }
 }
 
-fn run(
+async fn run(
     terminal: &mut DefaultTerminal,
-    mut map: Map,
+    mut app: App,
     mut updates: UnboundedReceiver<RefreshEvent>,
 ) -> Result<()> {
     let mut refresh = RefreshState {
@@ -68,28 +70,40 @@ fn run(
     };
     loop {
         // Drain every pending poll outcome before drawing. Data swaps in
-        // place; input state (and, once #14 lands, cursor/query — merged via
-        // refresh::preserve_cursor by ticket identity) is never reset.
+        // place via App::replace_map, which keeps the cursor pinned to
+        // ticket identity; query and scope are never reset.
         while let Ok(event) = updates.try_recv() {
             refresh.apply(&event);
             if let RefreshEvent::Updated(new_map) = event {
-                map = new_map;
+                app.replace_map(new_map);
             }
         }
 
         let indicator = refresh.freshness().indicator();
-        terminal.draw(|frame| wf::ui::draw(frame, &map, &indicator))?;
+        terminal.draw(|frame| wf::ui::draw(frame, &app, &indicator))?;
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(())
+                match app.handle_key(key) {
+                    Outcome::Quit => return Ok(()),
+                    Outcome::Refresh => {
+                        // Force refresh (ctrl-r): refetch in place, without
+                        // waiting for the background poll cycle.
+                        match wf::fetch::fetch_map(OWNER, REPO, MAP_ISSUE).await {
+                            Ok(map) => {
+                                app.replace_map(map);
+                                refresh.apply(&RefreshEvent::Unchanged);
+                                app.notice = Some("refreshed".to_string());
+                            }
+                            Err(err) => {
+                                refresh.apply(&RefreshEvent::Failed);
+                                app.notice = Some(format!("refresh failed: {err}"));
+                            }
+                        }
                     }
-                    _ => {}
+                    Outcome::Continue => {}
                 }
             }
         }
