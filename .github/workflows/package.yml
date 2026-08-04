@@ -91,6 +91,10 @@ jobs:
       - name: Build the package
         uses: prefix-dev/rattler-build-action@v0.2.39
         with:
+          # The action's own default is v0.68.0, which predates --no-config. This
+          # is the version the recipe was developed and measured against; keep it
+          # in step with the pin in the release job below.
+          rattler-build-version: v0.72.2
           recipe-path: recipe/recipe.yaml
           # --no-config: rattler-build otherwise discovers any pixi or
           # rattler-build config file in the tree and adopts its default-channels,
@@ -158,6 +162,7 @@ jobs:
         if: env.PIXI_TOKEN != ''
         uses: prefix-dev/rattler-build-action@v0.2.39
         with:
+          rattler-build-version: v0.72.2 # same pin as the build job above
           setup-only: true
 
       - name: Publish to prefix.dev/blooop
