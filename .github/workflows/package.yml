@@ -150,7 +150,12 @@ jobs:
         run: |
           pkg="$(find package -name 'wf-*.conda' -print -quit)"
           test -n "$pkg"
+          # `--repo` is required, not tidiness: this job never checks the
+          # source out (it only needs the built artifact), so `gh` has no git
+          # remote to infer the target from and fails with "not a git
+          # repository". Naming the repo is cheaper than a checkout.
           gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
             "$pkg"
