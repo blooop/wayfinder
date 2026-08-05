@@ -290,6 +290,7 @@ async fn autostart_reconciles_a_research_frontier_exactly_once() {
         launch.agent_argv(),
         vec![
             "claude".to_string(),
+            "--dangerously-skip-permissions".to_string(),
             "-p".to_string(),
             "/wayfinder 1 3".to_string()
         ]

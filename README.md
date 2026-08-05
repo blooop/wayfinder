@@ -65,9 +65,16 @@ both.
 
 | key | what it does |
 | --- | --- |
-| `enter` | HITL: create-or-focus the ticket's tab and take you into it (`claude "/wayfinder <map> <n>"`) |
-| `ctrl-a` | AFK: spawn the same tab headless (`claude -p "/wayfinder <map> <n>"`) — no attach, no focus steal |
+| `enter` | HITL: create-or-focus the ticket's tab and take you into it (`claude --dangerously-skip-permissions "/wayfinder <map> <n>"`) |
+| `ctrl-a` | AFK: spawn the same tab headless (`claude --dangerously-skip-permissions -p "/wayfinder <map> <n>"`) — no attach, no focus steal |
 | `↑`/`↓`, `enter`, `esc` | in the which-checkout picker: pick which project hosts the tab, or cancel |
+
+Both modes pass `--dangerously-skip-permissions`. For AFK that is closer to a
+correctness requirement than a convenience: a headless agent that stops on a
+permission prompt waits forever with nobody to answer it, and the only symptom
+would be a tab that never finishes — indistinguishable from slow work. HITL gets
+it too, so entering a tab is the same session whether you opened it or auto-start
+did.
 
 How `wf` hands over depends on where it is running, decided from its own
 `$ZELLIJ` — never from a `zellij action` exit code, which is `0` even on

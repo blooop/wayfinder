@@ -308,6 +308,11 @@ fn prompt(map_issue: u64, ticket: u64) -> String {
     format!("/wayfinder {map_issue} {ticket}")
 }
 
+/// Agent tabs run unattended (always for AFK, and effectively for HITL, since
+/// the tab is created before anyone is looking at it), so they do not stop for
+/// permission prompts.
+const SKIP_PERMISSIONS: &str = "--dangerously-skip-permissions";
+
 impl Launch {
     /// This launch's stable tab identity — what every lookup uses.
     pub fn key(&self) -> &TabKey {
@@ -316,11 +321,19 @@ impl Launch {
 
     /// The command the tab runs: interactive `claude` for HITL, headless
     /// `claude -p` for AFK (#7).
+    ///
+    /// Both carry `--dangerously-skip-permissions`. For AFK it is closer to a
+    /// correctness requirement than a convenience: a headless agent that stops
+    /// on a permission prompt waits forever with nobody to answer it, and the
+    /// only evidence would be a tab that never finishes — indistinguishable from
+    /// slow work. HITL gets it too so that entering a tab is the same session
+    /// whether `wf` opened it or auto-start did.
     pub fn agent_argv(&self) -> Vec<String> {
         let prompt = prompt(self.map_issue, self.ticket);
+        let claude = ["claude".to_string(), SKIP_PERMISSIONS.to_string()];
         match self.mode {
-            Mode::Hitl => vec!["claude".to_string(), prompt],
-            Mode::Afk => vec!["claude".to_string(), "-p".to_string(), prompt],
+            Mode::Hitl => [claude.as_slice(), &[prompt]].concat(),
+            Mode::Afk => [claude.as_slice(), &["-p".to_string(), prompt]].concat(),
         }
     }
 
@@ -1006,7 +1019,11 @@ mod tests {
         };
         assert_eq!(
             launch.agent_argv(),
-            vec!["claude".to_string(), "/wayfinder 1 16".to_string()]
+            vec![
+                "claude".to_string(),
+                SKIP_PERMISSIONS.to_string(),
+                "/wayfinder 1 16".to_string()
+            ]
         );
     }
 
@@ -1020,6 +1037,7 @@ mod tests {
             launch.agent_argv(),
             vec![
                 "claude".to_string(),
+                SKIP_PERMISSIONS.to_string(),
                 "-p".to_string(),
                 "/wayfinder 1 16".to_string()
             ]
@@ -1048,6 +1066,7 @@ mod tests {
                 "/data/proj/wayfinder",
                 "--",
                 "claude",
+                SKIP_PERMISSIONS,
                 "/wayfinder 1 16",
             ]
         );
