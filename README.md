@@ -88,5 +88,37 @@ first so a stale layout cannot be resurrected).
 
 A finished or crashed agent's tab lingers with an EXITED banner — that is the
 post-mortem, and closing it is yours to do. The line above the match count
-counts the agent tabs zellij is holding, as of the last launch or `ctrl-r`; it
-stays empty when there are none.
+counts the agent tabs zellij is holding, as of the last launch, `ctrl-r`, or
+auto-start; it stays empty when there are none.
+
+## Auto-start
+
+While `wf` is running it keeps one invariant by itself: **every frontier
+`research` ticket has a tab.** After each poll that came back healthy, it diffs
+the frontier against the tabs that exist and spawns the missing ones as AFK
+agents — the same `ctrl-a` seam, no keystroke. A research ticket unblocked on
+another machine gets picked up on the next poll, so work happens while you are
+actually away.
+
+Only `wayfinder:research` is auto-started. `grilling` and `prototype` are HITL by
+definition, and `task` is excluded on purpose: a build ticket running unattended
+writes code and commits, which is a judgement for a keystroke now (`ctrl-a`) and
+not for a label set weeks ago. A ticket with no recognised type label is never
+auto-started either.
+
+It only ever creates:
+
+- an existing tab — running **or** EXITED — means the ticket is not started
+  again, so a dead agent's corpse is the "don't retry" record and you retry by
+  closing the tab;
+- a repo whose latest poll failed is skipped until one succeeds, since a stale
+  frontier could open a tab for a ticket already closed elsewhere;
+- a ticket that has left the frontier (claimed, blocked, closed) is left alone,
+  and no tab is ever closed for you.
+
+A tab that appears on its own is announced: the count line reads
+`auto-started wayfinder#3` and the agent-tab count is recounted on the spot, so
+the screen never disagrees with the tab bar about a tab nobody asked for.
+
+There is no off switch, no launch stagger and no fan-out cap: quitting `wf` is
+the switch.

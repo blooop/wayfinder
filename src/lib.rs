@@ -10,8 +10,13 @@
 //! Build 4: the launch seam (see #16/#5/#7) — `enter` creates or focuses the
 //! `<repo>#<n>` zellij tab in the project's session and hands the terminal
 //! over to a HITL agent; `ctrl-a` spawns the same tab headless (AFK).
+//!
+//! Build 6: auto-start (see #19/#18) — after every healthy poll, `wf` reconciles
+//! the invariant "every frontier `research` ticket has a tab" and spawns the
+//! missing ones itself through that same AFK seam ([`autostart`]).
 
 pub mod app;
+pub mod autostart;
 pub mod fetch;
 pub mod filter;
 pub mod launch;

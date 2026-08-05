@@ -783,6 +783,36 @@ pub async fn agent_tab_count(sessions: &[String]) -> usize {
     total
 }
 
+/// Read every session's tab names, for reconciliation (#19) — the impure half
+/// of [`crate::autostart::reconcile`], and the only zellij traffic auto-start
+/// adds per poll.
+///
+/// A session zellij does not have is recorded as holding **no** tabs, which is a
+/// fact rather than a failure: a launch into it would create it. A session whose
+/// query *errored* is left out of the map entirely, so reconciliation can tell
+/// "no tabs" from "don't know" and refuse to spawn on the latter. If the session
+/// listing itself fails nothing is known, so the empty map is returned and that
+/// poll reconciles nothing.
+pub async fn tabs_by_session(sessions: &[String]) -> crate::autostart::TabsBySession {
+    let mut tabs = crate::autostart::TabsBySession::new();
+    let Ok(listing) = list_sessions().await else {
+        return tabs;
+    };
+    let mut unique: Vec<&String> = sessions.iter().collect();
+    unique.sort();
+    unique.dedup();
+    for session in unique {
+        if session_state(&listing, session) != SessionState::Live {
+            tabs.insert(session.clone(), Vec::new());
+            continue;
+        }
+        if let Ok(names) = query_tab_names(session).await {
+            tabs.insert(session.clone(), names);
+        }
+    }
+    tabs
+}
+
 /// Distinct session names across cached checkouts, for [`agent_tab_count`].
 pub fn sessions_of(checkouts: &[Checkout]) -> Vec<String> {
     let mut sessions: Vec<String> = checkouts.iter().map(|c| c.session.clone()).collect();

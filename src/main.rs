@@ -13,6 +13,9 @@
 //! 5. `enter` / `ctrl-a` launch the picked ticket through the Build 4 seam
 //!    (#16): this loop is the only place that may suspend the TUI, so it
 //!    performs what [`wf::launch`] decides.
+//! 6. After every poll cycle reports, the same loop restores the auto-start
+//!    invariant (Build 6, #19): frontier `research` tickets that have no tab
+//!    get one, spawned AFK with no keystroke — see [`reconcile_autostart`].
 
 use std::collections::BTreeMap;
 use std::io::stdout;
@@ -28,6 +31,7 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use wf::app::{App, Outcome, Scope};
+use wf::autostart::{self, PollHealthByRepo};
 use wf::launch::{self, Handoff, Launch, TabOutcome};
 use wf::model::{merge_maps, Map};
 use wf::projects::{self, ProjectsCache};
@@ -243,6 +247,59 @@ async fn perform_launch(
     }
 }
 
+/// Restore the auto-start invariant — *every frontier `research` ticket has a
+/// tab* (#19, spec'd by #18) — and report what changed, if anything.
+///
+/// Called once per **poll report**, not once per event-loop turn: the decision
+/// itself is pure and cheap, but feeding it costs a `zellij` subprocess per
+/// session, and the frontier only moves when a poll lands. Hence
+/// [`autostart::any_candidate`] first — a type/status/health filter with no IO —
+/// so the tab strip is read only when some ticket could plausibly need a tab.
+///
+/// Create-only, and deduped on tab existence rather than on the claim, so this
+/// is safe to run every cycle: a ticket whose tab already exists (running, or an
+/// EXITED corpse) is left alone, and restarting `wf` does not double-spawn.
+async fn reconcile_autostart(
+    app: &mut App,
+    health: &PollHealthByRepo,
+    sessions: &[String],
+) -> Option<String> {
+    if !autostart::any_candidate(&app.map.tickets, health) {
+        return None;
+    }
+    let tabs = launch::tabs_by_session(sessions).await;
+    let launches = autostart::reconcile(
+        &app.map.tickets,
+        &app.checkouts,
+        &app.map_issues,
+        &tabs,
+        health,
+    );
+    if launches.is_empty() {
+        return None;
+    }
+
+    let host = launch::detect_host();
+    let mut started = Vec::new();
+    let mut failed = 0usize;
+    for launch in &launches {
+        match autostart::start(launch, &host).await {
+            Ok(_) => started.push(launch.key().to_string()),
+            Err(_) => failed += 1,
+        }
+    }
+    // Tabs appeared without a keystroke: recount so the AFK slot agrees with
+    // the tab bar (#7 — the tab *is* the supervision, so the count must be
+    // honest the moment it changes).
+    app.agent_tabs = launch::agent_tab_count(sessions).await;
+
+    match (started.is_empty(), failed) {
+        (true, _) => Some("auto-start failed".to_string()),
+        (false, 0) => Some(format!("auto-started {}", started.join(", "))),
+        (false, n) => Some(format!("auto-started {} ({n} failed)", started.join(", "))),
+    }
+}
+
 /// Poll outcomes folded into displayable state: when data was last verified
 /// fresh, and whether the latest poll failed. With several repos this is an
 /// aggregate: any success bumps the timestamp, any failure marks stale
@@ -285,15 +342,29 @@ async fn run(
         last_verified: None,
         failing: false,
     };
+    // Per-repo poll health, the freshness gate auto-start reads (#19). Starts
+    // empty, which reads as `Awaiting` for every repo — that is what puts the
+    // first reconcile on the first poll tick rather than at startup.
+    let mut health = PollHealthByRepo::new();
     loop {
         // Drain every pending poll outcome before drawing. An update swaps
         // one repo's map in the merged view; App::replace_map keeps the
         // cursor pinned to ticket identity, query and scope untouched.
+        let mut polled = false;
         while let Ok((slug, event)) = updates.try_recv() {
             refresh.apply(&event);
+            health.record(&slug, &event);
+            polled = true;
             if let RefreshEvent::Updated(new_map) = event {
                 maps.insert(slug, new_map);
                 app.replace_map(merge_maps(&maps));
+            }
+        }
+        // Reconcile on poll reports only, so the cadence is the poller's (~4s)
+        // and not this loop's 250ms keyboard tick.
+        if polled {
+            if let Some(notice) = reconcile_autostart(&mut app, &health, &sessions).await {
+                app.notice = Some(notice);
             }
         }
 
