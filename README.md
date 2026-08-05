@@ -4,7 +4,7 @@ wf: a multi-project wayfinder manager TUI — fuzzy-find picker and terminal sta
 ## Installing
 
 `wf` ships as a conda package on the `blooop` channel (published by the release
-below — until the first tag lands, build it with `cargo install --path .`):
+below):
 
 ```
 pixi global install -c https://prefix.dev/blooop -c conda-forge wf
