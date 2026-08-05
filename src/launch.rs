@@ -549,16 +549,34 @@ pub enum Handoff {
     Suspend(Vec<String>),
     /// Keep the TUI up: the tab runs on its own (AFK), or the zellij client
     /// was moved to it by native navigation while `wf` keeps running in its
-    /// own tab.
+    /// own tab — *in this same session*, so the user can navigate back to it.
     Stay,
+    /// Give the terminal back and exit: the client has left for another
+    /// session, so the tab `wf` is drawing in is one nobody is watching.
+    Quit,
 }
 
 /// Decide the handoff. AFK never attaches; inside zellij, `wf` is not the
-/// thing that owns the terminal, so it stays up and the *client* moves.
+/// thing that owns the terminal, so the *client* moves rather than the TUI
+/// suspending.
+///
+/// Whether `wf` survives that move is exactly whether it can be navigated back
+/// to. A same-session launch focuses a sibling tab, and `wf`'s own tab is still
+/// one `ctrl-o`/tab-switch away — so it stays. A cross-session launch moves the
+/// client *off* this session with [`switch_session_argv`], leaving `wf`'s tab
+/// behind in a session with no client: nothing can reach it, no keystroke can
+/// quit it, and it holds that pane's tty in raw mode for as long as it runs.
+/// Every such launch used to leak one, and returning to that session later
+/// landed you on a pane that swallowed every key you typed (#22). So `wf`
+/// hands over and exits, restoring the terminal on the way out.
 pub fn handoff(mode: Mode, host: &Host, session: &str) -> Handoff {
     match (mode, host) {
         (Mode::Afk, _) => Handoff::Stay,
         (Mode::Hitl, Host::Outside) => Handoff::Suspend(attach_argv(session)),
+        (Mode::Hitl, Host::Inside(current)) if current != session => Handoff::Quit,
+        // An unnamed host cannot be compared to the target, so it is treated as
+        // the same session: staying is the recoverable guess (a live TUI in a
+        // reachable tab), quitting is not.
         (Mode::Hitl, Host::Inside(_) | Host::InsideUnnamed) => Handoff::Stay,
     }
 }
@@ -1191,13 +1209,30 @@ mod tests {
         let launch = launch_for(Mode::Hitl, "k1");
         let host = Host::Inside("wayfinder".to_string());
         let tab = opened(TabOutcome::Created, "wayfinder#16 launch seam");
-        assert_eq!(handoff(Mode::Hitl, &host, "k1"), Handoff::Stay);
+        // The client leaves this session, so the tab wf is drawing in becomes
+        // unreachable: it must not be left running there (#22).
+        assert_eq!(handoff(Mode::Hitl, &host, "k1"), Handoff::Quit);
         assert_eq!(
             focus_steps(&host, &launch, &tab),
             vec![
                 go_to_tab_argv("k1", "wayfinder#16 launch seam"),
                 switch_session_argv("wayfinder", "k1")
             ]
+        );
+    }
+
+    #[test]
+    fn wf_survives_only_a_handoff_it_can_be_navigated_back_from() {
+        // Same session: wf's tab is still a tab-switch away, so it stays up.
+        let same = Host::Inside("wayfinder".to_string());
+        assert_eq!(handoff(Mode::Hitl, &same, "wayfinder"), Handoff::Stay);
+        // Another session: the client is gone from here, so staying would leak
+        // a TUI holding a pane nobody can reach.
+        assert_eq!(handoff(Mode::Hitl, &same, "k1"), Handoff::Quit);
+        // Unnamed: not comparable, so the recoverable guess wins.
+        assert_eq!(
+            handoff(Mode::Hitl, &Host::InsideUnnamed, "k1"),
+            Handoff::Stay
         );
     }
 

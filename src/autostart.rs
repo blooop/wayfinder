@@ -211,6 +211,7 @@ pub async fn start(launch: &Launch, host: &Host) -> Result<OpenTab> {
         // Matched rather than ignored so that changing it there has to come back
         // through here and answer for it.
         Handoff::Suspend(_) => bail!("auto-start will not suspend the TUI"),
+        Handoff::Quit => bail!("auto-start will not hand the terminal over"),
     }
 }
 

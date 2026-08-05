@@ -86,7 +86,9 @@ failure:
 - **inside the project's own session** — the tab is focused and `wf` keeps
   running in its own tab;
 - **inside another session** — zellij's session switcher gesture
-  (`switch-session`) moves you over.
+  (`switch-session`) moves you over, and `wf` exits as it goes: the tab it was
+  drawing in belongs to the session you just left, so nothing could reach it to
+  quit it. Run `wf` again in the session you land in to pick the next ticket.
 
 No new navigation keybindings: getting back is zellij's standard detach or
 tab/session switching. The project's session is created detached if it does not

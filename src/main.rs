@@ -28,6 +28,7 @@ use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::DefaultTerminal;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use wf::app::{App, Outcome, Scope};
@@ -171,9 +172,56 @@ async fn main() -> Result<()> {
     app.agent_tabs = launch::agent_tab_count(&sessions).await;
 
     let mut terminal = ratatui::init();
+    spawn_terminal_guard();
     let result = run(&mut terminal, app, maps, map_issues, sessions, updates).await;
     ratatui::restore();
-    result
+    if let Ending::HandedOver(parting) = result? {
+        println!("wf: {parting}");
+    }
+    Ok(())
+}
+
+/// The signals that end `wf` from outside, with the exit code each one
+/// conventionally produces (`128 + signo`).
+const FATAL_SIGNALS: [(fn() -> SignalKind, i32); 3] = [
+    (SignalKind::interrupt, 2),
+    (SignalKind::terminate, 15),
+    (SignalKind::hangup, 1),
+];
+
+/// Put the terminal back when `wf` is *killed* rather than quit.
+///
+/// Every ordinary exit funnels through the `ratatui::restore()` in [`main`],
+/// the error paths included — but a signal bypasses it, and the process dies
+/// with the tty still in raw mode. What the user then gets is a shell that
+/// prints its prompt and echoes nothing they type: a terminal that looks
+/// broken with no hint that `wf` is what broke it.
+///
+/// Key handling cannot cover this, because raw mode is precisely what stops
+/// `ctrl-c` from arriving as a signal at all: anything that gets here came from
+/// *outside* the TUI — a `kill`, a hangup when the session goes away, an OOM
+/// kill of a neighbour's process group. That is also why this is spawned rather
+/// than selected on in the event loop: the loop can be anywhere (mid-fetch,
+/// mid-launch, blocked on `event::poll`) and the terminal must come back
+/// regardless.
+///
+/// Each handler restores and exits rather than re-raising: there is nothing
+/// left to unwind, and re-raising would race the restore it just did.
+/// `SIGKILL` remains uncatchable, so `stty sane` stays the last resort.
+fn spawn_terminal_guard() {
+    for (kind, signo) in FATAL_SIGNALS {
+        tokio::spawn(async move {
+            // A handler that cannot be installed is not worth failing over:
+            // the TUI still works, it just dies ugly on that one signal.
+            let Ok(mut signal) = signal(kind()) else {
+                return;
+            };
+            if signal.recv().await.is_some() {
+                ratatui::restore();
+                std::process::exit(128 + signo);
+            }
+        });
+    }
 }
 
 /// Leave the TUI's grip on the terminal so a child process can own it. Paired
@@ -211,27 +259,45 @@ async fn refetch_all(maps: &mut BTreeMap<String, Map>, map_issues: &BTreeMap<Str
     failed
 }
 
+/// What one launch leaves behind: the line to show for it, and whether `wf`
+/// still owns a terminal to show it on.
+enum LaunchReport {
+    /// `wf` is still up; this is its notice line.
+    Notice(String),
+    /// The zellij client left for another session, so this launch was `wf`'s
+    /// last act: the line is printed on the way out instead (see
+    /// [`launch::Handoff::Quit`]).
+    HandedOver(String),
+}
+
 /// Perform one launch (#16): create-or-focus the tab, then hand over as this
 /// host requires — suspending the TUI around `zellij attach` when `wf` owns
-/// the terminal, staying up when zellij's own navigation does the moving.
-/// Returns the notice to show.
+/// the terminal, staying up when zellij's own navigation moves the client
+/// within this session, and quitting when it moves the client off it.
 async fn perform_launch(
     terminal: &mut DefaultTerminal,
     launch: &Launch,
     maps: &mut BTreeMap<String, Map>,
     map_issues: &BTreeMap<String, u64>,
-) -> Result<String> {
+) -> Result<LaunchReport> {
     let host = launch::detect_host();
     let (tab, handoff) = match launch::execute(launch, &host).await {
         Ok(result) => result,
-        Err(err) => return Ok(format!("launch failed: {err}")),
+        Err(err) => return Ok(LaunchReport::Notice(format!("launch failed: {err}"))),
     };
     let verb = match tab.outcome() {
         TabOutcome::Created => "started",
         TabOutcome::Existed => "focused",
     };
     match handoff {
-        Handoff::Stay => Ok(format!("{verb} {}", launch.describe())),
+        Handoff::Stay => Ok(LaunchReport::Notice(format!(
+            "{verb} {}",
+            launch.describe()
+        ))),
+        Handoff::Quit => Ok(LaunchReport::HandedOver(format!(
+            "{verb} {} — run `wf` in that session to pick another ticket",
+            launch.describe()
+        ))),
         Handoff::Suspend(argv) => {
             let (program, args) = argv.split_first().expect("attach argv is non-empty");
             suspend(terminal)?;
@@ -239,10 +305,10 @@ async fn perform_launch(
             resume(terminal)?;
             // Away for a while: the tracker moved (a claim, maybe a close).
             refetch_all(maps, map_issues).await;
-            Ok(match status {
+            Ok(LaunchReport::Notice(match status {
                 Ok(_) => format!("back from {}", launch.session),
                 Err(err) => format!("could not attach to {}: {err}", launch.session),
-            })
+            }))
         }
     }
 }
@@ -330,6 +396,16 @@ impl RefreshState {
     }
 }
 
+/// Why the event loop ended — the two ways `wf` gives the terminal back.
+enum Ending {
+    /// The user quit.
+    Quit,
+    /// A launch moved the zellij client to another session, so `wf` handed the
+    /// terminal over; this line is printed once the terminal is restored,
+    /// because by then there is no TUI left to show a notice in.
+    HandedOver(String),
+}
+
 async fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
@@ -337,7 +413,7 @@ async fn run(
     map_issues: BTreeMap<String, u64>,
     sessions: Vec<String>,
     mut updates: UnboundedReceiver<(String, RefreshEvent)>,
-) -> Result<()> {
+) -> Result<Ending> {
     let mut refresh = RefreshState {
         last_verified: None,
         failing: false,
@@ -376,7 +452,7 @@ async fn run(
                     continue;
                 }
                 match app.handle_key(key) {
-                    Outcome::Quit => return Ok(()),
+                    Outcome::Quit => return Ok(Ending::Quit),
                     Outcome::Refresh => {
                         // Force refresh (ctrl-r): refetch every map in
                         // place, without waiting for the poll cycles, and
@@ -393,8 +469,16 @@ async fn run(
                         }
                     }
                     Outcome::Launch(launch) => {
-                        let notice =
-                            perform_launch(terminal, &launch, &mut maps, &map_issues).await?;
+                        let notice = match perform_launch(terminal, &launch, &mut maps, &map_issues)
+                            .await?
+                        {
+                            LaunchReport::Notice(notice) => notice,
+                            // Nothing after this can be seen from here: the
+                            // client is in another session now.
+                            LaunchReport::HandedOver(parting) => {
+                                return Ok(Ending::HandedOver(parting))
+                            }
+                        };
                         app.replace_map(merge_maps(&maps));
                         app.notice = Some(notice);
                         // The new tab counts towards the AFK line; this also
