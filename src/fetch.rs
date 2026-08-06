@@ -31,7 +31,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 
 use crate::model::{
-    classify, Checks, Map, MapId, MapSet, PrLink, PrStatus, Review, Ticket, TicketType,
+    classify, Activity, Checks, Map, MapId, MapSet, PrLink, PrStatus, Review, Ticket, TicketType,
 };
 
 /// The label that makes an issue a map. Both the search that *finds* maps and
@@ -45,6 +45,7 @@ query($owner: String!, $name: String!, $number: Int!) {
     issue(number: $number) {
       title
       state
+      updatedAt
       labels(first: 20) { nodes { name } }
       subIssues(first: 100) {
         nodes {
@@ -91,6 +92,11 @@ struct Repository {
 struct MapIssue {
     title: String,
     state: String,
+    /// Defaulted so a response without the selection (an older fixture) parses
+    /// as "activity unknown" rather than failing the whole map — the same rule
+    /// the PR selection follows.
+    #[serde(rename = "updatedAt", default)]
+    updated_at: Option<String>,
     labels: Nodes<Label>,
     #[serde(rename = "subIssues")]
     sub_issues: Nodes<SubIssue>,
@@ -311,6 +317,8 @@ fn parse_map(body: &[u8], id: &MapId) -> Result<Map> {
 
     Ok(Map {
         title: issue.title,
+        // Interpreted here and nowhere inward, like every other tracker string.
+        last_activity: issue.updated_at.as_deref().and_then(Activity::parse),
         tickets,
     })
 }
@@ -517,6 +525,7 @@ mod tests {
     const PR_RESPONSE: &str = r#"{"data": {"repository": {"issue": {
         "title": "Map: wf",
         "state": "OPEN",
+        "updatedAt": "2026-08-06T12:34:56Z",
         "labels": {"nodes": [{"name": "wayfinder:map"}]},
         "subIssues": {"nodes": [
             {"number": 30, "title": "Raw tty leak", "state": "OPEN",
@@ -598,6 +607,20 @@ mod tests {
         // MAP_RESPONSE predates the #52 selection: absent connection, no PRs.
         let map = parse_map(MAP_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
         assert!(map.tickets.iter().all(|t| t.prs.is_empty()));
+    }
+
+    #[test]
+    fn the_map_issues_own_timestamp_becomes_its_last_activity() {
+        // The cluster sort key, parsed at the boundary like every other tracker
+        // string — nothing inward ever sees the ISO-8601 text.
+        let map = parse_map(PR_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
+        assert_eq!(map.last_activity, Activity::parse("2026-08-06T12:34:56Z"));
+        assert!(map.last_activity.is_some(), "the fixture stamp parsed");
+        // An absent selection is "activity unknown", not a fetch failure:
+        // MAP_RESPONSE predates the field and still yields a usable map.
+        let old = parse_map(MAP_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
+        assert_eq!(old.last_activity, None);
+        assert_eq!(old.tickets.len(), 3, "the rest of the map is unaffected");
     }
 
     #[test]

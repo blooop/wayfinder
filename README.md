@@ -50,6 +50,12 @@ done). Those are the ticket's own state, not the stage its rows draw below.
 A repo can keep several maps open at once and each gets its own cluster;
 focusing a project shows all of them.
 
+**Clusters are ordered by activity, with finished maps last**: the map issue
+touched most recently sits at the top, and a map whose every ticket is done
+sinks to the bottom however fresh it is — it is history, not work. Maps with
+equal (or unreadable) timestamps fall back to `repo`, then map number, so the
+order never shuffles between frames.
+
 **The default screen is the leverage view**: each cluster shows its takeable
 tickets (frontier and claimed), sorted by how many open tickets each one
 unblocks, with that unblocks-subtree drawn beneath it — so the next ticket is

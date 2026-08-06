@@ -515,7 +515,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{classify, Map, MapId, MapSet, Ticket, TicketType};
+    use crate::model::{classify, Activity, Map, MapId, MapSet, Ticket, TicketType};
     use crate::refresh::Startup;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -547,6 +547,7 @@ mod tests {
         };
         Map {
             title: "Map: wf".to_string(),
+            last_activity: None,
             tickets: vec![
                 t(2, "Choose the stack", false, true, vec![]),
                 t(6, "Re-entry breadcrumbs", true, false, vec![]),
@@ -845,6 +846,7 @@ mod tests {
             MapId::new("blooop/dotfiles", 4),
             Map {
                 title: "Map: dotfiles".to_string(),
+                last_activity: None,
                 tickets: vec![ticket(
                     "blooop/dotfiles",
                     103,
@@ -879,6 +881,7 @@ mod tests {
             MapId::new("blooop/wayfinder", 47),
             Map {
                 title: "Map: the selection view".to_string(),
+                last_activity: None,
                 tickets: vec![ticket(
                     "blooop/wayfinder",
                     50,
@@ -897,10 +900,66 @@ mod tests {
         let second = screen
             .find("▌ wayfinder · Map: the selection view")
             .expect("map #47's cluster");
-        assert!(first < second, "clusters order by (repo, number)");
+        assert!(
+            first < second,
+            "equal activity falls back to (repo, number)"
+        );
         assert!(screen.contains("#50 Build: clusters"), "{screen}");
         // One repo on screen, however many maps: the title names the repo.
         assert!(screen.contains("wf · blooop/wayfinder"), "{screen}");
+    }
+
+    #[test]
+    fn a_finished_map_renders_below_the_live_ones_however_recent_it_is() {
+        // The reported symptom: the finished map held the lowest issue number
+        // *and* the freshest activity, and so sat at the top of the tree. Both
+        // of the keys that would have put it there are deliberately set here.
+        let mut clusters = BTreeMap::new();
+        clusters.insert(
+            MapId::new("blooop/archive", 1),
+            Map {
+                title: "Map: archive".to_string(),
+                last_activity: Activity::parse("2026-08-06T12:00:00Z"),
+                tickets: vec![ticket(
+                    "blooop/archive",
+                    88,
+                    "Shipped last week",
+                    false,
+                    false,
+                    vec![],
+                )],
+            },
+        );
+        clusters.insert(
+            MapId::new("blooop/wayfinder", 47),
+            Map {
+                title: "Map: the selection view".to_string(),
+                last_activity: Activity::parse("2026-08-01T12:00:00Z"),
+                tickets: vec![ticket(
+                    "blooop/wayfinder",
+                    50,
+                    "Build: clusters",
+                    true,
+                    false,
+                    vec![],
+                )],
+            },
+        );
+        let mut app = App::new(clusters);
+        // The forest, because that is the screen a finished map appears on at
+        // all — leverage drops it as idle.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let screen = render(&app);
+        let live = screen
+            .find("▌ wayfinder · Map: the selection view")
+            .expect("the live cluster");
+        let finished = screen
+            .find("▌ archive · Map: archive")
+            .expect("the finished cluster");
+        assert!(
+            live < finished,
+            "finished maps sink to the bottom:\n{screen}"
+        );
     }
 
     #[test]
@@ -1177,6 +1236,7 @@ mod tests {
             MapId::new("blooop/wayfinder", 1),
             Map {
                 title: "Map: wf".to_string(),
+                last_activity: None,
                 tickets: (1..=30)
                     .map(|n| {
                         ticket(
@@ -1195,6 +1255,7 @@ mod tests {
             MapId::new("blooop/wayfinder", 47),
             Map {
                 title: "Map: the selection view".to_string(),
+                last_activity: None,
                 tickets: vec![ticket(
                     "blooop/wayfinder",
                     50,

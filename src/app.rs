@@ -7,12 +7,13 @@
 //! launch and `main` is the only thing that may act on it, because acting on
 //! it means giving the terminal back and never coming here again (#34).
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::launch::{self, Launch, LaunchMode, Staged, Targets};
-use crate::model::{stage, Map, MapId, MapSet, Status, Ticket};
+use crate::model::{stage, Activity, Map, MapId, MapSet, Status, Ticket};
 use crate::projects::Checkout;
 use crate::refresh::Startup;
 use crate::view::{self, Expanded, GroupId, Lens, Plan, Screen, Stop, StopAt};
@@ -102,8 +103,9 @@ pub enum StopKey {
 }
 
 pub struct App {
-    /// The clusters on screen: every open map that has arrived, in
-    /// (repo, number) order — which is also render order.
+    /// The clusters on screen: every open map that has arrived, keyed by id.
+    /// Render order is *not* this map's key order — it is decided by
+    /// [`App::scoped_clusters`], which leads on activity.
     pub clusters: BTreeMap<MapId, Map>,
     /// The maps believed open — the cached seed until the search answers, the
     /// search's answer afterwards. This is what `ctrl-r` refetches.
@@ -191,12 +193,37 @@ impl App {
         }
     }
 
-    /// The clusters currently in scope, in render order.
+    /// The clusters currently in scope, in render order: **work before
+    /// history, most recently active first.**
+    ///
+    /// Three keys, in this order:
+    ///
+    /// 1. Whether the map still has open work ([`Map::has_open_work`]). A
+    ///    finished map is history, and history belongs at the bottom however
+    ///    recently it was finished — otherwise a map completed this morning
+    ///    outranks every live one, which is the exact inversion this order
+    ///    exists to fix.
+    /// 2. Last activity, newest first. `None` (a timestamp that did not parse)
+    ///    sorts after every known one rather than being guessed into place.
+    /// 3. The [`MapId`] — (repo, number), the stable tie-break, so equal
+    ///    activity never renders in an arbitrary order that shifts between
+    ///    frames.
     pub fn scoped_clusters(&self) -> Vec<(&MapId, &Map)> {
-        self.clusters
+        let mut clusters: Vec<(&MapId, &Map)> = self
+            .clusters
             .iter()
             .filter(|(id, _)| self.in_scope(id))
-            .collect()
+            .collect();
+        // `!has_open_work` so `false` (live) sorts before `true` (finished), and
+        // `Reverse` so the newest activity leads — with `None` last, since
+        // `None < Some` reversed puts the unknown stamps at the end.
+        fn key<'a>(
+            (id, map): &(&'a MapId, &'a Map),
+        ) -> (bool, Reverse<Option<Activity>>, &'a MapId) {
+            (!map.has_open_work(), Reverse(map.last_activity), *id)
+        }
+        clusters.sort_by(|a, b| key(a).cmp(&key(b)));
+        clusters
     }
 
     /// Rows currently in scope (before the fuzzy query), cluster-major.
@@ -740,6 +767,7 @@ mod tests {
             MapId::new("blooop/wayfinder", 1),
             Map {
                 title: "Map: wf".to_string(),
+                last_activity: None,
                 tickets: vec![
                     ticket(
                         "blooop/wayfinder",
@@ -780,6 +808,7 @@ mod tests {
             MapId::new("blooop/dotfiles", 4),
             Map {
                 title: "Map: dotfiles".to_string(),
+                last_activity: None,
                 tickets: vec![ticket(
                     "blooop/dotfiles",
                     103,
@@ -791,6 +820,74 @@ mod tests {
             },
         );
         App::new(clusters)
+    }
+
+    /// A one-ticket cluster with a given last-activity stamp, open or finished.
+    fn cluster(repo: &str, number: u64, stamp: Option<&str>, open: bool) -> (MapId, Map) {
+        (
+            MapId::new(repo, number),
+            Map {
+                title: format!("Map: {repo}"),
+                last_activity: stamp.map(|s| Activity::parse(s).expect("fixture stamp parses")),
+                tickets: vec![ticket(repo, 1, "only ticket", open, false, vec![])],
+            },
+        )
+    }
+
+    fn cluster_order(app: &App) -> Vec<MapId> {
+        app.scoped_clusters()
+            .into_iter()
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn clusters_order_by_activity_with_finished_maps_last() {
+        // The bug this fixes: `blooop/finished` is both the lowest id *and* the
+        // most recently touched, and it still belongs at the bottom — a map with
+        // nothing left to do is history, however fresh.
+        let clusters: BTreeMap<MapId, Map> = [
+            cluster("blooop/finished", 1, Some("2026-08-06T12:00:00Z"), false),
+            cluster("blooop/stale", 2, Some("2026-08-01T09:00:00Z"), true),
+            cluster("blooop/fresh", 3, Some("2026-08-05T09:00:00Z"), true),
+            cluster("blooop/undated", 4, None, true),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            cluster_order(&App::new(clusters)),
+            vec![
+                MapId::new("blooop/fresh", 3),
+                MapId::new("blooop/stale", 2),
+                // An unparsed stamp is not guessed into the middle of the live
+                // maps: it sorts after every dated one…
+                MapId::new("blooop/undated", 4),
+                // …and the finished map is still below it.
+                MapId::new("blooop/finished", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn equal_activity_falls_back_to_repo_then_number() {
+        // Same instant on three maps: the order has to be *some* fixed one, or
+        // the screen reshuffles itself between frames for no reason.
+        let stamp = Some("2026-08-06T12:00:00Z");
+        let clusters: BTreeMap<MapId, Map> = [
+            cluster("blooop/wayfinder", 47, stamp, true),
+            cluster("kinisi/zeta", 4, stamp, true),
+            cluster("blooop/wayfinder", 1, stamp, true),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            cluster_order(&App::new(clusters)),
+            vec![
+                MapId::new("blooop/wayfinder", 1),
+                MapId::new("blooop/wayfinder", 47),
+                MapId::new("kinisi/zeta", 4),
+            ]
+        );
     }
 
     fn type_str(app: &mut App, s: &str) {
@@ -885,6 +982,7 @@ mod tests {
             MapId::new("blooop/wayfinder", 1),
             Map {
                 title: "Map: wf".to_string(),
+                last_activity: None,
                 tickets: vec![
                     ticket("blooop/wayfinder", 6, "root", true, false, vec![]),
                     ticket("blooop/wayfinder", 7, "dep a", true, false, vec![6]),
@@ -915,6 +1013,7 @@ mod tests {
             MapId::new("blooop/bencher", 1064),
             Map {
                 title: "Map: endgame".to_string(),
+                last_activity: None,
                 tickets: vec![
                     ticket("blooop/bencher", 1, "done", false, false, vec![]),
                     ticket("blooop/bencher", 10, "root, chained", true, false, vec![]),
@@ -1037,6 +1136,7 @@ mod tests {
             MapId::new("blooop/bencher", 1064),
             Map {
                 title: "Map: endgame".to_string(),
+                last_activity: None,
                 tickets: vec![
                     ticket("blooop/bencher", 1069, "root", true, false, vec![]),
                     ticket(
@@ -1265,6 +1365,7 @@ mod tests {
                 MapId::new("blooop/wayfinder", map_number),
                 Map {
                     title: format!("Map: {map_number}"),
+                    last_activity: None,
                     tickets: vec![ticket(
                         "blooop/wayfinder",
                         6,
@@ -1551,6 +1652,7 @@ mod tests {
                 MapId::new("blooop/wayfinder", 59),
                 Map {
                     title: "Map: the spine".to_string(),
+                    last_activity: None,
                     tickets: vec![t],
                 },
             );
@@ -1659,6 +1761,7 @@ mod tests {
             MapId::new("blooop/wayfinder", 1),
             Map {
                 title: "Map: wf".to_string(),
+                last_activity: None,
                 tickets: vec![ticket("blooop/wayfinder", 6, "t6", true, false, vec![])],
             },
         );
@@ -1666,6 +1769,7 @@ mod tests {
             MapId::new("blooop/wayfinder", 47),
             Map {
                 title: "Map: selection view".to_string(),
+                last_activity: None,
                 tickets: vec![ticket("blooop/wayfinder", 50, "t50", true, false, vec![])],
             },
         );
@@ -1673,6 +1777,7 @@ mod tests {
             MapId::new("blooop/dotfiles", 4),
             Map {
                 title: "Map: dotfiles".to_string(),
+                last_activity: None,
                 tickets: vec![ticket("blooop/dotfiles", 103, "t103", true, false, vec![])],
             },
         );
@@ -1721,6 +1826,7 @@ mod tests {
                 MapId::new(format!("{owner}/dotfiles"), 1),
                 Map {
                     title: "Map: dotfiles".to_string(),
+                    last_activity: None,
                     tickets: vec![ticket(
                         &format!("{owner}/dotfiles"),
                         5,

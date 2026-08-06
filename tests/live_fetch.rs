@@ -28,6 +28,15 @@ async fn fetches_the_live_wayfinder_map() {
     sorted.dedup();
     assert_eq!(numbers, sorted);
 
+    // The cluster sort key, proven against the real API: a fixture can only
+    // show that *some* timestamp parses, and the thing that can actually go
+    // wrong is the live `updatedAt` selection or its format — either of which
+    // would silently demote every map to "activity unknown".
+    assert!(
+        map.last_activity.is_some(),
+        "the live map issue's updatedAt must parse into an Activity"
+    );
+
     // The map's charted decisions are closed tickets — DONE must be non-empty.
     assert!(
         map.tickets.iter().any(|t| t.status == Status::Done),
