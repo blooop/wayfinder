@@ -45,7 +45,8 @@ Only repos with an open `wayfinder:map`-labelled issue show tickets; other
 checkouts stay cached but hidden.
 
 **Every open map renders as its own cluster** — a `▌ repo · map title` header
-carrying the per-status counts (`○` frontier `◐` claimed `⊘` blocked `●` done).
+carrying the per-**status** counts (`○` frontier `◐` claimed `⊘` blocked `●`
+done). Those are the ticket's own state, not the stage its rows draw below.
 A repo can keep several maps open at once and each gets its own cluster;
 focusing a project shows all of them.
 
@@ -57,6 +58,17 @@ chosen by what taking it unlocks, not by status alone. Rows are
 linked pull requests (GitHub's Development-panel set: closing keywords and
 manual links), shown as `draft`/`open`/`merged`/`closed` with `✓`/`✗` on an
 open PR when its checks and review are settled or need action.
+
+The leading glyph is the row's **stage**: `○` ready · `◐` building (in progress,
+for a decision node) · `◍` in review · `!` needs attention · `●` done, with `⊘`
+overriding on a blocked node, whose stage is unactionable until its blockers
+clear. Stage is derived from the linked PRs first and the ticket's own state
+only when they say nothing: an open PR with failing checks or a
+changes-requested review is needs-attention, a draft or pending checks is
+building, any other open PR is in review, and a node takes the **worst** of its
+open PRs — one red PR makes the node red. With no open PR, a merged one means
+done; with no PR at all it falls back to unclaimed → ready, claimed → building,
+closed → done.
 
 `↑`/`↓` prefer **siblings at the cursor's depth**, so on the default screen they
 move between tickets you can actually take and step over the blocked context
@@ -88,10 +100,14 @@ with something that means something else. The branch furniture stays uniformly
 dim: it is structure, not status.
 
 Done work collapses to a per-cluster `▸ ● N done (hidden)` line and blocked
-tickets no subtree reaches to `▸ ⊘ N blocked deeper down`. Both are ordinary
-cursor stops: put the cursor on one and `→` opens it in place (`▾`), listing
-what it held as rows you can select and launch, and `←` shuts it again — so
-nothing is ever merely a number you cannot reach. A map with nothing takeable
+tickets no subtree reaches to `▸ ⊘ N blocked deeper down`. **While shut, each
+carries a stage rollup** of what it is holding — the same glyphs as counts,
+`◍1 ●3` — so a branch you folded away still says whether anything in it wants
+you. Each held node is counted once, and only a shut row has a rollup: open it
+and the rows themselves are right there. Both are ordinary cursor stops: put
+the cursor on one and `→` opens it in place (`▾`), listing what it held as rows
+you can select and launch, and `←` shuts it again — so nothing is ever merely a
+number you cannot reach. A map with nothing takeable
 leaves the body entirely, counted on the bottom line as `· N idle maps hidden`.
 
 **`tab` shows the structure forest** instead: the whole blocking DAG, done
@@ -135,11 +151,39 @@ ask again.
 ## Launching
 
 Picking a ticket runs an agent on it — `claude --dangerously-skip-permissions
-"/wayfinder <map> <n>"`, with that project's checkout as its cwd — and that is
-the end of `wf`. It restores the terminal and **replaces its own process** with
-the agent: no picker underneath, no parent waiting, nothing to detach from. The
-agent holds the terminal, the exit code and the signals directly, because by
-then it *is* the process you started.
+"<skill> …"`, with that project's checkout as its cwd — and that is the end of
+`wf`. It restores the terminal and **replaces its own process** with the agent:
+no picker underneath, no parent waiting, nothing to detach from. The agent holds
+the terminal, the exit code and the signals directly, because by then it *is*
+the process you started.
+
+**Launching is two steps.** `enter` on the cursor's ticket does not launch: it
+opens the **launch line** where the count line was, showing where `enter` will
+go — `→ /tdd · #65 Author the /tdd skill`. What you type lands on that line, not
+in the query, and *is* the mode:
+
+| the line says | what launches |
+| --- | --- |
+| *(empty)* | interactive — the default |
+| `defer` | the subtree, resolved unattended |
+| `defer <text>` | deferred, with `<text>` as the steering prompt |
+| *anything else* | interactive, with what you typed as the steering prompt |
+
+`esc` backs out to the list with your query and cursor exactly as they were.
+`enter` on a **done** or **blocked** node opens nothing — it says why on the
+count line instead.
+
+**Which skill is a fact about the ticket**, from its type and its stage:
+
+| type | stage | launches |
+| --- | --- | --- |
+| `wayfinder:build` | ready · building · needs attention | `claude "/tdd <n>"` |
+| `wayfinder:build` | in review | `claude "/review <n>"` |
+| research · prototype · grilling · task | any unfinished stage | `claude "/wayfinder <map> <n>"` |
+| any | done | nothing — not launchable |
+
+The mode rides whichever route you got, as ` defer`, ` defer: <text>` or
+` steer: <text>` on the end of the prompt.
 
 | key | what it does |
 | --- | --- |
@@ -148,7 +192,8 @@ then it *is* the process you started.
 | `↑`/`↓`, `ctrl-j`/`ctrl-k` | move between siblings at the cursor's depth — on the default screen, the tickets you can take (cluster headers are never a stop) |
 | `→` | reveal: open a `▸ done`/`▸ blocked` group, else step forward one stop — which *is* descending, since a subtree's first row follows its parent |
 | `←` | close: shut an open group, else back out to the parent, else one stop back |
-| `enter` | run the agent on the ticket under the cursor, here, and exit — on a group line it folds instead, since there is no agent to run |
+| `enter` | open the launch line on the cursor's ticket; a second `enter` runs the agent here and exits — on a group line it folds instead, since there is no agent to run |
+| *type, then `enter`* | on the launch line: the mode (`defer`, `defer <text>`, or steering text) — `esc` backs out with the query and cursor intact |
 | `ctrl-f` | focus the cursor row's project — only its clusters stay on screen |
 | `ctrl-g` | widen back to every project |
 | `ctrl-r` | refetch every map in place, keeping your query, scope and cursor |
