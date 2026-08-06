@@ -91,23 +91,12 @@ pub fn body_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-/// The keybinding skeleton (#14): `tab` peek is deferred from v1; `enter`
-/// enters the ticket's agent session and `ctrl-a` spawns it AFK (#16); `esc`
-/// clears the query first and quits on an empty one, and `q` only quits when
-/// the query is empty (mid-query it types).
+/// The keybindings (#14): `tab` peek is deferred; `enter` runs the ticket's
+/// agent right here and `wf` is gone (#34); `esc` clears the query first and
+/// quits on an empty one, and `q` only quits when the query is empty (mid-query
+/// it types).
 const KEY_HINTS: &str =
-    "  enter launch · ctrl-a afk · ctrl-f focus · ctrl-g all · ctrl-r refresh · esc quit";
-
-/// The reserved AFK line (#1/#11): a count of the `<repo>#<n>` agent tabs
-/// zellij is holding, as of the last check. Empty when there are none —
-/// including before anything has been launched.
-pub fn afk_line(app: &App) -> String {
-    match app.agent_tabs {
-        0 => String::new(),
-        1 => "  agents: 1 tab".to_string(),
-        n => format!("  agents: {n} tabs"),
-    }
-}
+    "  enter launch · ctrl-f focus · ctrl-g all · ctrl-r refresh · esc quit";
 
 /// The project heading in the title bar.
 ///
@@ -134,9 +123,13 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     area
 }
 
-/// The which-checkout modal: one row per registered checkout of the repo
-/// (session name + path), because several checkouts of one repo each have
-/// their own session and the human must say which hosts the tab.
+/// The which-checkout modal: one row per registered checkout of the repo.
+///
+/// The one prompt `wf` still has, and the reason it survived the Build 7
+/// deletion (#34): a repo can have several checkouts, the agent must run in
+/// exactly one, and `wf` cannot guess which. The path *is* the row — it is what
+/// distinguishes the candidates, and with no session to name there is nothing
+/// shorter to show alongside it.
 fn draw_overlay(frame: &mut Frame, app: &App) {
     let Overlay::PickCheckout { launches, cursor } = &app.overlay else {
         return;
@@ -147,10 +140,9 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
         lines.push(Line::from(vec![
             Span::raw(format!("  {marker} ")),
             Span::styled(
-                format!("{:<12}", launch.session),
+                launch.cwd().display().to_string(),
                 Style::new().fg(Color::Cyan),
             ),
-            Span::raw(format!(" {}", launch.cwd.display())),
         ]));
     }
     lines.push(Line::default());
@@ -158,16 +150,13 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
         "  enter launch here · ↑/↓ pick · esc cancel",
         Style::new().add_modifier(Modifier::DIM),
     ));
-    // The key, not the label: this asks *which checkout*, so the ticket only
-    // needs identifying, and the title is already on the row behind the prompt.
-    let tab = launches
-        .first()
-        .map(|l| l.key().to_string())
-        .unwrap_or_default();
+    // This asks *which checkout*, so the ticket only needs identifying — its
+    // title is already on the row behind the prompt.
+    let key = launches.first().map(|l| l.key()).unwrap_or_default();
     let width = lines
         .iter()
         .map(|l| l.width() as u16 + 4)
-        .chain(std::iter::once(tab.len() as u16 + 32))
+        .chain(std::iter::once(key.len() as u16 + 30))
         .max()
         .unwrap_or(40);
     let area = centered(frame.area(), width, lines.len() as u16 + 2);
@@ -175,7 +164,7 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
-                .title(format!(" which checkout hosts {tab}? "))
+                .title(format!(" which checkout runs {key}? "))
                 .border_style(Style::new().fg(Color::Cyan)),
         ),
         area,
@@ -183,12 +172,10 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
 }
 
 /// Draw the full screen: bordered frame with the scope in the title, grouped
-/// list body, then the anchored bottom chrome — the AFK slot line (a count of
-/// live agent tabs, empty when there are none), the match-count line (with
-/// the subtle last-refreshed indicator from the background poll, empty before
-/// the first cycle, plus any one-shot notice), the fzf-style prompt, and the
-/// key hints. The which-checkout picker, when open, floats over all of it.
-pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
+/// list body, then the anchored bottom chrome — the match-count line (with the
+/// load hint and any one-shot notice), the fzf-style prompt, and the key hints.
+/// The which-checkout picker, when open, floats over all of it.
+pub fn draw(frame: &mut Frame, app: &App) {
     let mut block = match &app.scope {
         Scope::All => Block::bordered().title(format!(" wf · {} ", heading(app))),
         // The focused title names the project by its full slug — with one
@@ -201,9 +188,8 @@ pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
     let inner = block.inner(frame.area());
     frame.render_widget(block, frame.area());
 
-    let [body_area, afk_area, count_area, prompt_area, hint_area] = Layout::vertical([
+    let [body_area, count_area, prompt_area, hint_area] = Layout::vertical([
         Constraint::Min(0),
-        Constraint::Length(1), // AFK agents slot (see #7/#11)
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -211,23 +197,11 @@ pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
     .areas(inner);
 
     frame.render_widget(Paragraph::new(body_lines(app)), body_area);
-    frame.render_widget(
-        Paragraph::new(afk_line(app)).style(Style::new().fg(Color::Magenta)),
-        afk_area,
-    );
 
-    // The loading hint and the freshness indicator share one dim segment and
-    // can both be live at once (map 2 of 3 has landed, so the data on screen is
-    // fresh *and* incomplete); empty ones drop out rather than leaving gaps.
-    let status = [app.startup.hint(), refresh_indicator.to_string()]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
     let mut count_spans = vec![
         Span::raw(format!("  {}/{}", app.visible().len(), app.scoped().len())),
         Span::styled(
-            format!("  {status}"),
+            format!("  {}", app.startup.hint()),
             Style::new().add_modifier(Modifier::DIM),
         ),
     ];
@@ -293,13 +267,9 @@ mod tests {
 
     /// Render the app through TestBackend and return the screen as text.
     fn render(app: &App) -> String {
-        render_with_indicator(app, "")
-    }
-
-    fn render_with_indicator(app: &App, indicator: &str) -> String {
         let backend = TestBackend::new(90, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| draw(f, app, indicator)).expect("draw");
+        terminal.draw(|f| draw(f, app)).expect("draw");
         let buf = terminal.backend().buffer();
         let mut out = String::new();
         for y in 0..buf.area.height {
@@ -397,58 +367,47 @@ mod tests {
     /// The fixture map plus Build 4 launch inputs: two checkouts of the repo,
     /// so `enter` opens the which-checkout picker.
     fn launchable_app() -> App {
-        let checkout = |path: &str, session: &str| crate::projects::Checkout {
+        let checkout = |path: &str| crate::projects::Checkout {
             path: std::path::PathBuf::from(path),
             repo: "blooop/wayfinder".to_string(),
-            session: session.to_string(),
         };
         let mut map_issues = crate::launch::MapIssues::new();
         map_issues.insert("blooop/wayfinder".to_string(), 1);
         App::new(fixture_map()).with_projects(
             vec![
-                checkout("/data/k1/wayfinder", "k1"),
-                checkout("/data/k2/wayfinder", "k2"),
+                checkout("/data/k1/wayfinder"),
+                checkout("/data/k2/wayfinder"),
             ],
             map_issues,
         )
     }
 
     #[test]
-    fn the_hint_line_advertises_both_launch_keys() {
+    fn the_hint_line_advertises_the_one_launch_key_and_no_afk() {
         let screen = render(&App::new(fixture_map()));
         assert!(screen.contains("enter launch"));
-        assert!(screen.contains("ctrl-a afk"));
+        assert!(!screen.contains("ctrl-a"), "{screen}");
+        assert!(!screen.contains("afk"), "{screen}");
     }
 
     #[test]
-    fn the_afk_slot_is_empty_until_agent_tabs_exist() {
-        let mut app = App::new(fixture_map());
-        assert_eq!(afk_line(&app), "");
-        assert!(!render(&app).contains("agents:"));
-        app.agent_tabs = 1;
-        assert_eq!(afk_line(&app), "  agents: 1 tab");
-        app.agent_tabs = 3;
-        assert!(render(&app).contains("agents: 3 tabs"));
+    fn nothing_reserves_a_line_for_agents_any_more() {
+        // The `agents: N tabs` slot went with the tabs it counted (#26).
+        let screen = render(&App::new(fixture_map()));
+        assert!(!screen.contains("agents:"), "{screen}");
     }
 
     #[test]
-    fn the_checkout_picker_floats_over_the_list_with_one_row_per_session() {
+    fn the_checkout_picker_floats_over_the_list_with_one_row_per_tree() {
         let mut app = launchable_app();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let screen = render(&app);
-        assert!(screen.contains("which checkout hosts wayfinder#6?"), "{screen}");
-        assert!(screen.contains("▶ k1"));
-        assert!(screen.contains("/data/k1/wayfinder"));
-        assert!(screen.contains("  k2"));
+        assert!(screen.contains("which checkout runs wayfinder#6?"), "{screen}");
+        assert!(screen.contains("▶ /data/k1/wayfinder"), "{screen}");
+        assert!(screen.contains("/data/k2/wayfinder"), "{screen}");
         assert!(screen.contains("esc cancel"));
         // It is a modal: the rows it covers are overwritten, not blended.
         assert!(!screen.contains("Supervising AFK agents"), "{screen}");
-    }
-
-    #[test]
-    fn count_line_carries_the_refresh_indicator() {
-        let screen = render_with_indicator(&App::new(fixture_map()), "· ↻ 3s ago");
-        assert!(screen.contains("5/5  · ↻ 3s ago"));
     }
 
     #[test]
@@ -483,9 +442,9 @@ mod tests {
         app.startup = Startup::seeded(&found);
         app.startup.searched(&found);
         app.startup.record_arrival("a/one");
-        let screen = render_with_indicator(&app, "· ↻ just now");
+        let screen = render(&app);
         assert!(screen.contains("#6    Re-entry breadcrumbs"), "{screen}");
-        assert!(screen.contains("5/5  · loading maps 1/3 · ↻ just now"), "{screen}");
+        assert!(screen.contains("5/5  · loading maps 1/3"), "{screen}");
         // Rows exist, so the title names the project rather than the wait.
         assert!(screen.contains("wf · blooop/wayfinder"), "{screen}");
     }

@@ -1,10 +1,15 @@
 [package]
 name = "wf"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
-description = "Multi-project wayfinder manager TUI: fuzzy-find picker and terminal starmap over agentic planning maps"
+description = "Multi-project wayfinder ticket selector: a fuzzy-find picker over agentic planning maps that runs the agent on the ticket you pick"
 license = "MIT"
 repository = "https://github.com/blooop/wayfinder"
+
+[dev-dependencies]
+# Only the pty end-to-end test needs it: driving the real binary through a real
+# terminal is the only way to prove `enter` execs the agent (tests/live_launch_exec.rs).
+libc = "0.2"
 
 [dependencies]
 anyhow = "1"

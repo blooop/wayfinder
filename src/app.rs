@@ -1,19 +1,18 @@
-//! Main-screen state and the Build 2 keybinding skeleton.
+//! Main-screen state and the keybindings (#14).
 //!
 //! [`App`] owns everything the screen needs between keypresses: the map, the
 //! fuzzy query, the cursor over *visible* rows, the project scope, and a
-//! one-shot notice line. Key handling returns an [`Outcome`] so the event
-//! loop owns side effects (quit, refetch, launch) — the `Refresh` outcome is
-//! the same seam the background poller drives (#17), and `Launch` is the
-//! Build 4 seam (#16): the app decides *what* to launch, the loop performs
-//! it (it is the only thing that can suspend the TUI).
+//! one-shot notice line. Key handling returns an [`Outcome`] so the binary owns
+//! the side effects: the app decides *what* to launch and `main` is the only
+//! thing that may act on it, because acting on it means giving the terminal
+//! back and never coming here again (#34).
 
 use std::collections::BTreeMap;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::filter::matching_indices;
-use crate::launch::{self, Launch, MapIssues, Mode, Targets};
+use crate::launch::{self, Launch, MapIssues, Targets};
 use crate::model::{merge_maps, Map, Ticket, GROUP_LABELS};
 use crate::projects::Checkout;
 use crate::refresh::Startup;
@@ -35,14 +34,14 @@ pub enum Outcome {
     /// Force a refetch (`ctrl-r`). The loop performs it and puts the result
     /// back via [`App::replace_map`].
     Refresh,
-    /// Launch this agent session (#16): the loop creates-or-focuses the tab
-    /// and, for a HITL launch outside zellij, suspends the TUI to attach.
+    /// Run this ticket's agent. The last thing `wf` ever does: the loop
+    /// returns, the terminal is restored, and the process becomes the agent.
     Launch(Launch),
 }
 
-/// A modal layer over the main screen. Only one thing needs one in v1: a
-/// repo with several registered checkouts (the k1–k5 pattern) must be asked
-/// which project hosts the ticket's tab.
+/// A modal layer over the main screen. Only one thing needs one: a repo with
+/// several registered checkouts (the k1–k5 pattern) must be asked which tree
+/// the agent runs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
     None,
@@ -59,13 +58,10 @@ pub struct App {
     /// keypress.
     pub notice: Option<String>,
     /// Launch input from the projects cache (#15 handoff): which checkouts
-    /// exist and which zellij session each one uses.
+    /// exist on this machine.
     pub checkouts: Vec<Checkout>,
     /// Each repo's map issue number — `/wayfinder`'s first argument.
     pub map_issues: MapIssues,
-    /// `<repo>#<n>` tabs counted at the last check, shown in the reserved
-    /// AFK slot (#7: the tab *is* the supervision).
-    pub agent_tabs: usize,
     /// How much of the initial load has landed (#27). The screen is drawn
     /// before any of it, so this is what stops an empty list from reading as
     /// "no tickets" while the fetch is still out.
@@ -84,7 +80,6 @@ impl App {
             notice: None,
             checkouts: Vec::new(),
             map_issues: MapIssues::new(),
-            agent_tabs: 0,
             startup: Startup::loaded(),
             overlay: Overlay::None,
             cursor: 0,
@@ -102,8 +97,8 @@ impl App {
         }
     }
 
-    /// Attach the launch inputs: the cached checkouts (candidate hosts and
-    /// their session names) and the per-repo map issue numbers.
+    /// Attach the launch inputs: the cached checkouts (the candidate trees an
+    /// agent could run in) and the per-repo map issue numbers.
     pub fn with_projects(mut self, checkouts: Vec<Checkout>, map_issues: MapIssues) -> Self {
         self.checkouts = checkouts;
         self.map_issues = map_issues;
@@ -198,7 +193,7 @@ impl App {
     /// Resolve a launch of the cursor's ticket: straight to the loop when
     /// there is one candidate checkout, through the picker when there are
     /// several, and a notice when there is none to launch into.
-    fn request_launch(&mut self, mode: Mode) -> Outcome {
+    fn request_launch(&mut self) -> Outcome {
         let Some(ticket) = self.cursor_ticket().cloned() else {
             self.notice = Some("nothing selected".to_string());
             return Outcome::Continue;
@@ -208,7 +203,7 @@ impl App {
             self.notice = Some(format!("{repo} has no map — nothing to hand /wayfinder"));
             return Outcome::Continue;
         };
-        match launch::plan(&self.checkouts, &ticket, map_issue, mode) {
+        match launch::plan(&self.checkouts, &ticket, map_issue) {
             Targets::Unregistered => {
                 self.notice = Some(format!(
                     "no registered checkout of {repo} on this machine — run wf inside one"
@@ -216,7 +211,7 @@ impl App {
                 Outcome::Continue
             }
             Targets::One(launch) => {
-                self.notice = Some(format!("{} → {}", mode.label(), launch.describe()));
+                self.notice = Some(format!("→ {}", launch.describe()));
                 Outcome::Launch(launch)
             }
             Targets::Many(launches) => {
@@ -248,7 +243,7 @@ impl App {
                     .into_iter()
                     .nth(cursor)
                     .expect("picker cursor stays in range");
-                self.notice = Some(format!("{} → {}", launch.mode.label(), launch.describe()));
+                self.notice = Some(format!("→ {}", launch.describe()));
                 Outcome::Launch(launch)
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -321,10 +316,9 @@ impl App {
                 self.move_cursor(-1);
                 Outcome::Continue
             }
-            // The launch seam (#16): enter takes you into the agent session,
-            // ctrl-a fires the same tab headless and leaves you here.
-            KeyCode::Enter => self.request_launch(Mode::Hitl),
-            KeyCode::Char('a') if ctrl => self.request_launch(Mode::Afk),
+            // The whole point of the picker: enter runs the agent here, and
+            // there is nothing to come back to.
+            KeyCode::Enter => self.request_launch(),
             KeyCode::Esc => {
                 if self.query.is_empty() {
                     Outcome::Quit
@@ -448,53 +442,50 @@ mod tests {
     /// The fixture app plus launch inputs: one checkout of wayfinder, two of
     /// a multi-checkout repo, and map issues for both.
     fn launchable_app() -> App {
-        let checkout = |path: &str, repo: &str, session: &str| Checkout {
+        let checkout = |path: &str, repo: &str| Checkout {
             path: std::path::PathBuf::from(path),
             repo: repo.to_string(),
-            session: session.to_string(),
         };
         let mut map_issues = MapIssues::new();
         map_issues.insert("blooop/wayfinder".to_string(), 1);
         map_issues.insert("blooop/dotfiles".to_string(), 4);
         fixture_app().with_projects(
             vec![
-                checkout("/data/proj/wayfinder", "blooop/wayfinder", "wayfinder"),
-                checkout("/data/k1/dotfiles", "blooop/dotfiles", "k1"),
-                checkout("/data/k2/dotfiles", "blooop/dotfiles", "k2"),
+                checkout("/data/proj/wayfinder", "blooop/wayfinder"),
+                checkout("/data/k1/dotfiles", "blooop/dotfiles"),
+                checkout("/data/k2/dotfiles", "blooop/dotfiles"),
             ],
             map_issues,
         )
     }
 
     #[test]
-    fn enter_launches_the_cursors_ticket_hitl_without_prompting() {
+    fn enter_launches_the_cursors_ticket_without_prompting() {
         let mut app = launchable_app();
         // Cursor starts on frontier wayfinder#6, whose repo has one checkout.
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.mode, Mode::Hitl);
-        assert_eq!(launch.key().to_string(), "wayfinder#6");
-        // The tab a human reads carries the capped title (#20); the identity
-        // the seam looks up does not.
-        assert_eq!(launch.label.to_string(), "wayfinder#6 Re-entry…");
-        assert_eq!(launch.session, "wayfinder");
-        assert_eq!(launch.map_issue, 1);
+        assert_eq!(launch.key(), "wayfinder#6");
+        assert_eq!(launch.cwd(), std::path::Path::new("/data/proj/wayfinder"));
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder 1 6");
         assert_eq!(app.overlay, Overlay::None, "one candidate must not prompt");
-        assert!(app.notice.as_deref().unwrap().contains("wayfinder#6 in wayfinder"));
+        assert!(app
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("wayfinder#6 in /data/proj/wayfinder"));
     }
 
     #[test]
-    fn ctrl_a_launches_the_same_ticket_afk() {
+    fn ctrl_a_no_longer_launches_anything() {
+        // Unattended work is another terminal session, not a keystroke here
+        // (#26): `ctrl-a` must be inert rather than quietly typing an `a`.
         let mut app = launchable_app();
-        let launch = match app.handle_key(ctrl('a')) {
-            Outcome::Launch(launch) => launch,
-            other => panic!("expected a launch, got {other:?}"),
-        };
-        assert_eq!(launch.mode, Mode::Afk);
-        assert_eq!(launch.key().to_string(), "wayfinder#6");
-        assert!(app.notice.as_deref().unwrap().contains("afk agent"));
+        assert_eq!(app.handle_key(ctrl('a')), Outcome::Continue);
+        assert_eq!(app.query, "");
+        assert_eq!(app.notice, None);
     }
 
     #[test]
@@ -517,10 +508,8 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.session, "k2");
-        assert_eq!(launch.cwd, std::path::PathBuf::from("/data/k2/dotfiles"));
-        assert_eq!(launch.key().to_string(), "dotfiles#103");
-        assert_eq!(launch.label.to_string(), "dotfiles#103 Prune legacy bash…");
+        assert_eq!(launch.cwd(), std::path::Path::new("/data/k2/dotfiles"));
+        assert_eq!(launch.key(), "dotfiles#103");
         assert_eq!(app.overlay, Overlay::None);
     }
 
@@ -528,7 +517,7 @@ mod tests {
     fn the_picker_clamps_and_esc_cancels_it() {
         let mut app = launchable_app();
         app.handle_key(key(KeyCode::Down));
-        app.handle_key(ctrl('a')); // AFK launch also prompts
+        app.handle_key(key(KeyCode::Enter));
         for _ in 0..5 {
             app.handle_key(key(KeyCode::Down));
         }
@@ -566,8 +555,6 @@ mod tests {
         type_str(&mut app, "zzzz");
         assert!(app.cursor_ticket().is_none());
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
-        assert_eq!(app.notice.as_deref(), Some("nothing selected"));
-        assert_eq!(app.handle_key(ctrl('a')), Outcome::Continue);
         assert_eq!(app.notice.as_deref(), Some("nothing selected"));
     }
 
