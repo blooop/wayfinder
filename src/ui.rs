@@ -70,41 +70,22 @@ fn cursor_span(under_cursor: bool) -> Span<'static> {
     }
 }
 
-/// One colour shared by the marker and the elbows leading down to it, so the
-/// selection reads as a single lit path rather than a lone glyph.
+/// The marker's colour: orange, and deliberately not one of the six the screen
+/// already spends — cyan on cluster headers and the prompt, green/yellow/red on
+/// the status glyphs and counts, magenta on PR badges, dim on everything
+/// settled. A selection drawn in any of those competes with something that means
+/// something else, which is how the cursor got hard to find in the first place.
 ///
-/// Orange, and deliberately not one of the six the screen already spends:
-/// cyan on cluster headers and the prompt, green/yellow/red on the status
-/// glyphs and counts, magenta on PR badges, dim on everything settled. A
-/// selection drawn in any of those competes with something that means
-/// something else, which is exactly how the cursor got lost in the first place.
+/// It is the *only* thing drawn in it. Lighting the branch run leading down to
+/// the selection as well was tried and dropped: telling apart the elbows that
+/// lead to the cursor from the guides that merely pass it needs rules that are
+/// hard to see and easy to get subtly wrong, and a marker that stands out on its
+/// own does the job the highlight was for.
 const CURSOR_COLOR: Color = Color::Indexed(208);
 
-/// How one unit of tree furniture is drawn: in the cursor's colour when it lies
-/// on the path down to the selection ([`crate::view::cursor_path`]), dim
-/// otherwise.
-///
-/// The branches are what say *where* the cursor is. Left uniformly dim, the
-/// marker was the only lit thing on a screen full of near-identical indented
-/// rows.
-fn furniture_style(on_path: bool) -> Style {
-    if on_path {
-        Style::new().fg(CURSOR_COLOR)
-    } else {
-        Style::new().add_modifier(Modifier::DIM)
-    }
-}
-
-/// Split a row's furniture into its two-column units (`│ `, `  `, `├─`, `└─`) —
-/// one per level of depth, which is the granularity the path highlight works at.
-fn furniture_units(prefix: &str) -> Vec<String> {
-    prefix
-        .chars()
-        .collect::<Vec<char>>()
-        .chunks(2)
-        .map(|unit| unit.iter().collect())
-        .collect()
-}
+/// Tree furniture is uniformly dim: it is structure, not status, and the orange
+/// marker is what says where the cursor is.
+const FURNITURE: Style = Style::new().add_modifier(Modifier::DIM);
 
 /// The `⇄ PR#n <state>` badge spans for one linked PR (#52) — evidence of the
 /// ticket's progress, riding after the `[type]` suffix. An open PR folds its
@@ -156,7 +137,6 @@ fn ticket_line(
     also_needs: &[u64],
     name_repo: bool,
     under_cursor: bool,
-    lit_unit: Option<usize>,
 ) -> Line<'static> {
     let repo = if name_repo {
         ticket.short_repo().to_string()
@@ -165,24 +145,21 @@ fn ticket_line(
     };
     // Nested rows carry the cursor column as extra indent, so a branch begins
     // directly under the glyph of the row it hangs from instead of to its left.
-    let mut spans = vec![Span::raw("  ")];
-    if !prefix.is_empty() {
-        spans.push(Span::raw("  "));
-    }
-    // One span per two-column unit, so the single elbow on the path to the
-    // cursor can light while the rest of the same row — the `│` guides that
-    // carry on down past the selection — stays dim.
-    for (i, unit) in furniture_units(prefix).into_iter().enumerate() {
-        spans.push(Span::styled(unit, furniture_style(lit_unit == Some(i))));
-    }
-    spans.extend([
+    let indent = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("  {prefix}")
+    };
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(indent, FURNITURE),
         cursor_span(under_cursor),
         Span::styled(
             ticket.status.glyph().to_string(),
             glyph_style(&ticket.status),
         ),
         Span::raw(format!(" {repo}#{} {}", ticket.number, ticket.title)),
-    ]);
+    ];
     if let Some(name) = ticket.ticket_type.short_name() {
         spans.push(Span::styled(
             format!(" [{name}]"),
@@ -216,13 +193,7 @@ pub fn body_lines(app: &App) -> Vec<Line<'static>> {
 /// where a ticket row's tree furniture would be, then the count it is holding.
 /// It says `(hidden)` only while shut — once open, the rows are right there and
 /// claiming otherwise would be a lie.
-fn group_line(
-    kind: GroupKind,
-    hidden: usize,
-    expanded: bool,
-    under_cursor: bool,
-    on_path: bool,
-) -> Line<'static> {
+fn group_line(kind: GroupKind, hidden: usize, expanded: bool, under_cursor: bool) -> Line<'static> {
     let fold = if expanded { '▾' } else { '▸' };
     let (glyph, label, color) = match kind {
         GroupKind::BlockedDeeper => ('⊘', "blocked deeper down", Color::Red),
@@ -232,7 +203,7 @@ fn group_line(
     Line::from(vec![
         Span::raw("  "),
         cursor_span(under_cursor),
-        Span::styled(format!("{fold} "), furniture_style(under_cursor || on_path)),
+        Span::styled(format!("{fold} "), FURNITURE),
         Span::styled(glyph.to_string(), Style::new().fg(color)),
         Span::styled(
             format!(" {hidden} {label}{tail}"),
@@ -253,8 +224,6 @@ fn group_line(
 fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize>) {
     let name_repo = matches!(app.screen(), Screen::Flattened { .. });
     let cursor_pos = app.cursor_pos();
-    // How much furniture each row has on the path to the cursor, by stop index.
-    let path = crate::view::cursor_path(&plan.stops(), cursor_pos);
     let mut stop = 0usize;
     let mut cursor_line = None;
     // Every stop the plan lists gets one line, in the same order, so this
@@ -279,15 +248,13 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                 also_needs,
                 depth: _,
             } => {
-                let (here, under_cursor) = mark(&lines, &mut cursor_line);
-                let lit = path.get(here).copied().flatten();
+                let (_, under_cursor) = mark(&lines, &mut cursor_line);
                 lines.push(ticket_line(
                     app.ticket(row),
                     prefix,
                     also_needs,
                     name_repo,
                     under_cursor,
-                    lit,
                 ));
             }
             Item::Group {
@@ -295,17 +262,8 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                 hidden,
                 expanded,
             } => {
-                // A group's fold marker sits where furniture would, so it lights
-                // when the cursor is among the rows it holds.
-                let (here, under_cursor) = mark(&lines, &mut cursor_line);
-                let on_path = path.get(here).copied().flatten().is_some();
-                lines.push(group_line(
-                    id.kind,
-                    *hidden,
-                    *expanded,
-                    under_cursor,
-                    on_path,
-                ));
+                let (_, under_cursor) = mark(&lines, &mut cursor_line);
+                lines.push(group_line(id.kind, *hidden, *expanded, under_cursor));
             }
             Item::Blank => lines.push(Line::default()),
         }
@@ -740,41 +698,6 @@ mod tests {
         assert!(screen.contains("⇄ PR#14 open"), "{screen}");
         assert!(!screen.contains('✓'), "{screen}");
         assert!(!screen.contains('✗'), "{screen}");
-    }
-
-    #[test]
-    fn the_branch_leading_into_the_cursor_row_is_lit_not_dim() {
-        // On a screen of near-identical indented rows the lone ▶ was doing all
-        // the work; the run of furniture into it is what shows *where* the
-        // selection sits, so it shares the marker's colour.
-        let mut app = fixture_app();
-        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        assert_eq!(app.cursor_ticket().expect("a ticket").number, 7);
-
-        let lines = body_lines(&app);
-        let furniture = |needle: &str| -> Style {
-            let line = lines
-                .iter()
-                .find(|line| line.to_string().contains(needle))
-                .unwrap_or_else(|| panic!("no row for {needle}"));
-            line.spans
-                .iter()
-                .find(|span| span.content.contains('─'))
-                .unwrap_or_else(|| panic!("no branch on {needle}"))
-                .style
-        };
-
-        assert_eq!(
-            furniture("#7 Supervising").fg,
-            Some(CURSOR_COLOR),
-            "the selected row's elbow is lit"
-        );
-        let elsewhere = furniture("#14 Breadcrumb");
-        assert_ne!(elsewhere.fg, Some(CURSOR_COLOR));
-        assert!(
-            elsewhere.add_modifier.contains(Modifier::DIM),
-            "every other branch stays dim"
-        );
     }
 
     #[test]

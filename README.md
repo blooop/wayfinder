@@ -70,28 +70,22 @@ that is an only child, say) `↑`/`↓` step to the neighbouring row instead, an
 `←` falls back the same way once there is no parent left to climb to. `→` steps
 one stop at a time, so it is the key that visits everything.
 
-The cursor `▶` sits directly against the item it points at rather than in a
-left-hand gutter, so it visibly steps rightward as you descend and the depth
-axis is something you can see. Along with it, the **chain of elbows** from the
-cluster down to the selection lights up — on each row of the path, the
-`├─`/`└─` that joins it to its parent, and nothing else:
+The cursor is a bold **orange `▶`** sitting directly against the item it points
+at rather than in a left-hand gutter, so it steps visibly rightward as you
+descend and the depth axis is something you can see:
 
 ```
     ○ #1069 Prototype the reconciled on-disk form
-    └─  ⊘ #1070 A3 disposition…              ← └─ lit
-      ├─  ⊘ #1071 A4 disposition…            ← ├─ lit
-      │ ├─▶ ⊘ #1073 Dispositions for plans…  ← ├─ and ▶ lit; the │ before it is not
+    └─  ⊘ #1070 A3 disposition…
+      ├─  ⊘ #1071 A4 disposition…
+      │ ├─▶ ⊘ #1073 Dispositions for plans…
 ```
 
-A row's leading `│` guides stay dim deliberately: they belong to shallower
-levels and carry on *down* the screen past the selection to reach later
-siblings, so lighting them would suggest the highlight continues below the
-cursor. A row the path merely passes stays dark for the same reason — a lit
-elbow always means "the selection is through here", never "this row is chosen".
-
-The highlight is **orange**, which is the one hue the screen does not otherwise
-spend: cyan is cluster headers and the prompt, green/yellow/red are the status
-glyphs and counts, magenta is PR badges, dim is everything settled.
+Orange because it is the one hue the screen does not otherwise spend — cyan is
+cluster headers and the prompt, green/yellow/red the status glyphs and counts,
+magenta the PR badges, dim everything settled — so the selection never competes
+with something that means something else. The branch furniture stays uniformly
+dim: it is structure, not status.
 
 Done work collapses to a per-cluster `▸ ● N done (hidden)` line and blocked
 tickets no subtree reaches to `▸ ⊘ N blocked deeper down`. Both are ordinary
