@@ -51,9 +51,12 @@ async fn discovery_then_every_map_arrives_through_one_channel() {
     let found = loop {
         match next(&mut rx).await {
             LoadEvent::Discovered(found) => break found,
-            // The search retries, so a blip is survivable rather than fatal.
-            LoadEvent::SearchFailed => continue,
-            other => panic!("expected discovery first, got {other:?}"),
+            // The search retries, so a blip is survivable rather than fatal:
+            // go round and wait for the next event.
+            LoadEvent::SearchFailed => {}
+            other @ LoadEvent::Fetched { .. } => {
+                panic!("expected discovery first, got {other:?}")
+            }
         }
     };
     assert!(
@@ -165,8 +168,9 @@ async fn a_stale_seed_reports_failure_and_is_replaced_by_the_search() {
                 assert!(!map.tickets.is_empty());
                 break;
             }
-            // The aborted load may have queued one last failure first.
-            LoadEvent::Fetched { .. } => continue,
+            // The aborted load may have queued one last failure first: go round
+            // and keep waiting for the loaded one.
+            LoadEvent::Fetched { .. } => {}
             other => panic!("unexpected event {other:?}"),
         }
     }

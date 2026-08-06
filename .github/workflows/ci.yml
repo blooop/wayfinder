@@ -1,0 +1,89 @@
+name: CI
+
+# Formatting, lints, tests and docs — everything that can be judged without
+# building a package. `package.yml` is the other half: it proves the recipe
+# still installs and runs. Kept apart on purpose. A rattler build takes minutes
+# and downloads a toolchain of its own, so folding `cargo fmt` into it would
+# make the cheapest possible failure the slowest one to hear about.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A warning is a failure here and only here. The lint levels themselves live
+  # in Cargo.toml's `[lints]` table, at `warn`, so a local `cargo build` stays
+  # readable while a pull request cannot merge with a warning in it — one place
+  # to change a level, one place that decides how loudly it lands.
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # One job, not four. Every step below needs the same dependency graph
+  # compiled, and separate jobs would each pay for it from scratch — the whole
+  # run is faster than a single cold `cargo clippy`. The steps are ordered by
+  # how cheap they are to fix, so the fastest failure is also the first one:
+  # formatting needs no compilation at all, lints need one check pass, tests
+  # need a build.
+  check:
+    name: fmt + clippy + test + doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Keyed on the lockfile and the compiler version, and scoped to this
+      # workflow so `package.yml`'s registry cache stays a separate thing.
+      - name: Cache cargo's registry and the target directory
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci
+
+      # First, because it is the one check that cannot be wrong about the code:
+      # it either matches `cargo fmt` or it does not. rustfmt.toml holds only
+      # stable options, so this runs on the stable toolchain above rather than
+      # needing nightly.
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # `--all-targets` reaches the tests, the example and the `#[cfg(test)]`
+      # modules — most of this crate's code is in one of those, and a lint that
+      # stopped at `src/` would miss it. `--locked` fails on a Cargo.lock that
+      # does not match Cargo.toml instead of quietly updating it, which is the
+      # same promise the recipe's `--locked` build makes.
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked
+
+      # The unit tests, the ones that need nothing but a compiler. Everything
+      # under `tests/` is a `live_*` integration test — a real `gh`, real
+      # network, and assertions against this project's own tracker as it stands
+      # today — so running them here would make CI fail whenever the map moves
+      # on. They are compiled below instead of run.
+      - name: Unit tests
+        run: cargo test --locked --lib --bins --examples
+
+      # Compiled but not run: a test that no longer builds is rot, and this is
+      # what catches it at the commit that caused it rather than the next time
+      # somebody runs them by hand.
+      - name: The live tests still compile
+        run: cargo test --locked --all-targets --no-run
+
+      # `RUSTDOCFLAGS` above makes this fail on a broken intra-doc link. Worth a
+      # step of its own in a crate this heavily documented: the doc comments
+      # cross-reference each other constantly, and a link that silently stops
+      # resolving is a comment that has started lying about where its subject
+      # lives.
+      - name: Docs
+        run: cargo doc --no-deps --all-features --locked

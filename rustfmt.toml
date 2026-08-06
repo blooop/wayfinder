@@ -1,0 +1,18 @@
+# Formatting is not a matter of taste here — it is `cargo fmt` and nothing else,
+# so a diff never contains a line that only moved. Everything below is a
+# *stable* rustfmt option on purpose: `cargo fmt --check` runs on stable in CI
+# (.github/workflows/ci.yml), and a single nightly-only key makes rustfmt reject
+# the whole file, so the pretty import-grouping options are deliberately absent.
+edition = "2021"
+
+# The default width, stated rather than implied, because the doc comments in
+# this crate are hand-wrapped to it and a future change here would silently
+# invalidate all of them.
+max_width = 100
+
+# `\n`, never `\r\n`, whatever the checkout's platform does.
+newline_style = "Unix"
+
+# `Self { name }` over `Self { name: name }`, and `?` over `try!`.
+use_field_init_shorthand = true
+use_try_shorthand = true

@@ -2,7 +2,7 @@
 //! see what `wf` will draw, and to drive its keys, without taking over the
 //! terminal. Throwaway.
 //!
-//! Run: cargo run --example preview_screen -- blooop/wayfinder 47 [more...]
+//! Run: `cargo run --example preview_screen -- blooop/wayfinder 47 [more...]`
 //! Keys to replay come from $KEYS, e.g. KEYS="down right right" — one of
 //! down/up/left/right/tab/<char>.
 
@@ -74,8 +74,8 @@ async fn main() {
         "cursor: {} of {} → {} at depth {}",
         pos,
         stops.len(),
-        stops.get(pos).map(&label).unwrap_or("nothing".into()),
-        stops.get(pos).map(|at| at.depth as isize).unwrap_or(-1),
+        stops.get(pos).map_or("nothing".into(), &label),
+        stops.get(pos).map_or(-1, |at| at.depth as isize),
     );
     if std::env::var("NAV").is_ok() {
         for (i, at) in stops.iter().enumerate() {

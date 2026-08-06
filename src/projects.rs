@@ -36,12 +36,12 @@ pub struct Checkout {
 /// The per-machine cache of touched checkouts, plus the last map search's
 /// findings (#28).
 ///
-/// The findings are a set of [`MapId`]s, not held on a [`Checkout`]: which
-/// issues are a repo's maps is a property of the repo, and two checkouts of
-/// one repo would otherwise each carry a copy that can disagree with the
-/// other. A set of ids rather than a per-repo number because a repo can hold
-/// several open maps at once (#50) — the old `repo → one number` table could
-/// not even represent that.
+/// The findings are a set of [`MapId`](crate::model::MapId)s, not held on a
+/// [`Checkout`]: which issues are a repo's maps is a property of the repo, and
+/// two checkouts of one repo would otherwise each carry a copy that can
+/// disagree with the other. A set of ids rather than a per-repo number because
+/// a repo can hold several open maps at once (#50) — the old
+/// `repo → one number` table could not even represent that.
 ///
 /// There is deliberately no third "not yet searched" state. The search is
 /// unconditional — the cache is a head start, never a skip (see
@@ -70,6 +70,13 @@ impl ProjectsCache {
     }
 
     /// Persist the cache, creating parent directories as needed.
+    ///
+    /// # Errors
+    ///
+    /// An unwritable cache directory or file. The counterpart
+    /// [`load_or_default`](Self::load_or_default) swallows its errors because a
+    /// cache that will not load is merely empty; one that will not *save*
+    /// silently loses the registration this run just made, so it is reported.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)

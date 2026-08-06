@@ -366,7 +366,7 @@ mod tests {
     use super::*;
 
     fn argv(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
+        args.iter().copied().map(String::from).collect()
     }
 
     #[test]

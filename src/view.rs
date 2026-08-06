@@ -44,6 +44,7 @@ pub enum Lens {
 }
 
 impl Lens {
+    #[must_use]
     pub fn toggled(self) -> Lens {
         match self {
             Lens::Leverage => Lens::Forest,
@@ -183,7 +184,7 @@ impl Plan {
 }
 
 /// Plan the body for the clusters in scope, in their given (render) order.
-pub fn plan(clusters: &[(&MapId, &Map)], screen: Screen, expanded: &Expanded) -> Plan {
+pub fn plan(clusters: &[(&MapId, &Map)], screen: Screen<'_>, expanded: &Expanded) -> Plan {
     match screen {
         Screen::Structured(Lens::Leverage) => leverage(clusters, expanded),
         Screen::Structured(Lens::Forest) => forest(clusters),
@@ -205,7 +206,7 @@ fn is_open(t: &Ticket) -> bool {
 fn open_unblocks(map: &Map, number: u64) -> Vec<u64> {
     map.unblocks(number)
         .into_iter()
-        .filter(|&n| map.index_of(n).map(|i| is_open(&map.tickets[i])) == Some(true))
+        .filter(|&n| map.index_of(n).is_some_and(|i| is_open(&map.tickets[i])))
         .collect()
 }
 
@@ -1101,7 +1102,7 @@ mod tests {
         assert_eq!(
             furniture,
             vec![
-                (13, "".to_string(), 0),
+                (13, String::new(), 0),
                 (14, "├─".to_string(), 1),
                 (15, "│ └─".to_string(), 2),
                 (17, "└─".to_string(), 1),

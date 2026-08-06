@@ -29,6 +29,14 @@
 //! Needs network, an authenticated `gh`, and a `blooop/wayfinder` checkout with
 //! at least one ticket on its map — i.e. this repo.
 
+// The crate denies `unsafe_code` (see `[lints.rust]` in Cargo.toml) and `src/`
+// contains none. This file is the single exception, and it is the reason the
+// deny is worth having elsewhere: `openpty`, `fork`/`exec`, and turning the raw
+// fds it hands back into `OwnedFd`s are libc calls with no safe equivalent in
+// std, and a real pty is the only way to observe the launch at all. Nothing here
+// is part of the shipped binary.
+#![allow(unsafe_code)]
+
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -111,11 +119,11 @@ fn openpty_sized(rows: u16, cols: u16) -> (OwnedFd, OwnedFd) {
     size.ws_col = cols;
     let rc = unsafe {
         libc::openpty(
-            &mut master,
-            &mut slave,
+            std::ptr::from_mut(&mut master),
+            std::ptr::from_mut(&mut slave),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &size,
+            std::ptr::from_ref(&size),
         )
     };
     assert_eq!(rc, 0, "openpty failed");
@@ -188,6 +196,11 @@ fn flags(stty: &str) -> Vec<&str> {
         .collect()
 }
 
+// One test rather than several because it is one *run*: the pty, the shim, the
+// two enters and the exec all have to happen in one process's lifetime, and
+// three claims read off one launch is what makes them claims about the same
+// launch. Splitting it to satisfy a line count would mean three real starts.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
     let scratch = Scratch::new();

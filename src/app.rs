@@ -102,6 +102,7 @@ pub enum StopKey {
     Group(GroupId),
 }
 
+#[derive(Debug)]
 pub struct App {
     /// The clusters on screen: every open map that has arrived, keyed by id.
     /// Render order is *not* this map's key order — it is decided by
@@ -181,6 +182,7 @@ impl App {
     /// Attach the launch input: the cached checkouts (the candidate trees an
     /// agent could run in). Which map a ticket belongs to is no longer a
     /// lookup — every row sits in a cluster that *is* its map (#50).
+    #[must_use]
     pub fn with_checkouts(mut self, checkouts: Vec<Checkout>) -> Self {
         self.checkouts = checkouts;
         self
@@ -508,8 +510,8 @@ impl App {
     ///
     /// Everything this needs came with the [`Staged`] launch, so a refetch
     /// between the two enters cannot redirect it at another ticket.
-    fn resolve_launch(&mut self, staged: Staged, mode: LaunchMode) -> Outcome {
-        match launch::plan(&self.checkouts, &staged, mode) {
+    fn resolve_launch(&mut self, staged: &Staged, mode: &LaunchMode) -> Outcome {
+        match launch::plan(&self.checkouts, staged, mode) {
             Targets::Unregistered => {
                 self.notice = Some(format!(
                     "no registered checkout of {} on this machine — run wf inside one",
@@ -551,7 +553,7 @@ impl App {
             // Back to the list; the overlay is already None.
             KeyCode::Esc => Outcome::Continue,
             KeyCode::Char('c') if ctrl => Outcome::Quit,
-            KeyCode::Enter => self.resolve_launch(staged, LaunchMode::parse(&text)),
+            KeyCode::Enter => self.resolve_launch(&staged, &LaunchMode::parse(&text)),
             KeyCode::Backspace => {
                 text.pop();
                 self.overlay = Overlay::LaunchLine { staged, text };
@@ -1413,7 +1415,9 @@ mod tests {
                 assert_eq!(launches.len(), 2);
                 assert_eq!(*cursor, 0);
             }
-            other => panic!("expected the picker, got {other:?}"),
+            other @ (Overlay::None | Overlay::LaunchLine { .. }) => {
+                panic!("expected the picker, got {other:?}")
+            }
         }
         // The picker owns every key: typing must not leak into the query.
         app.handle_key(key(KeyCode::Char('x')));
@@ -1438,7 +1442,9 @@ mod tests {
         }
         match &app.overlay {
             Overlay::PickCheckout { cursor, .. } => assert_eq!(*cursor, 1),
-            other => panic!("expected the picker, got {other:?}"),
+            other @ (Overlay::None | Overlay::LaunchLine { .. }) => {
+                panic!("expected the picker, got {other:?}")
+            }
         }
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Outcome::Continue);
         assert_eq!(app.overlay, Overlay::None);
