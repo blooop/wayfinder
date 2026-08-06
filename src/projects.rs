@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-use crate::launch::MapIssues;
+use crate::model::MapSet;
 
 /// One touched checkout: where it lives, and which repo its `origin` points at.
 ///
@@ -36,22 +36,27 @@ pub struct Checkout {
 /// The per-machine cache of touched checkouts, plus the last map search's
 /// findings (#28).
 ///
-/// The findings are keyed by **repo slug**, not held on a [`Checkout`]: which
-/// issue is a repo's map is a property of the repo, and two checkouts of one
-/// repo would otherwise each carry a copy that can disagree with the other.
+/// The findings are a set of [`MapId`]s, not held on a [`Checkout`]: which
+/// issues are a repo's maps is a property of the repo, and two checkouts of
+/// one repo would otherwise each carry a copy that can disagree with the
+/// other. A set of ids rather than a per-repo number because a repo can hold
+/// several open maps at once (#50) — the old `repo → one number` table could
+/// not even represent that.
 ///
 /// There is deliberately no third "not yet searched" state. The search is
 /// unconditional — the cache is a head start, never a skip (see
 /// [`crate::refresh::spawn_discovery`]) — so nothing ever branches on *why* a
-/// repo is absent from `maps`, only on the fact that it has no head start.
-/// A state nothing can observe is a state not worth modelling.
+/// repo is absent from `open_maps`, only on the fact that it has no head
+/// start. A state nothing can observe is a state not worth modelling.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectsCache {
     pub checkouts: Vec<Checkout>,
-    /// `repo slug → map issue number`, as of the last successful search.
-    /// Absent from an older cache file, which simply means no head start.
+    /// Every open map the last successful search found. A fresh field name
+    /// (not the pre-#50 `maps` table) on purpose: an older cache file's `maps`
+    /// is skipped as an unknown field, so its checkouts survive the upgrade
+    /// and only the head start is lost — once.
     #[serde(default)]
-    pub maps: MapIssues,
+    pub open_maps: MapSet,
 }
 
 impl ProjectsCache {
@@ -85,35 +90,30 @@ impl ProjectsCache {
         self.forget_unknown_maps();
     }
 
-    /// The head start (#28): every map issue number the last search found, for
-    /// repos still in the cache. Read before the first frame, so the pollers
-    /// start fetching at `t≈0` instead of after the ~2.5 s search.
-    pub fn map_seed(&self) -> MapIssues {
-        self.maps.clone()
+    /// The head start (#28): every open map the last search found, for repos
+    /// still in the cache. Read before the first frame, so the loaders start
+    /// fetching at `t≈0` instead of after the ~2.5 s search.
+    pub fn map_seed(&self) -> MapSet {
+        self.open_maps.clone()
     }
 
     /// Record what a search over `searched` found, so the next run has a head
-    /// start. Repos that were searched and have no map are simply dropped —
-    /// absence *is* "no head start", and that is all this table means.
-    pub fn record_search(&mut self, searched: &[String], found: &MapIssues) {
-        for repo in searched {
-            match found.get(repo) {
-                Some(&number) => {
-                    self.maps.insert(repo.clone(), number);
-                }
-                None => {
-                    self.maps.remove(repo);
-                }
-            }
-        }
+    /// start. A searched repo keeps exactly the maps the search named — a repo
+    /// whose maps all closed is simply dropped, because absence *is* "no head
+    /// start", and that is all this set means.
+    pub fn record_search(&mut self, searched: &[String], found: &MapSet) {
+        self.open_maps
+            .retain(|id| !searched.contains(&id.repo) || found.contains(id));
+        self.open_maps
+            .extend(found.iter().filter(|id| searched.contains(&id.repo)).cloned());
     }
 
     /// Drop findings for repos no checkout points at any more — the seed must
     /// not outlive the checkouts that justify fetching it.
     fn forget_unknown_maps(&mut self) {
         let repos = self.repos();
-        self.maps
-            .retain(|repo, _| repos.binary_search(repo).is_ok());
+        self.open_maps
+            .retain(|id| repos.binary_search(&id.repo).is_ok());
     }
 
     /// Drop checkouts whose directory no longer exists. A deleted checkout must
@@ -199,6 +199,7 @@ pub async fn discover_checkout(dir: &Path) -> Option<(PathBuf, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::MapId;
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
@@ -233,22 +234,25 @@ mod tests {
 
     #[test]
     fn an_older_cache_file_still_loads() {
-        // Two shape changes so far, and a cache is not truth: the seed shipped
-        // after the cache did (#28), so an older file simply has no head start;
-        // and the per-checkout session name went with the multiplexer (#34), so
-        // a file that still carries one is read straight past it.
+        // Three shape changes so far, and a cache is not truth: the seed
+        // shipped after the cache did (#28), so an older file simply has no
+        // head start; the per-checkout session name went with the multiplexer
+        // (#34); and the `repo → one map` table gave way to `open_maps` (#50).
+        // A file carrying any of the old shapes is read straight past them —
+        // the checkouts always survive.
         let dir = std::env::temp_dir().join(format!("wf-test-old-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("projects.json");
         std::fs::write(
             &file,
             br#"{"checkouts": [{"path": "/data/proj/wayfinder",
-                 "repo": "blooop/wayfinder", "session": "wayfinder"}]}"#,
+                 "repo": "blooop/wayfinder", "session": "wayfinder"}],
+                 "maps": {"blooop/wayfinder": 1}}"#,
         )
         .unwrap();
         let cache = ProjectsCache::load_or_default(&file);
         assert_eq!(cache.checkouts.len(), 1, "the checkouts must survive");
-        assert!(cache.map_seed().is_empty());
+        assert!(cache.map_seed().is_empty(), "the pre-#50 table is not a seed");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -259,23 +263,29 @@ mod tests {
         cache.register(p("/data/proj/dotfiles"), "blooop/dotfiles".to_string());
         let searched = cache.repos();
 
-        let found: MapIssues = [("blooop/wayfinder".to_string(), 1)].into_iter().collect();
+        // Two open maps on one repo both seed — the whole point of #50.
+        let found: MapSet = [
+            MapId::new("blooop/wayfinder", 1),
+            MapId::new("blooop/wayfinder", 47),
+        ]
+        .into_iter()
+        .collect();
         cache.record_search(&searched, &found);
         assert_eq!(cache.map_seed(), found, "an unmapped repo is simply absent");
 
-        // The map moved and the other repo gained one: the search is the
+        // One map closed, the other repo gained one: the search is the
         // authority, so the seed follows it rather than accumulating.
-        let found: MapIssues = [
-            ("blooop/wayfinder".to_string(), 42),
-            ("blooop/dotfiles".to_string(), 7),
+        let found: MapSet = [
+            MapId::new("blooop/wayfinder", 47),
+            MapId::new("blooop/dotfiles", 7),
         ]
         .into_iter()
         .collect();
         cache.record_search(&searched, &found);
         assert_eq!(cache.map_seed(), found);
 
-        // And a map that has gone stops being a head start.
-        cache.record_search(&searched, &MapIssues::new());
+        // And maps that have gone stop being a head start.
+        cache.record_search(&searched, &MapSet::new());
         assert!(cache.map_seed().is_empty());
     }
 
@@ -290,7 +300,7 @@ mod tests {
         cache.register(gone.clone(), "blooop/wayfinder".to_string());
         cache.record_search(
             &cache.repos(),
-            &[("blooop/wayfinder".to_string(), 1)].into_iter().collect(),
+            &[MapId::new("blooop/wayfinder", 1)].into_iter().collect(),
         );
         assert!(!cache.map_seed().is_empty());
 

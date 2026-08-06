@@ -2,15 +2,14 @@
 //! blooop/wayfinder's live map (#1) through `gh api graphql`. Needs network
 //! and an authenticated `gh`.
 
-use wf::model::{Status, TicketType};
+use wf::model::{MapId, Status, TicketType};
 
 #[tokio::test]
 async fn fetches_the_live_wayfinder_map() {
-    let map = wf::fetch::fetch_map("blooop", "wayfinder", 1)
+    let map = wf::fetch::fetch_map(&MapId::new("blooop/wayfinder", 1))
         .await
         .expect("live fetch of blooop/wayfinder map #1");
 
-    assert_eq!(map.repo, "blooop/wayfinder");
     assert!(map.title.starts_with("Map:"), "map issue title: {}", map.title);
     assert!(
         map.tickets.len() >= 7,
@@ -29,6 +28,14 @@ async fn fetches_the_live_wayfinder_map() {
     assert!(
         map.tickets.iter().any(|t| t.status == Status::Done),
         "the live map has closed tickets; none classified as done"
+    );
+
+    // #50: the full edge set survives the parse. This map's builds were chained
+    // by blocking edges and are long closed, so if closed blockers were still
+    // being discarded the whole DAG would come back empty.
+    assert!(
+        map.tickets.iter().any(|t| !t.blocked_by.is_empty()),
+        "the live map's blocking edges must survive their blockers closing"
     );
 
     // #19's addition: the `labels` selection is accepted by the real API and

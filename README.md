@@ -37,12 +37,17 @@ known project, `ctrl-f` re-focuses the row's project). Run outside a checkout
 to open on all of them.
 
 The registry is a per-machine cache at `~/.cache/wf/projects.json`
-(`$XDG_CACHE_HOME` respected) holding `{path, repo}` per checkout, plus the map
-issue number the last search found for each repo. Deleting it is safe — projects
-re-accrete as you open them, and the map numbers are re-found on the next start.
+(`$XDG_CACHE_HOME` respected) holding `{path, repo}` per checkout, plus every
+open map that the last search found. Deleting it is safe — projects re-accrete
+as you open them, and the maps are re-found on the next start.
 
 Only repos with an open `wayfinder:map`-labelled issue show tickets; other
 checkouts stay cached but hidden.
+
+**Every open map renders as its own cluster** — a `▌ repo · map title` header
+carrying the per-status counts (`○` frontier `◐` claimed `⊘` blocked `●` done),
+with the map's tickets grouped beneath it. A repo can keep several maps open at
+once and each gets its own cluster; focusing a project shows all of them.
 
 ## Startup
 
@@ -88,7 +93,7 @@ then it *is* the process you started.
 | *type anything* | fuzzy-filter the list; group headers stay, showing `matched/total` |
 | `↑`/`↓`, `ctrl-j`/`ctrl-k` | move the cursor over ticket rows (headers are never a stop) |
 | `enter` | run the agent on the ticket under the cursor, here, and exit |
-| `ctrl-f` | focus the cursor row's project — drops the repo column |
+| `ctrl-f` | focus the cursor row's project — only its clusters stay on screen |
 | `ctrl-g` | widen back to every project |
 | `ctrl-r` | refetch every map in place, keeping your query, scope and cursor |
 | `esc` | clear the query; on an empty query, quit |

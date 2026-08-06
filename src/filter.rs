@@ -51,6 +51,7 @@ mod tests {
             title: title.to_string(),
             status: Status::Frontier,
             ticket_type: TicketType::Task,
+            blocked_by: vec![],
         }
     }
 

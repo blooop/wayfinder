@@ -1,8 +1,47 @@
-//! The wayfinder ticket model: tickets and their derived status.
+//! The wayfinder ticket model: maps, tickets, and their derived status.
 //!
 //! Status is derived, never stored (per the wayfinder model):
 //! closed = done; open + assigned = claimed; open + unassigned with open
 //! blockers = blocked; otherwise frontier.
+
+use serde::{Deserialize, Serialize};
+
+/// The identity of one map: the repo it lives in and its map issue number.
+///
+/// A repo can hold several open maps at once (#50), so the slug alone stopped
+/// being an identity — every place that used to say "this repo's map" (the
+/// projects cache, the loaders, the failure set, the clusters on screen) now
+/// says *which* map, and a second map on one repo is an ordinary value instead
+/// of the one the lowest-number rule silently hid.
+///
+/// `Ord` is (repo, number), which is also the on-screen cluster order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MapId {
+    /// Full repo slug (e.g. "blooop/wayfinder") — the full slug, never the
+    /// short name, because a fork and its upstream share a short name.
+    pub repo: String,
+    /// The map issue's number in that repo.
+    pub number: u64,
+}
+
+impl MapId {
+    pub fn new(repo: impl Into<String>, number: u64) -> Self {
+        Self {
+            repo: repo.into(),
+            number,
+        }
+    }
+
+    /// The short repo name shown in the cluster header (the slug's name half:
+    /// "blooop/wayfinder" → "wayfinder"). Display only — never an identity key.
+    pub fn short_repo(&self) -> &str {
+        self.repo.split('/').next_back().unwrap_or(&self.repo)
+    }
+}
+
+/// The set of maps believed open — what the search answers with, what the
+/// cache seeds, and what the loaders reconcile against.
+pub type MapSet = std::collections::BTreeSet<MapId>;
 
 /// Derived state of a ticket on a map. `Blocked` carries the open blockers
 /// (`needs`) so a blocked ticket without its blockers is unrepresentable.
@@ -25,7 +64,7 @@ impl Status {
         }
     }
 
-    /// Position of this status's group on the main screen
+    /// Position of this status's group within a cluster
     /// (frontier / claimed / blocked / done).
     pub fn group(&self) -> usize {
         match self {
@@ -120,7 +159,6 @@ impl TicketType {
             TicketType::Untyped => 4,
         }
     }
-
 }
 
 /// One ticket (sub-issue) on a map.
@@ -136,51 +174,65 @@ pub struct Ticket {
     pub status: Status,
     /// The `wayfinder:*` type, parsed from the issue's labels at fetch time.
     pub ticket_type: TicketType,
+    /// Every issue this ticket is blocked by — the full DAG edge set, closed
+    /// blockers included (#50). This is *structure*, where
+    /// [`Status::Blocked::needs`] is *status*: `needs` is the open subset at
+    /// fetch time, and both are parsed once from the same `gh` response rather
+    /// than one being re-derived from the other. Reverse (unblocks) edges are
+    /// derived locally by inversion ([`Map::unblocks`]); the numbers may name
+    /// issues outside the map, which inversion simply never visits.
+    pub blocked_by: Vec<u64>,
 }
 
 impl Ticket {
-    /// The short repo name shown in the row's repo column (the slug's name
-    /// half: "blooop/wayfinder" → "wayfinder"). Display only — never an
-    /// identity key.
+    /// The short repo name (the slug's name half: "blooop/wayfinder" →
+    /// "wayfinder"). Display and fuzzy-match only — never an identity key.
     pub fn short_repo(&self) -> &str {
         self.repo.split('/').next_back().unwrap_or(&self.repo)
     }
 }
 
-/// One project's map: the map issue plus its sub-issue tickets.
+/// One map's cluster: the map issue plus its sub-issue tickets.
+///
+/// Deliberately *without* its own [`MapId`]: a map is always held under its id
+/// (in the clusters the screen renders, in a load event), so carrying a second
+/// copy would let the two disagree.
 #[derive(Debug, Clone)]
 pub struct Map {
-    /// Full repo slug (e.g. "blooop/wayfinder"), shown in the header.
-    pub repo: String,
     /// Title of the map issue itself.
     pub title: String,
     pub tickets: Vec<Ticket>,
 }
 
-/// Merge the latest map per repo (keyed by slug) into the single [`Map`]
-/// the screen renders. Several checkouts of one repo share one entry here,
-/// so each repo's tickets appear exactly once. Tickets sort by
-/// (repo, number); the header names the one repo when there is one, or
-/// counts projects otherwise.
-pub fn merge_maps(maps: &std::collections::BTreeMap<String, Map>) -> Map {
-    let repo = match maps.len() {
-        0 => "no projects — run wf inside a checkout to register it".to_string(),
-        1 => maps.keys().next().expect("len checked").clone(),
-        n => format!("{n} projects"),
-    };
-    let mut tickets: Vec<Ticket> = maps.values().flat_map(|m| m.tickets.iter().cloned()).collect();
-    tickets.sort_by(|a, b| (&a.repo, a.number).cmp(&(&b.repo, b.number)));
-    Map {
-        repo,
-        title: "wf".to_string(),
-        tickets,
+impl Map {
+    /// The tickets this ticket unblocks — the reverse of [`Ticket::blocked_by`],
+    /// derived by inversion over the map's own tickets (#50). Direct dependents
+    /// only; edges pointing outside the map never show up here because the
+    /// tickets that would carry them are not on this map.
+    pub fn unblocks(&self, number: u64) -> Vec<u64> {
+        self.tickets
+            .iter()
+            .filter(|t| t.blocked_by.contains(&number))
+            .map(|t| t.number)
+            .collect()
+    }
+
+    /// Ticket counts by status group (frontier / claimed / blocked / done) —
+    /// the cluster header's `○n ◐n ⊘n ●n`.
+    pub fn counts(&self) -> [usize; 4] {
+        let mut counts = [0; 4];
+        for t in &self.tickets {
+            counts[t.status.group()] += 1;
+        }
+        counts
     }
 }
 
 /// Derive a ticket's status from its raw tracker state.
 ///
 /// `open_blockers` lists the numbers of *open* issues blocking this one;
-/// closed blockers don't block.
+/// closed blockers don't block (they are structure, kept on
+/// [`Ticket::blocked_by`], not status).
 pub fn classify(is_open: bool, is_assigned: bool, open_blockers: Vec<u64>) -> Status {
     if !is_open {
         Status::Done
@@ -220,23 +272,6 @@ mod tests {
     #[test]
     fn open_unassigned_unblocked_is_frontier() {
         assert_eq!(classify(true, false, vec![]), Status::Frontier);
-    }
-
-    fn map(slug: &str, numbers: &[u64]) -> Map {
-        Map {
-            repo: slug.to_string(),
-            title: format!("Map: {slug}"),
-            tickets: numbers
-                .iter()
-                .map(|&n| Ticket {
-                    repo: slug.to_string(),
-                    number: n,
-                    title: format!("t{n}"),
-                    status: Status::Frontier,
-                    ticket_type: TicketType::Task,
-                })
-                .collect(),
-        }
     }
 
     #[test]
@@ -306,41 +341,81 @@ mod tests {
     }
 
     #[test]
-    fn merge_flattens_repos_sorted_by_repo_then_number() {
-        let mut maps = std::collections::BTreeMap::new();
-        maps.insert("kinisi/zeta".to_string(), map("kinisi/zeta", &[2, 1]));
-        maps.insert("blooop/alpha".to_string(), map("blooop/alpha", &[9]));
-        let merged = merge_maps(&maps);
-        assert_eq!(merged.repo, "2 projects");
-        let keys: Vec<(&str, u64)> = merged
-            .tickets
-            .iter()
-            .map(|t| (t.repo.as_str(), t.number))
-            .collect();
+    fn short_repo_is_the_name_half_of_the_slug() {
+        assert_eq!(MapId::new("blooop/wayfinder", 1).short_repo(), "wayfinder");
+        let t = Ticket {
+            repo: "blooop/wayfinder".to_string(),
+            number: 1,
+            title: "t".to_string(),
+            status: Status::Frontier,
+            ticket_type: TicketType::Task,
+            blocked_by: vec![],
+        };
+        assert_eq!(t.short_repo(), "wayfinder");
+    }
+
+    #[test]
+    fn map_ids_order_by_repo_then_number_which_is_cluster_order() {
+        let mut ids = vec![
+            MapId::new("kinisi/zeta", 4),
+            MapId::new("blooop/wayfinder", 47),
+            MapId::new("blooop/wayfinder", 1),
+        ];
+        ids.sort();
         assert_eq!(
-            keys,
-            vec![("blooop/alpha", 9), ("kinisi/zeta", 1), ("kinisi/zeta", 2)]
+            ids,
+            vec![
+                MapId::new("blooop/wayfinder", 1),
+                MapId::new("blooop/wayfinder", 47),
+                MapId::new("kinisi/zeta", 4),
+            ]
         );
     }
 
-    #[test]
-    fn short_repo_is_the_name_half_of_the_slug() {
-        let t = &map("blooop/wayfinder", &[1]).tickets[0];
-        assert_eq!(t.short_repo(), "wayfinder");
-        assert_eq!(t.repo, "blooop/wayfinder");
+    fn ticket(number: u64, open: bool, blocked_by: Vec<u64>) -> Ticket {
+        Ticket {
+            repo: "blooop/wayfinder".to_string(),
+            number,
+            title: format!("t{number}"),
+            status: classify(open, false, vec![]),
+            ticket_type: TicketType::Task,
+            blocked_by,
+        }
     }
 
     #[test]
-    fn merge_of_one_repo_names_it_in_the_header() {
-        let mut maps = std::collections::BTreeMap::new();
-        maps.insert("blooop/alpha".to_string(), map("blooop/alpha", &[1]));
-        assert_eq!(merge_maps(&maps).repo, "blooop/alpha");
+    fn unblocks_is_the_local_inversion_of_the_full_edge_set() {
+        // #50 → #51 and #50 → #52, with #48 closed but its edge kept: the DAG
+        // survives the blocker closing, which is exactly why closed edges stay.
+        let map = Map {
+            title: "Map: selection view".to_string(),
+            tickets: vec![
+                ticket(48, false, vec![]),
+                ticket(50, true, vec![48]),
+                ticket(51, true, vec![50]),
+                ticket(52, true, vec![50]),
+            ],
+        };
+        assert_eq!(map.unblocks(50), vec![51, 52]);
+        assert_eq!(map.unblocks(48), vec![50], "closed blockers keep their edges");
+        assert_eq!(map.unblocks(52), Vec::<u64>::new());
+        // An edge pointing outside the map inverts to nothing rather than
+        // panicking or inventing a ticket.
+        assert_eq!(map.unblocks(999), Vec::<u64>::new());
     }
 
     #[test]
-    fn merge_of_nothing_says_so() {
-        let merged = merge_maps(&std::collections::BTreeMap::new());
-        assert!(merged.tickets.is_empty());
-        assert!(merged.repo.contains("no projects"), "header: {}", merged.repo);
+    fn counts_tally_the_four_status_groups() {
+        let mut done = ticket(2, false, vec![]);
+        done.status = Status::Done;
+        let mut claimed = ticket(9, true, vec![]);
+        claimed.status = Status::Claimed;
+        let mut blocked = ticket(7, true, vec![6]);
+        blocked.status = Status::Blocked { needs: vec![6] };
+        let map = Map {
+            title: "Map: wf".to_string(),
+            tickets: vec![ticket(6, true, vec![]), claimed, blocked, done],
+        };
+        assert_eq!(map.counts(), [1, 1, 1, 1]);
     }
 }

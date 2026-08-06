@@ -270,15 +270,19 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
     );
     let (skip, prompt) = argv.split_once(' ').expect("two arguments");
     assert_eq!(skip, "--dangerously-skip-permissions");
-    // This repo's map is issue #1; which ticket the cursor was on is the live
-    // frontier's business, so only its shape is asserted.
-    let ticket = prompt
-        .strip_prefix("/wayfinder 1 ")
+    // This repo keeps several maps open (#50) and which cluster the cursor was
+    // in is the live tracker's business, so only the prompt's shape is
+    // asserted: `/wayfinder <map> <ticket>`, both numbers.
+    let numbers = prompt
+        .strip_prefix("/wayfinder ")
         .unwrap_or_else(|| panic!("prompt was {prompt:?}"));
-    assert!(
-        !ticket.is_empty() && ticket.chars().all(|c| c.is_ascii_digit()),
-        "prompt was {prompt:?}"
-    );
+    let (map, ticket) = numbers.split_once(' ').expect("map and ticket numbers");
+    for half in [map, ticket] {
+        assert!(
+            !half.is_empty() && half.chars().all(|c| c.is_ascii_digit()),
+            "prompt was {prompt:?}"
+        );
+    }
 
     // Claim 3a: the tty itself came back. `wf` runs raw the whole time it is
     // up, so an agent that finds a raw tty here is one that would have found a

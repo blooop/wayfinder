@@ -13,7 +13,6 @@
 //! its own initiative — it hands [`Launch`] to the binary, which restores and
 //! then calls [`Launch::exec`] as its last act.
 
-use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -199,9 +198,6 @@ pub fn plan(checkouts: &[Checkout], ticket: &Ticket, map_issue: u64) -> Targets 
     }
 }
 
-/// Map issue numbers by repo slug — `/wayfinder`'s first argument.
-pub type MapIssues = BTreeMap<String, u64>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +210,7 @@ mod tests {
             title: "the ticket".to_string(),
             status: classify(true, false, vec![]),
             ticket_type: TicketType::Task,
+            blocked_by: vec![],
         }
     }
 
@@ -339,6 +336,7 @@ mod tests {
             title: "done".to_string(),
             status: Status::Done,
             ticket_type: TicketType::Task,
+            blocked_by: vec![],
         };
         match plan(&cache(), &done, 1) {
             Targets::One(launch) => assert_eq!(launch.key(), "wayfinder#2"),
