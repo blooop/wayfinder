@@ -743,12 +743,10 @@ mod tests {
     }
 
     #[test]
-    fn a_shut_group_carries_a_stage_rollup_counted_once_per_node() {
+    fn a_shut_group_carries_a_stage_rollup_of_what_it_holds() {
         // The done group holds #2 (plain done) and #4 — closed, but its PR is
         // still open and approved, so it reads in-review: a closed ticket
         // whose PR never landed is exactly what the rollup exists to surface.
-        // #2 unblocks two open tickets, so the DAG reaches it twice; the
-        // rollup counts the *held node*, once.
         let mut with_pr = ticket(4, false, false, vec![]);
         with_pr.prs = vec![PrLink {
             repo: "blooop/wayfinder".to_string(),
@@ -808,6 +806,61 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn a_node_the_rendered_tree_reaches_twice_is_counted_once() {
+        // The DAG's diamond: #6 and #9 are both takeable and both unblock #7,
+        // so the leverage view genuinely renders #7 *twice* — once under each
+        // root. That is the hazard the rollup rule exists for ("counted once
+        // per node via the rendered tree", #61): counts must come from the
+        // set of nodes a group holds, not from the rows on screen.
+        let m = map(vec![
+            ticket(6, true, false, vec![]),
+            ticket(7, true, false, vec![6, 9]),
+            ticket(9, true, false, vec![]),
+            ticket(2, false, false, vec![]),
+        ]);
+        let binding = id();
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        // The premise, pinned: without it the rest of this test proves nothing.
+        assert_eq!(
+            stops(&plan, &m).into_iter().filter(|&n| n == 7).count(),
+            2,
+            "#7 hangs under both #6 and #9"
+        );
+
+        // Every shut group's counts sum to exactly what it holds — one entry
+        // per held node, and #7, rendered twice but held by nobody, is in no
+        // rollup at all.
+        let shut: Vec<(usize, Vec<(RowGlyph, usize)>)> = plan
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Group {
+                    hidden,
+                    fold: Fold::Shut { rollup },
+                    ..
+                } => Some((*hidden, rollup.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shut.len(),
+            1,
+            "only the done group holds anything: {shut:?}"
+        );
+        for (hidden, rollup) in shut {
+            assert_eq!(
+                rollup.iter().map(|(_, n)| n).sum::<usize>(),
+                hidden,
+                "rollup totals what the group holds, not what was drawn"
+            );
+        }
     }
 
     #[test]

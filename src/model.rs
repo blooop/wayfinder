@@ -128,21 +128,52 @@ impl RowGlyph {
 /// What one **open** PR says about its node — the fixed per-PR table (#61).
 /// `None` for merged and closed PRs, which are not open and speak elsewhere
 /// (merged: the done fallback; closed: nothing at all).
+///
+/// The two axes are read separately and **exhaustively** — every `Checks` and
+/// every `Review` variant is named, and so is every [`Signal`], so adding a
+/// variant to any of the three is a compile error rather than a new value
+/// silently reading as "in review".
+///
+/// Never `Ready` and never `Done`: an open PR is evidence of work in flight,
+/// so [`stage`]'s `max` over open PRs can only ever land in the middle three.
 fn open_pr_stage(status: &PrStatus) -> Option<Stage> {
     match status {
         PrStatus::Draft => Some(Stage::Building),
-        PrStatus::Open { checks, review } => Some(
-            if matches!(checks, Checks::Failing) || matches!(review, Review::ChangesRequested) {
-                Stage::NeedsAttention
-            } else if matches!(checks, Checks::Pending) {
-                Stage::Building
-            } else {
-                // Otherwise open — approved-awaiting-merge included.
-                Stage::InReview
-            },
-        ),
+        PrStatus::Open { checks, review } => {
+            let from_checks = match checks {
+                Checks::Failing => Signal::Red,
+                Checks::Pending => Signal::Moving,
+                // Settled, or none configured at all: nothing left to wait on.
+                Checks::Passing | Checks::Absent => Signal::Settled,
+            };
+            let from_review = match review {
+                Review::ChangesRequested => Signal::Red,
+                // Approved-awaiting-merge included, and a review nobody is
+                // required to give: the PR is still up for its look.
+                Review::Approved | Review::Required | Review::NotRequired => Signal::Settled,
+            };
+            Some(match from_checks.max(from_review) {
+                Signal::Red => Stage::NeedsAttention,
+                Signal::Moving => Stage::Building,
+                Signal::Settled => Stage::InReview,
+            })
+        }
         PrStatus::Merged | PrStatus::Closed => None,
     }
+}
+
+/// What one axis of an open PR contributes to its stage — the #61 table read
+/// as two independent readings rather than a chain of `if`s.
+///
+/// `Ord` is the table's precedence, which is *not* the [`Stage`] lattice: a
+/// red signal wins ("checks `Failing` **or** review `ChangesRequested` → needs
+/// attention"), then work still moving ("draft, or checks `Pending` →
+/// building"), and a settled axis speaks last ("otherwise open → in review").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Signal {
+    Settled,
+    Moving,
+    Red,
 }
 
 /// Derive a node's stage from its linked PRs and its derived status (#61).
@@ -624,6 +655,84 @@ mod tests {
             ),
             Stage::InReview
         );
+    }
+
+    #[test]
+    fn the_two_axes_of_one_pr_settle_by_the_tables_own_precedence() {
+        // Where the rows overlap, row 1 wins: a changes-requested review is
+        // needs-attention even while the checks are still moving, or already
+        // red. Not the `Stage` lattice — building outranks in review *within
+        // one PR*, which is why the axes have their own order.
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Pending, Review::ChangesRequested)],
+                &Status::Frontier
+            ),
+            Stage::NeedsAttention
+        );
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Failing, Review::ChangesRequested)],
+                &Status::Frontier
+            ),
+            Stage::NeedsAttention
+        );
+        // Row 2 over row 3: pending checks hold the node at building however
+        // settled the review axis is.
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Pending, Review::Approved)],
+                &Status::Frontier
+            ),
+            Stage::Building
+        );
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Pending, Review::NotRequired)],
+                &Status::Frontier
+            ),
+            Stage::Building
+        );
+    }
+
+    #[test]
+    fn an_open_pr_never_speaks_the_ends_of_the_lattice() {
+        // The invariant the max-over-open-PRs rule rests on: an open PR is
+        // work in flight, so it can only ever contribute the middle three.
+        // Were one to yield `Done`, a single open PR would mark the node
+        // finished; were one to yield `Ready`, `max` would silently drop it.
+        let every_open = [PrStatus::Draft].into_iter().chain(
+            [
+                Checks::Absent,
+                Checks::Passing,
+                Checks::Pending,
+                Checks::Failing,
+            ]
+            .into_iter()
+            .flat_map(|checks| {
+                [
+                    Review::NotRequired,
+                    Review::Required,
+                    Review::Approved,
+                    Review::ChangesRequested,
+                ]
+                .into_iter()
+                .map(move |review| PrStatus::Open { checks, review })
+            }),
+        );
+        for status in every_open {
+            let derived = open_pr_stage(&status).expect("an open PR always says something");
+            assert!(
+                matches!(
+                    derived,
+                    Stage::Building | Stage::InReview | Stage::NeedsAttention
+                ),
+                "{status:?} gave {derived:?}"
+            );
+        }
+        // And the two that are not open say nothing at all here.
+        assert_eq!(open_pr_stage(&PrStatus::Merged), None);
+        assert_eq!(open_pr_stage(&PrStatus::Closed), None);
     }
 
     #[test]
