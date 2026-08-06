@@ -15,7 +15,7 @@ use crate::launch::{self, Launch, Targets};
 use crate::model::{Map, MapId, MapSet, Ticket};
 use crate::projects::Checkout;
 use crate::refresh::Startup;
-use crate::view::{self, Lens, Plan, Screen};
+use crate::view::{self, Expanded, GroupId, Lens, Plan, Screen, Stop, StopAt};
 
 /// Project scope: everything, or one repo focused via `ctrl-f`. A repo, not a
 /// map: focusing where you stand means seeing every open map of that repo.
@@ -77,6 +77,15 @@ pub struct RowKey {
     pub ticket: u64,
 }
 
+/// A *stop's* stable identity — [`RowKey`] widened to cover the other thing the
+/// cursor can be on since #57. A group needs no widening of its own: a
+/// [`GroupId`] already names a map and a kind rather than any index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopKey {
+    Ticket(RowKey),
+    Group(GroupId),
+}
+
 pub struct App {
     /// The clusters on screen: every open map that has arrived, in
     /// (repo, number) order — which is also render order.
@@ -115,6 +124,10 @@ pub struct App {
     /// whether the body is currently *flattened* is derived from the query in
     /// [`App::screen`], so the two can never disagree.
     lens: Lens,
+    /// Which collapsible groups the human has opened (#57). Keyed by
+    /// [`GroupId`], so an expansion survives a refetch, a query and a lens
+    /// toggle — it is a choice about a *map*, not about a frame.
+    expanded: Expanded,
     cursor: usize,
 }
 
@@ -132,6 +145,7 @@ impl App {
             startup: Startup::loaded(),
             overlay: Overlay::None,
             lens: Lens::Leverage,
+            expanded: Expanded::new(),
             cursor: 0,
         }
     }
@@ -194,15 +208,21 @@ impl App {
     }
 
     /// The body, planned: every line the screen shows, in on-screen order —
-    /// what the draw walks, and what [`App::visible`] takes its cursor stops
-    /// from, so the two can never disagree about order.
+    /// what the draw walks and what the cursor navigates, so the two can never
+    /// disagree about order.
     pub fn plan(&self) -> Plan {
-        view::plan(&self.scoped_clusters(), self.screen())
+        view::plan(&self.scoped_clusters(), self.screen(), &self.expanded)
     }
 
-    /// Rows visible right now, in on-screen order — the plan's ticket rows.
-    /// The cursor indexes this list; headers, counts, and spacers are never
-    /// cursor stops.
+    /// Every cursor stop with its depth, in on-screen order (#57). The cursor
+    /// indexes this list; headers and spacers are never stops, but group lines
+    /// are — opening one is an action, so it needs naming.
+    pub fn stops(&self) -> Vec<StopAt> {
+        self.plan().stops()
+    }
+
+    /// Ticket rows on screen — what the match count counts. A subset of
+    /// [`App::stops`].
     pub fn visible(&self) -> Vec<Row> {
         self.plan().rows()
     }
@@ -220,17 +240,37 @@ impl App {
         }
     }
 
-    /// Cursor position clamped into the visible list.
+    /// A stop's durable identity: a ticket by (map, number), a group by its
+    /// own id — which already names no indices.
+    fn stop_key(&self, stop: &Stop) -> StopKey {
+        match stop {
+            Stop::Ticket(row) => StopKey::Ticket(self.row_key(row)),
+            Stop::Group(id) => StopKey::Group(id.clone()),
+        }
+    }
+
+    /// Cursor position clamped into the stop list.
     pub fn cursor_pos(&self) -> usize {
-        self.cursor.min(self.visible().len().saturating_sub(1))
+        self.cursor.min(self.stops().len().saturating_sub(1))
     }
 
-    /// The row under the cursor, if any is visible.
+    /// What the cursor is on, if anything is on screen.
+    pub fn cursor_stop(&self) -> Option<Stop> {
+        self.stops()
+            .get(self.cursor_pos())
+            .map(|at| at.stop.clone())
+    }
+
+    /// The row under the cursor — `None` when the cursor is on a group line,
+    /// which is exactly why the two are different types.
     pub fn cursor_row(&self) -> Option<Row> {
-        self.visible().get(self.cursor_pos()).cloned()
+        match self.cursor_stop() {
+            Some(Stop::Ticket(row)) => Some(row),
+            Some(Stop::Group(_)) | None => None,
+        }
     }
 
-    /// The ticket under the cursor, if any row is visible.
+    /// The ticket under the cursor, if the cursor is on one.
     pub fn cursor_ticket(&self) -> Option<&Ticket> {
         self.cursor_row().map(|row| {
             let map: &Map = &self.clusters[&row.map];
@@ -238,38 +278,115 @@ impl App {
         })
     }
 
-    /// The cursor row's stable identity.
-    fn cursor_key(&self) -> Option<RowKey> {
-        self.cursor_row().map(|row| self.row_key(&row))
+    /// Which map the cursor is in, whichever kind of stop it is on — what
+    /// `ctrl-f` focuses. Every stop belongs to a cluster, so this is total
+    /// wherever the cursor can be at all.
+    pub fn cursor_map(&self) -> Option<MapId> {
+        match self.cursor_stop()? {
+            Stop::Ticket(row) => Some(row.map),
+            Stop::Group(id) => Some(id.map),
+        }
     }
 
-    /// Point the cursor at a specific row if it is visible.
-    fn point_at(&mut self, key: &RowKey) {
+    /// The cursor's stable identity.
+    fn cursor_key(&self) -> Option<StopKey> {
+        self.cursor_stop().map(|stop| self.stop_key(&stop))
+    }
+
+    /// Point the cursor at a specific stop if it is on screen.
+    fn point_at(&mut self, key: &StopKey) {
         let pos = self
-            .visible()
+            .stops()
             .iter()
-            .position(|row| &self.row_key(row) == key);
+            .position(|at| &self.stop_key(&at.stop) == key);
         self.cursor = pos.unwrap_or(0);
     }
 
-    fn move_cursor(&mut self, delta: isize) {
-        let len = self.visible().len();
-        if len == 0 {
+    /// `↑`/`↓`: the next stop at the cursor's own depth (#57).
+    ///
+    /// Walking *siblings* rather than lines is what makes the default screen a
+    /// pick list: at depth 0 the stops are the takeable tickets and the group
+    /// lines, so `↓` moves between things you can act on and steps over the
+    /// blocked context hanging beneath them. The search stops at a shallower
+    /// stop because that means leaving the parent — except at depth 0, where
+    /// nothing is shallower and the walk therefore spans clusters, keeping the
+    /// multi-project list one axis.
+    fn move_sibling(&mut self, delta: isize) {
+        let stops = self.stops();
+        if stops.is_empty() {
             self.cursor = 0;
             return;
         }
-        let pos = self.cursor_pos() as isize + delta;
-        self.cursor = pos.clamp(0, len as isize - 1) as usize;
+        let pos = self.cursor_pos();
+        let depth = stops[pos].depth;
+        let mut i = pos as isize;
+        loop {
+            i += delta;
+            let Some(at) = usize::try_from(i).ok().and_then(|i| stops.get(i)) else {
+                return; // ran off the end: stay put rather than wrap
+            };
+            if at.depth == depth {
+                self.cursor = i as usize;
+                return;
+            }
+            if at.depth < depth {
+                return; // left the parent
+            }
+        }
     }
 
-    /// Swap in freshly fetched clusters, keeping query/scope intact and the
-    /// cursor pinned to row identity (falling back to the same position,
-    /// clamped, if the row vanished — see `refresh::preserve_cursor`).
+    /// `→`: reveal what the cursor is on — open a shut group, or step into the
+    /// first child of a ticket's subtree. One key, one meaning: *deeper*.
+    fn descend(&mut self) {
+        if let Some(Stop::Group(id)) = self.cursor_stop() {
+            if !self.expanded.contains(&id) {
+                self.expanded.insert(id);
+                return; // the rows appear beneath; the cursor stays on the line
+            }
+        }
+        let stops = self.stops();
+        let pos = self.cursor_pos();
+        let Some(here) = stops.get(pos) else { return };
+        if let Some(next) = stops.get(pos + 1) {
+            if next.depth == here.depth + 1 {
+                self.cursor = pos + 1;
+            }
+        }
+    }
+
+    /// `←`: close what the cursor is on — shut an open group, or come back out
+    /// to the parent. The mirror of [`App::descend`].
+    fn ascend(&mut self) {
+        if let Some(Stop::Group(id)) = self.cursor_stop() {
+            if self.expanded.remove(&id) {
+                return; // shut it; the cursor stays on the line
+            }
+        }
+        let stops = self.stops();
+        let pos = self.cursor_pos();
+        let Some(depth) = stops.get(pos).map(|at| at.depth) else {
+            return;
+        };
+        if depth == 0 {
+            return;
+        }
+        if let Some(parent) = (0..pos).rev().find(|&i| stops[i].depth == depth - 1) {
+            self.cursor = parent;
+        }
+    }
+
+    /// Swap in freshly fetched clusters, keeping query/scope/expansions intact
+    /// and the cursor pinned to stop identity (falling back to the same
+    /// position, clamped, if the stop vanished — see `refresh::preserve_cursor`).
     pub fn replace_clusters(&mut self, clusters: BTreeMap<MapId, Map>) {
         let anchor = self.cursor_key();
         let old_index = self.cursor_pos();
         self.clusters = clusters;
-        let new_order: Vec<RowKey> = self.visible().iter().map(|row| self.row_key(row)).collect();
+        let new_order: Vec<StopKey> = self
+            .stops()
+            .iter()
+            .map(|at| self.stop_key(&at.stop))
+            .collect();
         self.cursor = crate::refresh::preserve_cursor(anchor.as_ref(), old_index, &new_order);
     }
 
@@ -279,6 +396,15 @@ impl App {
     /// ticket belongs to is the cluster it sits in — a row without a map is
     /// unrepresentable, so the old "repo has no map" failure is gone with it.
     fn request_launch(&mut self) -> Outcome {
+        // On a group line there is no agent to run, and exactly one thing the
+        // key could plausibly mean — so `enter` opens or shuts it rather than
+        // reporting that nothing is selected when something plainly is.
+        if let Some(Stop::Group(id)) = self.cursor_stop() {
+            if !self.expanded.remove(&id) {
+                self.expanded.insert(id);
+            }
+            return Outcome::Continue;
+        }
         let Some(row) = self.cursor_row() else {
             self.notice = Some("nothing selected".to_string());
             return Outcome::Continue;
@@ -379,9 +505,12 @@ impl App {
                 Outcome::Refresh
             }
             KeyCode::Char('f') if ctrl => {
-                if let Some(key) = self.cursor_key() {
-                    self.scope = Scope::Project(key.map.repo.clone());
-                    self.point_at(&key);
+                if let Some(map) = self.cursor_map() {
+                    let anchor = self.cursor_key();
+                    self.scope = Scope::Project(map.repo);
+                    if let Some(key) = anchor {
+                        self.point_at(&key);
+                    }
                 }
                 Outcome::Continue
             }
@@ -404,20 +533,33 @@ impl App {
                 }
                 Outcome::Continue
             }
+            // `↑`/`↓` walk siblings at the cursor's depth (#57) — the pick
+            // axis, stepping over the context beneath a ticket rather than
+            // through it.
             KeyCode::Down => {
-                self.move_cursor(1);
+                self.move_sibling(1);
                 Outcome::Continue
             }
             KeyCode::Up => {
-                self.move_cursor(-1);
+                self.move_sibling(-1);
                 Outcome::Continue
             }
             KeyCode::Char('j') if ctrl => {
-                self.move_cursor(1);
+                self.move_sibling(1);
                 Outcome::Continue
             }
             KeyCode::Char('k') if ctrl => {
-                self.move_cursor(-1);
+                self.move_sibling(-1);
+                Outcome::Continue
+            }
+            // `→`/`←` are the depth axis: reveal what the cursor is on, or
+            // close it again.
+            KeyCode::Right => {
+                self.descend();
+                Outcome::Continue
+            }
+            KeyCode::Left => {
+                self.ascend();
                 Outcome::Continue
             }
             // The whole point of the picker: enter runs the agent here, and
@@ -559,47 +701,168 @@ mod tests {
         assert_eq!(app.cursor_pos(), 0);
     }
 
+    /// What the cursor is on, as a short label: a ticket by number, a group by
+    /// kind. Reads like the screen does.
+    fn at(app: &App) -> String {
+        match app.cursor_stop() {
+            Some(Stop::Ticket(row)) => format!("#{}", app.ticket(&row).number),
+            Some(Stop::Group(g)) => format!("{:?}", g.kind),
+            None => "nothing".to_string(),
+        }
+    }
+
     #[test]
-    fn cursor_moves_in_leverage_order_and_clamps() {
-        let mut app = fixture_app();
+    fn down_walks_the_takeable_tickets_and_steps_over_their_context() {
         // Clusters order by (repo, number): dotfiles#4 before wayfinder#1.
-        // Leverage order within wayfinder: root #6 (it unblocks #7), #7 as its
-        // subtree, then root #9; done #2 is not a row at all.
-        assert_eq!(app.cursor_ticket().unwrap().number, 103);
+        // The depth-0 axis is dotfiles #103, then wayfinder's takeable #6 and
+        // #9, then its Done group — #7 hangs under #6 as context and is *not*
+        // on this axis, which is the whole point of #57.
+        let mut app = fixture_app();
+        assert_eq!(at(&app), "#103");
         app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.cursor_ticket().unwrap().number, 6);
+        assert_eq!(at(&app), "#6");
         app.handle_key(ctrl('j'));
-        assert_eq!(app.cursor_ticket().unwrap().number, 7);
+        assert_eq!(at(&app), "#9", "#7 is context under #6, not a stop here");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "Done");
         for _ in 0..10 {
             app.handle_key(key(KeyCode::Down));
         }
-        assert_eq!(app.cursor_ticket().unwrap().number, 9); // clamped at last row
+        assert_eq!(at(&app), "Done", "clamped at the last stop");
         app.handle_key(ctrl('k'));
-        assert_eq!(app.cursor_ticket().unwrap().number, 7);
+        assert_eq!(at(&app), "#9");
         for _ in 0..10 {
             app.handle_key(key(KeyCode::Up));
         }
-        assert_eq!(app.cursor_ticket().unwrap().number, 103); // clamped at first row
+        assert_eq!(
+            at(&app),
+            "#103",
+            "clamped at the first stop, across clusters"
+        );
+    }
+
+    #[test]
+    fn right_descends_into_the_subtree_and_left_comes_back() {
+        let mut app = fixture_app();
+        app.handle_key(key(KeyCode::Down)); // wayfinder #6
+        assert_eq!(at(&app), "#6");
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(at(&app), "#7", "→ steps into what #6 unblocks");
+        // Down inside the subtree walks *siblings at that depth* — #7 is an
+        // only child, so there is nowhere to go and the cursor holds rather
+        // than escaping to another depth.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "#7");
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(at(&app), "#6", "← returns to the parent");
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(at(&app), "#6", "← at depth 0 is inert, never a wrap");
+    }
+
+    #[test]
+    fn down_walks_siblings_when_a_root_unblocks_several() {
+        // Three dependents of one root: inside the subtree, ↓ steps between
+        // them and stops at the last rather than leaking back out to depth 0.
+        let mut clusters = BTreeMap::new();
+        clusters.insert(
+            MapId::new("blooop/wayfinder", 1),
+            Map {
+                title: "Map: wf".to_string(),
+                tickets: vec![
+                    ticket("blooop/wayfinder", 6, "root", true, false, vec![]),
+                    ticket("blooop/wayfinder", 7, "dep a", true, false, vec![6]),
+                    ticket("blooop/wayfinder", 8, "dep b", true, false, vec![6]),
+                    ticket("blooop/wayfinder", 9, "dep c", true, false, vec![6]),
+                ],
+            },
+        );
+        let mut app = App::new(clusters);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(at(&app), "#7");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "#8");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "#9");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "#9", "held at the last sibling");
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(at(&app), "#8");
+    }
+
+    #[test]
+    fn the_done_group_is_selectable_and_right_left_open_and_shut_it() {
+        let mut app = fixture_app();
+        // Walk to the group line: it is an ordinary stop on the same axis.
+        while at(&app) != "Done" {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert!(app.cursor_ticket().is_none(), "a group is not a ticket");
+        // Shut: the done ticket is not on screen at all.
+        assert!(!app.visible().iter().any(|r| app.ticket(r).number == 2));
+
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(at(&app), "Done", "→ opens it; the cursor stays on the line");
+        assert!(
+            app.visible().iter().any(|r| app.ticket(r).number == 2),
+            "the done ticket is on screen now"
+        );
+        // And it is reachable: → again steps into the rows it holds.
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(at(&app), "#2");
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(at(&app), "Done");
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(at(&app), "Done", "← shuts it, cursor still on the line");
+        assert!(!app.visible().iter().any(|r| app.ticket(r).number == 2));
+    }
+
+    #[test]
+    fn enter_on_a_group_folds_it_rather_than_claiming_nothing_is_selected() {
+        let mut app = launchable_app();
+        while at(&app) != "Done" {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert_eq!(app.notice, None, "no 'nothing selected' — something is");
+        assert!(app.visible().iter().any(|r| app.ticket(r).number == 2));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.visible().iter().any(|r| app.ticket(r).number == 2));
+    }
+
+    #[test]
+    fn an_expansion_survives_a_refetch() {
+        // Keyed by (map, kind), so swapping the clusters underneath keeps the
+        // group open — and keeps the cursor on the group line.
+        let mut app = fixture_app();
+        while at(&app) != "Done" {
+            app.handle_key(key(KeyCode::Down));
+        }
+        app.handle_key(key(KeyCode::Right));
+        let same = app.clusters.clone();
+        app.replace_clusters(same);
+        assert_eq!(at(&app), "Done");
+        assert!(app.visible().iter().any(|r| app.ticket(r).number == 2));
     }
 
     #[test]
     fn tab_toggles_the_lens_and_the_cursor_stays_on_its_ticket() {
         let mut app = fixture_app();
-        app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Down)); // leverage: 103, 6, ▶7, 9
-        assert_eq!(app.cursor_ticket().unwrap().number, 7);
+        app.handle_key(key(KeyCode::Down)); // wayfinder #6
+        app.handle_key(key(KeyCode::Right)); // into its subtree: #7
+        assert_eq!(at(&app), "#7");
         assert_eq!(app.screen(), Screen::Structured(Lens::Leverage));
 
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.screen(), Screen::Structured(Lens::Forest));
         // The forest shows done #2 as a row and reorders — the cursor follows
         // its ticket, not its old position.
-        assert_eq!(app.cursor_ticket().unwrap().number, 7);
+        assert_eq!(at(&app), "#7");
         assert_eq!(app.visible().len(), 5, "the forest is total");
+        assert_eq!(app.stops().len(), 5, "and holds nothing back to open");
 
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.screen(), Screen::Structured(Lens::Leverage));
-        assert_eq!(app.cursor_ticket().unwrap().number, 7);
+        assert_eq!(at(&app), "#7");
     }
 
     #[test]

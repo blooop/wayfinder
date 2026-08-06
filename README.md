@@ -56,11 +56,19 @@ chosen by what taking it unlocks, not by status alone. Rows are
 `<glyph> #n <title> [type] ⇄ PR#n <state>` — the `⇄` badges are the ticket's
 linked pull requests (GitHub's Development-panel set: closing keywords and
 manual links), shown as `draft`/`open`/`merged`/`closed` with `✓`/`✗` on an
-open PR when its checks and review are settled or need action. Done work
-collapses to a per-cluster
-`● N done (hidden)` count; blocked tickets no subtree reaches collapse to
-`⊘ N blocked deeper down`; a map with nothing takeable leaves the body
-entirely, counted on the bottom line as `· N idle maps hidden`.
+open PR when its checks and review are settled or need action.
+
+`↑`/`↓` walk **siblings at the cursor's depth**, so on the default screen they
+move between tickets you can actually take and step over the blocked context
+hanging beneath them; `→` reveals what the cursor is on and `←` closes it again.
+Depth 0 spans clusters, so `↓` still carries you from one project into the next.
+
+Done work collapses to a per-cluster `▸ ● N done (hidden)` line and blocked
+tickets no subtree reaches to `▸ ⊘ N blocked deeper down`. Both are ordinary
+cursor stops: put the cursor on one and `→` opens it in place (`▾`), listing
+what it held as rows you can select and launch, and `←` shuts it again — so
+nothing is ever merely a number you cannot reach. A map with nothing takeable
+leaves the body entirely, counted on the bottom line as `· N idle maps hidden`.
 
 **`tab` shows the structure forest** instead: the whole blocking DAG, done
 tickets dimmed in place. A ticket's tree parent is its lowest-numbered in-map
@@ -113,8 +121,10 @@ then it *is* the process you started.
 | --- | --- |
 | *type anything* | fuzzy-filter: the tree flattens to one score-ordered list; clearing restores it |
 | `tab` | toggle the leverage view ⇄ the structure forest |
-| `↑`/`↓`, `ctrl-j`/`ctrl-k` | move the cursor over ticket rows (headers are never a stop) |
-| `enter` | run the agent on the ticket under the cursor, here, and exit |
+| `↑`/`↓`, `ctrl-j`/`ctrl-k` | move between siblings at the cursor's depth — on the default screen, the tickets you can take (cluster headers are never a stop) |
+| `→` | reveal: step into a ticket's subtree, or open a `▸ done`/`▸ blocked` group |
+| `←` | close: back out to the parent, or shut an open group |
+| `enter` | run the agent on the ticket under the cursor, here, and exit — on a group line it folds instead, since there is no agent to run |
 | `ctrl-f` | focus the cursor row's project — only its clusters stay on screen |
 | `ctrl-g` | widen back to every project |
 | `ctrl-r` | refetch every map in place, keeping your query, scope and cursor |
