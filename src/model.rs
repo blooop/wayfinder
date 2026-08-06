@@ -76,6 +76,71 @@ impl Status {
     }
 }
 
+/// Where a node stands in its lifecycle — one five-value lattice for every
+/// node (#61), **derived, never declared**: from its linked PRs when any are
+/// open or merged, from its ticket state otherwise. Blocked is deliberately
+/// not here — it is [`Status`], and the glyph column overrides with `⊘` while
+/// the stage underneath stays whatever the derivation says.
+///
+/// `Ord` follows the lattice `ready → building → in review → needs attention
+/// → done`, which is also the constant max-over-open-PRs order (needs
+/// attention > in review > building): an open PR can only ever contribute the
+/// middle three, so `max` never has to special-case the ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stage {
+    Ready,
+    /// Building for build nodes, "in progress" for decision nodes — one slot,
+    /// two vocabularies, same glyph.
+    Building,
+    InReview,
+    NeedsAttention,
+    Done,
+}
+
+/// What one **open** PR says about its node — the fixed per-PR table (#61).
+/// `None` for merged and closed PRs, which are not open and speak elsewhere
+/// (merged: the done fallback; closed: nothing at all).
+fn open_pr_stage(status: &PrStatus) -> Option<Stage> {
+    match status {
+        PrStatus::Draft => Some(Stage::Building),
+        PrStatus::Open { checks, review } => Some(
+            if matches!(checks, Checks::Failing) || matches!(review, Review::ChangesRequested) {
+                Stage::NeedsAttention
+            } else if matches!(checks, Checks::Pending) {
+                Stage::Building
+            } else {
+                // Otherwise open — approved-awaiting-merge included.
+                Stage::InReview
+            },
+        ),
+        PrStatus::Merged | PrStatus::Closed => None,
+    }
+}
+
+/// Derive a node's stage from its linked PRs and its derived status (#61).
+///
+/// The node takes the **max over its open PRs** — a red PR anywhere makes the
+/// node red; nothing is silently ignored. With no open PRs, any merged PR
+/// means done, whatever the ticket still says; with no PR evidence at all it
+/// falls through to ticket state: ready (open, unblocked, unclaimed) / in
+/// progress (claimed) / done (closed). PR state dominates when present — a
+/// prototype's PR counts.
+pub fn stage(prs: &[PrLink], status: &Status) -> Stage {
+    if let Some(live) = prs.iter().filter_map(|pr| open_pr_stage(&pr.status)).max() {
+        return live;
+    }
+    if prs.iter().any(|pr| pr.status == PrStatus::Merged) {
+        return Stage::Done;
+    }
+    match status {
+        // A blocked node's work has not begun: ready underneath, with the `⊘`
+        // override and the launch refusal both keyed off status, not stage.
+        Status::Frontier | Status::Blocked { .. } => Stage::Ready,
+        Status::Claimed => Stage::Building,
+        Status::Done => Stage::Done,
+    }
+}
+
 /// What *kind* of work a ticket is — the `wayfinder:*` type label, parsed once
 /// at the `gh` boundary ([`TicketType::from_labels`]) and never re-sniffed from
 /// strings afterwards.
@@ -429,6 +494,134 @@ mod tests {
         assert_eq!(
             TicketType::from_labels(["wayfinder:task", "wayfinder:grilling"]),
             TicketType::Grilling
+        );
+    }
+
+    fn pr(status: PrStatus) -> PrLink {
+        PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 90,
+            status,
+        }
+    }
+
+    fn open_pr(checks: Checks, review: Review) -> PrLink {
+        pr(PrStatus::Open { checks, review })
+    }
+
+    #[test]
+    fn each_open_pr_maps_to_a_stage_by_the_fixed_table() {
+        // Row 1 of the #61 table: failing checks or a changes-requested review
+        // → needs attention. Either signal alone is enough.
+        assert_eq!(
+            stage(&[open_pr(Checks::Failing, Review::NotRequired)], &Status::Frontier),
+            Stage::NeedsAttention
+        );
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Passing, Review::ChangesRequested)],
+                &Status::Frontier
+            ),
+            Stage::NeedsAttention
+        );
+        // Row 2: a draft, or checks still pending → building.
+        assert_eq!(
+            stage(&[pr(PrStatus::Draft)], &Status::Frontier),
+            Stage::Building
+        );
+        assert_eq!(
+            stage(&[open_pr(Checks::Pending, Review::Required)], &Status::Frontier),
+            Stage::Building
+        );
+        // Row 3: otherwise open — approved-awaiting-merge included → in review.
+        assert_eq!(
+            stage(&[open_pr(Checks::Passing, Review::Approved)], &Status::Frontier),
+            Stage::InReview
+        );
+        assert_eq!(
+            stage(&[open_pr(Checks::Absent, Review::NotRequired)], &Status::Frontier),
+            Stage::InReview
+        );
+        assert_eq!(
+            stage(&[open_pr(Checks::Passing, Review::Required)], &Status::Frontier),
+            Stage::InReview
+        );
+    }
+
+    #[test]
+    fn the_node_takes_the_max_over_its_open_prs() {
+        // The constant order: needs attention > in review > building. A red PR
+        // anywhere makes the node red, whichever way the tracker lists them.
+        let building = || pr(PrStatus::Draft);
+        let in_review = || open_pr(Checks::Passing, Review::Approved);
+        let attention = || open_pr(Checks::Failing, Review::NotRequired);
+        assert_eq!(
+            stage(&[building(), attention()], &Status::Frontier),
+            Stage::NeedsAttention
+        );
+        assert_eq!(
+            stage(&[attention(), building()], &Status::Frontier),
+            Stage::NeedsAttention
+        );
+        assert_eq!(
+            stage(&[building(), in_review()], &Status::Frontier),
+            Stage::InReview
+        );
+        assert_eq!(
+            stage(&[in_review(), attention()], &Status::Frontier),
+            Stage::NeedsAttention
+        );
+        // A merged PR alongside an open one is not silently ignored either —
+        // the open PR is the live signal and wins.
+        assert_eq!(
+            stage(&[pr(PrStatus::Merged), building()], &Status::Frontier),
+            Stage::Building
+        );
+    }
+
+    #[test]
+    fn with_no_open_prs_a_merged_pr_means_done() {
+        // The work landed: done, whatever the ticket itself still says.
+        assert_eq!(stage(&[pr(PrStatus::Merged)], &Status::Frontier), Stage::Done);
+        assert_eq!(stage(&[pr(PrStatus::Merged)], &Status::Claimed), Stage::Done);
+        assert_eq!(stage(&[pr(PrStatus::Merged)], &Status::Done), Stage::Done);
+    }
+
+    #[test]
+    fn a_closed_unmerged_pr_is_no_evidence_at_all() {
+        // Abandoned PRs neither advance nor hold the node: fall through to
+        // ticket state as if they were never linked.
+        assert_eq!(stage(&[pr(PrStatus::Closed)], &Status::Frontier), Stage::Ready);
+        assert_eq!(stage(&[pr(PrStatus::Closed)], &Status::Claimed), Stage::Building);
+    }
+
+    #[test]
+    fn with_no_prs_stage_derives_from_ticket_state() {
+        // The decision-node half of the lattice: ready (open, unblocked,
+        // unclaimed) / in progress (claimed — the building slot) / done.
+        assert_eq!(stage(&[], &Status::Frontier), Stage::Ready);
+        assert_eq!(stage(&[], &Status::Claimed), Stage::Building);
+        assert_eq!(stage(&[], &Status::Done), Stage::Done);
+        // A blocked node's work has not begun, so its stage is ready — the
+        // glyph column overrides with ⊘ and enter refuses it, but blocked is
+        // status, not a sixth stage.
+        assert_eq!(stage(&[], &Status::Blocked { needs: vec![7] }), Stage::Ready);
+    }
+
+    #[test]
+    fn pr_state_dominates_ticket_state_when_present() {
+        // Two derivation sources, one type — a prototype's PR counts (#61),
+        // and even a *closed* ticket with an open PR reads as that PR's stage.
+        assert_eq!(
+            stage(&[open_pr(Checks::Passing, Review::Approved)], &Status::Done),
+            Stage::InReview
+        );
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Failing, Review::NotRequired)],
+                &Status::Claimed
+            ),
+            Stage::NeedsAttention
         );
     }
 
