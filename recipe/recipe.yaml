@@ -72,12 +72,13 @@ requirements:
 
   # No *declared* run requirements, on purpose — the only one the package has is
   # the `libgcc` that the C compiler's run_exports adds above. `wf` shells out to
-  # `gh`, `zellij` and the agent CLI, but it discovers them on PATH and degrades
-  # with a readable error when they are missing, which is the same call the
-  # sibling `zjsh` recipe makes. Declaring them would clone zellij and gh into
-  # this environment on every machine that already installs both as their own
-  # pixi-global tools, and would still not guarantee the agent CLI, which does
-  # not come from this channel at all.
+  # `gh`, `zellij` and the agent CLI, but it discovers them on PATH: a missing
+  # `gh` or agent CLI degrades to a readable error, and a missing `zellij` is not
+  # an error at all — the launch just happens in wf's own terminal instead of a
+  # tab. That is the same call the sibling `zjsh` recipe makes. Declaring them
+  # would clone zellij and gh into this environment on every machine that already
+  # installs both as their own pixi-global tools, and would still not guarantee
+  # the agent CLI, which does not come from this channel at all.
 
 tests:
   - script:
@@ -102,9 +103,11 @@ about:
     `wf` is a fuzzy-find picker and terminal starmap over the wayfinder planning
     maps of every project on the machine. Projects accrete as you use it, each
     mapped repo's tickets are read live from GitHub Issues via `gh`, and picking
-    a ticket creates or focuses a zellij tab named `<repo>#<n>` running an agent
-    on it — `enter` to work it interactively, `ctrl-a` to spawn it headless.
-    zellij is optional: without it, `enter` runs the agent in wf's own terminal.
+    a ticket runs an agent on it in that project's checkout — `enter` to work it
+    interactively, `ctrl-a` to spawn it headless. With zellij installed each
+    ticket gets its own `<repo>#<n>` tab, which is what makes an agent outlive
+    `wf` and be found again; without it, `enter` runs the agent in wf's own
+    terminal.
 
 extra:
   recipe-maintainers:
