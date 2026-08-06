@@ -439,28 +439,46 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     frame.render_widget(body, body_area);
 
-    // The load hint, the failure note, and the idle count share one dim
-    // segment, and any of them can be live at once; empty ones drop out
-    // rather than leaving gaps.
-    let status = [app.startup.hint(), failure_note(app), idle_note(&plan)]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut count_spans = vec![
-        Span::raw(format!("  {}/{}", app.visible().len(), app.scoped().len())),
-        Span::styled(
-            format!("  {status}"),
-            Style::new().add_modifier(Modifier::DIM),
-        ),
-    ];
-    if let Some(notice) = &app.notice {
-        count_spans.push(Span::styled(
-            format!("   {notice}"),
-            Style::new().add_modifier(Modifier::DIM),
-        ));
+    // The count line's slot is shared: while a launch is staged (#62) the
+    // launch line lives there instead — the resolved route, the ticket it
+    // launches, and the mode text as it is typed.
+    if let Overlay::LaunchLine { row, route, text } = &app.overlay {
+        let ticket = app.ticket(row);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("  → {}", route.label()),
+                    Style::new().fg(Color::Cyan),
+                ),
+                Span::raw(format!(" · #{} {}  {text}", ticket.number, ticket.title)),
+                Span::styled("█", Style::new().add_modifier(Modifier::DIM)),
+            ])),
+            count_area,
+        );
+    } else {
+        // The load hint, the failure note, and the idle count share one dim
+        // segment, and any of them can be live at once; empty ones drop out
+        // rather than leaving gaps.
+        let status = [app.startup.hint(), failure_note(app), idle_note(&plan)]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut count_spans = vec![
+            Span::raw(format!("  {}/{}", app.visible().len(), app.scoped().len())),
+            Span::styled(
+                format!("  {status}"),
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+        ];
+        if let Some(notice) = &app.notice {
+            count_spans.push(Span::styled(
+                format!("   {notice}"),
+                Style::new().add_modifier(Modifier::DIM),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(count_spans)), count_area);
     }
-    frame.render_widget(Paragraph::new(Line::from(count_spans)), count_area);
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -919,7 +937,8 @@ mod tests {
     #[test]
     fn the_checkout_picker_floats_over_the_list_with_one_row_per_tree() {
         let mut app = launchable_app();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // stage
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // resolve
         let screen = render(&app);
         assert!(
             screen.contains("which checkout runs wayfinder#6?"),
@@ -928,6 +947,34 @@ mod tests {
         assert!(screen.contains("▶ /data/k1/wayfinder"), "{screen}");
         assert!(screen.contains("/data/k2/wayfinder"), "{screen}");
         assert!(screen.contains("esc cancel"));
+    }
+
+    #[test]
+    fn the_launch_line_replaces_the_count_line_and_shows_the_route() {
+        let mut app = fixture_app();
+        let screen = render(&app);
+        assert!(screen.contains("5/5"), "{screen}");
+
+        // Enter on #6 (a task at ready): the line opens where the count was,
+        // naming the resolved route and the ticket it launches.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(
+            screen.contains("→ /wayfinder · #6 Re-entry breadcrumbs"),
+            "{screen}"
+        );
+        assert!(!screen.contains("5/5"), "the count line is replaced: {screen}");
+
+        // The typed mode shows on the line as it accumulates.
+        type_str(&mut app, "defer something");
+        let screen = render(&app);
+        assert!(screen.contains("defer something"), "{screen}");
+
+        // Esc gives the count line back.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("5/5"), "{screen}");
+        assert!(!screen.contains("→ /wayfinder"), "{screen}");
     }
 
     #[test]

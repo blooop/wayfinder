@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::launch::{self, Launch, Targets};
-use crate::model::{Map, MapId, MapSet, Ticket};
+use crate::launch::{self, Launch, LaunchMode, Route, Targets};
+use crate::model::{stage, Map, MapId, MapSet, Status, Ticket};
 use crate::projects::Checkout;
 use crate::refresh::Startup;
 use crate::view::{self, Expanded, GroupId, Lens, Plan, Screen, Stop, StopAt};
@@ -38,12 +38,23 @@ pub enum Outcome {
     Launch(Launch),
 }
 
-/// A modal layer over the main screen. Only one thing needs one: a repo with
-/// several registered checkouts (the k1–k5 pattern) must be asked which tree
-/// the agent runs in.
+/// A modal layer over the main screen: the staged second step of a launch
+/// (#62), or the which-checkout prompt. Either owns every key while up, so no
+/// typing leaks into the query behind it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
     None,
+    /// The launch line — enter on a launchable node staged this launch, and
+    /// the line now collects its mode: empty is interactive, `defer [text]`
+    /// defers, anything else steers ([`LaunchMode::parse`]). The route is
+    /// already resolved from (type, stage), so the line can *show* where enter
+    /// goes — and a line for an unlaunchable node is unrepresentable, because
+    /// no `Route` exists to put in it.
+    LaunchLine {
+        row: Row,
+        route: Route,
+        text: String,
+    },
     /// Candidates are complete launches, so the pick cannot produce an
     /// inconsistent one.
     PickCheckout {
@@ -412,11 +423,12 @@ impl App {
         self.cursor = crate::refresh::preserve_cursor(anchor.as_ref(), old_index, &new_order);
     }
 
-    /// Resolve a launch of the cursor's ticket: straight to the loop when
-    /// there is one candidate checkout, through the picker when there are
-    /// several, and a notice when there is none to launch into. Which map the
-    /// ticket belongs to is the cluster it sits in — a row without a map is
-    /// unrepresentable, so the old "repo has no map" failure is gone with it.
+    /// The first enter (#62): stage a launch of the cursor's ticket by opening
+    /// the launch line — or refuse, with a count-line notice, the two things
+    /// that cannot launch. Blocked is refused on *status* (its stage is
+    /// unactionable, whatever it is); done is refused by [`launch::route`]
+    /// returning no route — stage, not ticket state, so a merged PR on a
+    /// still-open ticket refuses too.
     fn request_launch(&mut self) -> Outcome {
         // On a group line there is no agent to run, and exactly one thing the
         // key could plausibly mean — so `enter` opens or shuts it rather than
@@ -431,15 +443,42 @@ impl App {
             self.notice = Some("nothing selected".to_string());
             return Outcome::Continue;
         };
+        let ticket = self.ticket(&row);
+        if let Status::Blocked { needs } = &ticket.status {
+            let needs: Vec<String> = needs.iter().map(|n| format!("#{n}")).collect();
+            self.notice = Some(format!(
+                "#{} is blocked — needs {}",
+                ticket.number,
+                needs.join(", ")
+            ));
+            return Outcome::Continue;
+        }
+        match launch::route(ticket.ticket_type, stage(&ticket.prs, &ticket.status)) {
+            None => {
+                self.notice = Some(format!("#{} is done — nothing to launch", ticket.number));
+                Outcome::Continue
+            }
+            Some(route) => {
+                self.overlay = Overlay::LaunchLine {
+                    row,
+                    route,
+                    text: String::new(),
+                };
+                Outcome::Continue
+            }
+        }
+    }
+
+    /// The second enter: resolve the staged launch against the projects cache
+    /// — straight to the loop when there is one candidate checkout, through
+    /// the picker when there are several, and a notice when there is none to
+    /// launch into. Which map the ticket belongs to is the cluster it sits in
+    /// — a row without a map is unrepresentable, so the old "repo has no map"
+    /// failure is gone with it.
+    fn resolve_launch(&mut self, row: Row, route: Route, mode: LaunchMode) -> Outcome {
         let ticket = self.ticket(&row).clone();
         let map_issue = row.map.number;
-        match launch::plan(
-            &self.checkouts,
-            &ticket,
-            map_issue,
-            launch::Route::Wayfinder,
-            launch::LaunchMode::Interactive,
-        ) {
+        match launch::plan(&self.checkouts, &ticket, map_issue, route, mode) {
             Targets::Unregistered => {
                 self.notice = Some(format!(
                     "no registered checkout of {} on this machine — run wf inside one",
@@ -460,6 +499,41 @@ impl App {
                     launches,
                     cursor: 0,
                 };
+                Outcome::Continue
+            }
+        }
+    }
+
+    /// Keys while the launch line is up (#62). The line owns every printable
+    /// key — filtering already happened, this text is the launch's mode — and
+    /// esc backs out to the list with the query and cursor untouched (they
+    /// were never touched to begin with; the invariant is that nothing here
+    /// may touch them).
+    fn handle_launch_line_key(
+        &mut self,
+        key: KeyEvent,
+        row: Row,
+        route: Route,
+        mut text: String,
+    ) -> Outcome {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            // Back to the list; the overlay is already None.
+            KeyCode::Esc => Outcome::Continue,
+            KeyCode::Char('c') if ctrl => Outcome::Quit,
+            KeyCode::Enter => self.resolve_launch(row, route, LaunchMode::parse(&text)),
+            KeyCode::Backspace => {
+                text.pop();
+                self.overlay = Overlay::LaunchLine { row, route, text };
+                Outcome::Continue
+            }
+            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                text.push(c);
+                self.overlay = Overlay::LaunchLine { row, route, text };
+                Outcome::Continue
+            }
+            _ => {
+                self.overlay = Overlay::LaunchLine { row, route, text };
                 Outcome::Continue
             }
         }
@@ -520,10 +594,14 @@ impl App {
     /// chord bindings.
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
         self.notice = None;
-        if let Overlay::PickCheckout { launches, cursor } =
-            std::mem::replace(&mut self.overlay, Overlay::None)
-        {
-            return self.handle_overlay_key(key, launches, cursor);
+        match std::mem::replace(&mut self.overlay, Overlay::None) {
+            Overlay::PickCheckout { launches, cursor } => {
+                return self.handle_overlay_key(key, launches, cursor);
+            }
+            Overlay::LaunchLine { row, route, text } => {
+                return self.handle_launch_line_key(key, row, route, text);
+            }
+            Overlay::None => {}
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -622,7 +700,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{classify, TicketType};
+    use crate::model::{classify, Checks, PrLink, PrStatus, Review, TicketType};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1141,10 +1219,20 @@ mod tests {
     }
 
     #[test]
-    fn enter_launches_the_cursors_ticket_with_its_clusters_map() {
+    fn enter_opens_the_launch_line_and_a_second_enter_launches() {
+        // The two-step (#62): the first enter stages the launch — nothing
+        // execs yet — and an empty line's enter is the interactive default.
         let mut app = launchable_app();
         // Move to wayfinder#6, whose repo has one checkout.
         app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        match &app.overlay {
+            Overlay::LaunchLine { route, text, .. } => {
+                assert_eq!(*route, Route::Wayfinder, "a task is a decision node");
+                assert_eq!(text, "", "the line opens empty");
+            }
+            other => panic!("expected the launch line, got {other:?}"),
+        }
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
@@ -1188,6 +1276,7 @@ mod tests {
         }]);
         // Row 0 is map #1's copy, row 1 is map #47's.
         app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter)); // stage it
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
@@ -1208,7 +1297,9 @@ mod tests {
     #[test]
     fn several_checkouts_open_the_picker_and_enter_launches_the_pick() {
         let mut app = launchable_app();
-        // Cursor starts on dotfiles#103 — two checkouts.
+        // Cursor starts on dotfiles#103 — two checkouts. The first enter
+        // stages the launch; the second resolves it to the picker.
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         match &app.overlay {
             Overlay::PickCheckout { launches, cursor } => {
@@ -1233,7 +1324,8 @@ mod tests {
     #[test]
     fn the_picker_clamps_and_esc_cancels_it() {
         let mut app = launchable_app();
-        app.handle_key(key(KeyCode::Enter)); // dotfiles#103 under the cursor
+        app.handle_key(key(KeyCode::Enter)); // dotfiles#103: stage the launch
+        app.handle_key(key(KeyCode::Enter)); // resolve — two checkouts: picker
         for _ in 0..5 {
             app.handle_key(key(KeyCode::Down));
         }
@@ -1252,14 +1344,185 @@ mod tests {
     fn a_repo_with_no_checkout_says_so_instead_of_launching() {
         // No checkouts registered: every ticket is unlaunchable — and the one
         // reason left is the missing checkout, because a row's map is its
-        // cluster and cannot be missing.
+        // cluster and cannot be missing. The line still opens (the route is a
+        // fact about the ticket); the *resolution* is what has nowhere to run.
         let mut app = fixture_app();
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         let notice = app.notice.as_deref().unwrap();
         assert!(
             notice.contains("no registered checkout"),
             "notice: {notice}"
         );
+    }
+
+    #[test]
+    fn launch_line_typing_lands_in_the_line_and_esc_restores_the_list() {
+        // The line owns every printable key: nothing leaks into the query.
+        // Esc backs out with the query and the cursor exactly as they were.
+        let mut app = launchable_app();
+        type_str(&mut app, "bread"); // flattens to wayfinder#6
+        assert_eq!(app.cursor_ticket().unwrap().number, 6);
+        app.handle_key(key(KeyCode::Enter));
+        type_str(&mut app, "half a thought");
+        app.handle_key(key(KeyCode::Backspace));
+        match &app.overlay {
+            Overlay::LaunchLine { text, .. } => assert_eq!(text, "half a though"),
+            other => panic!("expected the launch line, got {other:?}"),
+        }
+        assert_eq!(app.query, "bread", "typing stayed out of the query");
+
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.query, "bread", "esc kept the query");
+        assert_eq!(
+            app.cursor_ticket().unwrap().number,
+            6,
+            "esc kept the cursor"
+        );
+        // And esc means *back to the list*, never quit-from-the-line: the next
+        // esc clears the query, the one after quits — the ordinary ladder.
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Outcome::Continue);
+        assert!(app.query.is_empty());
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Outcome::Quit);
+    }
+
+    #[test]
+    fn defer_text_on_the_launch_line_launches_deferred_with_steering() {
+        // The acceptance shape: enter → `defer something` → enter produces a
+        // command carrying `defer: something`.
+        let mut app = launchable_app();
+        app.handle_key(key(KeyCode::Down)); // wayfinder#6, one checkout
+        app.handle_key(key(KeyCode::Enter));
+        type_str(&mut app, "defer something");
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(
+            launch.agent_argv().last().unwrap(),
+            "/wayfinder 1 6 defer: something"
+        );
+    }
+
+    #[test]
+    fn the_typed_mode_survives_the_checkout_picker() {
+        // Two checkouts of dotfiles: the mode is settled on the line, the
+        // picker only answers *where* — the pick must not lose the defer.
+        let mut app = launchable_app();
+        app.handle_key(key(KeyCode::Enter)); // dotfiles#103: stage
+        type_str(&mut app, "defer");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert!(matches!(app.overlay, Overlay::PickCheckout { .. }));
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder 4 103 defer");
+    }
+
+    #[test]
+    fn enter_on_a_done_or_blocked_node_is_a_notice_not_a_launch_line() {
+        let mut app = launchable_app();
+        // Blocked: #7 hangs under #6 as context.
+        app.handle_key(key(KeyCode::Down)); // #6
+        app.handle_key(key(KeyCode::Right)); // into #7
+        assert_eq!(at(&app), "#7");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert_eq!(app.overlay, Overlay::None, "no line on a blocked node");
+        assert!(
+            app.notice.as_deref().unwrap().contains("blocked"),
+            "{:?}",
+            app.notice
+        );
+        // Done: #2 sits behind the Done group.
+        while at(&app) != "Done" {
+            app.handle_key(key(KeyCode::Down));
+        }
+        app.handle_key(key(KeyCode::Right)); // open the group
+        app.handle_key(key(KeyCode::Right)); // onto #2
+        assert_eq!(at(&app), "#2");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert_eq!(app.overlay, Overlay::None, "no line on a done node");
+        assert!(
+            app.notice.as_deref().unwrap().contains("done"),
+            "{:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn a_build_node_routes_by_its_stage() {
+        // One build ticket, staged by its PR: in review → /review; the same
+        // ticket with no PR evidence is ready → /tdd.
+        let build_app = |prs: Vec<PrLink>| -> App {
+            let mut t = ticket(
+                "blooop/wayfinder",
+                65,
+                "Author the /tdd skill",
+                true,
+                false,
+                vec![],
+            );
+            t.ticket_type = TicketType::Build;
+            t.prs = prs;
+            let mut clusters = BTreeMap::new();
+            clusters.insert(
+                MapId::new("blooop/wayfinder", 59),
+                Map {
+                    title: "Map: the spine".to_string(),
+                    tickets: vec![t],
+                },
+            );
+            App::new(clusters).with_checkouts(vec![Checkout {
+                path: std::path::PathBuf::from("/data/proj/wayfinder"),
+                repo: "blooop/wayfinder".to_string(),
+            }])
+        };
+
+        let mut ready = build_app(vec![]);
+        ready.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&ready.overlay, Overlay::LaunchLine { route: Route::Tdd, .. }),
+            "{:?}",
+            ready.overlay
+        );
+        let launch = match ready.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.agent_argv().last().unwrap(), "/tdd 65");
+
+        let mut in_review = build_app(vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 90,
+            status: PrStatus::Open {
+                checks: Checks::Passing,
+                review: Review::Approved,
+            },
+        }]);
+        in_review.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&in_review.overlay, Overlay::LaunchLine { route: Route::Review, .. }),
+            "{:?}",
+            in_review.overlay
+        );
+        let launch = match in_review.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.agent_argv().last().unwrap(), "/review 65");
+
+        // A merged PR with nothing open means done — stage, not ticket state,
+        // is what refuses the launch.
+        let mut done = build_app(vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 90,
+            status: PrStatus::Merged,
+        }]);
+        assert_eq!(done.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert_eq!(done.overlay, Overlay::None);
+        assert!(done.notice.as_deref().unwrap().contains("done"));
     }
 
     #[test]
