@@ -572,6 +572,7 @@ mod tests {
             .collect();
         Map {
             title: "Map: fixture".to_string(),
+            last_activity: None,
             tickets,
         }
     }
@@ -754,6 +755,7 @@ mod tests {
         // from in-map blockers, and this blocker is deliberately not one.
         let m = Map {
             title: "Map: fixture".to_string(),
+            last_activity: None,
             tickets: vec![
                 ticket(6, true, false, vec![]),
                 ticket(7, true, false, vec![999]),

@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 /// says *which* map, and a second map on one repo is an ordinary value instead
 /// of the one the lowest-number rule silently hid.
 ///
-/// `Ord` is (repo, number), which is also the on-screen cluster order.
+/// `Ord` is (repo, number) — the stable tie-break under the cluster order
+/// ([`crate::app::App::scoped_clusters`]), which leads on activity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MapId {
     /// Full repo slug (e.g. "blooop/wayfinder") — the full slug, never the
@@ -260,6 +261,42 @@ impl Ticket {
     }
 }
 
+/// When the tracker last saw the map issue, reduced to the only thing wf asks
+/// of it: an order. Packed decimal `YYYYMMDDhhmmss`, so `Ord` is chronological
+/// and there is no second representation of the same instant to disagree with.
+///
+/// Constructible only by [`Activity::parse`] — a value of this type is a
+/// timestamp that parsed, never a string hoped to be one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Activity(u64);
+
+impl Activity {
+    /// Parse a tracker timestamp (`2026-08-06T12:34:56Z`, which is the only
+    /// shape GitHub's GraphQL `DateTime` emits).
+    ///
+    /// `None` for anything else. That is deliberately not a fallback instant:
+    /// an unrecognised format would have to be *guessed* into an order, and a
+    /// guess here silently reshuffles the screen. "Activity unknown" is a
+    /// meaning of its own, and [`crate::app::App::scoped_clusters`] sorts it
+    /// last among live maps rather than pretending it is ancient or fresh.
+    pub fn parse(stamp: &str) -> Option<Activity> {
+        let (date, time) = stamp.strip_suffix('Z')?.split_once('T')?;
+        let mut fields = date.split('-').chain(time.split(':'));
+        let mut packed = 0u64;
+        // Fixed widths, so every field below the year is < 100 and decimal
+        // packing keeps the ordering chronological. The year's own `* 100` is
+        // harmless: it is the first field, with nothing yet packed under it.
+        for width in [4, 2, 2, 2, 2, 2] {
+            let field = fields.next()?;
+            if field.len() != width || !field.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            packed = packed * 100 + field.parse::<u64>().ok()?;
+        }
+        fields.next().is_none().then_some(Activity(packed))
+    }
+}
+
 /// One map's cluster: the map issue plus its sub-issue tickets.
 ///
 /// Deliberately *without* its own [`MapId`]: a map is always held under its id
@@ -269,6 +306,9 @@ impl Ticket {
 pub struct Map {
     /// Title of the map issue itself.
     pub title: String,
+    /// When the map issue was last touched, if the tracker's timestamp parsed
+    /// ([`Activity`]) — the cluster sort key.
+    pub last_activity: Option<Activity>,
     pub tickets: Vec<Ticket>,
 }
 
@@ -290,6 +330,16 @@ impl Map {
             .filter(|t| t.blocked_by.contains(&number))
             .map(|t| t.number)
             .collect()
+    }
+
+    /// Whether any ticket on this map is still open — whether the map is work
+    /// or history. A map whose every ticket is done is *finished*, and so is a
+    /// map with no tickets at all: both have nothing left to do, which is the
+    /// one question the cluster order asks (finished maps sort last).
+    pub fn has_open_work(&self) -> bool {
+        self.tickets
+            .iter()
+            .any(|t| !matches!(t.status, Status::Done))
     }
 
     /// Ticket counts by status group (frontier / claimed / blocked / done) —
@@ -448,7 +498,73 @@ mod tests {
     }
 
     #[test]
-    fn map_ids_order_by_repo_then_number_which_is_cluster_order() {
+    fn activity_orders_chronologically_across_every_field() {
+        let stamps = [
+            "2025-12-31T23:59:59Z",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:01Z",
+            "2026-01-01T00:01:00Z",
+            "2026-01-01T01:00:00Z",
+            "2026-01-02T00:00:00Z",
+            "2026-02-01T00:00:00Z",
+        ];
+        let parsed: Vec<Activity> = stamps
+            .iter()
+            .map(|s| Activity::parse(s).expect(s))
+            .collect();
+        let mut sorted = parsed.clone();
+        sorted.sort();
+        assert_eq!(parsed, sorted, "already in chronological order");
+        // …and the ordering is strict: no two distinct instants collide.
+        sorted.dedup();
+        assert_eq!(sorted.len(), stamps.len());
+    }
+
+    #[test]
+    fn an_unrecognised_timestamp_is_no_instant_rather_than_a_guessed_one() {
+        for junk in [
+            "",
+            "2026-08-06",                // date only
+            "2026-08-06T12:34:56",       // no zone marker
+            "2026-08-06T12:34:56+01:00", // an offset wf cannot pack
+            "2026-08-06T12:34:56.123Z",  // fractional seconds
+            "2026-8-6T12:34:56Z",        // unpadded fields
+            "26-08-06T12:34:56Z",        // two-digit year
+            "2026-08-06T12:34Z",         // no seconds
+            "2026-08-06T12:34:56:78Z",   // a seventh field
+            "yyyy-mm-ddThh:mm:ssZ",      // not digits
+            "2026-08-06 12:34:56Z",      // space where the T belongs
+        ] {
+            assert_eq!(Activity::parse(junk), None, "{junk:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn a_map_has_open_work_until_every_ticket_is_done() {
+        let live = Map {
+            title: "Map: wf".to_string(),
+            last_activity: None,
+            tickets: vec![ticket(2, false, vec![]), ticket(6, true, vec![])],
+        };
+        assert!(live.has_open_work());
+        let finished = Map {
+            title: "Map: wf".to_string(),
+            last_activity: None,
+            tickets: vec![ticket(2, false, vec![]), ticket(6, false, vec![])],
+        };
+        assert!(!finished.has_open_work(), "every ticket done is finished");
+        // A map with no tickets has nothing left to do either — the same answer
+        // to the same question, not a third case.
+        let empty = Map {
+            title: "Map: wf".to_string(),
+            last_activity: None,
+            tickets: vec![],
+        };
+        assert!(!empty.has_open_work());
+    }
+
+    #[test]
+    fn map_ids_order_by_repo_then_number_which_is_the_cluster_tie_break() {
         let mut ids = vec![
             MapId::new("kinisi/zeta", 4),
             MapId::new("blooop/wayfinder", 47),
@@ -483,6 +599,7 @@ mod tests {
         // survives the blocker closing, which is exactly why closed edges stay.
         let map = Map {
             title: "Map: selection view".to_string(),
+            last_activity: None,
             tickets: vec![
                 ticket(48, false, vec![]),
                 ticket(50, true, vec![48]),
@@ -512,6 +629,7 @@ mod tests {
         blocked.status = Status::Blocked { needs: vec![6] };
         let map = Map {
             title: "Map: wf".to_string(),
+            last_activity: None,
             tickets: vec![ticket(6, true, vec![]), claimed, blocked, done],
         };
         assert_eq!(map.counts(), [1, 1, 1, 1]);
