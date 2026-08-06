@@ -84,7 +84,7 @@ fn body_with_cursor(app: &App) -> (Vec<Line<'static>>, Option<usize>) {
             }
             let members: Vec<&Row> = visible
                 .iter()
-                .filter(|(row_id, i)| row_id == id && map.tickets[*i].status.group() == group)
+                .filter(|row| &row.map == id && map.tickets[row.index].status.group() == group)
                 .collect();
             let header = if filtering {
                 format!("  {label} — {}/{}", members.len(), total)
@@ -96,7 +96,7 @@ fn body_with_cursor(app: &App) -> (Vec<Line<'static>>, Option<usize>) {
                 Style::new().add_modifier(Modifier::BOLD),
             ));
             for row in members {
-                let ticket = &map.tickets[row.1];
+                let ticket = &map.tickets[row.index];
                 let under_cursor = cursor_row.as_ref() == Some(row);
                 if under_cursor {
                     cursor_line = Some(lines.len());

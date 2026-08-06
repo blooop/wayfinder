@@ -49,14 +49,30 @@ pub enum Overlay {
     PickCheckout { launches: Vec<Launch>, cursor: usize },
 }
 
-/// One on-screen row: which map's cluster it is in, and the ticket's index
+/// One on-screen row: which map's cluster it is in, and the ticket's position
 /// within that cluster. The map half matters (#50): two maps of one repo may
 /// list the same ticket, and those are two distinct rows.
-pub type Row = (MapId, usize);
+///
+/// **Positional, and only valid against the clusters it was read from** — an
+/// index into a `Vec` that the next fetch replaces. [`RowKey`] is the durable
+/// half. They are separate named types rather than two same-shaped tuples
+/// because that is the distinction that matters and the one a `.0`/`.1` at a
+/// call site cannot show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    pub map: MapId,
+    /// Index into that cluster's `tickets`.
+    pub index: usize,
+}
 
-/// A row's stable identity across refreshes: the map and the ticket number —
-/// what the cursor anchors to when clusters are swapped underneath it.
-pub type RowKey = (MapId, u64);
+/// A row's stable identity across refreshes: the map and the ticket *number* —
+/// what the cursor anchors to when clusters are swapped underneath it. Unlike
+/// [`Row`] this survives a refetch, which is the whole reason both exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowKey {
+    pub map: MapId,
+    pub ticket: u64,
+}
 
 pub struct App {
     /// The clusters on screen: every open map that has arrived, in
@@ -150,7 +166,12 @@ impl App {
     pub fn scoped(&self) -> Vec<Row> {
         self.scoped_clusters()
             .into_iter()
-            .flat_map(|(id, map)| (0..map.tickets.len()).map(|i| (id.clone(), i)))
+            .flat_map(|(id, map)| {
+                (0..map.tickets.len()).map(|index| Row {
+                    map: id.clone(),
+                    index,
+                })
+            })
             .collect()
     }
 
@@ -168,7 +189,10 @@ impl App {
                         .iter()
                         .copied()
                         .filter(|&i| map.tickets[i].status.group() == group)
-                        .map(|i| (id.clone(), i)),
+                        .map(|index| Row {
+                            map: id.clone(),
+                            index,
+                        }),
                 );
             }
         }
@@ -177,7 +201,15 @@ impl App {
 
     /// The ticket a row names.
     pub fn ticket(&self, row: &Row) -> &Ticket {
-        &self.clusters[&row.0].tickets[row.1]
+        &self.clusters[&row.map].tickets[row.index]
+    }
+
+    /// A row's durable identity — the anchor a refetch preserves.
+    pub fn row_key(&self, row: &Row) -> RowKey {
+        RowKey {
+            map: row.map.clone(),
+            ticket: self.ticket(row).number,
+        }
     }
 
     /// Cursor position clamped into the visible list.
@@ -193,15 +225,14 @@ impl App {
     /// The ticket under the cursor, if any row is visible.
     pub fn cursor_ticket(&self) -> Option<&Ticket> {
         self.cursor_row().map(|row| {
-            let map: &Map = &self.clusters[&row.0];
-            &map.tickets[row.1]
+            let map: &Map = &self.clusters[&row.map];
+            &map.tickets[row.index]
         })
     }
 
     /// The cursor row's stable identity.
     fn cursor_key(&self) -> Option<RowKey> {
-        self.cursor_row()
-            .map(|row| (row.0.clone(), self.ticket(&row).number))
+        self.cursor_row().map(|row| self.row_key(&row))
     }
 
     /// Point the cursor at a specific row if it is visible.
@@ -209,7 +240,7 @@ impl App {
         let pos = self
             .visible()
             .iter()
-            .position(|row| row.0 == key.0 && self.ticket(row).number == key.1);
+            .position(|row| &self.row_key(row) == key);
         self.cursor = pos.unwrap_or(0);
     }
 
@@ -233,7 +264,7 @@ impl App {
         let new_order: Vec<RowKey> = self
             .visible()
             .iter()
-            .map(|row| (row.0.clone(), self.ticket(row).number))
+            .map(|row| self.row_key(row))
             .collect();
         self.cursor = crate::refresh::preserve_cursor(anchor.as_ref(), old_index, &new_order);
     }
@@ -249,7 +280,7 @@ impl App {
             return Outcome::Continue;
         };
         let ticket = self.ticket(&row).clone();
-        let map_issue = row.0.number;
+        let map_issue = row.map.number;
         match launch::plan(&self.checkouts, &ticket, map_issue) {
             Targets::Unregistered => {
                 self.notice = Some(format!(
@@ -334,7 +365,7 @@ impl App {
             }
             KeyCode::Char('f') if ctrl => {
                 if let Some(key) = self.cursor_key() {
-                    self.scope = Scope::Project(key.0.repo.clone());
+                    self.scope = Scope::Project(key.map.repo.clone());
                     self.point_at(&key);
                 }
                 Outcome::Continue
@@ -696,7 +727,7 @@ mod tests {
         assert_eq!(app.scope, Scope::Project("blooop/wayfinder".to_string()));
         let visible = app.visible();
         assert_eq!(visible.len(), 2, "both wayfinder maps stay on screen");
-        assert!(visible.iter().all(|(id, _)| id.repo == "blooop/wayfinder"));
+        assert!(visible.iter().all(|row| row.map.repo == "blooop/wayfinder"));
     }
 
     #[test]

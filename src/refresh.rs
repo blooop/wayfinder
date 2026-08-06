@@ -380,11 +380,14 @@ mod tests {
     fn the_same_ticket_under_two_maps_is_two_distinct_rows() {
         // #50: identity carries the map, so the cursor stays on the cluster it
         // was in rather than jumping to the other map's copy of the ticket.
-        let on_map_1 = (MapId::new("blooop/wayfinder", 1), 6u64);
-        let on_map_47 = (MapId::new("blooop/wayfinder", 47), 6u64);
-        let order = [on_map_1.clone(), on_map_47.clone()];
-        assert_eq!(preserve_cursor(Some(&on_map_47), 0, &order), 1);
-        assert_eq!(preserve_cursor(Some(&on_map_1), 1, &order), 0);
+        // Against the real `RowKey`, since that is the K this is generic for.
+        let on = |map: u64| crate::app::RowKey {
+            map: MapId::new("blooop/wayfinder", map),
+            ticket: 6,
+        };
+        let order = [on(1), on(47)];
+        assert_eq!(preserve_cursor(Some(&on(47)), 0, &order), 1);
+        assert_eq!(preserve_cursor(Some(&on(1)), 1, &order), 0);
     }
 
     #[test]

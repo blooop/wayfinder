@@ -38,8 +38,8 @@ to open on all of them.
 
 The registry is a per-machine cache at `~/.cache/wf/projects.json`
 (`$XDG_CACHE_HOME` respected) holding `{path, repo}` per checkout, plus every
-open map the last search found. Deleting it is safe — projects re-accrete as
-you open them, and the maps are re-found on the next start.
+open map that the last search found. Deleting it is safe — projects re-accrete
+as you open them, and the maps are re-found on the next start.
 
 Only repos with an open `wayfinder:map`-labelled issue show tickets; other
 checkouts stay cached but hidden.
