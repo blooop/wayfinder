@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::launch::{self, Launch, LaunchMode, Route, Targets};
+use crate::launch::{self, Launch, LaunchMode, Staged, Targets};
 use crate::model::{stage, Map, MapId, MapSet, Status, Ticket};
 use crate::projects::Checkout;
 use crate::refresh::Startup;
@@ -50,9 +50,13 @@ pub enum Overlay {
     /// already resolved from (type, stage), so the line can *show* where enter
     /// goes — and a line for an unlaunchable node is unrepresentable, because
     /// no `Route` exists to put in it.
+    ///
+    /// The staged launch is index-free ([`Staged`]) for the same reason the
+    /// picker's candidates are complete `Launch`es: a background map arrival
+    /// swaps the clusters underneath an open overlay, and a positional [`Row`]
+    /// held across that would name a different ticket, or none at all.
     LaunchLine {
-        row: Row,
-        route: Route,
+        staged: Staged,
         text: String,
     },
     /// Candidates are complete launches, so the pick cannot produce an
@@ -460,8 +464,7 @@ impl App {
             }
             Some(route) => {
                 self.overlay = Overlay::LaunchLine {
-                    row,
-                    route,
+                    staged: Staged::new(ticket, row.map.number, route),
                     text: String::new(),
                 };
                 Outcome::Continue
@@ -475,14 +478,15 @@ impl App {
     /// launch into. Which map the ticket belongs to is the cluster it sits in
     /// — a row without a map is unrepresentable, so the old "repo has no map"
     /// failure is gone with it.
-    fn resolve_launch(&mut self, row: Row, route: Route, mode: LaunchMode) -> Outcome {
-        let ticket = self.ticket(&row).clone();
-        let map_issue = row.map.number;
-        match launch::plan(&self.checkouts, &ticket, map_issue, route, mode) {
+    ///
+    /// Everything this needs came with the [`Staged`] launch, so a refetch
+    /// between the two enters cannot redirect it at another ticket.
+    fn resolve_launch(&mut self, staged: Staged, mode: LaunchMode) -> Outcome {
+        match launch::plan(&self.checkouts, &staged, mode) {
             Targets::Unregistered => {
                 self.notice = Some(format!(
                     "no registered checkout of {} on this machine — run wf inside one",
-                    ticket.repo
+                    staged.repo
                 ));
                 Outcome::Continue
             }
@@ -493,7 +497,7 @@ impl App {
             Targets::Many(launches) => {
                 self.notice = Some(format!(
                     "{}#{}: which checkout?",
-                    ticket.repo, ticket.number
+                    staged.repo, staged.ticket
                 ));
                 self.overlay = Overlay::PickCheckout {
                     launches,
@@ -512,8 +516,7 @@ impl App {
     fn handle_launch_line_key(
         &mut self,
         key: KeyEvent,
-        row: Row,
-        route: Route,
+        staged: Staged,
         mut text: String,
     ) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -521,19 +524,19 @@ impl App {
             // Back to the list; the overlay is already None.
             KeyCode::Esc => Outcome::Continue,
             KeyCode::Char('c') if ctrl => Outcome::Quit,
-            KeyCode::Enter => self.resolve_launch(row, route, LaunchMode::parse(&text)),
+            KeyCode::Enter => self.resolve_launch(staged, LaunchMode::parse(&text)),
             KeyCode::Backspace => {
                 text.pop();
-                self.overlay = Overlay::LaunchLine { row, route, text };
+                self.overlay = Overlay::LaunchLine { staged, text };
                 Outcome::Continue
             }
             KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
                 text.push(c);
-                self.overlay = Overlay::LaunchLine { row, route, text };
+                self.overlay = Overlay::LaunchLine { staged, text };
                 Outcome::Continue
             }
             _ => {
-                self.overlay = Overlay::LaunchLine { row, route, text };
+                self.overlay = Overlay::LaunchLine { staged, text };
                 Outcome::Continue
             }
         }
@@ -598,8 +601,8 @@ impl App {
             Overlay::PickCheckout { launches, cursor } => {
                 return self.handle_overlay_key(key, launches, cursor);
             }
-            Overlay::LaunchLine { row, route, text } => {
-                return self.handle_launch_line_key(key, row, route, text);
+            Overlay::LaunchLine { staged, text } => {
+                return self.handle_launch_line_key(key, staged, text);
             }
             Overlay::None => {}
         }
@@ -700,6 +703,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::launch::Route;
     use crate::model::{classify, Checks, PrLink, PrStatus, Review, TicketType};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1227,8 +1231,10 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         match &app.overlay {
-            Overlay::LaunchLine { route, text, .. } => {
-                assert_eq!(*route, Route::Wayfinder, "a task is a decision node");
+            Overlay::LaunchLine { staged, text } => {
+                assert_eq!(staged.route, Route::Wayfinder, "a task is a decision node");
+                assert_eq!(staged.ticket, 6);
+                assert_eq!(staged.title, "Re-entry breadcrumbs", "the line names it");
                 assert_eq!(text, "", "the line opens empty");
             }
             other => panic!("expected the launch line, got {other:?}"),
@@ -1425,6 +1431,77 @@ mod tests {
     }
 
     #[test]
+    fn a_staged_launch_survives_a_refetch_moving_its_ticket() {
+        // The line stays up while background fetches are still landing (#27),
+        // and each arrival swaps the clusters underneath it. A staged launch
+        // is snapshotted index-free, so the line keeps naming — and launching
+        // — the ticket it was opened on, wherever that ticket now sits.
+        let staged = || {
+            let mut app = launchable_app();
+            app.handle_key(key(KeyCode::Down)); // wayfinder#6, at index 1
+            app.handle_key(key(KeyCode::Enter));
+            type_str(&mut app, "defer");
+            app
+        };
+        let wf = MapId::new("blooop/wayfinder", 1);
+
+        // Reordered: index 1 now names #9, not #6.
+        let mut app = staged();
+        let mut reordered = app.clusters.clone();
+        reordered.get_mut(&wf).expect("the map").tickets = vec![
+            ticket(
+                "blooop/wayfinder",
+                6,
+                "Re-entry breadcrumbs",
+                true,
+                false,
+                vec![],
+            ),
+            ticket(
+                "blooop/wayfinder",
+                9,
+                "Main screen design",
+                true,
+                true,
+                vec![],
+            ),
+        ];
+        app.replace_clusters(reordered);
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(
+            launch.agent_argv().last().unwrap(),
+            "/wayfinder 1 6 defer",
+            "the staged ticket, not whatever landed at its old index"
+        );
+
+        // Shorter: the old index is off the end entirely, and the map the row
+        // was picked in has gone. Neither may panic, and the launch still
+        // names the ticket the human chose.
+        let mut app = staged();
+        let mut shrunk = BTreeMap::new();
+        shrunk.insert(
+            MapId::new("blooop/dotfiles", 4),
+            app.clusters
+                .get(&MapId::new("blooop/dotfiles", 4))
+                .expect("the dotfiles map")
+                .clone(),
+        );
+        app.replace_clusters(shrunk);
+        match &app.overlay {
+            Overlay::LaunchLine { staged, .. } => assert_eq!(staged.ticket, 6),
+            other => panic!("expected the launch line, got {other:?}"),
+        }
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder 1 6 defer");
+    }
+
+    #[test]
     fn enter_on_a_done_or_blocked_node_is_a_notice_not_a_launch_line() {
         let mut app = launchable_app();
         // Blocked: #7 hangs under #6 as context.
@@ -1489,7 +1566,10 @@ mod tests {
             matches!(
                 &ready.overlay,
                 Overlay::LaunchLine {
-                    route: Route::Tdd,
+                    staged: Staged {
+                        route: Route::Tdd,
+                        ..
+                    },
                     ..
                 }
             ),
@@ -1515,7 +1595,10 @@ mod tests {
             matches!(
                 &in_review.overlay,
                 Overlay::LaunchLine {
-                    route: Route::Review,
+                    staged: Staged {
+                        route: Route::Review,
+                        ..
+                    },
                     ..
                 }
             ),

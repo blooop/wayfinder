@@ -126,6 +126,48 @@ pub fn route(ticket_type: TicketType, stage: Stage) -> Option<Route> {
     }
 }
 
+/// A launch the first enter staged but the machine has not answered yet (#62):
+/// everything the launch line draws and the second enter needs, snapshotted
+/// **index-free**.
+///
+/// Index-free is the whole point. `crate::app::Row` is positional — an index
+/// into a `Vec` that the next fetch replaces — and the line stays up while
+/// background map arrivals swap the clusters underneath it (#27). A `Row` held
+/// here would draw, and then launch, whichever ticket had landed at that
+/// index; a shorter map would panic on the next frame. So the staged launch
+/// carries the ticket's own facts, the way [`Targets::Many`] carries complete
+/// [`Launch`]es rather than a choice to re-resolve later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Staged {
+    /// The ticket's repo, full slug (`owner/name`) — what the checkout cache
+    /// is matched on (#15).
+    pub repo: String,
+    /// The ticket the launch line names.
+    pub ticket: u64,
+    /// Its title as it read when the line opened — the line is showing the
+    /// human what they picked, not re-reporting a row that may have moved.
+    pub title: String,
+    /// The map issue of the cluster the row was picked in (#50) — which map a
+    /// ticket listed twice was launched from.
+    pub map_issue: u64,
+    /// Resolved from (type, stage) by [`route`] at the first enter, which is
+    /// also where an unlaunchable node was refused: no `Route`, no `Staged`.
+    pub route: Route,
+}
+
+impl Staged {
+    /// Stage a launch of `ticket`, picked in the cluster of `map_issue`.
+    pub fn new(ticket: &Ticket, map_issue: u64, route: Route) -> Staged {
+        Staged {
+            repo: ticket.repo.clone(),
+            ticket: ticket.number,
+            title: ticket.title.clone(),
+            map_issue,
+            route,
+        }
+    }
+}
+
 /// A fully-resolved launch: which checkout the agent runs in, which ticket of
 /// which map it is handed, and — since the two-step (#62) — which skill it
 /// runs ([`Route`]) and in what mode ([`LaunchMode`]).
@@ -297,21 +339,15 @@ pub enum Targets {
 /// Resolve a launch request against the projects cache. Zero or one candidate
 /// never prompts. The route and mode arrive already settled — this function
 /// only answers *where* the agent can run.
-pub fn plan(
-    checkouts: &[Checkout],
-    ticket: &Ticket,
-    map_issue: u64,
-    route: Route,
-    mode: LaunchMode,
-) -> Targets {
-    let launches: Vec<Launch> = candidate_checkouts(checkouts, &ticket.repo)
+pub fn plan(checkouts: &[Checkout], staged: &Staged, mode: LaunchMode) -> Targets {
+    let launches: Vec<Launch> = candidate_checkouts(checkouts, &staged.repo)
         .into_iter()
         .map(|c| Launch {
-            repo: ticket.repo.clone(),
-            ticket: ticket.number,
-            map_issue,
+            repo: staged.repo.clone(),
+            ticket: staged.ticket,
+            map_issue: staged.map_issue,
             cwd: c.path.clone(),
-            route,
+            route: staged.route,
             mode: mode.clone(),
         })
         .collect();
@@ -352,9 +388,7 @@ mod tests {
     fn plan_wf(checkouts: &[Checkout], ticket: &Ticket, map_issue: u64) -> Targets {
         plan(
             checkouts,
-            ticket,
-            map_issue,
-            Route::Wayfinder,
+            &Staged::new(ticket, map_issue, Route::Wayfinder),
             LaunchMode::Interactive,
         )
     }
@@ -468,7 +502,8 @@ mod tests {
     #[test]
     fn the_agent_command_is_the_route_plus_the_mode_suffix() {
         let launch = |route: Route, mode: LaunchMode| -> String {
-            match plan(&cache(), &ticket("blooop/wayfinder", 16), 1, route, mode) {
+            let staged = Staged::new(&ticket("blooop/wayfinder", 16), 1, route);
+            match plan(&cache(), &staged, mode) {
                 Targets::One(l) => l.agent_argv().last().expect("a prompt").clone(),
                 other => panic!("{other:?}"),
             }

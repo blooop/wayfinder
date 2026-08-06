@@ -460,15 +460,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // The count line's slot is shared: while a launch is staged (#62) the
     // launch line lives there instead — the resolved route, the ticket it
     // launches, and the mode text as it is typed.
-    if let Overlay::LaunchLine { row, route, text } = &app.overlay {
-        let ticket = app.ticket(row);
+    if let Overlay::LaunchLine { staged, text } = &app.overlay {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
-                    format!("  → {}", route.label()),
+                    format!("  → {}", staged.route.label()),
                     Style::new().fg(Color::Cyan),
                 ),
-                Span::raw(format!(" · #{} {}  {text}", ticket.number, ticket.title)),
+                Span::raw(format!(" · #{} {}  {text}", staged.ticket, staged.title)),
                 Span::styled("█", Style::new().add_modifier(Modifier::DIM)),
             ])),
             count_area,
