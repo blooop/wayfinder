@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Overlay, Scope};
+use crate::launch::Launch;
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
 use crate::view::{Fold, GroupKind, Item, Plan, Screen};
 
@@ -24,9 +25,10 @@ fn glyph_style(glyph: RowGlyph) -> Style {
         RowGlyph::Stage(Stage::Ready) => Style::new().fg(Color::Green),
         RowGlyph::Stage(Stage::Building) => Style::new().fg(Color::Yellow),
         RowGlyph::Stage(Stage::InReview) => Style::new().fg(Color::Magenta),
-        RowGlyph::Stage(Stage::NeedsAttention) => Style::new().fg(Color::Red),
+        // One arm, because it is one meaning: both of these are waiting on a
+        // person, and the colour is what says so.
+        RowGlyph::Stage(Stage::NeedsAttention) | RowGlyph::Blocked => Style::new().fg(Color::Red),
         RowGlyph::Stage(Stage::Done) => Style::new().add_modifier(Modifier::DIM),
-        RowGlyph::Blocked => Style::new().fg(Color::Red),
     }
 }
 
@@ -189,7 +191,7 @@ fn ticket_line(
 }
 
 /// The body as styled lines: the [`Plan`] walked in order. Shared by the live
-/// draw and the TestBackend tests.
+/// draw and the `TestBackend` tests.
 pub fn body_lines(app: &App) -> Vec<Line<'static>> {
     body_with_cursor(app, &app.plan()).0
 }
@@ -304,6 +306,11 @@ const KEY_HINTS: &str =
 /// [`crate::refresh::Startup`] exists to remove. So both other cases are named
 /// before "no projects" is claimed. With clusters on screen, the heading
 /// counts the ground they cover: the one repo's slug, or how many projects.
+///
+/// # Panics
+///
+/// Never: the arm that takes the single failed id has already matched on
+/// `len() == 1`.
 pub fn heading(app: &App) -> String {
     if app.clusters.is_empty() {
         if !app.startup.is_loaded() {
@@ -336,6 +343,11 @@ pub fn heading(app: &App) -> String {
 /// one: four clusters on screen and a fifth missing draws a perfectly normal
 /// screen, so the only place left to say so is here — and it has to survive
 /// the next keypress, which the one-shot notice does not.
+///
+/// # Panics
+///
+/// Never: as in [`heading`], the arm that takes the single failed id has
+/// already matched on `len() == 1`.
 pub fn failure_note(app: &App) -> String {
     match app.failed.len() {
         0 => String::new(),
@@ -377,7 +389,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// exactly one, and `wf` cannot guess which. The path *is* the row — it is what
 /// distinguishes the candidates, and with no session to name there is nothing
 /// shorter to show alongside it.
-fn draw_overlay(frame: &mut Frame, app: &App) {
+fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     let Overlay::PickCheckout { launches, cursor } = &app.overlay else {
         return;
     };
@@ -399,7 +411,7 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
     ));
     // This asks *which checkout*, so the ticket only needs identifying — its
     // title is already on the row behind the prompt.
-    let key = launches.first().map(|l| l.key()).unwrap_or_default();
+    let key = launches.first().map(Launch::key).unwrap_or_default();
     let width = lines
         .iter()
         .map(|l| l.width() as u16 + 4)
@@ -422,7 +434,7 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
 /// clusters, then the anchored bottom chrome — the match-count line (with the
 /// load hint and any one-shot notice), the fzf-style prompt, and the key hints.
 /// The which-checkout picker, when open, floats over all of it.
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let mut block = match &app.scope {
         Scope::All => Block::bordered().title(format!(" wf · {} ", heading(app))),
         // The focused title names the project by its full slug — with one
@@ -569,7 +581,7 @@ mod tests {
         }
     }
 
-    /// Render the app through TestBackend and return the screen as text.
+    /// Render the app through `TestBackend` and return the screen as text.
     fn render(app: &App) -> String {
         let backend = TestBackend::new(90, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");

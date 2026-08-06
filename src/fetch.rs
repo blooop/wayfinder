@@ -11,9 +11,9 @@
 //!
 //! The `blockedBy` selection already carries the *full* edge set — closed
 //! blockers included — and since #50 the parse keeps it: the open subset
-//! becomes [`Status::Blocked`]'s `needs`, the whole set becomes
-//! [`Ticket::blocked_by`] (the DAG), and neither is re-derived from the other
-//! afterwards.
+//! becomes [`Status::Blocked`](crate::model::Status::Blocked)'s `needs`, the
+//! whole set becomes [`Ticket::blocked_by`] (the DAG), and neither is
+//! re-derived from the other afterwards.
 //!
 //! Both invocations are `stdin`-nulled and `kill_on_drop`. Neither is
 //! decoration. `tokio`'s `Command::output()` pipes only stdout and stderr and
@@ -180,7 +180,7 @@ fn parse_pr(pr: &PrNode) -> Option<PrLink> {
             checks: match pr.status_check_rollup.as_ref().map(|r| r.state.as_str()) {
                 None => Checks::Absent,
                 Some("SUCCESS") => Checks::Passing,
-                Some("FAILURE") | Some("ERROR") => Checks::Failing,
+                Some("FAILURE" | "ERROR") => Checks::Failing,
                 Some(_) => Checks::Pending, // EXPECTED, PENDING, or newer
             },
             review: match pr.review_decision.as_deref() {
@@ -205,6 +205,14 @@ fn is_open(state: &str) -> bool {
 
 /// Fetch one map live: the map issue named by `id`, its sub-issues, and their
 /// blocking edges — one `gh api graphql` round trip.
+///
+/// # Errors
+///
+/// A malformed repo slug, a `gh` that is missing or unauthenticated, a network
+/// failure, or a response that does not parse. Every one of them is the same
+/// thing to the caller — the cluster for this map does not arrive — and
+/// [`refresh`](crate::refresh) turns it into the failure note on screen rather
+/// than an exit.
 pub async fn fetch_map(id: &MapId) -> Result<Map> {
     let (owner, name) = id
         .repo
@@ -333,6 +341,12 @@ struct SearchResponse {
 /// contributes several ids (#50 — the lowest-number-per-slug rule that used to
 /// hide all but one is gone), and repos without maps are simply absent. Only
 /// open map issues count — a closed map is a finished map.
+///
+/// # Errors
+///
+/// The search itself failing: no `gh`, no credentials, no network, or a
+/// response that does not parse. An empty `repos` is not an error — it is an
+/// empty [`MapSet`], which is what a machine with nothing discovered yet has.
 pub async fn find_maps(repos: &[String]) -> Result<MapSet> {
     if repos.is_empty() {
         return Ok(MapSet::new());

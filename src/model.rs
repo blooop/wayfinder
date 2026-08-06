@@ -255,8 +255,8 @@ impl TicketType {
     /// recognised label is [`TicketType::Untyped`].
     ///
     /// Labels are a *set*, so several type labels on one issue is a
-    /// representable input and needs a rule. It resolves by
-    /// [`TicketType::precedence`], HITL-first, so an ambiguous ticket never
+    /// representable input and needs a rule. It resolves by `precedence`
+    /// (private, just below), HITL-first, so an ambiguous ticket never
     /// reads as the kind you could walk away from:
     /// `wayfinder:research` + `wayfinder:task` is a `Task`.
     pub fn from_labels<'a, I: IntoIterator<Item = &'a str>>(labels: I) -> TicketType {
@@ -372,6 +372,12 @@ pub struct Ticket {
     pub title: String,
     pub status: Status,
     /// The `wayfinder:*` type, parsed from the issue's labels at fetch time.
+    ///
+    /// Named after the label vocabulary it carries rather than shortened to
+    /// `kind`: on the tracker this is literally the ticket's *type*, and
+    /// `ticket.ticket_type` matching `wayfinder:type/*` is worth more than
+    /// avoiding the repeated word.
+    #[allow(clippy::struct_field_names)]
     pub ticket_type: TicketType,
     /// Every issue this ticket is blocked by — the full DAG edge set, closed
     /// blockers included (#50). This is *structure*, where

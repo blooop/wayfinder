@@ -1,0 +1,7 @@
+# `wf` is a binary. `src/lib.rs` exists so the integration tests under `tests/`
+# can reach the internals, not because anything outside this repository links
+# against it — there is no semver promise to keep. Telling clippy that turns on
+# the lints it otherwise suppresses for `pub` items (needless_pass_by_value,
+# wrong_self_convention, and the rest of the API-shape family), which is where
+# most of this crate's code lives.
+avoid-breaking-exported-api = false

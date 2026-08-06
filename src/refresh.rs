@@ -3,7 +3,7 @@
 //!
 //! `wf` is on screen for seconds and restarts warm in ~0.6 s, so there is
 //! nothing here to keep fresh — [Build 7](https://github.com/blooop/wayfinder/issues/34)
-//! deleted the two-tier ETag poll ([Build 5](https://github.com/blooop/wayfinder/issues/17))
+//! deleted the two-tier `ETag` poll ([Build 5](https://github.com/blooop/wayfinder/issues/17))
 //! along with the event loop it served. What is left is a **one-shot load per
 //! map**, streamed:
 //!
@@ -126,7 +126,7 @@ impl Startup {
     /// unless it has already reported.
     pub fn searched(&mut self, maps: &MapSet) {
         self.search = Search::Answered;
-        self.expected = maps.clone();
+        self.expected.clone_from(maps);
     }
 
     /// Record `id`'s map reporting. A *failed* fetch counts as reported: the
@@ -187,7 +187,7 @@ impl Startup {
 /// set is reconciled against the truth instead. The id *is* the whole target
 /// — repo and number both — so "same repo, different map number" is simply a
 /// different key, not a number to compare.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Loaders {
     running: BTreeMap<MapId, JoinHandle<()>>,
 }

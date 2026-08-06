@@ -19,6 +19,36 @@ nothing else — there is no multiplexer to install.
 `wf --version` and `wf --help` are the only arguments; everything else is keys
 in the TUI.
 
+## Checks
+
+`.github/workflows/ci.yml` runs four things on every pull request and every push
+to main, in the order they are cheap to fix:
+
+```
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked
+cargo test --locked --lib --bins --examples
+cargo doc --no-deps --all-features --locked
+```
+
+Run them locally with the same commands. CI adds `RUSTFLAGS=-D warnings`, so
+anything that warns there fails; the lint *levels* live in one place,
+Cargo.toml's `[lints]` table, which is `clippy::all` + `clippy::pedantic` plus a
+handful of rustc lints, and denies `unsafe` outright — the only `unsafe` in the
+repo is the pty harness in `tests/live_launch_exec.rs`, which says so with a
+file-level `allow` and a reason. `rustfmt.toml` and `clippy.toml` hold the rest;
+every lint that is switched off carries a comment saying why, so the list stays
+arguable rather than accumulating.
+
+Everything under `tests/` is a `live_*` integration test — a real `gh`, real
+network, real assertions against this project's own tracker — so CI compiles
+them but does not run them, and a moving map never breaks a build. Run them
+yourself when the fetch or launch path changes:
+
+```
+cargo test --test live_fetch --test live_discovery
+```
+
 ## Releasing
 
 `recipe/recipe.yaml` builds the binary straight from the checkout, and

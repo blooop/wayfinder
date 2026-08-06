@@ -6,6 +6,63 @@ description = "Multi-project wayfinder ticket selector: a fuzzy-find picker over
 license = "MIT"
 repository = "https://github.com/blooop/wayfinder"
 
+# The lint level for every target in the crate — `src/`, `tests/`, and the
+# doctests — declared here rather than as `#![warn(...)]` in `src/lib.rs`,
+# because an inner attribute in the library root does not reach `tests/`.
+# Nothing is `deny` except `unsafe_code`: CI turns warnings into failures with
+# `-D warnings` (.github/workflows/ci.yml), so a local build stays readable
+# while a pull request still cannot merge with a warning in it.
+[lints.rust]
+# There is no `unsafe` in `src/` and there is no reason for any: everything
+# dangerous `wf` does, it does by handing work to another process. The one
+# genuine exception is the pty harness in tests/live_launch_exec.rs, which says
+# so with a file-level `allow` — so adding unsafe anywhere is now a visible,
+# deliberate act rather than a line that slips through review.
+unsafe_code = "deny"
+
+# `&Foo` in a signature where `Foo` has a lifetime, written `&Foo<'_>`. Purely
+# so the elision is visible at the call site.
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+unused_lifetimes = "warn"
+trivial_casts = "warn"
+
+[lints.clippy]
+# `all` is correctness + suspicious + style + complexity + perf; `pedantic` is
+# the opinionated layer on top. Both at `priority = -1` so the individual
+# `allow`s below win over the group they belong to, whatever order cargo emits
+# them in.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Every `allow` below is a lint that is right about the code and wrong about
+# this crate. Nothing else is silenced — the rest of `pedantic` was fixed rather
+# than switched off.
+
+# `#[must_use]` is a promise to a caller outside the crate, and there is none:
+# `wf` is a binary. Annotating ~55 internal accessors would be pure noise.
+must_use_candidate = "allow"
+
+# Laying out a terminal is `usize` arithmetic that has to end up in ratatui's
+# `u16` coordinates. The casts are the honest expression of that boundary, and
+# a screen wide enough to overflow one does not exist; `try_into().unwrap()` at
+# each site would only move the same assumption into a panic.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+
+# Wants `Duration::from_mins(1)` where a test writes `from_secs(60)`. The
+# timeouts in tests/live_launch_exec.rs are meant to be compared with each other
+# at a glance — `from_secs(60)` beside `from_secs(30)` says more than one of each
+# unit does — and the suggested constructor is newer than the toolchain the
+# recipe asks for anyway.
+duration_suboptimal_units = "allow"
+
+# `dbg!` survives a review far too easily.
+dbg_macro = "warn"
+
 [dev-dependencies]
 # Only the pty end-to-end test needs it: driving the real binary through a real
 # terminal is the only way to prove `enter` execs the agent (tests/live_launch_exec.rs).

@@ -246,9 +246,15 @@ impl Launch {
     /// **The caller must have restored the terminal first.** There is no second
     /// chance after the image is replaced, so that ordering lives in `main`,
     /// where it is one statement above the call, rather than in here.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: [`agent_argv`](Self::agent_argv) builds the vector
+    /// literally and always starts it with the program name, so the split below
+    /// cannot come up empty. The `expect` is there to say so.
     pub fn exec(&self) -> anyhow::Error {
         let argv = self.agent_argv();
-        let (program, args) = argv.split_first().expect("agent argv is never empty");
+        let (program, rest) = argv.split_first().expect("agent argv is never empty");
 
         // Resolved against `$PATH` *before* the chdir, deliberately. `exec`
         // chdirs into `cwd` and only then runs `execvp`, so a `$PATH` holding
@@ -275,13 +281,13 @@ impl Launch {
 
         // `CommandExt::exec` only ever returns on failure.
         let err = Command::new(&program)
-            .args(args)
+            .args(rest)
             .current_dir(&self.cwd)
             .exec();
         // Quoted, so the prompt reads as the single argument it is — the whole
         // invariant `agent_argv` exists to hold.
         let quoted: Vec<String> = std::iter::once(program.display().to_string())
-            .chain(args.iter().cloned())
+            .chain(rest.iter().cloned())
             .map(|a| format!("{a:?}"))
             .collect();
         anyhow::Error::new(err).context(format!(
@@ -339,7 +345,12 @@ pub enum Targets {
 /// Resolve a launch request against the projects cache. Zero or one candidate
 /// never prompts. The route and mode arrive already settled — this function
 /// only answers *where* the agent can run.
-pub fn plan(checkouts: &[Checkout], staged: &Staged, mode: LaunchMode) -> Targets {
+///
+/// # Panics
+///
+/// Never: the `expect` in the one-candidate arm is guarded by the `match` on
+/// the length immediately above it.
+pub fn plan(checkouts: &[Checkout], staged: &Staged, mode: &LaunchMode) -> Targets {
     let launches: Vec<Launch> = candidate_checkouts(checkouts, &staged.repo)
         .into_iter()
         .map(|c| Launch {
@@ -389,7 +400,7 @@ mod tests {
         plan(
             checkouts,
             &Staged::new(ticket, map_issue, Route::Wayfinder),
-            LaunchMode::Interactive,
+            &LaunchMode::Interactive,
         )
     }
 
@@ -449,7 +460,7 @@ mod tests {
         };
         assert_eq!(launches.len(), 2);
         assert_eq!(
-            launches.iter().map(|l| l.cwd()).collect::<Vec<_>>(),
+            launches.iter().map(Launch::cwd).collect::<Vec<_>>(),
             vec![
                 Path::new("/data/k1/kinisi_ros"),
                 Path::new("/data/k2/kinisi_ros")
@@ -503,7 +514,7 @@ mod tests {
     fn the_agent_command_is_the_route_plus_the_mode_suffix() {
         let launch = |route: Route, mode: LaunchMode| -> String {
             let staged = Staged::new(&ticket("blooop/wayfinder", 16), 1, route);
-            match plan(&cache(), &staged, mode) {
+            match plan(&cache(), &staged, &mode) {
                 Targets::One(l) => l.agent_argv().last().expect("a prompt").clone(),
                 other => panic!("{other:?}"),
             }

@@ -2,7 +2,7 @@
 //! very checkout is discovered from its git metadata, registered into a
 //! throwaway cache, its map found via the one-shot label search, and the
 //! map fetched. Needs network, an authenticated `gh`, and this test running
-//! from inside the wayfinder checkout (CARGO_MANIFEST_DIR).
+//! from inside the wayfinder checkout (`CARGO_MANIFEST_DIR`).
 
 use std::path::Path;
 
