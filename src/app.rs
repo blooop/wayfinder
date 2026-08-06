@@ -1418,7 +1418,10 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder 4 103 defer");
+        assert_eq!(
+            launch.agent_argv().last().unwrap(),
+            "/wayfinder 4 103 defer"
+        );
     }
 
     #[test]
@@ -1483,7 +1486,13 @@ mod tests {
         let mut ready = build_app(vec![]);
         ready.handle_key(key(KeyCode::Enter));
         assert!(
-            matches!(&ready.overlay, Overlay::LaunchLine { route: Route::Tdd, .. }),
+            matches!(
+                &ready.overlay,
+                Overlay::LaunchLine {
+                    route: Route::Tdd,
+                    ..
+                }
+            ),
             "{:?}",
             ready.overlay
         );
@@ -1503,7 +1512,13 @@ mod tests {
         }]);
         in_review.handle_key(key(KeyCode::Enter));
         assert!(
-            matches!(&in_review.overlay, Overlay::LaunchLine { route: Route::Review, .. }),
+            matches!(
+                &in_review.overlay,
+                Overlay::LaunchLine {
+                    route: Route::Review,
+                    ..
+                }
+            ),
             "{:?}",
             in_review.overlay
         );

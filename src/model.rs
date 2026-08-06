@@ -54,16 +54,6 @@ pub enum Status {
 }
 
 impl Status {
-    /// The state glyph shown at the start of every row.
-    pub fn glyph(&self) -> char {
-        match self {
-            Status::Frontier => '○',
-            Status::Claimed => '◐',
-            Status::Blocked { .. } => '⊘',
-            Status::Done => '●',
-        }
-    }
-
     /// Position of this status within the cluster header's counts
     /// (frontier / claimed / blocked / done).
     pub fn group(&self) -> usize {
@@ -95,6 +85,44 @@ pub enum Stage {
     InReview,
     NeedsAttention,
     Done,
+}
+
+/// What a row's leading glyph column shows (#62): the node's stage, unless
+/// the node is blocked — `⊘` overrides, because a blocked node's stage is
+/// unactionable until its blockers clear. One sum type rather than a char, so
+/// the rollup counts and the row draw share meanings, not symbols.
+///
+/// `Ord` is display order — `○ ◐ ◍ ! ● ⊘` — which the derive gives for free:
+/// stages in lattice order, the blocked override after them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RowGlyph {
+    Stage(Stage),
+    Blocked,
+}
+
+impl RowGlyph {
+    /// The glyph column for one ticket: its stage, blocked overriding.
+    pub fn of(ticket: &Ticket) -> RowGlyph {
+        match ticket.status {
+            Status::Blocked { .. } => RowGlyph::Blocked,
+            Status::Frontier | Status::Claimed | Status::Done => {
+                RowGlyph::Stage(stage(&ticket.prs, &ticket.status))
+            }
+        }
+    }
+
+    /// The character drawn: `○` ready · `◐` building/in progress · `◍` in
+    /// review · `!` needs attention · `●` done · `⊘` blocked.
+    pub fn char(self) -> char {
+        match self {
+            RowGlyph::Stage(Stage::Ready) => '○',
+            RowGlyph::Stage(Stage::Building) => '◐',
+            RowGlyph::Stage(Stage::InReview) => '◍',
+            RowGlyph::Stage(Stage::NeedsAttention) => '!',
+            RowGlyph::Stage(Stage::Done) => '●',
+            RowGlyph::Blocked => '⊘',
+        }
+    }
 }
 
 /// What one **open** PR says about its node — the fixed per-PR table (#61).
@@ -549,7 +577,10 @@ mod tests {
         // Row 1 of the #61 table: failing checks or a changes-requested review
         // → needs attention. Either signal alone is enough.
         assert_eq!(
-            stage(&[open_pr(Checks::Failing, Review::NotRequired)], &Status::Frontier),
+            stage(
+                &[open_pr(Checks::Failing, Review::NotRequired)],
+                &Status::Frontier
+            ),
             Stage::NeedsAttention
         );
         assert_eq!(
@@ -565,20 +596,32 @@ mod tests {
             Stage::Building
         );
         assert_eq!(
-            stage(&[open_pr(Checks::Pending, Review::Required)], &Status::Frontier),
+            stage(
+                &[open_pr(Checks::Pending, Review::Required)],
+                &Status::Frontier
+            ),
             Stage::Building
         );
         // Row 3: otherwise open — approved-awaiting-merge included → in review.
         assert_eq!(
-            stage(&[open_pr(Checks::Passing, Review::Approved)], &Status::Frontier),
+            stage(
+                &[open_pr(Checks::Passing, Review::Approved)],
+                &Status::Frontier
+            ),
             Stage::InReview
         );
         assert_eq!(
-            stage(&[open_pr(Checks::Absent, Review::NotRequired)], &Status::Frontier),
+            stage(
+                &[open_pr(Checks::Absent, Review::NotRequired)],
+                &Status::Frontier
+            ),
             Stage::InReview
         );
         assert_eq!(
-            stage(&[open_pr(Checks::Passing, Review::Required)], &Status::Frontier),
+            stage(
+                &[open_pr(Checks::Passing, Review::Required)],
+                &Status::Frontier
+            ),
             Stage::InReview
         );
     }
@@ -617,8 +660,14 @@ mod tests {
     #[test]
     fn with_no_open_prs_a_merged_pr_means_done() {
         // The work landed: done, whatever the ticket itself still says.
-        assert_eq!(stage(&[pr(PrStatus::Merged)], &Status::Frontier), Stage::Done);
-        assert_eq!(stage(&[pr(PrStatus::Merged)], &Status::Claimed), Stage::Done);
+        assert_eq!(
+            stage(&[pr(PrStatus::Merged)], &Status::Frontier),
+            Stage::Done
+        );
+        assert_eq!(
+            stage(&[pr(PrStatus::Merged)], &Status::Claimed),
+            Stage::Done
+        );
         assert_eq!(stage(&[pr(PrStatus::Merged)], &Status::Done), Stage::Done);
     }
 
@@ -626,8 +675,14 @@ mod tests {
     fn a_closed_unmerged_pr_is_no_evidence_at_all() {
         // Abandoned PRs neither advance nor hold the node: fall through to
         // ticket state as if they were never linked.
-        assert_eq!(stage(&[pr(PrStatus::Closed)], &Status::Frontier), Stage::Ready);
-        assert_eq!(stage(&[pr(PrStatus::Closed)], &Status::Claimed), Stage::Building);
+        assert_eq!(
+            stage(&[pr(PrStatus::Closed)], &Status::Frontier),
+            Stage::Ready
+        );
+        assert_eq!(
+            stage(&[pr(PrStatus::Closed)], &Status::Claimed),
+            Stage::Building
+        );
     }
 
     #[test]
@@ -640,7 +695,39 @@ mod tests {
         // A blocked node's work has not begun, so its stage is ready — the
         // glyph column overrides with ⊘ and enter refuses it, but blocked is
         // status, not a sixth stage.
-        assert_eq!(stage(&[], &Status::Blocked { needs: vec![7] }), Stage::Ready);
+        assert_eq!(
+            stage(&[], &Status::Blocked { needs: vec![7] }),
+            Stage::Ready
+        );
+    }
+
+    #[test]
+    fn the_glyph_column_shows_the_stage_with_blocked_overriding() {
+        // The five stage glyphs (#62)…
+        assert_eq!(RowGlyph::Stage(Stage::Ready).char(), '○');
+        assert_eq!(RowGlyph::Stage(Stage::Building).char(), '◐');
+        assert_eq!(RowGlyph::Stage(Stage::InReview).char(), '◍');
+        assert_eq!(RowGlyph::Stage(Stage::NeedsAttention).char(), '!');
+        assert_eq!(RowGlyph::Stage(Stage::Done).char(), '●');
+        // …and the blocked override: whatever the PRs say, a blocked node's
+        // stage is unactionable and the column says so.
+        assert_eq!(RowGlyph::Blocked.char(), '⊘');
+        let mut blocked = Ticket {
+            repo: "blooop/wayfinder".to_string(),
+            number: 7,
+            title: "t7".to_string(),
+            status: Status::Blocked { needs: vec![6] },
+            ticket_type: TicketType::Build,
+            blocked_by: vec![6],
+            prs: vec![open_pr(Checks::Failing, Review::NotRequired)],
+        };
+        assert_eq!(RowGlyph::of(&blocked), RowGlyph::Blocked);
+        // The same ticket unblocked reads as its PR's stage.
+        blocked.status = Status::Frontier;
+        assert_eq!(
+            RowGlyph::of(&blocked),
+            RowGlyph::Stage(Stage::NeedsAttention)
+        );
     }
 
     #[test]

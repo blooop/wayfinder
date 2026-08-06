@@ -10,10 +10,12 @@
 //!
 //! It pins down three claims, in the order they can fail:
 //!
-//! 1. **`enter` execs the agent.** `claude` is shimmed to a script that records
-//!    its argv and cwd, so the assertion is on what `wf` actually handed the
-//!    agent — `--dangerously-skip-permissions "/wayfinder <map> <n>"`, in the
-//!    checkout — rather than on what it planned to.
+//! 1. **`enter` execs the agent.** Two enters since the two-step launch (#62):
+//!    the first stages the launch line, the second launches it interactive.
+//!    `claude` is shimmed to a script that records its argv and cwd, so the
+//!    assertion is on what `wf` actually handed the agent —
+//!    `--dangerously-skip-permissions "<skill> …"`, in the checkout — rather
+//!    than on what it planned to.
 //! 2. **`wf` is gone.** The shim is the *same process* as the `wf` that was
 //!    spawned: an `exec` replaces the image, so the pid the test is waiting on
 //!    exits with the shim's status. Spawn-and-wait would leave a `wf` parent
@@ -235,8 +237,14 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
     // Generous, because a cold cache pays for the map search before the fetch.
     wait_for(&seen, "▶", Duration::from_secs(60), "the map to load");
 
+    // First enter stages the launch: the line shows the resolved route where
+    // the count line was. The second enter, on an empty line, launches
+    // interactive — today's default.
     keys.write_all(b"\r").expect("send enter");
     keys.flush().expect("flush enter");
+    wait_for(&seen, "→ /", Duration::from_secs(10), "the launch line");
+    keys.write_all(b"\r").expect("send the second enter");
+    keys.flush().expect("flush the second enter");
 
     let stream = wait_for(&seen, RAN, Duration::from_secs(30), "the agent to run");
     let screen = String::from_utf8_lossy(&stream).into_owned();
@@ -273,18 +281,25 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
     );
     let (skip, prompt) = argv.split_once(' ').expect("two arguments");
     assert_eq!(skip, "--dangerously-skip-permissions");
-    // This repo keeps several maps open (#50) and which cluster the cursor was
-    // in is the live tracker's business, so only the prompt's shape is
-    // asserted: `/wayfinder <map> <ticket>`, both numbers.
-    let numbers = prompt
-        .strip_prefix("/wayfinder ")
-        .unwrap_or_else(|| panic!("prompt was {prompt:?}"));
-    let (map, ticket) = numbers.split_once(' ').expect("map and ticket numbers");
-    for half in [map, ticket] {
+    // This repo keeps several maps open (#50), and which cluster — and which
+    // ticket, at which stage — the cursor landed on is the live tracker's
+    // business. So only the prompt's shape is asserted: one of the three
+    // routes (#61), with its numeric arguments and no mode suffix (the line
+    // was empty — interactive).
+    let (skill, numbers) = prompt.split_once(' ').expect("a skill and arguments");
+    let halves: Vec<&str> = match skill {
+        "/wayfinder" => numbers.splitn(2, ' ').collect(),
+        "/tdd" | "/review" => vec![numbers],
+        other => panic!("unroutable skill {other:?} in prompt {prompt:?}"),
+    };
+    for half in &halves {
         assert!(
             !half.is_empty() && half.chars().all(|c| c.is_ascii_digit()),
             "prompt was {prompt:?}"
         );
+    }
+    if skill == "/wayfinder" {
+        assert_eq!(halves.len(), 2, "prompt was {prompt:?}");
     }
 
     // Claim 3a: the tty itself came back. `wf` runs raw the whole time it is
