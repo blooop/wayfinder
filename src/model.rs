@@ -145,13 +145,17 @@ pub fn stage(prs: &[PrLink], status: &Status) -> Stage {
 /// at the `gh` boundary ([`TicketType::from_labels`]) and never re-sniffed from
 /// strings afterwards.
 ///
-/// Total over the four types the skill defines **plus** [`TicketType::Untyped`],
-/// so a ticket that carries no type label is an ordinary value rather than a
-/// missing one. Every site that decides something from a type matches all five
-/// arms with no wildcard, which is what makes a fifth `wayfinder:*` type a
-/// compile error rather than a silent misreading.
+/// Total over the five types the skill suite defines **plus**
+/// [`TicketType::Untyped`], so a ticket that carries no type label is an
+/// ordinary value rather than a missing one. Every site that decides something
+/// from a type matches all six arms with no wildcard, which is what makes a
+/// new `wayfinder:*` type a compile error rather than a silent misreading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketType {
+    /// `wayfinder:build` — the one execution type (#61): a ticket that is a
+    /// build contract, worked by `/tdd` and `/review` across its stages rather
+    /// than resolved in a decision session.
+    Build,
     /// `wayfinder:research` — away-from-keyboard by definition: reading sources
     /// to surface a fact a decision waits on.
     Research,
@@ -179,6 +183,7 @@ impl TicketType {
     /// binary shipped.
     pub fn from_label(label: &str) -> Option<TicketType> {
         match label.trim() {
+            "wayfinder:build" => Some(TicketType::Build),
             "wayfinder:research" => Some(TicketType::Research),
             "wayfinder:task" => Some(TicketType::Task),
             "wayfinder:grilling" => Some(TicketType::Grilling),
@@ -209,6 +214,7 @@ impl TicketType {
     /// wants, and "untyped" answers a question nobody asked.
     pub fn short_name(self) -> Option<&'static str> {
         match self {
+            TicketType::Build => Some("build"),
             TicketType::Research => Some("research"),
             TicketType::Task => Some("task"),
             TicketType::Grilling => Some("grilling"),
@@ -230,9 +236,12 @@ impl TicketType {
             TicketType::Prototype => 1,
             TicketType::Task => 2,
             TicketType::Research => 3,
+            // The most autonomous type of all — its whole lifecycle runs
+            // unattended — so every other real type outranks it.
+            TicketType::Build => 4,
             // Never returned by `from_label`, so this rank is only a
             // total-ordering formality — and last, so a real type always wins.
-            TicketType::Untyped => 4,
+            TicketType::Untyped => 5,
         }
     }
 }
@@ -439,6 +448,32 @@ mod tests {
         assert_eq!(
             TicketType::from_labels(["enhancement", "wayfinder:research", "good first issue"]),
             TicketType::Research
+        );
+    }
+
+    #[test]
+    fn the_build_type_label_parses_and_ranks_last_among_real_types() {
+        // The vocabulary grows exactly one type (#61): `wayfinder:build`.
+        assert_eq!(
+            TicketType::from_labels(["wayfinder:build"]),
+            TicketType::Build
+        );
+        assert_eq!(TicketType::Build.short_name(), Some("build"));
+        // HITL-first still holds: build is the most autonomous type of all —
+        // its whole lifecycle runs unattended — so every other real type wins
+        // an ambiguous ticket, and build still beats having no type.
+        for other in [
+            "wayfinder:research",
+            "wayfinder:task",
+            "wayfinder:grilling",
+            "wayfinder:prototype",
+        ] {
+            let both = TicketType::from_labels(["wayfinder:build", other]);
+            assert_ne!(both, TicketType::Build, "build + {other}");
+        }
+        assert_eq!(
+            TicketType::from_labels(["bug", "wayfinder:build"]),
+            TicketType::Build
         );
     }
 

@@ -17,8 +17,67 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::model::Ticket;
+use crate::model::{Stage, Ticket, TicketType};
 use crate::projects::Checkout;
+
+/// Which skill the launched agent runs — the (type, stage) → skill table,
+/// hardcoded in `wf` (#61): not per-ticket config, not a Notes-parsed table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// `/tdd <n>` — build work: ready, resuming, or acting on red checks and
+    /// requested changes (the reviewer's comments live on the PR).
+    Tdd,
+    /// `/review <n>` — a build whose PR awaits its independent look.
+    Review,
+    /// `/wayfinder <map> <n>` — every decision session.
+    Wayfinder,
+}
+
+impl Route {
+    /// How the route reads on the launch line: the slash command it execs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Route::Tdd => "/tdd",
+            Route::Review => "/review",
+            Route::Wayfinder => "/wayfinder",
+        }
+    }
+}
+
+/// Resolve which skill a (type, stage) launches. Total, with `None` as the
+/// one honest refusal: done is not launchable, whatever the type. Blocked is
+/// refused *before* this is consulted — blocked is [`crate::model::Status`],
+/// not a stage, so an illegal blocked route is unrepresentable here.
+///
+/// Every arm is named on both axes: adding a stage or a type without deciding
+/// its route is a compile error, not a silent fall-through.
+pub fn route(ticket_type: TicketType, stage: Stage) -> Option<Route> {
+    match stage {
+        Stage::Done => None,
+        // Build rows of the #61 table: in-review hands off to the fresh-eyes
+        // reviewer; everything else on a build node is code work.
+        Stage::InReview => match ticket_type {
+            TicketType::Build => Some(Route::Review),
+            TicketType::Research
+            | TicketType::Task
+            | TicketType::Grilling
+            | TicketType::Prototype
+            | TicketType::Untyped => Some(Route::Wayfinder),
+        },
+        Stage::Ready | Stage::Building | Stage::NeedsAttention => match ticket_type {
+            TicketType::Build => Some(Route::Tdd),
+            // Decision types (untyped riding along, as it always launched):
+            // /wayfinder at every unfinished stage — PR-dominant derivation
+            // can put a decision node past "in progress" (a prototype's PR
+            // counts), and the skill owns its node's PR state.
+            TicketType::Research
+            | TicketType::Task
+            | TicketType::Grilling
+            | TicketType::Prototype
+            | TicketType::Untyped => Some(Route::Wayfinder),
+        },
+    }
+}
 
 /// A fully-resolved launch: which checkout the agent runs in, and which ticket
 /// of which map it is handed.
@@ -331,6 +390,65 @@ mod tests {
         assert_eq!(short_repo("blooop/wayfinder"), "wayfinder");
         // Not a slug at all: the whole thing is the name.
         assert_eq!(short_repo("wayfinder"), "wayfinder");
+    }
+
+    #[test]
+    fn build_nodes_route_to_tdd_except_in_review_which_routes_to_review() {
+        // The #61 routing table's build rows: failing checks and requested
+        // changes are code work, so needs-attention goes back to /tdd.
+        assert_eq!(route(TicketType::Build, Stage::Ready), Some(Route::Tdd));
+        assert_eq!(route(TicketType::Build, Stage::Building), Some(Route::Tdd));
+        assert_eq!(
+            route(TicketType::Build, Stage::NeedsAttention),
+            Some(Route::Tdd)
+        );
+        assert_eq!(
+            route(TicketType::Build, Stage::InReview),
+            Some(Route::Review)
+        );
+    }
+
+    #[test]
+    fn decision_types_route_to_wayfinder_at_every_unfinished_stage() {
+        // The table lists decision types at ready/in-progress, but PR-dominant
+        // derivation can put one at in-review or needs-attention (a
+        // prototype's PR counts) — the skill owns its node's PR state, so the
+        // route stays /wayfinder at every stage short of done. Untyped rides
+        // along: launching untyped tickets is today's behavior, kept.
+        for ticket_type in [
+            TicketType::Research,
+            TicketType::Task,
+            TicketType::Grilling,
+            TicketType::Prototype,
+            TicketType::Untyped,
+        ] {
+            for stage in [
+                Stage::Ready,
+                Stage::Building,
+                Stage::InReview,
+                Stage::NeedsAttention,
+            ] {
+                assert_eq!(
+                    route(ticket_type, stage),
+                    Some(Route::Wayfinder),
+                    "{ticket_type:?} at {stage:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn done_is_not_launchable_whatever_the_type() {
+        for ticket_type in [
+            TicketType::Build,
+            TicketType::Research,
+            TicketType::Task,
+            TicketType::Grilling,
+            TicketType::Prototype,
+            TicketType::Untyped,
+        ] {
+            assert_eq!(route(ticket_type, Stage::Done), None, "{ticket_type:?}");
+        }
     }
 
     #[test]
