@@ -255,7 +255,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
 /// quits on an empty one, and `q` only quits when the query is empty (mid-query
 /// it types).
 const KEY_HINTS: &str =
-    "  enter launch · ←→ open · tab structure · ctrl-f focus · ctrl-r refresh · esc quit";
+    "  enter launch · ←→ depth · ctrl-j/k ready · tab structure · ctrl-r refresh · esc quit";
 
 /// The project heading in the title bar.
 ///
