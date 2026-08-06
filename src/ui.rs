@@ -2,8 +2,9 @@
 //! [`Plan`] (#51). The default is the leverage view — takeable tickets,
 //! most-dependents-first, each with the subtree it unblocks — with the full
 //! blocking forest on `tab` and a live query flattening either into one
-//! score-ordered list. Rows are `<glyph> #n <title> [type]`; done work is a
-//! per-cluster count on the default screen and dimmed in place on the forest.
+//! score-ordered list. Rows are `<glyph> #n <title> [type] ⇄ PR#n <state>`;
+//! done work is a per-cluster count on the default screen and dimmed in place
+//! on the forest.
 
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -12,7 +13,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Overlay, Scope};
-use crate::model::{Map, MapId, Status, Ticket};
+use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, Status, Ticket};
 use crate::view::{Item, Plan, Screen};
 
 fn glyph_style(status: &Status) -> Style {
@@ -50,10 +51,50 @@ fn cluster_header(id: &MapId, map: &Map) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The `⇄ PR#n <state>` badge spans for one linked PR (#52) — evidence of the
+/// ticket's progress, riding after the `[type]` suffix. An open PR folds its
+/// two live signals into one glyph: `✗` when something needs acting on (checks
+/// failing or changes requested), `✓` when nothing is outstanding, nothing
+/// while it is still in flight. A PR living in another repo names it — links
+/// are cross-repo capable and the badge must not imply otherwise.
+fn pr_badge(ticket_repo: &str, pr: &PrLink) -> Vec<Span<'static>> {
+    let repo = if pr.repo == ticket_repo {
+        String::new()
+    } else {
+        format!(" {}", pr.short_repo())
+    };
+    let (word, verdict) = match &pr.status {
+        PrStatus::Draft => ("draft", None),
+        PrStatus::Merged => ("merged", None),
+        PrStatus::Closed => ("closed", None),
+        PrStatus::Open { checks, review } => {
+            let acting_needed =
+                matches!(checks, Checks::Failing) || matches!(review, Review::ChangesRequested);
+            let settled = matches!(checks, Checks::Passing | Checks::Absent)
+                && matches!(review, Review::Approved | Review::NotRequired);
+            let verdict = if acting_needed {
+                Some(Span::styled(" ✗", Style::new().fg(Color::Red)))
+            } else if settled {
+                Some(Span::styled(" ✓", Style::new().fg(Color::Green)))
+            } else {
+                None
+            };
+            ("open", verdict)
+        }
+    };
+    let mut spans = vec![Span::styled(
+        format!("  ⇄ PR{repo}#{} {word}", pr.number),
+        Style::new().fg(Color::Magenta),
+    )];
+    spans.extend(verdict);
+    spans
+}
+
 /// One ticket row: cursor marker, tree furniture, state glyph, `#n title`,
-/// then the dim `[type]` suffix — and on the forest, the extra blocking edges
-/// the tree position cannot show (`⤷ also needs #n`). The flattened screen has
-/// no cluster header above the row, so the row names its repo itself.
+/// then the dim `[type]` suffix and any `⇄ PR` badges — and on the forest, the
+/// extra blocking edges the tree position cannot show (`⤷ also needs #n`). The
+/// flattened screen has no cluster header above the row, so the row names its
+/// repo itself.
 fn ticket_line(
     ticket: &Ticket,
     prefix: &str,
@@ -81,6 +122,9 @@ fn ticket_line(
             format!(" [{name}]"),
             Style::new().add_modifier(Modifier::DIM),
         ));
+    }
+    for pr in &ticket.prs {
+        spans.extend(pr_badge(&ticket.repo, pr));
     }
     if !also_needs.is_empty() {
         let needs: Vec<String> = also_needs.iter().map(|n| format!("#{n}")).collect();
@@ -384,6 +428,7 @@ mod tests {
             status: classify(open, assigned, needs.clone()),
             ticket_type: TicketType::Task,
             blocked_by: needs,
+            prs: vec![],
         }
     }
 
@@ -503,6 +548,82 @@ mod tests {
             screen.contains("#6 Re-entry breadcrumbs [task]"),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn pr_badges_ride_their_ticket_row() {
+        let mut map = wf_map();
+        let t6 = map
+            .tickets
+            .iter_mut()
+            .find(|t| t.number == 6)
+            .expect("#6 in the fixture");
+        t6.prs = vec![
+            PrLink {
+                repo: "blooop/wayfinder".to_string(),
+                number: 46,
+                status: PrStatus::Merged,
+            },
+            // Cross-repo, and with both live signals demanding action.
+            PrLink {
+                repo: "blooop/dotfiles".to_string(),
+                number: 12,
+                status: PrStatus::Open {
+                    checks: Checks::Failing,
+                    review: Review::ChangesRequested,
+                },
+            },
+        ];
+        // Nothing outstanding on #9's PR: checks pass, no review required.
+        map.tickets
+            .iter_mut()
+            .find(|t| t.number == 9)
+            .expect("#9 in the fixture")
+            .prs = vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 13,
+            status: PrStatus::Open {
+                checks: Checks::Passing,
+                review: Review::NotRequired,
+            },
+        }];
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        let app = App::new(clusters);
+        let screen = render(&app);
+        // Same-repo badge: `⇄ PR#n <state>` after the [type] suffix.
+        assert!(
+            screen.contains("Re-entry breadcrumbs [task]  ⇄ PR#46 merged"),
+            "{screen}"
+        );
+        // Cross-repo badge names the PR's repo; ✗ folds failing checks and a
+        // changes-requested review into one act-on-it signal.
+        assert!(screen.contains("⇄ PR dotfiles#12 open ✗"), "{screen}");
+        // ✓ only when nothing is outstanding.
+        assert!(screen.contains("⇄ PR#13 open ✓"), "{screen}");
+    }
+
+    #[test]
+    fn an_in_flight_open_pr_gets_no_verdict_glyph() {
+        let mut map = wf_map();
+        map.tickets
+            .iter_mut()
+            .find(|t| t.number == 6)
+            .expect("#6")
+            .prs = vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 14,
+            status: PrStatus::Open {
+                checks: Checks::Pending,
+                review: Review::Required,
+            },
+        }];
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        let screen = render(&App::new(clusters));
+        assert!(screen.contains("⇄ PR#14 open"), "{screen}");
+        assert!(!screen.contains('✓'), "{screen}");
+        assert!(!screen.contains('✗'), "{screen}");
     }
 
     #[test]

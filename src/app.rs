@@ -477,6 +477,7 @@ mod tests {
             status: classify(open, assigned, needs.clone()),
             ticket_type: TicketType::Task,
             blocked_by: needs,
+            prs: vec![],
         }
     }
 
