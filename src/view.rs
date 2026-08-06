@@ -171,6 +171,66 @@ impl Plan {
     }
 }
 
+/// How much of each row's branch furniture lies on the path from the root down
+/// to the cursor: the number of leading two-column units to draw lit rather
+/// than dim, indexed by stop.
+///
+/// The colour follows the **tree**, not the cursor's row. A selection four
+/// levels down is connected to its cluster by a run of guides that may pass
+/// through many unrelated rows on the way, and it is that whole run which says
+/// where you are — lighting only the cursor's own line leaves the eye to guess
+/// which of the identical `│` columns above it is the one that leads there.
+///
+/// What lights is the **chain of branches** leading to the selection: each path
+/// node's own `├─`/`└─`, and on the cursor's row its whole indent. Rows the
+/// path merely passes on the way — an earlier sibling and its subtree — stay
+/// entirely dim, so a lit branch always means "the selection is through here"
+/// and never "this row is chosen". The result reads as a staircase from the
+/// cluster down to the cursor.
+///
+/// The lit units of a row are always a leading run, which is why one count per
+/// row suffices.
+pub fn cursor_path(stops: &[StopAt], cursor: usize) -> Vec<usize> {
+    let mut lit = vec![0usize; stops.len()];
+    let Some(here) = stops.get(cursor) else {
+        return lit;
+    };
+
+    // owners[k] is the stop that owns unit position k — the path node at depth
+    // k + 1, the deepest of which is the cursor itself.
+    let mut owners = vec![cursor; here.depth];
+    let mut depth = here.depth;
+    for i in (0..cursor).rev() {
+        if depth <= 1 {
+            break;
+        }
+        if stops[i].depth == depth - 1 {
+            depth -= 1;
+            owners[depth - 1] = i;
+        }
+    }
+
+    for (k, &owner) in owners.iter().enumerate() {
+        for (r, at) in stops.iter().enumerate().take(cursor + 1).skip(owner) {
+            // Light this unit if it is the path node's own branch, or a
+            // continuation guide of it passing through a deeper row.
+            if r == owner || at.depth > k + 1 {
+                lit[r] = lit[r].max(k + 1);
+            }
+        }
+    }
+
+    // The depth-0 node the path hangs from. A ticket there has no furniture to
+    // light, but a *group* has its fold marker, and an open group whose rows
+    // the cursor is inside should show it.
+    if here.depth > 0 {
+        if let Some(root) = (0..cursor).rev().find(|&i| stops[i].depth == 0) {
+            lit[root] = lit[root].max(1);
+        }
+    }
+    lit
+}
+
 /// Plan the body for the clusters in scope, in their given (render) order.
 pub fn plan(clusters: &[(&MapId, &Map)], screen: Screen, expanded: &Expanded) -> Plan {
     match screen {
@@ -941,6 +1001,113 @@ mod tests {
             vec![7, 8],
             "every ticket is a row exactly once"
         );
+    }
+
+    /// A cluster shaped so the path to a deep row has to pass *through* an
+    /// unrelated sibling subtree — the case that separates "light the tree" from
+    /// "light the cursor's row".
+    fn forked_map() -> Map {
+        map(vec![
+            ticket(10, true, false, vec![]),   // root
+            ticket(11, true, false, vec![10]), // first child
+            ticket(12, true, false, vec![11]), // …with a child of its own
+            ticket(13, true, false, vec![10]), // second child: the target
+            ticket(14, true, false, vec![13]), // its child
+        ])
+    }
+
+    #[test]
+    fn the_lit_path_runs_from_the_root_down_to_the_cursor() {
+        let m = forked_map();
+        let binding = id();
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        // Stops: 0 #10 d0, 1 #11 d1, 2 #12 d2, 3 #13 d1, 4 #14 d2.
+        assert_eq!(
+            nav(&plan, &m),
+            vec![
+                ("#10".to_string(), 0),
+                ("#11".to_string(), 1),
+                ("#12".to_string(), 2),
+                ("#13".to_string(), 1),
+                ("#14".to_string(), 2),
+            ]
+        );
+        let stops = plan.stops();
+
+        // Cursor on #14, two levels down and past #11's subtree entirely. The
+        // chain is #10 → #13 → #14: #13's own branch lights, #14 lights its
+        // whole indent, and #11/#12 — merely in the way — stay dark. #10's 1 is
+        // the allowance a depth-0 line needs for a group's fold marker; a
+        // ticket there has no furniture, so it draws nothing.
+        assert_eq!(
+            cursor_path(&stops, 4),
+            vec![1, 0, 0, 1, 2],
+            "#11 and #12 are passed over, not claimed"
+        );
+
+        // Cursor on #12: now it is #11's branch that is on the way, and #13/#14
+        // (below the cursor) are untouched.
+        assert_eq!(cursor_path(&stops, 2), vec![1, 1, 2, 0, 0]);
+
+        // Cursor on a depth-0 root: nothing to trace.
+        assert_eq!(cursor_path(&stops, 0), vec![0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_sibling_the_path_passes_is_left_entirely_dim() {
+        // The distinction the highlight rests on. #11 is at the same depth as
+        // the path node #13 and sits directly above it, so lighting anything on
+        // its row would read as a second selection.
+        let m = forked_map();
+        let binding = id();
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        let stops = plan.stops();
+        let lit = cursor_path(&stops, 4);
+        assert_eq!(
+            (stops[1].depth, lit[1]),
+            (1, 0),
+            "#11 is a sibling, not the way"
+        );
+        assert_eq!((stops[2].depth, lit[2]), (2, 0), "nor is its child #12");
+        assert_eq!((stops[3].depth, lit[3]), (1, 1), "#13 is on the chain");
+        assert_eq!(
+            (stops[4].depth, lit[4]),
+            (2, 2),
+            "and the cursor lights in full"
+        );
+    }
+
+    #[test]
+    fn the_path_lights_the_group_a_held_row_sits_under() {
+        // Selecting a done ticket inside an opened group should light that
+        // group's fold marker — the only furniture a depth-0 line has.
+        let m = map(vec![
+            ticket(2, false, false, vec![]),
+            ticket(6, true, false, vec![]),
+        ]);
+        let binding = id();
+        let open: Expanded = [GroupId {
+            map: binding.clone(),
+            kind: GroupKind::Done,
+        }]
+        .into_iter()
+        .collect();
+        let plan = plan(&[(&binding, &m)], Screen::Structured(Lens::Leverage), &open);
+        let stops = plan.stops();
+        // Stops: 0 #6 d0, 1 Done d0, 2 #2 d1.
+        assert_eq!(stops.len(), 3);
+        let lit = cursor_path(&stops, 2);
+        assert_eq!(lit[1], 1, "the group line the held row hangs from is lit");
+        assert_eq!(lit[2], 1, "and the held row's own branch");
+        assert_eq!(lit[0], 0, "the unrelated frontier ticket is not");
     }
 
     #[test]

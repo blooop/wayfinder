@@ -88,7 +88,25 @@ async fn main() {
         }
         return;
     }
+    // Re-emit the real styles as ANSI so the lit path is visible in a pipe.
     for line in body_lines(&app) {
-        println!("{line}");
+        let mut out = String::new();
+        for span in &line.spans {
+            let cyan = span.style.fg == Some(ratatui::style::Color::Cyan);
+            let dim = span
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM);
+            let code = if cyan {
+                "\x1b[36;1m"
+            } else if dim {
+                "\x1b[2m"
+            } else {
+                "\x1b[0m"
+            };
+            out.push_str(code);
+            out.push_str(&span.content);
+        }
+        println!("{out}\x1b[0m");
     }
 }

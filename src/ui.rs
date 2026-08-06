@@ -71,19 +71,30 @@ fn cursor_span(under_cursor: bool) -> Span<'static> {
 /// selected row reads as a single lit-up path rather than a lone glyph.
 const CURSOR_COLOR: Style = Style::new().fg(Color::Cyan);
 
-/// How a row's tree furniture is drawn: dim on every ordinary row, and in the
-/// cursor's own colour on the selected one.
+/// How one unit of tree furniture is drawn: in the cursor's colour when it lies
+/// on the path down to the selection ([`crate::view::cursor_path`]), dim
+/// otherwise.
 ///
 /// The branches are what say *where* the cursor is. Left uniformly dim, the
 /// marker was the only lit thing on a screen full of near-identical indented
-/// rows; lighting the run of furniture up to it draws the eye along the path
-/// from the parent down to the selection.
-fn furniture_style(under_cursor: bool) -> Style {
-    if under_cursor {
+/// rows.
+fn furniture_style(on_path: bool) -> Style {
+    if on_path {
         CURSOR_COLOR
     } else {
         Style::new().add_modifier(Modifier::DIM)
     }
+}
+
+/// Split a row's furniture into its two-column units (`│ `, `  `, `├─`, `└─`) —
+/// one per level of depth, which is the granularity the path highlight works at.
+fn furniture_units(prefix: &str) -> Vec<String> {
+    prefix
+        .chars()
+        .collect::<Vec<char>>()
+        .chunks(2)
+        .map(|unit| unit.iter().collect())
+        .collect()
 }
 
 /// The `⇄ PR#n <state>` badge spans for one linked PR (#52) — evidence of the
@@ -136,6 +147,7 @@ fn ticket_line(
     also_needs: &[u64],
     name_repo: bool,
     under_cursor: bool,
+    lit_units: usize,
 ) -> Line<'static> {
     let repo = if name_repo {
         ticket.short_repo().to_string()
@@ -144,21 +156,23 @@ fn ticket_line(
     };
     // Nested rows carry the cursor column as extra indent, so a branch begins
     // directly under the glyph of the row it hangs from instead of to its left.
-    let indent = if prefix.is_empty() {
-        String::new()
-    } else {
-        format!("  {prefix}")
-    };
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::styled(indent, furniture_style(under_cursor)),
+    let mut spans = vec![Span::raw("  ")];
+    if !prefix.is_empty() {
+        spans.push(Span::raw("  "));
+    }
+    // One span per two-column unit, so the run on the path to the cursor can be
+    // lit while the rest of the same row stays dim.
+    for (i, unit) in furniture_units(prefix).into_iter().enumerate() {
+        spans.push(Span::styled(unit, furniture_style(i < lit_units)));
+    }
+    spans.extend([
         cursor_span(under_cursor),
         Span::styled(
             ticket.status.glyph().to_string(),
             glyph_style(&ticket.status),
         ),
         Span::raw(format!(" {repo}#{} {}", ticket.number, ticket.title)),
-    ];
+    ]);
     if let Some(name) = ticket.ticket_type.short_name() {
         spans.push(Span::styled(
             format!(" [{name}]"),
@@ -192,7 +206,13 @@ pub fn body_lines(app: &App) -> Vec<Line<'static>> {
 /// where a ticket row's tree furniture would be, then the count it is holding.
 /// It says `(hidden)` only while shut — once open, the rows are right there and
 /// claiming otherwise would be a lie.
-fn group_line(kind: GroupKind, hidden: usize, expanded: bool, under_cursor: bool) -> Line<'static> {
+fn group_line(
+    kind: GroupKind,
+    hidden: usize,
+    expanded: bool,
+    under_cursor: bool,
+    on_path: bool,
+) -> Line<'static> {
     let fold = if expanded { '▾' } else { '▸' };
     let (glyph, label, color) = match kind {
         GroupKind::BlockedDeeper => ('⊘', "blocked deeper down", Color::Red),
@@ -202,7 +222,7 @@ fn group_line(kind: GroupKind, hidden: usize, expanded: bool, under_cursor: bool
     Line::from(vec![
         Span::raw("  "),
         cursor_span(under_cursor),
-        Span::styled(format!("{fold} "), furniture_style(under_cursor)),
+        Span::styled(format!("{fold} "), furniture_style(under_cursor || on_path)),
         Span::styled(glyph.to_string(), Style::new().fg(color)),
         Span::styled(
             format!(" {hidden} {label}{tail}"),
@@ -223,17 +243,20 @@ fn group_line(kind: GroupKind, hidden: usize, expanded: bool, under_cursor: bool
 fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize>) {
     let name_repo = matches!(app.screen(), Screen::Flattened { .. });
     let cursor_pos = app.cursor_pos();
+    // How much furniture each row has on the path to the cursor, by stop index.
+    let path = crate::view::cursor_path(&plan.stops(), cursor_pos);
     let mut stop = 0usize;
     let mut cursor_line = None;
     // Every stop the plan lists gets one line, in the same order, so this
     // single counter is what keeps the drawn ▶ and the cursor in agreement.
     let mut mark = |lines: &Vec<Line<'static>>, cursor_line: &mut Option<usize>| {
-        let under_cursor = stop == cursor_pos;
+        let here = stop;
+        let under_cursor = here == cursor_pos;
         if under_cursor {
             *cursor_line = Some(lines.len());
         }
         stop += 1;
-        under_cursor
+        (here, under_cursor)
     };
 
     let mut lines = vec![Line::default()];
@@ -246,13 +269,15 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                 also_needs,
                 depth: _,
             } => {
-                let under_cursor = mark(&lines, &mut cursor_line);
+                let (here, under_cursor) = mark(&lines, &mut cursor_line);
+                let lit = path.get(here).copied().unwrap_or(0);
                 lines.push(ticket_line(
                     app.ticket(row),
                     prefix,
                     also_needs,
                     name_repo,
                     under_cursor,
+                    lit,
                 ));
             }
             Item::Group {
@@ -260,8 +285,17 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                 hidden,
                 expanded,
             } => {
-                let under_cursor = mark(&lines, &mut cursor_line);
-                lines.push(group_line(id.kind, *hidden, *expanded, under_cursor));
+                // A group's fold marker sits where furniture would, so it lights
+                // when the cursor is among the rows it holds.
+                let (here, under_cursor) = mark(&lines, &mut cursor_line);
+                let on_path = path.get(here).copied().unwrap_or(0) > 0;
+                lines.push(group_line(
+                    id.kind,
+                    *hidden,
+                    *expanded,
+                    under_cursor,
+                    on_path,
+                ));
             }
             Item::Blank => lines.push(Line::default()),
         }
