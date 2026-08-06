@@ -58,24 +58,24 @@ linked pull requests (GitHub's Development-panel set: closing keywords and
 manual links), shown as `draft`/`open`/`merged`/`closed` with `✓`/`✗` on an
 open PR when its checks and review are settled or need action.
 
-Navigation has **two axes**, which is what keeps a tree browsable and a pick
-list quick at the same time:
+`↑`/`↓` prefer **siblings at the cursor's depth**, so on the default screen they
+move between tickets you can actually take and step over the blocked context
+hanging beneath them; `→` reveals what the cursor is on and `←` closes it again.
+Depth 0 spans clusters, so `↓` still carries you from one project into the next.
 
-- `↑`/`↓` **move**, one row at a time, depth-first through the body exactly as
-  drawn — into subtrees and back out. Held down they walk the whole list and
-  settle against its ends, so nothing on screen is unreachable.
-- `→`/`←` **change depth**: `→` opens a shut `▸` group or steps onto the first
-  child of the subtree under the cursor, `←` shuts an open one or climbs to the
-  parent. They only ever land one level away, and hold still where there is no
-  such level (`→` on a leaf, `←` at the top).
-- `ctrl-j`/`ctrl-k` are the **pick axis**: the next ticket you could actually
-  take — frontier or claimed — skipping blocked context, done rows and group
-  lines alike. This is the "what do I do next" key, and it walks the actionable
-  work of every project in turn.
+Every direction key **always navigates**: held down, each one keeps moving until
+it reaches its own end of the list, and none of them can strand the cursor. A
+preference is only a preference — where there is no sibling to walk to (a ticket
+that is an only child, say) `↑`/`↓` step to the neighbouring row instead, and
+`←` falls back the same way once there is no parent left to climb to. `→` steps
+one stop at a time, so it is the key that visits everything.
 
 The cursor `▶` sits directly against the item it points at rather than in a
 left-hand gutter, so it visibly steps rightward as you descend and the depth
-axis is something you can see.
+axis is something you can see. The run of branch furniture leading into it is
+lit in the same colour, drawing the eye along the path from the parent down to
+the selection — on a screen of near-identical indented rows, the marker alone
+was too small a thing to find.
 
 Done work collapses to a per-cluster `▸ ● N done (hidden)` line and blocked
 tickets no subtree reaches to `▸ ⊘ N blocked deeper down`. Both are ordinary
@@ -135,10 +135,9 @@ then it *is* the process you started.
 | --- | --- |
 | *type anything* | fuzzy-filter: the tree flattens to one score-ordered list; clearing restores it |
 | `tab` | toggle the leverage view ⇄ the structure forest |
-| `↑`/`↓` | move one row, depth-first through the body as drawn (cluster headers are never a stop) |
-| `→` | one level deeper: open a `▸ done`/`▸ blocked` group, else onto the subtree's first child |
-| `←` | one level out: shut an open group, else climb to the parent |
-| `ctrl-j`/`ctrl-k` | jump to the next/previous ticket you could take, skipping context, done rows and group lines |
+| `↑`/`↓`, `ctrl-j`/`ctrl-k` | move between siblings at the cursor's depth — on the default screen, the tickets you can take (cluster headers are never a stop) |
+| `→` | reveal: open a `▸ done`/`▸ blocked` group, else step forward one stop — which *is* descending, since a subtree's first row follows its parent |
+| `←` | close: shut an open group, else back out to the parent, else one stop back |
 | `enter` | run the agent on the ticket under the cursor, here, and exit — on a group line it folds instead, since there is no agent to run |
 | `ctrl-f` | focus the cursor row's project — only its clusters stay on screen |
 | `ctrl-g` | widen back to every project |

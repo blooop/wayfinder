@@ -61,9 +61,28 @@ fn cluster_header(id: &MapId, map: &Map) -> Line<'static> {
 /// rightward as you descend, which is the whole feedback the depth keys need.
 fn cursor_span(under_cursor: bool) -> Span<'static> {
     if under_cursor {
-        Span::styled("▶ ", Style::new().fg(Color::Cyan))
+        Span::styled("▶ ", CURSOR_COLOR)
     } else {
         Span::raw("  ")
+    }
+}
+
+/// One colour shared by the marker and the branch run leading into it, so the
+/// selected row reads as a single lit-up path rather than a lone glyph.
+const CURSOR_COLOR: Style = Style::new().fg(Color::Cyan);
+
+/// How a row's tree furniture is drawn: dim on every ordinary row, and in the
+/// cursor's own colour on the selected one.
+///
+/// The branches are what say *where* the cursor is. Left uniformly dim, the
+/// marker was the only lit thing on a screen full of near-identical indented
+/// rows; lighting the run of furniture up to it draws the eye along the path
+/// from the parent down to the selection.
+fn furniture_style(under_cursor: bool) -> Style {
+    if under_cursor {
+        CURSOR_COLOR
+    } else {
+        Style::new().add_modifier(Modifier::DIM)
     }
 }
 
@@ -132,7 +151,7 @@ fn ticket_line(
     };
     let mut spans = vec![
         Span::raw("  "),
-        Span::styled(indent, Style::new().add_modifier(Modifier::DIM)),
+        Span::styled(indent, furniture_style(under_cursor)),
         cursor_span(under_cursor),
         Span::styled(
             ticket.status.glyph().to_string(),
@@ -183,7 +202,7 @@ fn group_line(kind: GroupKind, hidden: usize, expanded: bool, under_cursor: bool
     Line::from(vec![
         Span::raw("  "),
         cursor_span(under_cursor),
-        Span::styled(format!("{fold} "), Style::new().add_modifier(Modifier::DIM)),
+        Span::styled(format!("{fold} "), furniture_style(under_cursor)),
         Span::styled(glyph.to_string(), Style::new().fg(color)),
         Span::styled(
             format!(" {hidden} {label}{tail}"),
@@ -255,7 +274,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
 /// quits on an empty one, and `q` only quits when the query is empty (mid-query
 /// it types).
 const KEY_HINTS: &str =
-    "  enter launch · ←→ depth · ctrl-j/k ready · tab structure · ctrl-r refresh · esc quit";
+    "  enter launch · ←→ open · tab structure · ctrl-f focus · ctrl-r refresh · esc quit";
 
 /// The project heading in the title bar.
 ///
@@ -677,6 +696,41 @@ mod tests {
         assert!(screen.contains("⇄ PR#14 open"), "{screen}");
         assert!(!screen.contains('✓'), "{screen}");
         assert!(!screen.contains('✗'), "{screen}");
+    }
+
+    #[test]
+    fn the_branch_leading_into_the_cursor_row_is_lit_not_dim() {
+        // On a screen of near-identical indented rows the lone ▶ was doing all
+        // the work; the run of furniture into it is what shows *where* the
+        // selection sits, so it shares the marker's colour.
+        let mut app = fixture_app();
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.cursor_ticket().expect("a ticket").number, 7);
+
+        let lines = body_lines(&app);
+        let furniture = |needle: &str| -> Style {
+            let line = lines
+                .iter()
+                .find(|line| line.to_string().contains(needle))
+                .unwrap_or_else(|| panic!("no row for {needle}"));
+            line.spans
+                .iter()
+                .find(|span| span.content.contains('─'))
+                .unwrap_or_else(|| panic!("no branch on {needle}"))
+                .style
+        };
+
+        assert_eq!(
+            furniture("#7 Supervising").fg,
+            Some(Color::Cyan),
+            "the selected row's branch is lit"
+        );
+        let elsewhere = furniture("#14 Breadcrumb");
+        assert_ne!(elsewhere.fg, Some(Color::Cyan));
+        assert!(
+            elsewhere.add_modifier.contains(Modifier::DIM),
+            "every other branch stays dim"
+        );
     }
 
     #[test]

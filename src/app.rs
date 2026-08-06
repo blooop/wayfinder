@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::launch::{self, Launch, Targets};
-use crate::model::{Map, MapId, MapSet, Status, Ticket};
+use crate::model::{Map, MapId, MapSet, Ticket};
 use crate::projects::Checkout;
 use crate::refresh::Startup;
 use crate::view::{self, Expanded, GroupId, Lens, Plan, Screen, Stop, StopAt};
@@ -302,55 +302,63 @@ impl App {
         self.cursor = pos.unwrap_or(0);
     }
 
-    /// `↑`/`↓`: the next stop on screen, whatever its depth (#57).
+    /// `↑`/`↓`: the next stop at the cursor's own depth, else simply the next
+    /// stop (#57).
     ///
-    /// The plain depth-first walk of the body as drawn, exactly as a file tree
-    /// behaves — one line at a time, into subtrees and out of them, so nothing
-    /// on screen is unreachable and the keys never stall short of an end.
-    /// Jumping *over* the context to the next actionable ticket is a separate
-    /// axis ([`App::move_takeable`]) rather than a special case of this one.
-    fn move_row(&mut self, delta: isize) {
-        let len = self.stops().len();
-        if len == 0 {
+    /// Preferring *siblings* is what makes the default screen a pick list: at
+    /// depth 0 the stops are the takeable tickets and the group lines, so `↓`
+    /// moves between things you can act on and steps over the blocked context
+    /// hanging beneath them. The scan gives up at a shallower stop, because
+    /// that means leaving the parent — except at depth 0, where nothing is
+    /// shallower and the walk therefore spans clusters, keeping the
+    /// multi-project list one axis.
+    ///
+    /// The fallback is not a nicety. A ticket that is an **only child** has no
+    /// sibling in either direction, and long single-file chains are the normal
+    /// shape of a real map — so a strict sibling walk left the cursor wedged on
+    /// them, unable to move at all. Falling through to the adjacent stop means
+    /// `↑`/`↓` can always walk the tree and no stop is ever unreachable by them
+    /// alone, while a genuine sibling still wins whenever there is one.
+    fn move_sibling(&mut self, delta: isize) {
+        let stops = self.stops();
+        if stops.is_empty() {
             self.cursor = 0;
             return;
         }
-        let pos = self.cursor_pos() as isize + delta;
-        self.cursor = pos.clamp(0, len as isize - 1) as usize;
-    }
-
-    /// `ctrl-j`/`ctrl-k`: the next ticket you could actually take — frontier or
-    /// claimed — skipping the blocked context, the done rows and the group
-    /// lines alike.
-    ///
-    /// This is the pick axis, on its own keys. Held down it walks the
-    /// actionable work of every cluster in turn and stops when there is no more
-    /// of it, which is the honest end for a key that means *next thing to do*.
-    fn move_takeable(&mut self, delta: isize) {
-        let stops = self.stops();
-        let mut i = self.cursor_pos() as isize;
+        let pos = self.cursor_pos();
+        let depth = stops[pos].depth;
+        let mut adjacent = None;
+        let mut i = pos as isize;
         loop {
             i += delta;
             let Some(at) = usize::try_from(i).ok().and_then(|i| stops.get(i)) else {
-                return; // no further actionable ticket that way
+                break; // ran off the end
             };
-            if let Stop::Ticket(row) = &at.stop {
-                if matches!(self.ticket(row).status, Status::Frontier | Status::Claimed) {
-                    self.cursor = i as usize;
-                    return;
-                }
+            let i = i as usize;
+            adjacent.get_or_insert(i);
+            if at.depth == depth {
+                self.cursor = i;
+                return;
             }
+            if at.depth < depth {
+                break; // left the parent
+            }
+        }
+        // No sibling that way: step one stop, so the cursor is never wedged.
+        // `None` only when there is nothing at all in that direction, which is
+        // the one case where holding still is the honest answer.
+        if let Some(next) = adjacent {
+            self.cursor = next;
         }
     }
 
-    /// `→`: one level deeper — open a shut group, else step onto the first
-    /// child of the subtree under the cursor.
+    /// `→`: reveal — open a shut group, else move *forward* one stop.
     ///
-    /// A plan always emits a node's children immediately after it, so the first
-    /// child is simply the next stop *when* it is a level down; that check is
-    /// what keeps this a depth key rather than a second `↓`. On a leaf there is
-    /// nothing deeper and it holds still, which costs nothing now that `↑`/`↓`
-    /// reach every row on their own.
+    /// Stepping forward one stop is what descending *is*: a plan always emits a
+    /// node's children immediately after it, so the stop after a ticket with a
+    /// subtree is its first child. On a leaf there is nothing to descend into
+    /// and the same step carries on to whatever comes next, which is what keeps
+    /// the key live everywhere — held down, `→` visits every stop in order.
     fn descend(&mut self) {
         if let Some(Stop::Group(id)) = self.cursor_stop() {
             if !self.expanded.contains(&id) {
@@ -358,17 +366,15 @@ impl App {
                 return; // the rows appear beneath; the cursor stays on the line
             }
         }
-        let stops = self.stops();
         let pos = self.cursor_pos();
-        let Some(here) = stops.get(pos) else { return };
-        if stops.get(pos + 1).map(|next| next.depth) == Some(here.depth + 1) {
+        if pos + 1 < self.stops().len() {
             self.cursor = pos + 1;
         }
     }
 
-    /// `←`: one level out — shut an open group, else climb to the parent. The
-    /// mirror of [`App::descend`], and inert at depth 0 for the same reason:
-    /// there is no level to go to.
+    /// `←`: close — shut an open group, else out to the parent, else back one
+    /// stop. The mirror of [`App::descend`]: it only ever moves earlier in the
+    /// body, and the last clause is what stops it dying at depth 0.
     fn ascend(&mut self) {
         if let Some(Stop::Group(id)) = self.cursor_stop() {
             if self.expanded.remove(&id) {
@@ -380,11 +386,14 @@ impl App {
         let Some(depth) = stops.get(pos).map(|at| at.depth) else {
             return;
         };
-        if depth == 0 {
-            return;
+        if depth > 0 {
+            if let Some(parent) = (0..pos).rev().find(|&i| stops[i].depth == depth - 1) {
+                self.cursor = parent;
+                return;
+            }
         }
-        if let Some(parent) = (0..pos).rev().find(|&i| stops[i].depth == depth - 1) {
-            self.cursor = parent;
+        if pos > 0 {
+            self.cursor = pos - 1;
         }
     }
 
@@ -546,24 +555,23 @@ impl App {
                 }
                 Outcome::Continue
             }
-            // `↑`/`↓` walk the body as drawn, one row at a time (#57).
+            // `↑`/`↓` walk siblings at the cursor's depth (#57) — the pick
+            // axis, stepping over the context beneath a ticket rather than
+            // through it.
             KeyCode::Down => {
-                self.move_row(1);
+                self.move_sibling(1);
                 Outcome::Continue
             }
             KeyCode::Up => {
-                self.move_row(-1);
+                self.move_sibling(-1);
                 Outcome::Continue
             }
-            // `ctrl-j`/`ctrl-k` are the pick axis: the next ticket you could
-            // take, skipping context. They used to be plain aliases of `↓`/`↑`,
-            // which was a binding spent on nothing.
             KeyCode::Char('j') if ctrl => {
-                self.move_takeable(1);
+                self.move_sibling(1);
                 Outcome::Continue
             }
             KeyCode::Char('k') if ctrl => {
-                self.move_takeable(-1);
+                self.move_sibling(-1);
                 Outcome::Continue
             }
             // `→`/`←` are the depth axis: reveal what the cursor is on, or
@@ -726,73 +734,64 @@ mod tests {
     }
 
     #[test]
-    fn up_and_down_walk_every_row_depth_first() {
-        // The body as drawn, one line at a time — into subtrees and out again,
-        // exactly as a file tree behaves. Clusters order by (repo, number), so
-        // dotfiles#4 comes before wayfinder#1.
+    fn down_walks_the_takeable_tickets_and_steps_over_their_context() {
+        // Clusters order by (repo, number): dotfiles#4 before wayfinder#1.
+        // The depth-0 axis is dotfiles #103, then wayfinder's takeable #6 and
+        // #9, then its Done group — #7 hangs under #6 as context and is *not*
+        // on this axis, which is the whole point of #57.
         let mut app = fixture_app();
-        let mut walked = vec![at(&app)];
-        for _ in 0..app.stops().len() {
+        assert_eq!(at(&app), "#103");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "#6");
+        app.handle_key(ctrl('j'));
+        assert_eq!(at(&app), "#9", "#7 is context under #6, not a stop here");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "Done");
+        for _ in 0..10 {
             app.handle_key(key(KeyCode::Down));
-            walked.push(at(&app));
         }
-        assert_eq!(
-            walked,
-            vec!["#103", "#6", "#7", "#9", "Done", "Done"],
-            "↓ visits #7 — the context under #6 — rather than skipping it, then clamps"
-        );
+        assert_eq!(at(&app), "Done", "clamped at the last stop");
+        app.handle_key(ctrl('k'));
+        assert_eq!(at(&app), "#9");
         for _ in 0..10 {
             app.handle_key(key(KeyCode::Up));
         }
         assert_eq!(
             at(&app),
             "#103",
-            "↑ clamps at the first stop, across clusters"
+            "clamped at the first stop, across clusters"
         );
     }
 
     #[test]
-    fn ctrl_j_and_k_jump_between_the_tickets_you_could_take() {
-        // The pick axis, on its own keys: frontier and claimed tickets only, so
-        // blocked context, done rows and group lines are all stepped over.
-        let mut app = fixture_app();
-        assert_eq!(at(&app), "#103");
-        app.handle_key(ctrl('j'));
-        assert_eq!(at(&app), "#6");
-        app.handle_key(ctrl('j'));
-        assert_eq!(at(&app), "#9", "#7 is blocked context, not takeable");
-        app.handle_key(ctrl('j'));
-        assert_eq!(at(&app), "#9", "nothing actionable left — the honest end");
-        app.handle_key(ctrl('k'));
-        assert_eq!(at(&app), "#6");
-        app.handle_key(ctrl('k'));
-        assert_eq!(at(&app), "#103");
-        app.handle_key(ctrl('k'));
-        assert_eq!(at(&app), "#103");
-    }
-
-    #[test]
-    fn right_goes_one_level_deeper_and_left_one_level_out() {
+    fn right_descends_into_the_subtree_and_left_comes_back() {
         let mut app = fixture_app();
         app.handle_key(key(KeyCode::Down)); // wayfinder #6
         assert_eq!(at(&app), "#6");
         app.handle_key(key(KeyCode::Right));
         assert_eq!(at(&app), "#7", "→ steps into what #6 unblocks");
-        // #7 is a leaf: no level below it, and → is a depth key rather than a
-        // second ↓, so it holds.
+        // #7 is an only child, so there is no sibling to walk to — and ↓ must
+        // still move rather than wedge, so it steps to the adjacent stop.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "#9");
+        // ↑ from #9 finds *its* own sibling #6 rather than diving back into
+        // #6's subtree: a real sibling always beats the fallback.
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(at(&app), "#6");
         app.handle_key(key(KeyCode::Right));
         assert_eq!(at(&app), "#7");
         app.handle_key(key(KeyCode::Left));
-        assert_eq!(at(&app), "#6", "← climbs to the parent");
-        // At depth 0 there is no level above, so ← holds too.
+        assert_eq!(at(&app), "#6", "← returns to the parent");
+        // At depth 0 there is no parent to climb to, so ← keeps its promise the
+        // only way left: one stop back.
         app.handle_key(key(KeyCode::Left));
-        assert_eq!(at(&app), "#6");
+        assert_eq!(at(&app), "#103");
     }
 
     #[test]
-    fn right_enters_a_subtree_at_its_first_child() {
-        // Three dependents of one root: → lands on the first, ↓ walks the rest
-        // as ordinary rows, and ← from any of them returns to the parent.
+    fn down_walks_siblings_when_a_root_unblocks_several() {
+        // Three dependents of one root: inside the subtree, ↓ steps between
+        // them and stops at the last rather than leaking back out to depth 0.
         let mut clusters = BTreeMap::new();
         clusters.insert(
             MapId::new("blooop/wayfinder", 1),
@@ -813,8 +812,10 @@ mod tests {
         assert_eq!(at(&app), "#8");
         app.handle_key(key(KeyCode::Down));
         assert_eq!(at(&app), "#9");
-        app.handle_key(key(KeyCode::Left));
-        assert_eq!(at(&app), "#6", "← out of any of them lands on the parent");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "#9", "held at the last sibling");
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(at(&app), "#8");
     }
 
     /// A cluster with every awkward shape at once: a root whose only child has
@@ -842,127 +843,107 @@ mod tests {
         App::new(clusters)
     }
 
-    /// `knotty_app` with the done group opened, so the tests below cover both
-    /// stop lists a fold produces.
-    fn knotty_app_with(open_group: bool) -> App {
+    #[test]
+    fn every_direction_key_always_does_something_unless_it_is_at_that_end() {
+        // The rule the human asked for, as a property rather than an example:
+        // holding *any* direction key down keeps navigating. A key may only sit
+        // still when it is already against its own end of the body — otherwise
+        // it must move the cursor or fold something.
+        for forward in [true, false] {
+            for arrow in [true, false] {
+                let code = match (forward, arrow) {
+                    (true, true) => KeyCode::Down,
+                    (false, true) => KeyCode::Up,
+                    (true, false) => KeyCode::Right,
+                    (false, false) => KeyCode::Left,
+                };
+                // Try it from every reachable position, with the group both
+                // shut and open, since folding changes the stop list.
+                for open_group in [false, true] {
+                    let mut app = knotty_app();
+                    if open_group {
+                        while !matches!(app.cursor_stop(), Some(Stop::Group(_))) {
+                            app.handle_key(key(KeyCode::Down));
+                        }
+                        app.handle_key(key(KeyCode::Right));
+                        app.cursor = 0;
+                    }
+                    let total = app.stops().len();
+                    for start in 0..total {
+                        app.cursor = start;
+                        let before = (app.cursor_pos(), app.stops().len());
+                        app.handle_key(key(code));
+                        let after = (app.cursor_pos(), app.stops().len());
+                        let at_its_end = if forward {
+                            start + 1 == total
+                        } else {
+                            start == 0
+                        };
+                        if at_its_end {
+                            continue; // allowed to hold still, nothing beyond
+                        }
+                        assert_ne!(
+                            before,
+                            after,
+                            "{code:?} stalled at stop {start} of {total} \
+                             (group {}): a direction key must always navigate",
+                            if open_group { "open" } else { "shut" }
+                        );
+                        // …and it must go the way it was asked to go.
+                        if after.1 == before.1 {
+                            if forward {
+                                assert!(after.0 > before.0, "{code:?} went backwards");
+                            } else {
+                                assert!(after.0 < before.0, "{code:?} went forwards");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn holding_a_direction_key_walks_all_the_way_to_the_end() {
+        // The consequence of the property above: each key terminates against
+        // its end rather than looping or stalling part-way. `→` is the one that
+        // visits *every* stop, since it steps one at a time.
         let mut app = knotty_app();
-        if open_group {
-            while !matches!(app.cursor_stop(), Some(Stop::Group(_))) {
-                app.handle_key(key(KeyCode::Down));
-            }
+        let mut seen = vec![app.cursor_pos()];
+        for _ in 0..40 {
             app.handle_key(key(KeyCode::Right));
-            app.cursor = 0;
+            seen.push(app.cursor_pos());
         }
-        app
-    }
+        // `→` opened the group it passed through, so the body it finished
+        // walking is larger than the one it started on — measure it now.
+        let total = app.stops().len();
+        assert_eq!(app.cursor_pos(), total - 1, "→ reached the end");
+        let visited: BTreeSet<usize> = seen.into_iter().collect();
+        assert_eq!(visited.len(), total, "→ visited every stop");
 
-    #[test]
-    fn up_and_down_reach_every_row_and_never_stall_short() {
-        // The guarantee that makes ↑/↓ the movement axis: held down, they walk
-        // the whole body and settle against its ends, leaving nothing on screen
-        // unreachable — whatever depth it sits at.
-        for open_group in [false, true] {
-            let mut app = knotty_app_with(open_group);
+        // The other three settle against their own end too, from the far side.
+        for (code, forward) in [
+            (KeyCode::Left, false),
+            (KeyCode::Up, false),
+            (KeyCode::Down, true),
+        ] {
+            let mut app = knotty_app();
             let total = app.stops().len();
-            let mut seen = vec![app.cursor_pos()];
-            for _ in 0..total * 2 {
-                app.handle_key(key(KeyCode::Down));
-                seen.push(app.cursor_pos());
+            app.cursor = if forward { 0 } else { total - 1 };
+            for _ in 0..40 {
+                app.handle_key(key(code));
             }
-            assert_eq!(app.cursor_pos(), total - 1, "↓ settled at the last row");
-            let visited: BTreeSet<usize> = seen.into_iter().collect();
-            assert_eq!(visited.len(), total, "↓ visited every row");
-
-            for _ in 0..total * 2 {
-                app.handle_key(key(KeyCode::Up));
-            }
-            assert_eq!(app.cursor_pos(), 0, "↑ settled at the first row");
+            let end = if forward { app.stops().len() - 1 } else { 0 };
+            assert_eq!(app.cursor_pos(), end, "{code:?} settled at its end");
         }
     }
 
     #[test]
-    fn the_depth_keys_only_ever_change_depth() {
-        // What keeps →/← from being a second ↑/↓: whenever they move at all,
-        // they land exactly one level away. Where there is no such level they
-        // hold still, which is the price of a pure depth axis and is paid for
-        // by ↑/↓ reaching everything on their own.
-        for open_group in [false, true] {
-            let total = knotty_app_with(open_group).stops().len();
-            for start in 0..total {
-                for (code, deeper) in [(KeyCode::Right, true), (KeyCode::Left, false)] {
-                    let mut app = knotty_app_with(open_group);
-                    app.cursor = start;
-                    let before = app.stops();
-                    let depth = before[start].depth;
-                    app.handle_key(key(code));
-                    let after = app.stops();
-                    if after.len() != before.len() {
-                        continue; // it folded a group — the other thing it may do
-                    }
-                    let pos = app.cursor_pos();
-                    if pos == start {
-                        continue; // no level that way
-                    }
-                    let want = if deeper { depth + 1 } else { depth - 1 };
-                    assert_eq!(
-                        after[pos].depth, want,
-                        "{code:?} from stop {start} (depth {depth}) landed at depth {}",
-                        after[pos].depth
-                    );
-                    if deeper {
-                        assert!(pos > start, "→ must not move backwards");
-                    } else {
-                        assert!(pos < start, "← must not move forwards");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_pick_axis_only_ever_lands_on_takeable_tickets() {
-        // ctrl-j/ctrl-k exist to answer "what can I do next", so every stop
-        // they can reach must be a ticket you could actually claim — never a
-        // blocked row, a done row or a group line.
-        for open_group in [false, true] {
-            for (code, forward) in [(ctrl('j'), true), (ctrl('k'), false)] {
-                let mut app = knotty_app_with(open_group);
-                if !forward {
-                    app.cursor = app.stops().len() - 1;
-                }
-                for _ in 0..app.stops().len() * 2 {
-                    let before = app.cursor_pos();
-                    app.handle_key(code);
-                    let pos = app.cursor_pos();
-                    if pos == before {
-                        break; // no more actionable work that way
-                    }
-                    if forward {
-                        assert!(pos > before, "ctrl-j must not move backwards");
-                    } else {
-                        assert!(pos < before, "ctrl-k must not move forwards");
-                    }
-                    let stop = app.cursor_stop().expect("a stop");
-                    let Stop::Ticket(row) = stop else {
-                        panic!("the pick axis landed on a group line");
-                    };
-                    assert!(
-                        matches!(app.ticket(&row).status, Status::Frontier | Status::Claimed),
-                        "the pick axis landed on {:?}",
-                        app.ticket(&row).status
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_chain_of_only_children_walks_like_any_other_rows() {
-        // The live shape that first exposed the wedge (bencher#1064): a root
-        // whose single dependent has dependents of its own, so the middle
-        // ticket has no sibling in either direction. An earlier sibling-walking
-        // ↑/↓ went inert here; walking rows makes the shape unremarkable, which
-        // is the point of keeping this fixture.
+    fn an_only_child_never_wedges_the_cursor() {
+        // The live shape that exposed this (bencher#1064): a root whose single
+        // dependent has dependents of its own, so the middle ticket has no
+        // sibling in either direction. A strict sibling walk left ↑/↓ inert
+        // there — every stop must stay reachable by them alone.
         let mut clusters = BTreeMap::new();
         clusters.insert(
             MapId::new("blooop/bencher", 1064),
@@ -1001,12 +982,13 @@ mod tests {
         app.handle_key(key(KeyCode::Right)); // into #1070
         assert_eq!(at(&app), "#1070");
 
-        // ↓ just carries on down the rows, whatever the depths are doing.
+        // Down has no depth-1 sibling ahead: it steps on rather than freezing.
         app.handle_key(key(KeyCode::Down));
         assert_eq!(at(&app), "#1071");
+        // …and now there *is* a sibling, so the sibling wins.
         app.handle_key(key(KeyCode::Down));
         assert_eq!(at(&app), "#1072");
-        // …and ↑ retraces exactly the same path.
+        // Up back out the same way: sibling first, then the adjacent stop.
         app.handle_key(key(KeyCode::Up));
         assert_eq!(at(&app), "#1071");
         app.handle_key(key(KeyCode::Up));
