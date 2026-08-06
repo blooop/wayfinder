@@ -14,7 +14,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Overlay, Scope};
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, Status, Ticket};
-use crate::view::{Item, Plan, Screen};
+use crate::view::{GroupKind, Item, Plan, Screen};
 
 fn glyph_style(status: &Status) -> Style {
     match status {
@@ -50,6 +50,42 @@ fn cluster_header(id: &MapId, map: &Map) -> Line<'static> {
     }
     Line::from(spans)
 }
+
+/// The cursor marker, which sits **after** a row's tree furniture and directly
+/// against the item it points at.
+///
+/// Column matters here. Parked in a fixed left-hand gutter it could not show
+/// depth at all: `→` moving the cursor a level deeper looked identical to `↓`
+/// moving it a line down, so the depth axis was invisible and the keys felt
+/// interchangeable. Riding with the indentation, the marker steps visibly
+/// rightward as you descend, which is the whole feedback the depth keys need.
+fn cursor_span(under_cursor: bool) -> Span<'static> {
+    if under_cursor {
+        Span::styled(
+            "▶ ",
+            Style::new().fg(CURSOR_COLOR).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("  ")
+    }
+}
+
+/// The marker's colour: orange, and deliberately not one of the six the screen
+/// already spends — cyan on cluster headers and the prompt, green/yellow/red on
+/// the status glyphs and counts, magenta on PR badges, dim on everything
+/// settled. A selection drawn in any of those competes with something that means
+/// something else, which is how the cursor got hard to find in the first place.
+///
+/// It is the *only* thing drawn in it. Lighting the branch run leading down to
+/// the selection as well was tried and dropped: telling apart the elbows that
+/// lead to the cursor from the guides that merely pass it needs rules that are
+/// hard to see and easy to get subtly wrong, and a marker that stands out on its
+/// own does the job the highlight was for.
+const CURSOR_COLOR: Color = Color::Indexed(208);
+
+/// Tree furniture is uniformly dim: it is structure, not status, and the orange
+/// marker is what says where the cursor is.
+const FURNITURE: Style = Style::new().add_modifier(Modifier::DIM);
 
 /// The `⇄ PR#n <state>` badge spans for one linked PR (#52) — evidence of the
 /// ticket's progress, riding after the `[type]` suffix. An open PR folds its
@@ -102,15 +138,22 @@ fn ticket_line(
     name_repo: bool,
     under_cursor: bool,
 ) -> Line<'static> {
-    let cursor = if under_cursor { '▶' } else { ' ' };
     let repo = if name_repo {
         ticket.short_repo().to_string()
     } else {
         String::new()
     };
+    // Nested rows carry the cursor column as extra indent, so a branch begins
+    // directly under the glyph of the row it hangs from instead of to its left.
+    let indent = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("  {prefix}")
+    };
     let mut spans = vec![
-        Span::raw(format!("  {cursor} ")),
-        Span::styled(prefix.to_string(), Style::new().add_modifier(Modifier::DIM)),
+        Span::raw("  "),
+        Span::styled(indent, FURNITURE),
+        cursor_span(under_cursor),
         Span::styled(
             ticket.status.glyph().to_string(),
             glyph_style(&ticket.status),
@@ -146,13 +189,36 @@ pub fn body_lines(app: &App) -> Vec<Line<'static>> {
     body_with_cursor(app, &app.plan()).0
 }
 
-/// [`body_lines`] plus which line the cursor row landed on — what the draw
-/// scrolls to. `None` when no row is visible. Needed since #50: several
-/// clusters can be taller than the screen, and a cursor the body cannot show
-/// is a picker that cannot pick.
+/// A collapsible group's line (#57): the cursor column, a `▸`/`▾` fold marker
+/// where a ticket row's tree furniture would be, then the count it is holding.
+/// It says `(hidden)` only while shut — once open, the rows are right there and
+/// claiming otherwise would be a lie.
+fn group_line(kind: GroupKind, hidden: usize, expanded: bool, under_cursor: bool) -> Line<'static> {
+    let fold = if expanded { '▾' } else { '▸' };
+    let (glyph, label, color) = match kind {
+        GroupKind::BlockedDeeper => ('⊘', "blocked deeper down", Color::Red),
+        GroupKind::Done => ('●', "done", Color::Reset),
+    };
+    let tail = if expanded { "" } else { " (hidden)" };
+    Line::from(vec![
+        Span::raw("  "),
+        cursor_span(under_cursor),
+        Span::styled(format!("{fold} "), FURNITURE),
+        Span::styled(glyph.to_string(), Style::new().fg(color)),
+        Span::styled(
+            format!(" {hidden} {label}{tail}"),
+            Style::new().add_modifier(Modifier::DIM),
+        ),
+    ])
+}
+
+/// [`body_lines`] plus which line the cursor landed on — what the draw scrolls
+/// to. `None` when nothing is on screen. Needed since #50: several clusters can
+/// be taller than the screen, and a cursor the body cannot show is a picker
+/// that cannot pick.
 ///
-/// The cursor is matched by *stop position*, not row identity: the leverage
-/// view can legitimately show one ticket twice (as a takeable root and inside
+/// The cursor is matched by *stop position*, not identity: the leverage view
+/// can legitimately show one ticket twice (as a takeable root and inside
 /// another root's subtree), and only one of those occurrences is under the
 /// cursor.
 fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize>) {
@@ -160,6 +226,17 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
     let cursor_pos = app.cursor_pos();
     let mut stop = 0usize;
     let mut cursor_line = None;
+    // Every stop the plan lists gets one line, in the same order, so this
+    // single counter is what keeps the drawn ▶ and the cursor in agreement.
+    let mut mark = |lines: &Vec<Line<'static>>, cursor_line: &mut Option<usize>| {
+        let here = stop;
+        let under_cursor = here == cursor_pos;
+        if under_cursor {
+            *cursor_line = Some(lines.len());
+        }
+        stop += 1;
+        (here, under_cursor)
+    };
 
     let mut lines = vec![Line::default()];
     for item in &plan.items {
@@ -169,11 +246,9 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                 row,
                 prefix,
                 also_needs,
+                depth: _,
             } => {
-                let under_cursor = stop == cursor_pos;
-                if under_cursor {
-                    cursor_line = Some(lines.len());
-                }
+                let (_, under_cursor) = mark(&lines, &mut cursor_line);
                 lines.push(ticket_line(
                     app.ticket(row),
                     prefix,
@@ -181,16 +256,15 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                     name_repo,
                     under_cursor,
                 ));
-                stop += 1;
             }
-            Item::BlockedDeeper(n) => lines.push(Line::styled(
-                format!("     ⊘ {n} blocked deeper down"),
-                Style::new().fg(Color::Red).add_modifier(Modifier::DIM),
-            )),
-            Item::DoneHidden(n) => lines.push(Line::styled(
-                format!("     ● {n} done (hidden)"),
-                Style::new().add_modifier(Modifier::DIM),
-            )),
+            Item::Group {
+                id,
+                hidden,
+                expanded,
+            } => {
+                let (_, under_cursor) = mark(&lines, &mut cursor_line);
+                lines.push(group_line(id.kind, *hidden, *expanded, under_cursor));
+            }
             Item::Blank => lines.push(Line::default()),
         }
     }
@@ -202,7 +276,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
 /// quits on an empty one, and `q` only quits when the query is empty (mid-query
 /// it types).
 const KEY_HINTS: &str =
-    "  enter launch · tab structure · ctrl-f focus · ctrl-g all · ctrl-r refresh · esc quit";
+    "  enter launch · ←→ open · tab structure · ctrl-f focus · ctrl-r refresh · esc quit";
 
 /// The project heading in the title bar.
 ///
@@ -492,10 +566,10 @@ mod tests {
         // before #9 (unblocks #14) — each with its subtree drawn beneath it.
         let root6 = screen.find("○ #6 Re-entry breadcrumbs").expect("root #6");
         let sub7 = screen
-            .find("├─⊘ #7 Supervising AFK agents")
+            .find("├─  ⊘ #7 Supervising AFK agents")
             .expect("#7 under #6");
         let sub14 = screen
-            .find("└─⊘ #14 Breadcrumb markers")
+            .find("└─  ⊘ #14 Breadcrumb markers")
             .expect("#14 under #6");
         let root9 = screen.find("◐ #9 Main screen design").expect("root #9");
         assert!(root6 < sub7 && sub7 < sub14 && sub14 < root9, "{screen}");
@@ -519,10 +593,10 @@ mod tests {
         let done = screen.find("● #2 Choose the stack").expect("done in place");
         let root6 = screen.find("○ #6 Re-entry breadcrumbs").expect("root #6");
         let sub7 = screen
-            .find("├─⊘ #7 Supervising AFK agents")
+            .find("├─  ⊘ #7 Supervising AFK agents")
             .expect("#7 under #6");
         let sub14 = screen
-            .find("└─⊘ #14 Breadcrumb markers")
+            .find("└─  ⊘ #14 Breadcrumb markers")
             .expect("#14 under #6");
         let root9 = screen.find("◐ #9 Main screen design").expect("root #9");
         assert!(
@@ -624,6 +698,32 @@ mod tests {
         assert!(screen.contains("⇄ PR#14 open"), "{screen}");
         assert!(!screen.contains('✓'), "{screen}");
         assert!(!screen.contains('✗'), "{screen}");
+    }
+
+    #[test]
+    fn a_group_line_shows_its_fold_state_and_takes_the_cursor() {
+        let mut app = fixture_app();
+        let screen = render(&app);
+        // Shut: a `▸` fold marker and the count, saying it is hiding them.
+        assert!(screen.contains("▸ ● 1 done (hidden)"), "{screen}");
+
+        // Walk onto it — it is an ordinary stop, so the ▶ lands on it and the
+        // cursor column lines up with the ticket rows above.
+        while !matches!(app.cursor_stop(), Some(crate::view::Stop::Group(_))) {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let screen = render(&app);
+        assert!(screen.contains("▶ ▸ ● 1 done (hidden)"), "{screen}");
+
+        // Open: `▾`, and "(hidden)" drops — the row is right there now.
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("▶ ▾ ● 1 done"), "{screen}");
+        assert!(!screen.contains("(hidden)"), "{screen}");
+        assert!(
+            screen.contains("└─  ● #2 Choose the stack"),
+            "the done ticket hangs off the group line: {screen}"
+        );
     }
 
     #[test]

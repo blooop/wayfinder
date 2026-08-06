@@ -56,11 +56,43 @@ chosen by what taking it unlocks, not by status alone. Rows are
 `<glyph> #n <title> [type] ⇄ PR#n <state>` — the `⇄` badges are the ticket's
 linked pull requests (GitHub's Development-panel set: closing keywords and
 manual links), shown as `draft`/`open`/`merged`/`closed` with `✓`/`✗` on an
-open PR when its checks and review are settled or need action. Done work
-collapses to a per-cluster
-`● N done (hidden)` count; blocked tickets no subtree reaches collapse to
-`⊘ N blocked deeper down`; a map with nothing takeable leaves the body
-entirely, counted on the bottom line as `· N idle maps hidden`.
+open PR when its checks and review are settled or need action.
+
+`↑`/`↓` prefer **siblings at the cursor's depth**, so on the default screen they
+move between tickets you can actually take and step over the blocked context
+hanging beneath them; `→` reveals what the cursor is on and `←` closes it again.
+Depth 0 spans clusters, so `↓` still carries you from one project into the next.
+
+Every direction key **always navigates**: held down, each one keeps moving until
+it reaches its own end of the list, and none of them can strand the cursor. A
+preference is only a preference — where there is no sibling to walk to (a ticket
+that is an only child, say) `↑`/`↓` step to the neighbouring row instead, and
+`←` falls back the same way once there is no parent left to climb to. `→` steps
+one stop at a time, so it is the key that visits everything.
+
+The cursor is a bold **orange `▶`** sitting directly against the item it points
+at rather than in a left-hand gutter, so it steps visibly rightward as you
+descend and the depth axis is something you can see:
+
+```
+    ○ #1069 Prototype the reconciled on-disk form
+    └─  ⊘ #1070 A3 disposition…
+      ├─  ⊘ #1071 A4 disposition…
+      │ ├─▶ ⊘ #1073 Dispositions for plans…
+```
+
+Orange because it is the one hue the screen does not otherwise spend — cyan is
+cluster headers and the prompt, green/yellow/red the status glyphs and counts,
+magenta the PR badges, dim everything settled — so the selection never competes
+with something that means something else. The branch furniture stays uniformly
+dim: it is structure, not status.
+
+Done work collapses to a per-cluster `▸ ● N done (hidden)` line and blocked
+tickets no subtree reaches to `▸ ⊘ N blocked deeper down`. Both are ordinary
+cursor stops: put the cursor on one and `→` opens it in place (`▾`), listing
+what it held as rows you can select and launch, and `←` shuts it again — so
+nothing is ever merely a number you cannot reach. A map with nothing takeable
+leaves the body entirely, counted on the bottom line as `· N idle maps hidden`.
 
 **`tab` shows the structure forest** instead: the whole blocking DAG, done
 tickets dimmed in place. A ticket's tree parent is its lowest-numbered in-map
@@ -113,8 +145,10 @@ then it *is* the process you started.
 | --- | --- |
 | *type anything* | fuzzy-filter: the tree flattens to one score-ordered list; clearing restores it |
 | `tab` | toggle the leverage view ⇄ the structure forest |
-| `↑`/`↓`, `ctrl-j`/`ctrl-k` | move the cursor over ticket rows (headers are never a stop) |
-| `enter` | run the agent on the ticket under the cursor, here, and exit |
+| `↑`/`↓`, `ctrl-j`/`ctrl-k` | move between siblings at the cursor's depth — on the default screen, the tickets you can take (cluster headers are never a stop) |
+| `→` | reveal: open a `▸ done`/`▸ blocked` group, else step forward one stop — which *is* descending, since a subtree's first row follows its parent |
+| `←` | close: shut an open group, else back out to the parent, else one stop back |
+| `enter` | run the agent on the ticket under the cursor, here, and exit — on a group line it folds instead, since there is no agent to run |
 | `ctrl-f` | focus the cursor row's project — only its clusters stay on screen |
 | `ctrl-g` | widen back to every project |
 | `ctrl-r` | refetch every map in place, keeping your query, scope and cursor |

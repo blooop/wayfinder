@@ -1,21 +1,27 @@
-//! The body plan (#51): which rows the screen shows, in what order, with what
-//! tree furniture.
+//! The body plan (#51, #57): which lines the screen shows, in what order, with
+//! what tree furniture — and which of them the cursor can sit on.
 //!
 //! Everything the body draws is decided here as a [`Plan`] — one list that the
-//! cursor and the draw both walk, so the rows the cursor stops on are exactly
-//! the ticket rows on screen, in on-screen order. Three screens share it:
+//! cursor and the draw both walk, so the stops the cursor visits are exactly
+//! the lines on screen, in on-screen order. Three screens share it:
 //!
 //! - **Leverage** (the default): per cluster, the takeable tickets (frontier +
 //!   claimed) sorted most-open-dependents-first, each with the subtree of open
-//!   tickets it unblocks. Done collapses to a count; blocked tickets no subtree
-//!   reaches collapse to a count; a map with nothing takeable leaves the body
-//!   entirely and is only counted ([`Plan::idle_hidden`]).
+//!   tickets it unblocks. Done collapses to a [`Item::Group`] line, as do
+//!   blocked tickets no subtree reaches; a map with nothing takeable leaves the
+//!   body entirely and is only counted ([`Plan::idle_hidden`]).
 //! - **Forest** (`tab`): the whole DAG, done dimmed in place. Tree parent =
 //!   lowest-numbered in-map blocker; the other in-map blockers annotate the row
 //!   (`⤷ also needs #n`).
 //! - **Flattened** (a live query): one nucleo-score-ordered flat list across
-//!   every cluster in scope — no headers, no tree. Clearing the query restores
-//!   the structured screen.
+//!   every cluster in scope — no headers, no tree, every stop at depth 0.
+//!   Clearing the query restores the structured screen.
+//!
+//! Every stop carries its **depth** (#57), because that is what navigation is
+//! expressed in: `↑`/`↓` walk siblings at the cursor's own depth, `→` descends
+//! into what the cursor is on, `←` comes back out. Depth 0 deliberately spans
+//! clusters — the multi-project axis is one list — while deeper levels are
+//! bounded by their parent.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -56,30 +62,76 @@ pub enum Screen<'a> {
     Flattened { query: &'a str },
 }
 
-/// One line of the body. Only [`Item::Ticket`] is a cursor stop.
+/// Which of a cluster's two collapsible groups. Both are the same *kind* of
+/// thing — rows the leverage screen holds back behind a count — which is why
+/// they share one type and one set of keys rather than the done count being a
+/// special case (#57).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GroupKind {
+    /// Blocked tickets no rendered subtree reached.
+    BlockedDeeper,
+    /// Closed tickets.
+    Done,
+}
+
+/// One collapsible group's identity: which cluster's, and which kind. Durable
+/// across a refetch (it names no indices), so it is both the expansion-state
+/// key and half of the cursor's anchor.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GroupId {
+    pub map: MapId,
+    pub kind: GroupKind,
+}
+
+/// Which groups the human has opened. Keyed by [`GroupId`], so an expansion
+/// survives a refetch, a query, and a lens toggle.
+pub type Expanded = BTreeSet<GroupId>;
+
+/// What the cursor is on. Since #57 that is no longer always a ticket: a
+/// collapsed group is a stop too, because opening one is an action the cursor
+/// has to be able to name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    Ticket(Row),
+    Group(GroupId),
+}
+
+/// A stop plus the depth it sits at — everything navigation needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopAt {
+    pub stop: Stop,
+    pub depth: usize,
+}
+
+/// One line of the body. [`Item::Ticket`] and [`Item::Group`] are cursor
+/// stops; headers and spacers are not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
-    /// A cluster header — the map this and the following rows belong to.
+    /// A cluster header — the map this and the following lines belong to.
     Header(MapId),
     /// A ticket row.
     Ticket {
         row: Row,
-        /// Tree branch furniture ("├─", "│ └─", …). Empty at roots and on
+        depth: usize,
+        /// Tree branch furniture ("├─", "│ └─", …). Empty at depth 0 and on
         /// every flattened row.
         prefix: String,
         /// Forest only: in-map blockers beyond the primary parent.
         also_needs: Vec<u64>,
     },
-    /// Leverage: `⊘ N blocked deeper down` — blocked tickets no rendered
-    /// subtree reached, so they are on screen only as this count.
-    BlockedDeeper(usize),
-    /// Leverage: `● N done (hidden)`.
-    DoneHidden(usize),
+    /// A collapsible group of held-back rows, always at depth 0 of its
+    /// cluster. Carries what it is holding (`hidden`) and whether it is open,
+    /// so the line can say so without consulting anything else.
+    Group {
+        id: GroupId,
+        hidden: usize,
+        expanded: bool,
+    },
     /// Spacer between clusters.
     Blank,
 }
 
-/// The body, planned: the items in on-screen order, plus how many in-scope
+/// The body, planned: the lines in on-screen order, plus how many in-scope
 /// maps the leverage screen dropped for having nothing takeable.
 #[derive(Debug, Default)]
 pub struct Plan {
@@ -88,7 +140,26 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The cursor stops, in on-screen order.
+    /// The cursor stops, in on-screen order, each with its depth.
+    pub fn stops(&self) -> Vec<StopAt> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Ticket { row, depth, .. } => Some(StopAt {
+                    stop: Stop::Ticket(row.clone()),
+                    depth: *depth,
+                }),
+                Item::Group { id, .. } => Some(StopAt {
+                    stop: Stop::Group(id.clone()),
+                    depth: 0,
+                }),
+                Item::Header(_) | Item::Blank => None,
+            })
+            .collect()
+    }
+
+    /// The ticket rows on screen — what the match count counts. A subset of
+    /// [`Plan::stops`]: group lines are stops but not tickets.
     pub fn rows(&self) -> Vec<Row> {
         self.items
             .iter()
@@ -101,9 +172,9 @@ impl Plan {
 }
 
 /// Plan the body for the clusters in scope, in their given (render) order.
-pub fn plan(clusters: &[(&MapId, &Map)], screen: Screen) -> Plan {
+pub fn plan(clusters: &[(&MapId, &Map)], screen: Screen, expanded: &Expanded) -> Plan {
     match screen {
-        Screen::Structured(Lens::Leverage) => leverage(clusters),
+        Screen::Structured(Lens::Leverage) => leverage(clusters, expanded),
         Screen::Structured(Lens::Forest) => forest(clusters),
         Screen::Flattened { query } => flattened(clusters, query),
     }
@@ -127,18 +198,61 @@ fn open_unblocks(map: &Map, number: u64) -> Vec<u64> {
         .collect()
 }
 
-fn ticket_item(id: &MapId, index: usize, prefix: String, also_needs: Vec<u64>) -> Item {
+fn ticket_item(
+    id: &MapId,
+    index: usize,
+    depth: usize,
+    prefix: String,
+    also_needs: Vec<u64>,
+) -> Item {
     Item::Ticket {
         row: Row {
             map: id.clone(),
             index,
         },
+        depth,
         prefix,
         also_needs,
     }
 }
 
-fn leverage(clusters: &[(&MapId, &Map)]) -> Plan {
+/// Push a collapsible group and, when it is open, the rows it holds — as
+/// depth-1 children of the group line, so `←` from a held row lands on the
+/// group that holds it.
+fn push_group(
+    items: &mut Vec<Item>,
+    id: &MapId,
+    kind: GroupKind,
+    held: &[usize],
+    expanded: &Expanded,
+) {
+    if held.is_empty() {
+        return;
+    }
+    let group = GroupId {
+        map: (*id).clone(),
+        kind,
+    };
+    let is_expanded = expanded.contains(&group);
+    items.push(Item::Group {
+        id: group,
+        hidden: held.len(),
+        expanded: is_expanded,
+    });
+    if !is_expanded {
+        return;
+    }
+    for (i, &index) in held.iter().enumerate() {
+        let branch = if i + 1 == held.len() {
+            "└─"
+        } else {
+            "├─"
+        };
+        items.push(ticket_item(id, index, 1, branch.to_string(), vec![]));
+    }
+}
+
+fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded) -> Plan {
     let mut plan = Plan::default();
     for (id, map) in clusters {
         let mut roots: Vec<&Ticket> = map.tickets.iter().filter(|t| takeable(t)).collect();
@@ -155,12 +269,13 @@ fn leverage(clusters: &[(&MapId, &Map)]) -> Plan {
                 .index_of(root.number)
                 .expect("root is one of map.tickets");
             plan.items
-                .push(ticket_item(id, index, String::new(), vec![]));
+                .push(ticket_item(id, index, 0, String::new(), vec![]));
             let mut path = vec![root.number];
             walk_unblocks(
                 map,
                 id,
                 root.number,
+                1,
                 "",
                 &mut path,
                 &mut reached,
@@ -170,19 +285,33 @@ fn leverage(clusters: &[(&MapId, &Map)]) -> Plan {
 
         // Blocked tickets no subtree reached — blocked only through issues
         // outside the map (or a blocking cycle): the screen owes a count for
-        // what it is not showing.
-        let deeper = map
+        // what it is not showing, and a way to look.
+        let deeper: Vec<usize> = map
             .tickets
             .iter()
-            .filter(|t| matches!(t.status, Status::Blocked { .. }) && !reached.contains(&t.number))
-            .count();
-        if deeper > 0 {
-            plan.items.push(Item::BlockedDeeper(deeper));
-        }
-        let done = map.tickets.iter().filter(|t| !is_open(t)).count();
-        if done > 0 {
-            plan.items.push(Item::DoneHidden(done));
-        }
+            .enumerate()
+            .filter(|(_, t)| {
+                matches!(t.status, Status::Blocked { .. }) && !reached.contains(&t.number)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        push_group(
+            &mut plan.items,
+            id,
+            GroupKind::BlockedDeeper,
+            &deeper,
+            expanded,
+        );
+
+        let done: Vec<usize> = map
+            .tickets
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !is_open(t))
+            .map(|(i, _)| i)
+            .collect();
+        push_group(&mut plan.items, id, GroupKind::Done, &done, expanded);
+
         plan.items.push(Item::Blank);
     }
     plan.items.pop();
@@ -193,10 +322,12 @@ fn leverage(clusters: &[(&MapId, &Map)]) -> Plan {
 /// takeable still shows here (what taking the root unlocks includes it) *and*
 /// as its own root; a dependent already on the current path is a blocking
 /// cycle and is skipped rather than recursed into.
+#[allow(clippy::too_many_arguments)]
 fn walk_unblocks(
     map: &Map,
     id: &MapId,
     number: u64,
+    depth: usize,
     stem: &str,
     path: &mut Vec<u64>,
     reached: &mut BTreeSet<u64>,
@@ -211,16 +342,30 @@ fn walk_unblocks(
         let index = map
             .index_of(child)
             .expect("dependent is one of map.tickets");
-        let branch = if last { "└─" } else { "├─" };
-        items.push(ticket_item(id, index, format!("{stem}{branch}"), vec![]));
-        reached.insert(child);
-        let next = if last {
-            format!("{stem}  ")
+        let (branch, continuation) = if last {
+            ("└─", "  ")
         } else {
-            format!("{stem}│ ")
+            ("├─", "│ ")
         };
+        items.push(ticket_item(
+            id,
+            index,
+            depth,
+            format!("{stem}{branch}"),
+            vec![],
+        ));
+        reached.insert(child);
         path.push(child);
-        walk_unblocks(map, id, child, &next, path, reached, items);
+        walk_unblocks(
+            map,
+            id,
+            child,
+            depth + 1,
+            &format!("{stem}{continuation}"),
+            path,
+            reached,
+            items,
+        );
         path.pop();
     }
 }
@@ -258,6 +403,7 @@ fn forest(clusters: &[(&MapId, &Map)]) -> Plan {
                 map,
                 id,
                 root,
+                0,
                 "",
                 "",
                 &children,
@@ -279,6 +425,7 @@ fn forest(clusters: &[(&MapId, &Map)]) -> Plan {
                 map,
                 id,
                 orphan,
+                0,
                 "",
                 "",
                 &children,
@@ -305,6 +452,7 @@ fn walk_forest(
     map: &Map,
     id: &MapId,
     number: u64,
+    depth: usize,
     prefix: &str,
     stem: &str,
     children: &BTreeMap<u64, Vec<u64>>,
@@ -322,7 +470,13 @@ fn walk_forest(
         .into_iter()
         .skip(1)
         .collect();
-    items.push(ticket_item(id, index, prefix.to_string(), also_needs));
+    items.push(ticket_item(
+        id,
+        index,
+        depth,
+        prefix.to_string(),
+        also_needs,
+    ));
 
     let kids = children.get(&number).cloned().unwrap_or_default();
     for (i, &kid) in kids.iter().enumerate() {
@@ -338,6 +492,7 @@ fn walk_forest(
             map,
             id,
             kid,
+            depth + 1,
             &format!("{stem}{branch}"),
             &format!("{stem}{continuation}"),
             children,
@@ -367,7 +522,7 @@ fn flattened(clusters: &[(&MapId, &Map)], query: &str) -> Plan {
     Plan {
         items: scored
             .into_iter()
-            .map(|(_, id, _, index)| ticket_item(id, index, String::new(), vec![]))
+            .map(|(_, id, _, index)| ticket_item(id, index, 0, String::new(), vec![]))
             .collect(),
         idle_hidden: 0,
     }
@@ -421,7 +576,7 @@ mod tests {
         }
     }
 
-    /// Ticket numbers of the plan's cursor stops, resolved against `map`.
+    /// Ticket numbers of the plan's ticket rows, resolved against `map`.
     fn stops(plan: &Plan, m: &Map) -> Vec<u64> {
         plan.rows()
             .iter()
@@ -429,8 +584,27 @@ mod tests {
             .collect()
     }
 
+    /// Every cursor stop as (what it is, depth) — tickets by number, groups by
+    /// kind. This is the navigation surface, so it is what the tests assert on.
+    fn nav(plan: &Plan, m: &Map) -> Vec<(String, usize)> {
+        plan.stops()
+            .into_iter()
+            .map(|at| {
+                let label = match at.stop {
+                    Stop::Ticket(row) => format!("#{}", m.tickets[row.index].number),
+                    Stop::Group(g) => format!("{:?}", g.kind),
+                };
+                (label, at.depth)
+            })
+            .collect()
+    }
+
     fn id() -> MapId {
         MapId::new("blooop/wayfinder", 47)
+    }
+
+    fn nothing() -> Expanded {
+        Expanded::new()
     }
 
     #[test]
@@ -444,17 +618,138 @@ mod tests {
             ticket(9, true, false, vec![]),
         ]);
         let binding = id();
-        let plan = plan(&[(&binding, &m)], Screen::Structured(Lens::Leverage));
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
         // Roots: #6 (2 dependents) before #9 (0); each root's subtree follows it.
         assert_eq!(stops(&plan, &m), vec![6, 7, 8, 9]);
-        // The blocked tickets were reached, and the done one collapsed.
-        assert!(!plan.items.contains(&Item::BlockedDeeper(2)));
-        assert!(plan.items.contains(&Item::DoneHidden(1)));
+        // The blocked tickets were reached, so only done is held back.
+        assert_eq!(
+            nav(&plan, &m),
+            vec![
+                ("#6".to_string(), 0),
+                ("#7".to_string(), 1),
+                ("#8".to_string(), 1),
+                ("#9".to_string(), 0),
+                ("Done".to_string(), 0),
+            ]
+        );
     }
 
     #[test]
-    fn leverage_counts_what_no_subtree_reaches() {
-        // #7 blocked only by an out-of-map issue: no root's subtree reaches it.
+    fn the_takeable_tickets_and_the_groups_are_the_depth_zero_stops() {
+        // What `↓` walks: the actionable tickets plus the groups, never the
+        // blocked context rows hanging under a root.
+        let m = map(vec![
+            ticket(2, false, false, vec![]),
+            ticket(6, true, false, vec![]),
+            ticket(7, true, false, vec![6]),
+            ticket(9, true, false, vec![]),
+        ]);
+        let binding = id();
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        let top: Vec<String> = nav(&plan, &m)
+            .into_iter()
+            .filter(|(_, depth)| *depth == 0)
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(top, vec!["#6", "#9", "Done"]);
+    }
+
+    #[test]
+    fn an_expanded_group_hangs_its_rows_off_the_group_line() {
+        let m = map(vec![
+            ticket(2, false, false, vec![]),
+            ticket(4, false, false, vec![]),
+            ticket(6, true, false, vec![]),
+        ]);
+        let binding = id();
+        let open: Expanded = [GroupId {
+            map: binding.clone(),
+            kind: GroupKind::Done,
+        }]
+        .into_iter()
+        .collect();
+
+        // Collapsed: the done tickets are not stops at all.
+        let collapsed = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        assert_eq!(
+            nav(&collapsed, &m),
+            vec![("#6".to_string(), 0), ("Done".to_string(), 0)]
+        );
+        assert!(collapsed.items.iter().any(|i| matches!(
+            i,
+            Item::Group {
+                hidden: 2,
+                expanded: false,
+                ..
+            }
+        )));
+
+        // Expanded: they become depth-1 children, so `←` from one lands on the
+        // group line that holds it.
+        let expanded = plan(&[(&binding, &m)], Screen::Structured(Lens::Leverage), &open);
+        assert_eq!(
+            nav(&expanded, &m),
+            vec![
+                ("#6".to_string(), 0),
+                ("Done".to_string(), 0),
+                ("#2".to_string(), 1),
+                ("#4".to_string(), 1),
+            ]
+        );
+        assert!(expanded
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Group { expanded: true, .. })));
+    }
+
+    #[test]
+    fn expansion_is_per_cluster_not_global() {
+        // Two clusters both holding done work: opening one must not open the
+        // other, which is why the key carries the map.
+        let m = map(vec![
+            ticket(2, false, false, vec![]),
+            ticket(6, true, false, vec![]),
+        ]);
+        let a = MapId::new("blooop/wayfinder", 47);
+        let b = MapId::new("blooop/dotfiles", 4);
+        let open: Expanded = [GroupId {
+            map: b.clone(),
+            kind: GroupKind::Done,
+        }]
+        .into_iter()
+        .collect();
+        let plan = plan(
+            &[(&b, &m), (&a, &m)],
+            Screen::Structured(Lens::Leverage),
+            &open,
+        );
+        let expanded: Vec<bool> = plan
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Group { expanded, .. } => Some(*expanded),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(expanded, vec![true, false], "dotfiles open, wayfinder shut");
+    }
+
+    #[test]
+    fn leverage_holds_back_what_no_subtree_reaches() {
+        // #7 blocked only by an out-of-map issue: no root's subtree reaches it,
+        // so it is held behind the blocked group rather than silently dropped.
         // Built without the `map` helper — that helper derives blocked status
         // from in-map blockers, and this blocker is deliberately not one.
         let m = Map {
@@ -465,12 +760,14 @@ mod tests {
             ],
         };
         let binding = id();
-        let plan = plan(&[(&binding, &m)], Screen::Structured(Lens::Leverage));
-        assert_eq!(stops(&plan, &m), vec![6]);
-        assert!(
-            plan.items.contains(&Item::BlockedDeeper(1)),
-            "{:?}",
-            plan.items
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        assert_eq!(
+            nav(&plan, &m),
+            vec![("#6".to_string(), 0), ("BlockedDeeper".to_string(), 0)]
         );
     }
 
@@ -483,6 +780,7 @@ mod tests {
         let plan = plan(
             &[(&idle_id, &idle), (&live_id, &live)],
             Screen::Structured(Lens::Leverage),
+            &nothing(),
         );
         assert_eq!(plan.idle_hidden, 1);
         assert!(
@@ -503,8 +801,21 @@ mod tests {
         claimed.status = Status::Claimed;
         let m = map(vec![ticket(6, true, false, vec![]), claimed]);
         let binding = id();
-        let plan = plan(&[(&binding, &m)], Screen::Structured(Lens::Leverage));
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
         assert_eq!(stops(&plan, &m), vec![6, 9, 9]);
+        // …and only the depth-0 copy is on the `↓` axis.
+        assert_eq!(
+            nav(&plan, &m),
+            vec![
+                ("#6".to_string(), 0),
+                ("#9".to_string(), 1),
+                ("#9".to_string(), 0),
+            ]
+        );
     }
 
     #[test]
@@ -516,9 +827,21 @@ mod tests {
             ticket(8, true, false, vec![7]),
         ]);
         let binding = id();
-        let plan = plan(&[(&binding, &m)], Screen::Structured(Lens::Leverage));
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
         // #7 under #6; #8 under #7; the back-edge #8→#7 is skipped, not recursed.
         assert_eq!(stops(&plan, &m), vec![6, 7, 8]);
+        assert_eq!(
+            nav(&plan, &m),
+            vec![
+                ("#6".to_string(), 0),
+                ("#7".to_string(), 1),
+                ("#8".to_string(), 2),
+            ]
+        );
     }
 
     #[test]
@@ -531,7 +854,11 @@ mod tests {
             ticket(14, true, false, vec![6, 9]),
         ]);
         let binding = id();
-        let plan = plan(&[(&binding, &m)], Screen::Structured(Lens::Forest));
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Forest),
+            &nothing(),
+        );
         assert_eq!(
             stops(&plan, &m),
             vec![2, 6, 14, 9],
@@ -543,6 +870,18 @@ mod tests {
         });
         assert!(annotated, "{:?}", plan.items);
         assert_eq!(plan.idle_hidden, 0, "the forest hides nothing");
+        // Nothing is held back, so the forest has no group lines to open.
+        assert!(!plan.items.iter().any(|i| matches!(i, Item::Group { .. })));
+        // Depth is the real tree depth, so `→` descends the DAG here too.
+        assert_eq!(
+            nav(&plan, &m),
+            vec![
+                ("#2".to_string(), 0),
+                ("#6".to_string(), 0),
+                ("#14".to_string(), 1),
+                ("#9".to_string(), 0),
+            ]
+        );
     }
 
     #[test]
@@ -559,24 +898,28 @@ mod tests {
             ticket(17, false, false, vec![13]),
         ]);
         let binding = id();
-        let plan = plan(&[(&binding, &m)], Screen::Structured(Lens::Forest));
-        let furniture: Vec<(u64, String)> = plan
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Forest),
+            &nothing(),
+        );
+        let furniture: Vec<(u64, String, usize)> = plan
             .items
             .iter()
             .filter_map(|item| match item {
-                Item::Ticket { row, prefix, .. } => {
-                    Some((m.tickets[row.index].number, prefix.clone()))
-                }
+                Item::Ticket {
+                    row, prefix, depth, ..
+                } => Some((m.tickets[row.index].number, prefix.clone(), *depth)),
                 _ => None,
             })
             .collect();
         assert_eq!(
             furniture,
             vec![
-                (13, "".to_string()),
-                (14, "├─".to_string()),
-                (15, "│ └─".to_string()),
-                (17, "└─".to_string()),
+                (13, "".to_string(), 0),
+                (14, "├─".to_string(), 1),
+                (15, "│ └─".to_string(), 2),
+                (17, "└─".to_string(), 1),
             ]
         );
     }
@@ -588,7 +931,11 @@ mod tests {
             ticket(8, true, false, vec![7]),
         ]);
         let binding = id();
-        let plan = plan(&[(&binding, &m)], Screen::Structured(Lens::Forest));
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Forest),
+            &nothing(),
+        );
         assert_eq!(
             stops(&plan, &m),
             vec![7, 8],
@@ -608,14 +955,17 @@ mod tests {
         let plan = plan(
             &[(&b_id, &b), (&a_id, &a)],
             Screen::Flattened { query: "t" },
+            &nothing(),
         );
-        // Everything matches "t"; no headers, blanks, or counts — rows only.
+        // Everything matches "t"; no headers, blanks, or groups — rows only,
+        // all at depth 0, so `↑`/`↓` walk every hit and `→` has nowhere to go.
         assert!(
             plan.items.iter().all(|i| matches!(i, Item::Ticket { .. })),
             "{:?}",
             plan.items
         );
         assert_eq!(plan.rows().len(), 3, "done tickets stay findable by query");
+        assert!(plan.stops().iter().all(|at| at.depth == 0));
         assert_eq!(plan.idle_hidden, 0);
     }
 
@@ -632,6 +982,7 @@ mod tests {
         let plan = plan(
             &[(&a_id, &a), (&b_id, &b)],
             Screen::Flattened { query: "bread" },
+            &nothing(),
         );
         let first = plan.rows()[0].clone();
         assert_eq!(first.map, b_id, "score outranks cluster order");
