@@ -30,7 +30,9 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
 
-use crate::model::{classify, Map, MapId, MapSet, Ticket, TicketType};
+use crate::model::{
+    classify, Checks, Map, MapId, MapSet, PrLink, PrStatus, Review, Ticket, TicketType,
+};
 
 /// The label that makes an issue a map. Both the search that *finds* maps and
 /// the fetch that *reads* one test for this, so a cached number can never be
@@ -50,6 +52,13 @@ query($owner: String!, $name: String!, $number: Int!) {
           labels(first: 10) { nodes { name } }
           assignees(first: 5) { nodes { login } }
           blockedBy(first: 50) { nodes { number state } }
+          closedByPullRequestsReferences(first: 5, includeClosedPrs: true) {
+            nodes {
+              number state isDraft reviewDecision
+              statusCheckRollup { state }
+              repository { nameWithOwner }
+            }
+          }
         }
       }
     }
@@ -92,6 +101,12 @@ struct Nodes<T> {
     nodes: Vec<T>,
 }
 
+impl<T> Default for Nodes<T> {
+    fn default() -> Self {
+        Self { nodes: Vec::new() }
+    }
+}
+
 #[derive(Deserialize)]
 struct SubIssue {
     number: u64,
@@ -101,6 +116,11 @@ struct SubIssue {
     assignees: Nodes<Assignee>,
     #[serde(rename = "blockedBy")]
     blocked_by: Nodes<Blocker>,
+    /// Defaulted so a response without the selection (older fixtures, a
+    /// GitHub edition without the field) parses as "no linked PRs" rather
+    /// than failing the whole map.
+    #[serde(rename = "closedByPullRequestsReferences", default)]
+    closed_by_prs: Nodes<PrNode>,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +138,65 @@ struct Assignee {
 struct Blocker {
     number: u64,
     state: String,
+}
+
+#[derive(Deserialize)]
+struct PrNode {
+    number: u64,
+    state: String,
+    #[serde(rename = "isDraft")]
+    is_draft: bool,
+    /// Nullable with meaning: null is "no review required" (#49).
+    #[serde(rename = "reviewDecision")]
+    review_decision: Option<String>,
+    /// Nullable with meaning: null is "no checks configured" (#49).
+    #[serde(rename = "statusCheckRollup")]
+    status_check_rollup: Option<Rollup>,
+    repository: RepoRef,
+}
+
+#[derive(Deserialize)]
+struct Rollup {
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct RepoRef {
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
+}
+
+/// Interpret one linked PR (#52). `None` for a PR whose `state` this binary
+/// does not recognise — the badge is evidence, and no badge is better than a
+/// wrong one. The inner strings are open GraphQL enums too: an unknown check
+/// rollup or review decision reads as "in flight", the only claim that stays
+/// true whatever the new value means.
+fn parse_pr(pr: &PrNode) -> Option<PrLink> {
+    let status = match (pr.state.as_str(), pr.is_draft) {
+        ("MERGED", _) => PrStatus::Merged,
+        ("CLOSED", _) => PrStatus::Closed,
+        ("OPEN", true) => PrStatus::Draft,
+        ("OPEN", false) => PrStatus::Open {
+            checks: match pr.status_check_rollup.as_ref().map(|r| r.state.as_str()) {
+                None => Checks::Absent,
+                Some("SUCCESS") => Checks::Passing,
+                Some("FAILURE") | Some("ERROR") => Checks::Failing,
+                Some(_) => Checks::Pending, // EXPECTED, PENDING, or newer
+            },
+            review: match pr.review_decision.as_deref() {
+                None => Review::NotRequired,
+                Some("APPROVED") => Review::Approved,
+                Some("CHANGES_REQUESTED") => Review::ChangesRequested,
+                Some(_) => Review::Required, // REVIEW_REQUIRED, or newer
+            },
+        },
+        _ => return None,
+    };
+    Some(PrLink {
+        repo: pr.repository.name_with_owner.clone(),
+        number: pr.number,
+        status,
+    })
 }
 
 fn is_open(state: &str) -> bool {
@@ -205,6 +284,12 @@ fn parse_map(body: &[u8], id: &MapId) -> Result<Map> {
                 .map(|b| b.number)
                 .collect();
             let blocked_by: Vec<u64> = sub.blocked_by.nodes.iter().map(|b| b.number).collect();
+            let prs: Vec<PrLink> = sub
+                .closed_by_prs
+                .nodes
+                .iter()
+                .filter_map(parse_pr)
+                .collect();
             Ticket {
                 repo: id.repo.clone(),
                 number: sub.number,
@@ -218,6 +303,7 @@ fn parse_map(body: &[u8], id: &MapId) -> Result<Map> {
                     sub.labels.nodes.iter().map(|l| l.name.as_str()),
                 ),
                 blocked_by,
+                prs,
             }
         })
         .collect();
@@ -425,6 +511,93 @@ mod tests {
                 "unexpected error: {err}"
             );
         }
+    }
+
+    /// One sub-issue carrying the full PR-badge matrix (#52).
+    const PR_RESPONSE: &str = r#"{"data": {"repository": {"issue": {
+        "title": "Map: wf",
+        "state": "OPEN",
+        "labels": {"nodes": [{"name": "wayfinder:map"}]},
+        "subIssues": {"nodes": [
+            {"number": 30, "title": "Raw tty leak", "state": "OPEN",
+             "labels": {"nodes": []},
+             "assignees": {"nodes": []},
+             "blockedBy": {"nodes": []},
+             "closedByPullRequestsReferences": {"nodes": [
+                {"number": 33, "state": "MERGED", "isDraft": false,
+                 "reviewDecision": null, "statusCheckRollup": {"state": "SUCCESS"},
+                 "repository": {"nameWithOwner": "blooop/wayfinder"}},
+                {"number": 40, "state": "OPEN", "isDraft": false,
+                 "reviewDecision": "CHANGES_REQUESTED", "statusCheckRollup": {"state": "FAILURE"},
+                 "repository": {"nameWithOwner": "blooop/wayfinder"}},
+                {"number": 41, "state": "OPEN", "isDraft": false,
+                 "reviewDecision": null, "statusCheckRollup": null,
+                 "repository": {"nameWithOwner": "blooop/dotfiles"}},
+                {"number": 42, "state": "OPEN", "isDraft": true,
+                 "reviewDecision": "REVIEW_REQUIRED", "statusCheckRollup": {"state": "PENDING"},
+                 "repository": {"nameWithOwner": "blooop/wayfinder"}},
+                {"number": 43, "state": "CLOSED", "isDraft": false,
+                 "reviewDecision": null, "statusCheckRollup": null,
+                 "repository": {"nameWithOwner": "blooop/wayfinder"}},
+                {"number": 44, "state": "SOMETHING_NEW", "isDraft": false,
+                 "reviewDecision": null, "statusCheckRollup": null,
+                 "repository": {"nameWithOwner": "blooop/wayfinder"}}
+             ]}}
+        ]}
+    }}}}"#;
+
+    #[test]
+    fn linked_prs_parse_into_badge_facts_at_the_boundary() {
+        let map = parse_map(PR_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
+        let prs = &map.tickets[0].prs;
+        assert_eq!(
+            prs,
+            &vec![
+                // Merged wins over whatever the rollup says: it is history.
+                PrLink {
+                    repo: "blooop/wayfinder".to_string(),
+                    number: 33,
+                    status: PrStatus::Merged,
+                },
+                PrLink {
+                    repo: "blooop/wayfinder".to_string(),
+                    number: 40,
+                    status: PrStatus::Open {
+                        checks: Checks::Failing,
+                        review: Review::ChangesRequested,
+                    },
+                },
+                // Nulls mean things (#49): no checks configured, no review
+                // required — not missing data.
+                PrLink {
+                    repo: "blooop/dotfiles".to_string(),
+                    number: 41,
+                    status: PrStatus::Open {
+                        checks: Checks::Absent,
+                        review: Review::NotRequired,
+                    },
+                },
+                // Draft is parsed with state, not left as a flag to remember.
+                PrLink {
+                    repo: "blooop/wayfinder".to_string(),
+                    number: 42,
+                    status: PrStatus::Draft,
+                },
+                PrLink {
+                    repo: "blooop/wayfinder".to_string(),
+                    number: 43,
+                    status: PrStatus::Closed,
+                },
+                // #44's unrecognised state produced no badge at all.
+            ]
+        );
+    }
+
+    #[test]
+    fn a_response_without_the_pr_selection_still_parses() {
+        // MAP_RESPONSE predates the #52 selection: absent connection, no PRs.
+        let map = parse_map(MAP_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
+        assert!(map.tickets.iter().all(|t| t.prs.is_empty()));
     }
 
     #[test]

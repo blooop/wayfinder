@@ -53,7 +53,11 @@ focusing a project shows all of them.
 tickets (frontier and claimed), sorted by how many open tickets each one
 unblocks, with that unblocks-subtree drawn beneath it — so the next ticket is
 chosen by what taking it unlocks, not by status alone. Rows are
-`<glyph> #n <title> [type]`. Done work collapses to a per-cluster
+`<glyph> #n <title> [type] ⇄ PR#n <state>` — the `⇄` badges are the ticket's
+linked pull requests (GitHub's Development-panel set: closing keywords and
+manual links), shown as `draft`/`open`/`merged`/`closed` with `✓`/`✗` on an
+open PR when its checks and review are settled or need action. Done work
+collapses to a per-cluster
 `● N done (hidden)` count; blocked tickets no subtree reaches collapse to
 `⊘ N blocked deeper down`; a map with nothing takeable leaves the body
 entirely, counted on the bottom line as `· N idle maps hidden`.

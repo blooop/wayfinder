@@ -55,6 +55,7 @@ mod tests {
             status: Status::Frontier,
             ticket_type: TicketType::Task,
             blocked_by: vec![],
+            prs: vec![],
         }
     }
 

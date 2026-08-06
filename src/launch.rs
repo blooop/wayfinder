@@ -209,6 +209,7 @@ mod tests {
             status: classify(true, false, vec![]),
             ticket_type: TicketType::Task,
             blocked_by: vec![],
+            prs: vec![],
         }
     }
 
@@ -341,6 +342,7 @@ mod tests {
             status: Status::Done,
             ticket_type: TicketType::Task,
             blocked_by: vec![],
+            prs: vec![],
         };
         match plan(&cache(), &done, 1) {
             Targets::One(launch) => assert_eq!(launch.key(), "wayfinder#2"),

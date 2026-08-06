@@ -172,6 +172,61 @@ impl TicketType {
     }
 }
 
+/// One pull request linked to a ticket — GitHub's Development-panel link set
+/// (closing keywords and manual links, mentions excluded; the #49 resolution),
+/// shown as a `⇄` badge on the ticket's row. Evidence of progress, never a row
+/// of its own (#47).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrLink {
+    /// Full slug of the repo the PR lives in. Links are cross-repo capable,
+    /// so this may differ from the ticket's repo — the badge says so when it
+    /// does.
+    pub repo: String,
+    pub number: u64,
+    pub status: PrStatus,
+}
+
+impl PrLink {
+    /// The short repo name (display only), for badges on cross-repo PRs.
+    pub fn short_repo(&self) -> &str {
+        self.repo.split('/').next_back().unwrap_or(&self.repo)
+    }
+}
+
+/// Where a linked PR stands — `state` + `isDraft` parsed together at the `gh`
+/// boundary, so "draft" is a state of its own rather than a flag to remember
+/// to check. Only an open, ready PR carries the live signals: checks and
+/// review are questions about something still in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrStatus {
+    Draft,
+    Open { checks: Checks, review: Review },
+    Merged,
+    Closed,
+}
+
+/// The check rollup on an open PR. `Absent` is its own meaning — no checks
+/// configured — parsed from the *nullable* `statusCheckRollup` (#49), not a
+/// stand-in for "unknown".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checks {
+    Absent,
+    Pending,
+    Passing,
+    Failing,
+}
+
+/// The review decision on an open PR. A null `reviewDecision` means no review
+/// is required (#49) — `NotRequired`, a settled state — where `Required` is a
+/// review asked for and not yet given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Review {
+    NotRequired,
+    Required,
+    Approved,
+    ChangesRequested,
+}
+
 /// One ticket (sub-issue) on a map.
 #[derive(Debug, Clone)]
 pub struct Ticket {
@@ -193,6 +248,8 @@ pub struct Ticket {
     /// derived locally by inversion ([`Map::unblocks`]); the numbers may name
     /// issues outside the map, which inversion simply never visits.
     pub blocked_by: Vec<u64>,
+    /// The PRs linked to this ticket (#52), in the tracker's order.
+    pub prs: Vec<PrLink>,
 }
 
 impl Ticket {
@@ -385,6 +442,7 @@ mod tests {
             status: Status::Frontier,
             ticket_type: TicketType::Task,
             blocked_by: vec![],
+            prs: vec![],
         };
         assert_eq!(t.short_repo(), "wayfinder");
     }
@@ -415,6 +473,7 @@ mod tests {
             status: classify(open, false, vec![]),
             ticket_type: TicketType::Task,
             blocked_by,
+            prs: vec![],
         }
     }
 

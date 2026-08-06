@@ -380,6 +380,7 @@ mod tests {
             status: classify(open, assigned, if open { open_blockers } else { vec![] }),
             ticket_type: TicketType::Task,
             blocked_by,
+            prs: vec![],
         }
     }
 
