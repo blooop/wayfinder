@@ -92,13 +92,13 @@ async fn main() {
     for line in body_lines(&app) {
         let mut out = String::new();
         for span in &line.spans {
-            let cyan = span.style.fg == Some(ratatui::style::Color::Cyan);
+            let cyan = span.style.fg == Some(ratatui::style::Color::Indexed(208));
             let dim = span
                 .style
                 .add_modifier
                 .contains(ratatui::style::Modifier::DIM);
             let code = if cyan {
-                "\x1b[36;1m"
+                "\x1b[38;5;208;1m"
             } else if dim {
                 "\x1b[2m"
             } else {

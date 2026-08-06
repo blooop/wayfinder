@@ -171,61 +171,44 @@ impl Plan {
     }
 }
 
-/// How much of each row's branch furniture lies on the path from the root down
-/// to the cursor: the number of leading two-column units to draw lit rather
-/// than dim, indexed by stop.
+/// Which single unit of each row's branch furniture lies on the path from the
+/// cluster down to the cursor — the index of the two-column unit to draw lit
+/// rather than dim, indexed by stop, `None` for a row off the path.
 ///
-/// The colour follows the **tree**, not the cursor's row. A selection four
-/// levels down is connected to its cluster by a run of guides that may pass
-/// through many unrelated rows on the way, and it is that whole run which says
-/// where you are — lighting only the cursor's own line leaves the eye to guess
-/// which of the identical `│` columns above it is the one that leads there.
+/// The colour follows the **tree**, not the cursor's row. What lights is the
+/// chain of **elbows**: on each node from the cluster down to the selection, the
+/// `├─`/`└─` that joins it to its parent, and nothing else. Those sit one column
+/// further right on each successive row, so the lit run reads as a staircase
+/// descending to the arrow.
 ///
-/// What lights is the **chain of branches** leading to the selection: each path
-/// node's own `├─`/`└─`, and on the cursor's row its whole indent. Rows the
-/// path merely passes on the way — an earlier sibling and its subtree — stay
-/// entirely dim, so a lit branch always means "the selection is through here"
-/// and never "this row is chosen". The result reads as a staircase from the
-/// cluster down to the cursor.
+/// One unit per row, never a leading run — that distinction is the whole point.
+/// A row's leading units are `│` guides belonging to shallower levels, and they
+/// carry *on down the screen past the selection* to reach later siblings.
+/// Lighting them makes the highlight appear to continue below the cursor, which
+/// is precisely what it must not say. A row the path merely passes stays dark
+/// for the same reason: a lit elbow means "the selection is through here" and
+/// never "this row is chosen".
 ///
-/// The lit units of a row are always a leading run, which is why one count per
-/// row suffices.
-pub fn cursor_path(stops: &[StopAt], cursor: usize) -> Vec<usize> {
-    let mut lit = vec![0usize; stops.len()];
+/// The depth-0 node the chain hangs from is reported as `Some(0)` even though a
+/// ticket there has no furniture to light: a **group** line does, in the shape of
+/// its fold marker, and an open group whose rows the cursor is inside should
+/// show it.
+pub fn cursor_path(stops: &[StopAt], cursor: usize) -> Vec<Option<usize>> {
+    let mut lit = vec![None; stops.len()];
     let Some(here) = stops.get(cursor) else {
         return lit;
     };
+    // A node at depth d wears its own elbow at unit position d - 1.
+    lit[cursor] = Some(here.depth.saturating_sub(1));
 
-    // owners[k] is the stop that owns unit position k — the path node at depth
-    // k + 1, the deepest of which is the cursor itself.
-    let mut owners = vec![cursor; here.depth];
     let mut depth = here.depth;
-    for i in (0..cursor).rev() {
-        if depth <= 1 {
+    for (i, at) in stops.iter().enumerate().take(cursor).rev() {
+        if depth == 0 {
             break;
         }
-        if stops[i].depth == depth - 1 {
+        if at.depth == depth - 1 {
             depth -= 1;
-            owners[depth - 1] = i;
-        }
-    }
-
-    for (k, &owner) in owners.iter().enumerate() {
-        for (r, at) in stops.iter().enumerate().take(cursor + 1).skip(owner) {
-            // Light this unit if it is the path node's own branch, or a
-            // continuation guide of it passing through a deeper row.
-            if r == owner || at.depth > k + 1 {
-                lit[r] = lit[r].max(k + 1);
-            }
-        }
-    }
-
-    // The depth-0 node the path hangs from. A ticket there has no furniture to
-    // light, but a *group* has its fold marker, and an open group whose rows
-    // the cursor is inside should show it.
-    if here.depth > 0 {
-        if let Some(root) = (0..cursor).rev().find(|&i| stops[i].depth == 0) {
-            lit[root] = lit[root].max(1);
+            lit[i] = Some(depth.saturating_sub(1));
         }
     }
     lit
@@ -1039,22 +1022,26 @@ mod tests {
         let stops = plan.stops();
 
         // Cursor on #14, two levels down and past #11's subtree entirely. The
-        // chain is #10 → #13 → #14: #13's own branch lights, #14 lights its
-        // whole indent, and #11/#12 — merely in the way — stay dark. #10's 1 is
-        // the allowance a depth-0 line needs for a group's fold marker; a
-        // ticket there has no furniture, so it draws nothing.
+        // chain is #10 → #13 → #14, and each lights exactly one unit: its own
+        // elbow. #10's Some(0) is the allowance a depth-0 line needs for a
+        // group's fold marker — a ticket there has no furniture to draw.
         assert_eq!(
             cursor_path(&stops, 4),
-            vec![1, 0, 0, 1, 2],
+            vec![Some(0), None, None, Some(0), Some(1)],
             "#11 and #12 are passed over, not claimed"
         );
 
-        // Cursor on #12: now it is #11's branch that is on the way, and #13/#14
-        // (below the cursor) are untouched.
-        assert_eq!(cursor_path(&stops, 2), vec![1, 1, 2, 0, 0]);
+        // Cursor on #12: now #11 is on the chain, #13/#14 below are untouched.
+        assert_eq!(
+            cursor_path(&stops, 2),
+            vec![Some(0), Some(0), Some(1), None, None]
+        );
 
-        // Cursor on a depth-0 root: nothing to trace.
-        assert_eq!(cursor_path(&stops, 0), vec![0, 0, 0, 0, 0]);
+        // Cursor on a depth-0 root: no elbows anywhere to trace.
+        assert_eq!(
+            cursor_path(&stops, 0),
+            vec![Some(0), None, None, None, None]
+        );
     }
 
     #[test]
@@ -1073,16 +1060,18 @@ mod tests {
         let lit = cursor_path(&stops, 4);
         assert_eq!(
             (stops[1].depth, lit[1]),
-            (1, 0),
+            (1, None),
             "#11 is a sibling, not the way"
         );
-        assert_eq!((stops[2].depth, lit[2]), (2, 0), "nor is its child #12");
-        assert_eq!((stops[3].depth, lit[3]), (1, 1), "#13 is on the chain");
+        assert_eq!((stops[2].depth, lit[2]), (2, None), "nor is its child #12");
         assert_eq!(
-            (stops[4].depth, lit[4]),
-            (2, 2),
-            "and the cursor lights in full"
+            (stops[3].depth, lit[3]),
+            (1, Some(0)),
+            "#13's elbow is on the chain"
         );
+        // The cursor lights *only* its own elbow: unit 0 is a `│` guide of the
+        // level above, and it carries on down the screen past the selection.
+        assert_eq!((stops[4].depth, lit[4]), (2, Some(1)));
     }
 
     #[test]
@@ -1105,9 +1094,13 @@ mod tests {
         // Stops: 0 #6 d0, 1 Done d0, 2 #2 d1.
         assert_eq!(stops.len(), 3);
         let lit = cursor_path(&stops, 2);
-        assert_eq!(lit[1], 1, "the group line the held row hangs from is lit");
-        assert_eq!(lit[2], 1, "and the held row's own branch");
-        assert_eq!(lit[0], 0, "the unrelated frontier ticket is not");
+        assert_eq!(
+            lit[1],
+            Some(0),
+            "the group line the held row hangs from is lit"
+        );
+        assert_eq!(lit[2], Some(0), "and the held row's own branch");
+        assert_eq!(lit[0], None, "the unrelated frontier ticket is not");
     }
 
     #[test]

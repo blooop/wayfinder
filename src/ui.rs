@@ -61,15 +61,24 @@ fn cluster_header(id: &MapId, map: &Map) -> Line<'static> {
 /// rightward as you descend, which is the whole feedback the depth keys need.
 fn cursor_span(under_cursor: bool) -> Span<'static> {
     if under_cursor {
-        Span::styled("▶ ", CURSOR_COLOR)
+        Span::styled(
+            "▶ ",
+            Style::new().fg(CURSOR_COLOR).add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::raw("  ")
     }
 }
 
-/// One colour shared by the marker and the branch run leading into it, so the
-/// selected row reads as a single lit-up path rather than a lone glyph.
-const CURSOR_COLOR: Style = Style::new().fg(Color::Cyan);
+/// One colour shared by the marker and the elbows leading down to it, so the
+/// selection reads as a single lit path rather than a lone glyph.
+///
+/// Orange, and deliberately not one of the six the screen already spends:
+/// cyan on cluster headers and the prompt, green/yellow/red on the status
+/// glyphs and counts, magenta on PR badges, dim on everything settled. A
+/// selection drawn in any of those competes with something that means
+/// something else, which is exactly how the cursor got lost in the first place.
+const CURSOR_COLOR: Color = Color::Indexed(208);
 
 /// How one unit of tree furniture is drawn: in the cursor's colour when it lies
 /// on the path down to the selection ([`crate::view::cursor_path`]), dim
@@ -80,7 +89,7 @@ const CURSOR_COLOR: Style = Style::new().fg(Color::Cyan);
 /// rows.
 fn furniture_style(on_path: bool) -> Style {
     if on_path {
-        CURSOR_COLOR
+        Style::new().fg(CURSOR_COLOR)
     } else {
         Style::new().add_modifier(Modifier::DIM)
     }
@@ -147,7 +156,7 @@ fn ticket_line(
     also_needs: &[u64],
     name_repo: bool,
     under_cursor: bool,
-    lit_units: usize,
+    lit_unit: Option<usize>,
 ) -> Line<'static> {
     let repo = if name_repo {
         ticket.short_repo().to_string()
@@ -160,10 +169,11 @@ fn ticket_line(
     if !prefix.is_empty() {
         spans.push(Span::raw("  "));
     }
-    // One span per two-column unit, so the run on the path to the cursor can be
-    // lit while the rest of the same row stays dim.
+    // One span per two-column unit, so the single elbow on the path to the
+    // cursor can light while the rest of the same row — the `│` guides that
+    // carry on down past the selection — stays dim.
     for (i, unit) in furniture_units(prefix).into_iter().enumerate() {
-        spans.push(Span::styled(unit, furniture_style(i < lit_units)));
+        spans.push(Span::styled(unit, furniture_style(lit_unit == Some(i))));
     }
     spans.extend([
         cursor_span(under_cursor),
@@ -270,7 +280,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                 depth: _,
             } => {
                 let (here, under_cursor) = mark(&lines, &mut cursor_line);
-                let lit = path.get(here).copied().unwrap_or(0);
+                let lit = path.get(here).copied().flatten();
                 lines.push(ticket_line(
                     app.ticket(row),
                     prefix,
@@ -288,7 +298,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                 // A group's fold marker sits where furniture would, so it lights
                 // when the cursor is among the rows it holds.
                 let (here, under_cursor) = mark(&lines, &mut cursor_line);
-                let on_path = path.get(here).copied().unwrap_or(0) > 0;
+                let on_path = path.get(here).copied().flatten().is_some();
                 lines.push(group_line(
                     id.kind,
                     *hidden,
@@ -756,11 +766,11 @@ mod tests {
 
         assert_eq!(
             furniture("#7 Supervising").fg,
-            Some(Color::Cyan),
-            "the selected row's branch is lit"
+            Some(CURSOR_COLOR),
+            "the selected row's elbow is lit"
         );
         let elsewhere = furniture("#14 Breadcrumb");
-        assert_ne!(elsewhere.fg, Some(Color::Cyan));
+        assert_ne!(elsewhere.fg, Some(CURSOR_COLOR));
         assert!(
             elsewhere.add_modifier.contains(Modifier::DIM),
             "every other branch stays dim"
