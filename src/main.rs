@@ -33,7 +33,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use wf::app::{App, Outcome, Scope};
 use wf::autostart::{self, PollHealthByRepo};
-use wf::launch::{self, Handoff, Launch, MapIssues, TabOutcome};
+use wf::launch::{self, Handoff, Host, Launch, MapIssues, Mode, Opened};
 use wf::model::{merge_maps, Map};
 use wf::projects::{self, ProjectsCache};
 use wf::refresh::{Freshness, LoadEvent, Pollers, RefreshEvent, Startup};
@@ -275,25 +275,33 @@ enum LaunchReport {
     HandedOver(String),
 }
 
-/// Perform one launch (#16): create-or-focus the tab, then hand over as this
-/// host requires — suspending the TUI around `zellij attach` when `wf` owns
-/// the terminal, staying up when zellij's own navigation moves the client
-/// within this session, and quitting when it moves the client off it.
+/// Perform one launch (#16): give the agent somewhere to run, then hand over as
+/// this host requires — suspending the TUI around `zellij attach` when `wf` owns
+/// the terminal, staying up when zellij's own navigation moves the client within
+/// this session, quitting when it moves the client off it, and — with no zellij
+/// on the machine at all — suspending around the agent *itself*, which is then
+/// `wf`'s own child and comes back here when it exits.
 async fn perform_launch(
     terminal: &mut DefaultTerminal,
     launch: &Launch,
     maps: &mut BTreeMap<String, Map>,
     map_issues: &BTreeMap<String, u64>,
 ) -> Result<LaunchReport> {
-    let host = launch::detect_host();
-    let (tab, handoff) = match launch::execute(launch, &host).await {
+    let host = launch::detect_host().await;
+    // ctrl-a with no zellij. Refused here rather than in `App`, which decides
+    // *what* to launch and is deliberately blind to the environment; refused at
+    // all because #7 makes the tab the entire supervision story for a headless
+    // agent, and there is no tab here to hold one.
+    if launch.mode == Mode::Afk && host == Host::NoZellij {
+        return Ok(LaunchReport::Notice(
+            "no zellij — afk needs a tab; enter runs this ticket here instead".to_string(),
+        ));
+    }
+    let (opened, handoff) = match launch::execute(launch, &host).await {
         Ok(result) => result,
         Err(err) => return Ok(LaunchReport::Notice(format!("launch failed: {err}"))),
     };
-    let verb = match tab.outcome() {
-        TabOutcome::Created => "started",
-        TabOutcome::Existed => "focused",
-    };
+    let verb = opened.verb();
     match handoff {
         Handoff::Stay => Ok(LaunchReport::Notice(format!(
             "{verb} {}",
@@ -303,16 +311,27 @@ async fn perform_launch(
             "{verb} {} — run `wf` in that session to pick another ticket",
             launch.describe()
         ))),
-        Handoff::Suspend(argv) => {
-            let (program, args) = argv.split_first().expect("attach argv is non-empty");
+        Handoff::Suspend { argv, cwd } => {
+            let (program, args) = argv.split_first().expect("a handoff argv is non-empty");
+            // What was handed over decides what "back" means: a whole session,
+            // when the zellij client was free to roam its tabs, and this one
+            // ticket when the child *was* the agent.
+            let from = match &opened {
+                Opened::Tab(_) => launch.session.clone(),
+                Opened::Direct => launch.key().to_string(),
+            };
             suspend(terminal)?;
-            let status = tokio::process::Command::new(program).args(args).status().await;
+            let status = tokio::process::Command::new(program)
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .await;
             resume(terminal)?;
             // Away for a while: the tracker moved (a claim, maybe a close).
             refetch_all(maps, map_issues).await;
             Ok(LaunchReport::Notice(match status {
-                Ok(_) => format!("back from {}", launch.session),
-                Err(err) => format!("could not attach to {}: {err}", launch.session),
+                Ok(_) => format!("back from {from}"),
+                Err(err) => format!("could not run {from}: {err}"),
             }))
         }
     }
@@ -350,7 +369,7 @@ async fn reconcile_autostart(
         return None;
     }
 
-    let host = launch::detect_host();
+    let host = launch::detect_host().await;
     let mut started = Vec::new();
     let mut failed = 0usize;
     for launch in &launches {
