@@ -3,9 +3,11 @@
 //! `wf` is a selector (#26/#34). There is no multiplexer, no tab, no session
 //! and no supervision: the picked ticket resolves to a checkout, `wf` gives the
 //! terminal back, and its own process image is replaced by
-//! `claude --dangerously-skip-permissions "/wayfinder <map> <n>"` in that
-//! checkout ([`Launch::exec`]). Unattended work is not a feature here — it is
-//! another terminal session you start and switch away from.
+//! `claude --dangerously-skip-permissions "<skill> …"` in that checkout
+//! ([`Launch::exec`]) — which skill is the (type, stage) [`route`], and the
+//! launch line's mode rides the prompt as a suffix (#61/#62). Unattended work
+//! is still not supervised here — a deferred launch is the same exec with
+//! ` defer` in the prompt, watched from another terminal or not at all.
 //!
 //! The one thing that can go wrong is ordering: the terminal must be restored
 //! *before* the image is replaced, because after that there is no `wf` left to
@@ -40,6 +42,51 @@ impl Route {
             Route::Tdd => "/tdd",
             Route::Review => "/review",
             Route::Wayfinder => "/wayfinder",
+        }
+    }
+}
+
+/// What the launch line's typed text meant — parsed once at the second enter
+/// (parse, don't validate: the exec never re-reads a string). The four
+/// meanings of #62's staged prompt step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// An empty line: today's behavior, the default.
+    Interactive,
+    /// `defer` — the whole subtree, resolved unattended (#63).
+    Deferred,
+    /// `defer <text>` — deferred, with a steering prompt.
+    DeferredSteered(String),
+    /// Any other text — a steering prompt on an interactive launch.
+    Steered(String),
+}
+
+impl LaunchMode {
+    /// Parse the launch line. Total: every string means one of the four
+    /// things. `defer` is matched as a *word* — `deferred work` is steering
+    /// text that happens to start with the same letters, not a mode.
+    pub fn parse(text: &str) -> LaunchMode {
+        let text = text.trim();
+        if text.is_empty() {
+            return LaunchMode::Interactive;
+        }
+        match text.strip_prefix("defer") {
+            Some("") => LaunchMode::Deferred,
+            Some(rest) if rest.starts_with(char::is_whitespace) => {
+                LaunchMode::DeferredSteered(rest.trim_start().to_string())
+            }
+            _ => LaunchMode::Steered(text.to_string()),
+        }
+    }
+
+    /// The suffix appended to the exec'd slash command (#62/#63): nothing,
+    /// ` defer`, ` defer: <text>`, or ` steer: <text>`.
+    fn suffix(&self) -> String {
+        match self {
+            LaunchMode::Interactive => String::new(),
+            LaunchMode::Deferred => " defer".to_string(),
+            LaunchMode::DeferredSteered(text) => format!(" defer: {text}"),
+            LaunchMode::Steered(text) => format!(" steer: {text}"),
         }
     }
 }
@@ -79,15 +126,16 @@ pub fn route(ticket_type: TicketType, stage: Stage) -> Option<Route> {
     }
 }
 
-/// A fully-resolved launch: which checkout the agent runs in, and which ticket
-/// of which map it is handed.
+/// A fully-resolved launch: which checkout the agent runs in, which ticket of
+/// which map it is handed, and — since the two-step (#62) — which skill it
+/// runs ([`Route`]) and in what mode ([`LaunchMode`]).
 ///
 /// The fields are private and [`plan`] is the only constructor, so a launch
 /// whose checkout belongs to a different repo than its ticket is
-/// unrepresentable rather than merely undocumented. It is also, now, exactly
-/// *(checkout, ticket, map)* and nothing else: with the tab gone there is no
-/// session, no label and no mode for it to carry, and so no way for it to name
-/// a place it cannot run.
+/// unrepresentable rather than merely undocumented. The route arrives already
+/// resolved from (type, stage) by [`route`], which is where an unlaunchable
+/// node was refused — a `Launch` for a done node cannot be built, because no
+/// `Route` for it exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
     /// The ticket's repo, full slug (`owner/name`) — the identity half, kept
@@ -99,6 +147,10 @@ pub struct Launch {
     map_issue: u64,
     /// The checkout the agent works in: the process's working directory.
     cwd: PathBuf,
+    /// The skill this launch execs, resolved from (type, stage).
+    route: Route,
+    /// What the launch line said: interactive, deferred, steered.
+    mode: LaunchMode,
 }
 
 /// Agent sessions are started from a picker rather than from a shell someone is
@@ -123,12 +175,18 @@ impl Launch {
     }
 
     /// What `wf` becomes. `claude` takes a single positional prompt, so the
-    /// slash command and its arguments are one argv entry, not three.
+    /// slash command, its arguments and the mode suffix are one argv entry,
+    /// not several. Only `/wayfinder` takes the map argument — `/tdd` and
+    /// `/review` resolve the repo from the checkout they run in.
     pub fn agent_argv(&self) -> Vec<String> {
+        let prompt = match self.route {
+            Route::Tdd | Route::Review => format!("{} {}", self.route.label(), self.ticket),
+            Route::Wayfinder => format!("/wayfinder {} {}", self.map_issue, self.ticket),
+        };
         vec![
             "claude".to_string(),
             SKIP_PERMISSIONS.to_string(),
-            format!("/wayfinder {} {}", self.map_issue, self.ticket),
+            format!("{prompt}{}", self.mode.suffix()),
         ]
     }
 
@@ -237,8 +295,15 @@ pub enum Targets {
 }
 
 /// Resolve a launch request against the projects cache. Zero or one candidate
-/// never prompts.
-pub fn plan(checkouts: &[Checkout], ticket: &Ticket, map_issue: u64) -> Targets {
+/// never prompts. The route and mode arrive already settled — this function
+/// only answers *where* the agent can run.
+pub fn plan(
+    checkouts: &[Checkout],
+    ticket: &Ticket,
+    map_issue: u64,
+    route: Route,
+    mode: LaunchMode,
+) -> Targets {
     let launches: Vec<Launch> = candidate_checkouts(checkouts, &ticket.repo)
         .into_iter()
         .map(|c| Launch {
@@ -246,6 +311,8 @@ pub fn plan(checkouts: &[Checkout], ticket: &Ticket, map_issue: u64) -> Targets 
             ticket: ticket.number,
             map_issue,
             cwd: c.path.clone(),
+            route,
+            mode: mode.clone(),
         })
         .collect();
     match launches.len() {
@@ -279,6 +346,19 @@ mod tests {
         }
     }
 
+    /// An interactive `/wayfinder` plan — the default launch, and the shape
+    /// every checkout-resolution test wants (route and mode are orthogonal to
+    /// which trees are candidates).
+    fn plan_wf(checkouts: &[Checkout], ticket: &Ticket, map_issue: u64) -> Targets {
+        plan(
+            checkouts,
+            ticket,
+            map_issue,
+            Route::Wayfinder,
+            LaunchMode::Interactive,
+        )
+    }
+
     fn cache() -> Vec<Checkout> {
         vec![
             checkout("/data/k1/kinisi_ros", "kinisi/kinisi_ros"),
@@ -308,7 +388,7 @@ mod tests {
     #[test]
     fn one_candidate_never_prompts_and_none_is_unregistered() {
         let cache = cache();
-        match plan(&cache, &ticket("blooop/wayfinder", 16), 1) {
+        match plan_wf(&cache, &ticket("blooop/wayfinder", 16), 1) {
             Targets::One(launch) => {
                 assert_eq!(launch.cwd(), Path::new("/data/proj/wayfinder"));
                 assert_eq!(launch.key(), "wayfinder#16");
@@ -318,18 +398,18 @@ mod tests {
             other => panic!("expected One, got {other:?}"),
         }
         assert_eq!(
-            plan(&cache, &ticket("blooop/dotfiles", 3), 2),
+            plan_wf(&cache, &ticket("blooop/dotfiles", 3), 2),
             Targets::Unregistered
         );
         assert_eq!(
-            plan(&[], &ticket("blooop/wayfinder", 16), 1),
+            plan_wf(&[], &ticket("blooop/wayfinder", 16), 1),
             Targets::Unregistered
         );
     }
 
     #[test]
     fn several_checkouts_of_one_repo_offer_a_choice_of_trees() {
-        let launches = match plan(&cache(), &ticket("kinisi/kinisi_ros", 42), 7) {
+        let launches = match plan_wf(&cache(), &ticket("kinisi/kinisi_ros", 42), 7) {
             Targets::Many(launches) => launches,
             other => panic!("expected Many, got {other:?}"),
         };
@@ -347,7 +427,7 @@ mod tests {
 
     #[test]
     fn the_agent_runs_interactive_claude_with_one_prompt_argument() {
-        let launch = match plan(&cache(), &ticket("blooop/wayfinder", 16), 1) {
+        let launch = match plan_wf(&cache(), &ticket("blooop/wayfinder", 16), 1) {
             Targets::One(l) => l,
             other => panic!("{other:?}"),
         };
@@ -362,10 +442,70 @@ mod tests {
     }
 
     #[test]
+    fn the_launch_line_text_parses_to_its_mode() {
+        // The four meanings of the typed line (#62): empty is the interactive
+        // default, `defer` alone is the deferred subtree, `defer <text>` adds
+        // steering to it, anything else steers an interactive launch.
+        assert_eq!(LaunchMode::parse(""), LaunchMode::Interactive);
+        assert_eq!(LaunchMode::parse("   "), LaunchMode::Interactive);
+        assert_eq!(LaunchMode::parse("defer"), LaunchMode::Deferred);
+        assert_eq!(LaunchMode::parse("defer "), LaunchMode::Deferred);
+        assert_eq!(
+            LaunchMode::parse("defer skip the flaky suite"),
+            LaunchMode::DeferredSteered("skip the flaky suite".to_string())
+        );
+        assert_eq!(
+            LaunchMode::parse("try the other approach"),
+            LaunchMode::Steered("try the other approach".to_string())
+        );
+        // `defer` is a word, not a prefix: no fuzzy matching.
+        assert_eq!(
+            LaunchMode::parse("deferred work first"),
+            LaunchMode::Steered("deferred work first".to_string())
+        );
+    }
+
+    #[test]
+    fn the_agent_command_is_the_route_plus_the_mode_suffix() {
+        let launch = |route: Route, mode: LaunchMode| -> String {
+            match plan(&cache(), &ticket("blooop/wayfinder", 16), 1, route, mode) {
+                Targets::One(l) => l.agent_argv().last().expect("a prompt").clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        // The route picks the skill; only /wayfinder takes the map argument.
+        assert_eq!(launch(Route::Tdd, LaunchMode::Interactive), "/tdd 16");
+        assert_eq!(launch(Route::Review, LaunchMode::Interactive), "/review 16");
+        assert_eq!(
+            launch(Route::Wayfinder, LaunchMode::Interactive),
+            "/wayfinder 1 16"
+        );
+        // The mode rides as a suffix, whatever the route (#62/#63).
+        assert_eq!(
+            launch(Route::Wayfinder, LaunchMode::Deferred),
+            "/wayfinder 1 16 defer"
+        );
+        assert_eq!(
+            launch(
+                Route::Wayfinder,
+                LaunchMode::DeferredSteered("skip the flaky suite".to_string())
+            ),
+            "/wayfinder 1 16 defer: skip the flaky suite"
+        );
+        assert_eq!(
+            launch(
+                Route::Tdd,
+                LaunchMode::Steered("try the other approach".to_string())
+            ),
+            "/tdd 16 steer: try the other approach"
+        );
+    }
+
+    #[test]
     fn the_notice_names_the_ticket_and_the_tree_it_runs_in() {
         // With several checkouts, *which tree* is the only thing that varies —
         // so it is what the notice has to say.
-        let launches = match plan(&cache(), &ticket("kinisi/kinisi_ros", 42), 7) {
+        let launches = match plan_wf(&cache(), &ticket("kinisi/kinisi_ros", 42), 7) {
             Targets::Many(l) => l,
             other => panic!("{other:?}"),
         };
@@ -381,7 +521,7 @@ mod tests {
 
     #[test]
     fn the_key_is_the_short_repo_but_identity_stays_the_full_slug() {
-        let launch = match plan(&cache(), &ticket("upstream/dotfiles", 5), 4) {
+        let launch = match plan_wf(&cache(), &ticket("upstream/dotfiles", 5), 4) {
             Targets::One(l) => l,
             other => panic!("{other:?}"),
         };
@@ -462,7 +602,7 @@ mod tests {
             blocked_by: vec![],
             prs: vec![],
         };
-        match plan(&cache(), &done, 1) {
+        match plan_wf(&cache(), &done, 1) {
             Targets::One(launch) => assert_eq!(launch.key(), "wayfinder#2"),
             other => panic!("a done ticket still launches, got {other:?}"),
         }

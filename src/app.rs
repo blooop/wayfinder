@@ -433,7 +433,13 @@ impl App {
         };
         let ticket = self.ticket(&row).clone();
         let map_issue = row.map.number;
-        match launch::plan(&self.checkouts, &ticket, map_issue) {
+        match launch::plan(
+            &self.checkouts,
+            &ticket,
+            map_issue,
+            launch::Route::Wayfinder,
+            launch::LaunchMode::Interactive,
+        ) {
             Targets::Unregistered => {
                 self.notice = Some(format!(
                     "no registered checkout of {} on this machine — run wf inside one",
