@@ -18,19 +18,23 @@ fn assert_plausible_map(map: &Map) {
 async fn two_consecutive_polls_succeed() {
     let mut poller = Poller::new("blooop", "wayfinder", 1);
 
-    // Cycle 1: no stored ETag, so the probe 200s and the full GraphQL
-    // fetch reruns — must yield a real map, never Failed.
+    // Cycle 0 is the cold start, and since #27 it *is* the initial load: no
+    // ETag exists, so the probe is skipped and the GraphQL fetch runs outright
+    // — one round trip, and it must yield a real map, never Failed.
     match poller.poll_once().await {
         RefreshEvent::Updated(map) => assert_plausible_map(&map),
         other => panic!("first poll should fetch the map, got {other:?}"),
     }
 
-    // Cycle 2: the stored ETag makes this conditional. Unchanged (304) if
-    // the tracker sat still between polls, Updated if it moved — either is
-    // healthy; only Failed is a bug.
-    match poller.poll_once().await {
-        RefreshEvent::Unchanged => {}
-        RefreshEvent::Updated(map) => assert_plausible_map(&map),
-        RefreshEvent::Failed => panic!("second (conditional) poll failed"),
+    // Cycles 1 and 2 take the probe path. Cycle 1 has no ETag yet (the forced
+    // fetch above is REST-free, so it stores none) and 200s into a fetch;
+    // cycle 2 is the genuinely conditional one. Unchanged (304) if the tracker
+    // sat still, Updated if it moved — either is healthy; only Failed is a bug.
+    for cycle in 1..=2 {
+        match poller.poll_once().await {
+            RefreshEvent::Unchanged => {}
+            RefreshEvent::Updated(map) => assert_plausible_map(&map),
+            RefreshEvent::Failed => panic!("probe-path poll {cycle} failed"),
+        }
     }
 }

@@ -8,12 +8,15 @@
 //! Build 4 seam (#16): the app decides *what* to launch, the loop performs
 //! it (it is the only thing that can suspend the TUI).
 
+use std::collections::BTreeMap;
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::filter::matching_indices;
 use crate::launch::{self, Launch, MapIssues, Mode, Targets};
-use crate::model::{Map, Ticket, GROUP_LABELS};
+use crate::model::{merge_maps, Map, Ticket, GROUP_LABELS};
 use crate::projects::Checkout;
+use crate::refresh::Startup;
 
 /// Project scope: everything, or one repo focused via `ctrl-f`.
 /// With a single repo synced this is a near-no-op, but the state is wired
@@ -63,11 +66,16 @@ pub struct App {
     /// `<repo>#<n>` tabs counted at the last check, shown in the reserved
     /// AFK slot (#7: the tab *is* the supervision).
     pub agent_tabs: usize,
+    /// How much of the initial load has landed (#27). The screen is drawn
+    /// before any of it, so this is what stops an empty list from reading as
+    /// "no tickets" while the fetch is still out.
+    pub startup: Startup,
     pub overlay: Overlay,
     cursor: usize,
 }
 
 impl App {
+    /// An app over a map already in hand — so nothing is being waited on.
     pub fn new(map: Map) -> Self {
         Self {
             map,
@@ -77,8 +85,20 @@ impl App {
             checkouts: Vec::new(),
             map_issues: MapIssues::new(),
             agent_tabs: 0,
+            startup: Startup::Loaded,
             overlay: Overlay::None,
             cursor: 0,
+        }
+    }
+
+    /// An app with no data yet, drawn while the load is still in flight (#27).
+    /// The distinction from [`App::new`] is the whole point: same empty list,
+    /// two different meanings, told apart by [`App::startup`] rather than left
+    /// to the reader.
+    pub fn empty() -> Self {
+        Self {
+            startup: Startup::Searching,
+            ..Self::new(merge_maps(&BTreeMap::new()))
         }
     }
 

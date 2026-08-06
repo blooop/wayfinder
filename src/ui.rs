@@ -11,6 +11,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Overlay, Scope};
 use crate::model::{Status, GROUP_LABELS};
+use crate::refresh::Startup;
 
 fn glyph_style(status: &Status) -> Style {
     match status {
@@ -109,6 +110,20 @@ pub fn afk_line(app: &App) -> String {
     }
 }
 
+/// The project heading in the title bar.
+///
+/// `merge_maps` names the empty case "no projects — run wf inside a checkout to
+/// register it", which is the truth only once the load has finished; before
+/// that the very same emptiness just means the fetch is still out (#27), and
+/// telling a user with three registered projects that they have none is the
+/// exact ambiguity the [`Startup`] state exists to remove.
+pub fn heading(app: &App) -> String {
+    if app.startup != Startup::Loaded && app.map.tickets.is_empty() {
+        return "loading…".to_string();
+    }
+    app.map.repo.clone()
+}
+
 /// A centered box `width`×`height` (clamped) inside `area`.
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let [area] = Layout::horizontal([Constraint::Length(width.min(area.width))])
@@ -176,7 +191,7 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
 /// key hints. The which-checkout picker, when open, floats over all of it.
 pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
     let mut block = match &app.scope {
-        Scope::All => Block::bordered().title(format!(" wf · {} ", app.map.repo)),
+        Scope::All => Block::bordered().title(format!(" wf · {} ", heading(app))),
         // The focused title names the project by its full slug — with one
         // project on screen there is room, and it disambiguates forks.
         Scope::Project(repo) => Block::bordered().title(format!(" wf · {repo} — focused ")),
@@ -202,10 +217,18 @@ pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
         afk_area,
     );
 
+    // The loading hint and the freshness indicator share one dim segment and
+    // can both be live at once (map 2 of 3 has landed, so the data on screen is
+    // fresh *and* incomplete); empty ones drop out rather than leaving gaps.
+    let status = [app.startup.hint(), refresh_indicator.to_string()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut count_spans = vec![
         Span::raw(format!("  {}/{}", app.visible().len(), app.scoped().len())),
         Span::styled(
-            format!("  {refresh_indicator}"),
+            format!("  {status}"),
             Style::new().add_modifier(Modifier::DIM),
         ),
     ];
@@ -235,6 +258,7 @@ pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::launch::MapIssues;
     use crate::model::{classify, Map, Ticket, TicketType};
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -425,6 +449,44 @@ mod tests {
     fn count_line_carries_the_refresh_indicator() {
         let screen = render_with_indicator(&App::new(fixture_map()), "· ↻ 3s ago");
         assert!(screen.contains("5/5  · ↻ 3s ago"));
+    }
+
+    #[test]
+    fn the_first_frame_says_it_is_loading_rather_than_that_there_is_nothing() {
+        // The whole point of #27: this screen is drawn before any network call,
+        // so its empty list must not read as "no tickets" or "no projects".
+        let screen = render(&App::empty());
+        assert!(screen.contains("searching for maps…"), "{screen}");
+        assert!(screen.contains("wf · loading…"), "{screen}");
+        assert!(!screen.contains("no projects"), "{screen}");
+    }
+
+    #[test]
+    fn an_empty_list_reads_as_empty_only_once_the_load_finished() {
+        // Same empty map, opposite meaning — told apart by Startup alone.
+        let mut app = App::empty();
+        app.startup = Startup::Loaded;
+        let screen = render(&app);
+        assert!(screen.contains("no projects — run wf inside a checkout"), "{screen}");
+        assert!(!screen.contains("loading"), "{screen}");
+    }
+
+    #[test]
+    fn a_partial_load_shows_progress_beside_the_tickets_already_in() {
+        // One map of three has landed: the rows are real and fresh, and the
+        // count line still says more is coming.
+        let mut app = App::new(fixture_map());
+        let found: MapIssues = [("a/one", 1), ("b/two", 2), ("c/three", 3)]
+            .into_iter()
+            .map(|(slug, n)| (slug.to_string(), n))
+            .collect();
+        app.startup = Startup::discovered(&found);
+        app.startup.record_arrival("a/one");
+        let screen = render_with_indicator(&app, "· ↻ just now");
+        assert!(screen.contains("#6    Re-entry breadcrumbs"), "{screen}");
+        assert!(screen.contains("5/5  · loading maps 1/3 · ↻ just now"), "{screen}");
+        // Rows exist, so the title names the project rather than the wait.
+        assert!(screen.contains("wf · blooop/wayfinder"), "{screen}");
     }
 
     #[test]

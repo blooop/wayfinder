@@ -70,6 +70,30 @@ impl ProjectsCache {
             }),
         }
         self.checkouts.sort_by(|a, b| a.path.cmp(&b.path));
+        self.recompute_sessions();
+    }
+
+    /// Drop checkouts whose directory no longer exists, then recompute the
+    /// session names. A deleted checkout must stop offering itself as a launch
+    /// host — and because names are a pure function of the *surviving* path
+    /// set, the last checkout of a repo goes back to its plain directory name
+    /// (`~/proj/wayfinder` → `wayfinder`, not `proj`).
+    ///
+    /// Returns whether anything was removed, so the caller can skip a write.
+    /// Existence is one `stat` per entry: cheap enough for the path that runs
+    /// before the first frame. `exists()` is also the deliberately lenient
+    /// test — a checkout on an unmounted volume comes back when it mounts.
+    pub fn prune_missing(&mut self) -> bool {
+        let before = self.checkouts.len();
+        self.checkouts.retain(|c| c.path.is_dir());
+        let removed = self.checkouts.len() != before;
+        if removed {
+            self.recompute_sessions();
+        }
+        removed
+    }
+
+    fn recompute_sessions(&mut self) {
         let paths: Vec<PathBuf> = self.checkouts.iter().map(|c| c.path.clone()).collect();
         for (checkout, session) in self.checkouts.iter_mut().zip(derive_sessions(&paths)) {
             checkout.session = session;
@@ -242,6 +266,37 @@ mod tests {
         cache.register(p("/data/k1/kinisi_ros"), "kinisi/kinisi_ros".to_string());
         assert_eq!(cache.checkouts.len(), 2, "re-registering must not duplicate");
         assert_eq!(cache.repos(), vec!["kinisi/kinisi_ros".to_string()]);
+    }
+
+    #[test]
+    fn pruning_forgets_deleted_checkouts_and_renames_the_survivor() {
+        // Two checkouts of one repo, so both sessions are disambiguated by
+        // parent dir; delete one and the survivor gets its plain name back.
+        let root = std::env::temp_dir().join(format!("wf-test-prune-{}", std::process::id()));
+        let live = root.join("projects").join("wayfinder");
+        let gone = root.join("wayfinder");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&gone).unwrap();
+
+        let mut cache = ProjectsCache::default();
+        cache.register(live.clone(), "blooop/wayfinder".to_string());
+        cache.register(gone.clone(), "blooop/wayfinder".to_string());
+        let root_name = root.file_name().unwrap().to_string_lossy().into_owned();
+        let sessions: Vec<&str> = cache.checkouts.iter().map(|c| c.session.as_str()).collect();
+        assert_eq!(
+            sessions,
+            vec!["projects", root_name.as_str()],
+            "colliding leaf names are disambiguated by parent dir"
+        );
+
+        std::fs::remove_dir_all(&gone).unwrap();
+        assert!(cache.prune_missing(), "a deleted checkout is a change");
+        assert_eq!(cache.checkouts.len(), 1);
+        assert_eq!(cache.checkouts[0].path, live);
+        assert_eq!(cache.checkouts[0].session, "wayfinder");
+
+        assert!(!cache.prune_missing(), "nothing left to prune is not a change");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

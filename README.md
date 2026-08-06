@@ -46,6 +46,21 @@ home-relative path with `/` → `-` if names still collide.
 Only repos with an open `wayfinder:map`-labelled issue show tickets; other
 checkouts stay cached but hidden.
 
+## Startup
+
+`wf` draws its screen before it fetches anything, and fills it in as the data
+arrives. Nothing is on the path to the first frame but the local `git` calls
+that register the checkout, so the picker is up and answering keys immediately
+— the count line says `searching for maps…`, then `loading maps 1/3`, then goes
+quiet once everything is in.
+
+Which repos have maps takes one `wayfinder:map` label search, and it is the only
+genuinely serial step: nothing can load until it returns. Every map is then
+fetched concurrently, so N projects cost one round trip rather than N. A search
+that fails is retried rather than fatal, and the cwd focus applies as soon as
+the search answers whether this repo has a map — unless you have already chosen
+a scope yourself with `ctrl-f`/`ctrl-g`, which wins.
+
 ## Launching
 
 Picking a ticket creates or focuses a zellij tab in that project's session,

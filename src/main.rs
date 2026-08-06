@@ -29,14 +29,14 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::DefaultTerminal;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use wf::app::{App, Outcome, Scope};
 use wf::autostart::{self, PollHealthByRepo};
-use wf::launch::{self, Handoff, Launch, TabOutcome};
+use wf::launch::{self, Handoff, Launch, MapIssues, TabOutcome};
 use wf::model::{merge_maps, Map};
 use wf::projects::{self, ProjectsCache};
-use wf::refresh::{Freshness, Poller, RefreshEvent};
+use wf::refresh::{Freshness, LoadEvent, Poller, RefreshEvent, Startup};
 
 /// Everything `wf`'s argv can mean. Only one shape opens the TUI; the others
 /// answer on a stream and exit, touching neither the terminal, `gh`, nor
@@ -101,79 +101,46 @@ async fn main() -> Result<()> {
     }
 
     // Accretive registration: running wf here is what makes this checkout
-    // a project. Non-checkouts and non-GitHub remotes are simply None.
+    // a project. Non-checkouts and non-GitHub remotes are simply None. This
+    // is local git (<10ms) and the projects cache it writes is what the first
+    // frame is drawn from, so it stays ahead of the screen.
     let cwd = std::env::current_dir().context("cannot resolve the working directory")?;
     let here = projects::discover_checkout(&cwd).await;
     let cache_path =
         projects::default_cache_path().context("cannot resolve the XDG cache directory")?;
     let mut cache = ProjectsCache::load_or_default(&cache_path);
+    // Accretion needs a matching forget: a checkout that has been deleted must
+    // stop appearing as a launch host (and stop forcing its repo's other
+    // checkout into a disambiguated session name).
+    let pruned = cache.prune_missing();
     if let Some((path, slug)) = &here {
         cache.register(path.clone(), slug.clone());
         cache.save(&cache_path)?;
+    } else if pruned {
+        cache.save(&cache_path)?;
     }
-
-    // Map detection: one label search intersected with the cached remotes.
     let repos = cache.repos();
-    eprintln!("wf: {} cached repo(s); searching for maps…", repos.len());
-    let map_issues: BTreeMap<String, u64> = wf::fetch::find_maps(&repos)
-        .await?
-        .into_iter()
-        .collect();
-
-    // Initial fetch of every map, merged into the one list the screen shows.
-    let mut maps: BTreeMap<String, Map> = BTreeMap::new();
-    let mut startup_notice = None;
-    for (slug, &number) in &map_issues {
-        let (owner, name) = slug.split_once('/').expect("slug is owner/name");
-        eprintln!("wf: fetching {slug} map (#{number})…");
-        match wf::fetch::fetch_map(owner, name, number).await {
-            Ok(map) => {
-                maps.insert(slug.clone(), map);
-            }
-            Err(err) => {
-                eprintln!("wf: {slug}: {err}");
-                startup_notice = Some(format!("{slug}: initial fetch failed"));
-            }
-        }
-    }
-    if maps.is_empty() && !map_issues.is_empty() {
-        anyhow::bail!("every map fetch failed — check network and `gh auth status`");
-    }
-
-    let mut app = App::new(merge_maps(&maps))
-        .with_projects(cache.checkouts.clone(), map_issues.clone());
-    app.notice = startup_notice;
-    match &here {
-        // cwd-open focuses the project (lazygit-style) when its repo has a
-        // map; the repo column drops because the header names the project.
-        Some((_, slug)) if maps.contains_key(slug) => {
-            app.scope = Scope::Project(slug.clone());
-        }
-        Some((_, slug)) => {
-            app.notice = Some(format!("{slug} has no wayfinder:map — showing all projects"));
-        }
-        None => {}
-    }
-
-    // One poller per repo-with-map, all feeding one slug-tagged channel.
-    let pollers: Vec<Poller> = map_issues
-        .iter()
-        .map(|(slug, &number)| {
-            let (owner, name) = slug.split_once('/').expect("slug is owner/name");
-            Poller::new(owner, name, number)
-        })
-        .collect();
-    let updates = wf::refresh::spawn_all(pollers);
-
-    // Agent tabs already open from earlier sessions: the AFK line is honest
-    // from the first frame (#7 — the tab is the supervision, and it outlives
-    // any one `wf`).
     let sessions = launch::sessions_of(&cache.checkouts);
-    app.agent_tabs = launch::agent_tab_count(&sessions).await;
+    let app = App::empty().with_projects(cache.checkouts.clone(), MapIssues::new());
 
+    // The screen goes up *before* any network or zellij call (#27). Everything
+    // that used to run here — the map search, a serial fetch per repo, the
+    // agent-tab count — now streams into a UI that is already drawn and already
+    // reading keys, which is also why the progress `eprintln!`s are gone: they
+    // only existed because there was no screen to say it on.
     let mut terminal = ratatui::init();
     spawn_terminal_guard();
-    let result = run(&mut terminal, app, maps, map_issues, sessions, updates).await;
+
+    let (tx, updates) = mpsc::unbounded_channel();
+    wf::refresh::spawn_discovery(repos, tx.clone());
+    spawn_agent_tab_count(sessions.clone(), tx.clone());
+
+    // cwd-open focuses the project (lazygit-style), but only the map *search*
+    // can say whether this repo has a map, so the focus is handed to the loop
+    // to apply the moment discovery lands — rather than after every map has
+    // been fetched, as it used to, and still before there are rows to watch move.
+    let focus = here.map(|(_, slug)| slug);
+    let result = run(&mut terminal, app, sessions, tx, updates, focus).await;
     ratatui::restore();
     if let Ending::HandedOver(parting) = result? {
         println!("wf: {parting}");
@@ -243,17 +210,42 @@ fn resume(terminal: &mut DefaultTerminal) -> Result<()> {
     Ok(())
 }
 
+/// Count the agent tabs off the path to the first frame (#27), reporting the
+/// result as an event. Startup's only `zellij` traffic, and the boundary that
+/// can wedge (#21) — so it must not be something the screen waits behind.
+fn spawn_agent_tab_count(sessions: Vec<String>, tx: UnboundedSender<LoadEvent>) {
+    tokio::spawn(async move {
+        let count = launch::agent_tab_count(&sessions).await;
+        let _ = tx.send(LoadEvent::AgentTabs(count));
+    });
+}
+
 /// Refetch every map in place (`ctrl-r`, and after returning from a session —
 /// a claim or a close landed while we were away). True if any fetch failed.
-async fn refetch_all(maps: &mut BTreeMap<String, Map>, map_issues: &BTreeMap<String, u64>) -> bool {
-    let mut failed = false;
+///
+/// Concurrent, not sequential (#27): the fetches are independent `gh`
+/// subprocesses keyed by slug, so N repos cost one round trip of wall clock
+/// rather than N. This one is still awaited because both callers are explicit
+/// acts whose notice has to describe what actually happened.
+async fn refetch_all(maps: &mut BTreeMap<String, Map>, map_issues: &MapIssues) -> bool {
+    let mut fetches = tokio::task::JoinSet::new();
     for (slug, &number) in map_issues {
-        let (owner, name) = slug.split_once('/').expect("slug is owner/name");
-        match wf::fetch::fetch_map(owner, name, number).await {
-            Ok(map) => {
-                maps.insert(slug.clone(), map);
+        let slug = slug.clone();
+        fetches.spawn(async move {
+            let (owner, name) = slug.split_once('/').expect("slug is owner/name");
+            let fetched = wf::fetch::fetch_map(owner, name, number).await;
+            (slug, fetched)
+        });
+    }
+    let mut failed = false;
+    while let Some(joined) = fetches.join_next().await {
+        match joined {
+            Ok((slug, Ok(map))) => {
+                maps.insert(slug, map);
             }
-            Err(_) => failed = true,
+            // A failed fetch and a panicked task are the same fact here: this
+            // repo's map did not come back.
+            Ok((_, Err(_))) | Err(_) => failed = true,
         }
     }
     failed
@@ -406,14 +398,22 @@ enum Ending {
     HandedOver(String),
 }
 
+/// The event loop. It starts with **no data at all** (#27): the maps, which
+/// repos even have maps, and the agent-tab count all arrive as [`LoadEvent`]s
+/// while the screen is already up and answering keys.
+///
+/// `focus` is the cwd checkout's repo slug, if `wf` was run inside one — held
+/// as an `Option` that is *taken*, so the lazygit-style focus can be applied at
+/// most once, when discovery makes it answerable.
 async fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
-    mut maps: BTreeMap<String, Map>,
-    map_issues: BTreeMap<String, u64>,
     sessions: Vec<String>,
-    mut updates: UnboundedReceiver<(String, RefreshEvent)>,
+    tx: UnboundedSender<LoadEvent>,
+    mut updates: UnboundedReceiver<LoadEvent>,
+    mut focus: Option<String>,
 ) -> Result<Ending> {
+    let mut maps: BTreeMap<String, Map> = BTreeMap::new();
     let mut refresh = RefreshState {
         last_verified: None,
         failing: false,
@@ -423,17 +423,51 @@ async fn run(
     // first reconcile on the first poll tick rather than at startup.
     let mut health = PollHealthByRepo::new();
     loop {
-        // Drain every pending poll outcome before drawing. An update swaps
-        // one repo's map in the merged view; App::replace_map keeps the
-        // cursor pinned to ticket identity, query and scope untouched.
+        // Drain everything that landed before drawing. A fetch swaps one repo's
+        // map in the merged view; App::replace_map keeps the cursor pinned to
+        // ticket identity, query and scope untouched.
         let mut polled = false;
-        while let Ok((slug, event)) = updates.try_recv() {
-            refresh.apply(&event);
-            health.record(&slug, &event);
-            polled = true;
-            if let RefreshEvent::Updated(new_map) = event {
-                maps.insert(slug, new_map);
-                app.replace_map(merge_maps(&maps));
+        while let Ok(event) = updates.try_recv() {
+            match event {
+                LoadEvent::Discovered(map_issues) => {
+                    // Spawning the pollers *is* the initial load: each one's
+                    // first cycle fetches unconditionally, so every map is in
+                    // flight at once and each lands on screen as it arrives.
+                    let pollers: Vec<Poller> = map_issues
+                        .iter()
+                        .map(|(slug, &number)| {
+                            let (owner, name) = slug.split_once('/').expect("slug is owner/name");
+                            Poller::new(owner, name, number)
+                        })
+                        .collect();
+                    wf::refresh::spawn_all(pollers, tx.clone());
+                    app.startup = Startup::discovered(&map_issues);
+                    if let Some(slug) = focus.take() {
+                        if map_issues.contains_key(&slug) {
+                            app.scope = Scope::Project(slug);
+                        } else {
+                            app.notice =
+                                Some(format!("{slug} has no wayfinder:map — showing all projects"));
+                        }
+                    }
+                    app.map_issues = map_issues;
+                }
+                // Discovery retries, so this is a status report and not an end
+                // state: `wf` stays on screen and recovers when the search does.
+                LoadEvent::SearchFailed => {
+                    app.notice = Some("map search failed — retrying".to_string());
+                }
+                LoadEvent::Fetched { repo, outcome } => {
+                    refresh.apply(&outcome);
+                    health.record(&repo, &outcome);
+                    app.startup.record_arrival(&repo);
+                    polled = true;
+                    if let RefreshEvent::Updated(new_map) = outcome {
+                        maps.insert(repo, new_map);
+                        app.replace_map(merge_maps(&maps));
+                    }
+                }
+                LoadEvent::AgentTabs(count) => app.agent_tabs = count,
             }
         }
         // Reconcile on poll reports only, so the cadence is the poller's (~4s)
@@ -451,13 +485,21 @@ async fn run(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                match app.handle_key(key) {
+                let scope_before = app.scope.clone();
+                let outcome = app.handle_key(key);
+                // A scope the user chose while the load was still out is theirs
+                // to keep: the pending cwd focus is dropped rather than applied
+                // over their `ctrl-g` when discovery lands a moment later.
+                if app.scope != scope_before {
+                    focus = None;
+                }
+                match outcome {
                     Outcome::Quit => return Ok(Ending::Quit),
                     Outcome::Refresh => {
                         // Force refresh (ctrl-r): refetch every map in
                         // place, without waiting for the poll cycles, and
                         // recount the agent tabs while we are at it.
-                        let failed = refetch_all(&mut maps, &map_issues).await;
+                        let failed = refetch_all(&mut maps, &app.map_issues).await;
                         app.replace_map(merge_maps(&maps));
                         app.agent_tabs = launch::agent_tab_count(&sessions).await;
                         if failed {
@@ -469,6 +511,7 @@ async fn run(
                         }
                     }
                     Outcome::Launch(launch) => {
+                        let map_issues = app.map_issues.clone();
                         let notice = match perform_launch(terminal, &launch, &mut maps, &map_issues)
                             .await?
                         {
