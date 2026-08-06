@@ -51,6 +51,22 @@ fn cluster_header(id: &MapId, map: &Map) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The cursor marker, which sits **after** a row's tree furniture and directly
+/// against the item it points at.
+///
+/// Column matters here. Parked in a fixed left-hand gutter it could not show
+/// depth at all: `→` moving the cursor a level deeper looked identical to `↓`
+/// moving it a line down, so the depth axis was invisible and the keys felt
+/// interchangeable. Riding with the indentation, the marker steps visibly
+/// rightward as you descend, which is the whole feedback the depth keys need.
+fn cursor_span(under_cursor: bool) -> Span<'static> {
+    if under_cursor {
+        Span::styled("▶ ", Style::new().fg(Color::Cyan))
+    } else {
+        Span::raw("  ")
+    }
+}
+
 /// The `⇄ PR#n <state>` badge spans for one linked PR (#52) — evidence of the
 /// ticket's progress, riding after the `[type]` suffix. An open PR folds its
 /// two live signals into one glyph: `✗` when something needs acting on (checks
@@ -102,15 +118,22 @@ fn ticket_line(
     name_repo: bool,
     under_cursor: bool,
 ) -> Line<'static> {
-    let cursor = if under_cursor { '▶' } else { ' ' };
     let repo = if name_repo {
         ticket.short_repo().to_string()
     } else {
         String::new()
     };
+    // Nested rows carry the cursor column as extra indent, so a branch begins
+    // directly under the glyph of the row it hangs from instead of to its left.
+    let indent = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("  {prefix}")
+    };
     let mut spans = vec![
-        Span::raw(format!("  {cursor} ")),
-        Span::styled(prefix.to_string(), Style::new().add_modifier(Modifier::DIM)),
+        Span::raw("  "),
+        Span::styled(indent, Style::new().add_modifier(Modifier::DIM)),
+        cursor_span(under_cursor),
         Span::styled(
             ticket.status.glyph().to_string(),
             glyph_style(&ticket.status),
@@ -151,7 +174,6 @@ pub fn body_lines(app: &App) -> Vec<Line<'static>> {
 /// It says `(hidden)` only while shut — once open, the rows are right there and
 /// claiming otherwise would be a lie.
 fn group_line(kind: GroupKind, hidden: usize, expanded: bool, under_cursor: bool) -> Line<'static> {
-    let cursor = if under_cursor { '▶' } else { ' ' };
     let fold = if expanded { '▾' } else { '▸' };
     let (glyph, label, color) = match kind {
         GroupKind::BlockedDeeper => ('⊘', "blocked deeper down", Color::Red),
@@ -159,7 +181,8 @@ fn group_line(kind: GroupKind, hidden: usize, expanded: bool, under_cursor: bool
     };
     let tail = if expanded { "" } else { " (hidden)" };
     Line::from(vec![
-        Span::raw(format!("  {cursor} ")),
+        Span::raw("  "),
+        cursor_span(under_cursor),
         Span::styled(format!("{fold} "), Style::new().add_modifier(Modifier::DIM)),
         Span::styled(glyph.to_string(), Style::new().fg(color)),
         Span::styled(
@@ -522,10 +545,10 @@ mod tests {
         // before #9 (unblocks #14) — each with its subtree drawn beneath it.
         let root6 = screen.find("○ #6 Re-entry breadcrumbs").expect("root #6");
         let sub7 = screen
-            .find("├─⊘ #7 Supervising AFK agents")
+            .find("├─  ⊘ #7 Supervising AFK agents")
             .expect("#7 under #6");
         let sub14 = screen
-            .find("└─⊘ #14 Breadcrumb markers")
+            .find("└─  ⊘ #14 Breadcrumb markers")
             .expect("#14 under #6");
         let root9 = screen.find("◐ #9 Main screen design").expect("root #9");
         assert!(root6 < sub7 && sub7 < sub14 && sub14 < root9, "{screen}");
@@ -549,10 +572,10 @@ mod tests {
         let done = screen.find("● #2 Choose the stack").expect("done in place");
         let root6 = screen.find("○ #6 Re-entry breadcrumbs").expect("root #6");
         let sub7 = screen
-            .find("├─⊘ #7 Supervising AFK agents")
+            .find("├─  ⊘ #7 Supervising AFK agents")
             .expect("#7 under #6");
         let sub14 = screen
-            .find("└─⊘ #14 Breadcrumb markers")
+            .find("└─  ⊘ #14 Breadcrumb markers")
             .expect("#14 under #6");
         let root9 = screen.find("◐ #9 Main screen design").expect("root #9");
         assert!(
@@ -677,7 +700,7 @@ mod tests {
         assert!(screen.contains("▶ ▾ ● 1 done"), "{screen}");
         assert!(!screen.contains("(hidden)"), "{screen}");
         assert!(
-            screen.contains("└─● #2 Choose the stack"),
+            screen.contains("└─  ● #2 Choose the stack"),
             "the done ticket hangs off the group line: {screen}"
         );
     }
