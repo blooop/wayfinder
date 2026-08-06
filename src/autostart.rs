@@ -33,13 +33,20 @@
 //!
 //! No off switch, no stagger, no fan-out cap: quitting `wf` is the switch, and
 //! the population is typically zero to two.
+//!
+//! On a machine with no zellij ([`crate::launch::Host::NoZellij`]) auto-start is
+//! off, and off by the same rule rather than by a special case: an AFK agent is
+//! supervised by its tab, so with no tab to put it in there is nothing to
+//! start. The driver skips the reconcile, and if it did not, "no session's tab
+//! state is known" already means [`reconcile`] plans nothing — the same
+//! conservative answer it gives for an unqueryable session.
 
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 
 use crate::launch::{
-    execute, find_tab, plan, Handoff, Host, Launch, MapIssues, Mode, OpenTab, Targets,
+    execute, find_tab, plan, Handoff, Host, Launch, MapIssues, Mode, Opened, Targets,
 };
 use crate::model::{Status, Ticket};
 use crate::projects::Checkout;
@@ -199,18 +206,20 @@ pub fn reconcile(
 /// human's zellij client would already have been moved. [`reconcile`] only ever
 /// plans `Mode::Afk` and a test above pins that; this is the second lock, on the
 /// side that would do the damage.
-pub async fn start(launch: &Launch, host: &Host) -> Result<OpenTab> {
+pub async fn start(launch: &Launch, host: &Host) -> Result<Opened> {
     match launch.mode {
         Mode::Afk => {}
         Mode::Hitl => bail!("auto-start refuses a HITL launch: {}", launch.describe()),
     }
-    let (tab, handoff) = execute(launch, host).await?;
+    let (opened, handoff) = execute(launch, host).await?;
     match handoff {
-        Handoff::Stay => Ok(tab),
-        // Unreachable while `launch::handoff` maps every AFK launch to `Stay`.
-        // Matched rather than ignored so that changing it there has to come back
-        // through here and answer for it.
-        Handoff::Suspend(_) => bail!("auto-start will not suspend the TUI"),
+        Handoff::Stay => Ok(opened),
+        // Unreachable while `launch::handoff` maps every AFK launch *that has a
+        // tab* to `Stay`. Matched rather than ignored so that changing it there
+        // has to come back through here and answer for it — and it is the third
+        // lock on auto-start without zellij, where the handoff is a `Suspend`
+        // that would run a headless agent over the top of the TUI.
+        Handoff::Suspend { .. } => bail!("auto-start will not suspend the TUI"),
         Handoff::Quit => bail!("auto-start will not hand the terminal over"),
     }
 }

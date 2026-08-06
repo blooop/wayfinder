@@ -1,7 +1,13 @@
 //! The launch seam (Build 4, #16) — the daily-use line.
 //!
-//! One picked ticket becomes a zellij tab in that project's session, cwd set
-//! to the checkout, running the `/wayfinder` skill. The tab has two names and
+//! On a machine with zellij, one picked ticket becomes a zellij tab in that
+//! project's session, cwd set to the checkout, running the `/wayfinder` skill.
+//! On a machine **without** zellij ([`Host::NoZellij`]) there is no tab to make,
+//! so the same picked ticket runs the same agent as `wf`'s own child in `wf`'s
+//! own terminal: `enter` steps out of the TUI, the agent takes the screen, and
+//! quitting it comes back to the picker. Everything below that depends on a tab
+//! — dedupe, focus, the agent count, auto-start — simply has nothing to act on
+//! there, and says so rather than pretending. The tab has two names and
 //! the difference is load-bearing (#20): its **key** [`TabKey`] —
 //! `<short_repo>#<number>`, per the #7 naming amendment — is its identity, and
 //! its **label** [`TabLabel`] is the key plus a capped title, which is what a
@@ -33,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
+use tokio::sync::OnceCell;
 
 use crate::model::Ticket;
 use crate::projects::Checkout;
@@ -59,10 +66,19 @@ impl Mode {
     }
 }
 
-/// Where `wf` itself is running. Read once from `wf`'s own environment —
-/// never from a `zellij action` exit code, which is 0 even on failure.
+/// Where `wf` itself is running. The zellij cases are read once from `wf`'s own
+/// environment — never from a `zellij action` exit code, which is 0 even on
+/// failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Host {
+    /// There is no `zellij` on PATH at all, so no tab can host anything. `wf`
+    /// runs the agent as its own child in its own terminal instead.
+    ///
+    /// Distinct from [`Host::Outside`], which is "zellij exists, it just does
+    /// not own this terminal yet" — that one still gets a tab, and `wf` attaches
+    /// to reach it. Collapsing the two would make `wf` shell out to a binary
+    /// that is not there and read the failure as an empty session list.
+    NoZellij,
     /// No zellij session owns this terminal: `wf` must suspend itself and
     /// run `zellij attach` as a child to hand over.
     Outside,
@@ -74,7 +90,8 @@ pub enum Host {
     InsideUnnamed,
 }
 
-/// Classify the launch host from the two zellij variables.
+/// Classify the launch host from the two zellij variables, *given* that zellij
+/// is installed. [`detect_host`] answers the installed question first.
 pub fn host_from_env(zellij: Option<&str>, session_name: Option<&str>) -> Host {
     match zellij {
         None => Host::Outside,
@@ -85,11 +102,48 @@ pub fn host_from_env(zellij: Option<&str>, session_name: Option<&str>) -> Host {
     }
 }
 
-/// [`host_from_env`] against the live process environment.
-pub fn detect_host() -> Host {
-    let zellij = std::env::var("ZELLIJ").ok();
-    let name = std::env::var("ZELLIJ_SESSION_NAME").ok();
-    host_from_env(zellij.as_deref(), name.as_deref())
+/// Is there a `zellij` on PATH at all?
+///
+/// Probed by *running* it rather than by searching `$PATH`, because the question
+/// that matters is whether this module's invocations will work — a `zellij` that
+/// is on PATH but cannot start is no more usable than an absent one. `--version`
+/// is the one invocation that touches no session, and the inherited zellij
+/// variables are scrubbed as everywhere else so a stale `ZELLIJ_SESSION_NAME`
+/// cannot make even this hang (#5 findings).
+pub async fn zellij_available() -> bool {
+    Command::new("zellij")
+        .arg("--version")
+        .env_remove("ZELLIJ")
+        .env_remove("ZELLIJ_SESSION_NAME")
+        .env_remove("ZELLIJ_PANE_ID")
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+}
+
+/// The answer to [`detect_host`], computed at most once per process.
+///
+/// Both halves of that answer — whether zellij is installed, and which session
+/// owns this terminal — are fixed for `wf`'s lifetime, so this is a cache of a
+/// settled fact rather than state. Memoised rather than resolved at startup and
+/// threaded down, because the probe is a subprocess and #27 keeps every
+/// subprocess off the path to the first frame: the first caller to *need* the
+/// host pays for it, and that caller is always a keystroke or a poll.
+static HOST: OnceCell<Host> = OnceCell::const_new();
+
+/// The live launch host: [`Host::NoZellij`] when there is no zellij to talk to,
+/// otherwise [`host_from_env`] against the live process environment.
+pub async fn detect_host() -> Host {
+    HOST.get_or_init(|| async {
+        if !zellij_available().await {
+            return Host::NoZellij;
+        }
+        let zellij = std::env::var("ZELLIJ").ok();
+        let name = std::env::var("ZELLIJ_SESSION_NAME").ok();
+        host_from_env(zellij.as_deref(), name.as_deref())
+    })
+    .await
+    .clone()
 }
 
 /// A fully-resolved launch: which session hosts the tab, what the tab is
@@ -542,11 +596,17 @@ pub fn count_agent_tabs(names: &[String]) -> usize {
     names.iter().filter(|n| is_agent_tab(n)).count()
 }
 
-/// Whether `wf` itself must step aside after the tab exists.
+/// Whether `wf` itself must step aside once the agent has somewhere to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Handoff {
-    /// Suspend the TUI, run this argv as a child, then restore and refresh.
-    Suspend(Vec<String>),
+    /// Suspend the TUI, run this argv as a child in `cwd`, then restore and
+    /// refresh.
+    ///
+    /// The child is either `zellij attach` (the tab is elsewhere and `wf` owns
+    /// the terminal it must be reached from) or, with no zellij, the agent
+    /// itself. `cwd` is always the checkout: `zellij attach` does not care, and
+    /// an agent run directly cares completely.
+    Suspend { argv: Vec<String>, cwd: PathBuf },
     /// Keep the TUI up: the tab runs on its own (AFK), or the zellij client
     /// was moved to it by native navigation while `wf` keeps running in its
     /// own tab — *in this same session*, so the user can navigate back to it.
@@ -556,9 +616,10 @@ pub enum Handoff {
     Quit,
 }
 
-/// Decide the handoff. AFK never attaches; inside zellij, `wf` is not the
-/// thing that owns the terminal, so the *client* moves rather than the TUI
-/// suspending.
+/// Decide the handoff. With no zellij `wf` always steps out, because the agent
+/// *is* its child and they cannot share the screen. Otherwise: AFK never
+/// attaches; inside zellij, `wf` is not the thing that owns the terminal, so the
+/// *client* moves rather than the TUI suspending.
 ///
 /// Whether `wf` survives that move is exactly whether it can be navigated back
 /// to. A same-session launch focuses a sibling tab, and `wf`'s own tab is still
@@ -569,10 +630,27 @@ pub enum Handoff {
 /// Every such launch used to leak one, and returning to that session later
 /// landed you on a pane that swallowed every key you typed (#22). So `wf`
 /// hands over and exits, restoring the terminal on the way out.
-pub fn handoff(mode: Mode, host: &Host, session: &str) -> Handoff {
-    match (mode, host) {
+///
+/// Takes the whole [`Launch`] rather than a mode and a session name because the
+/// no-zellij handoff runs the agent itself, and so needs the argv and the cwd
+/// too — and because a mode passed separately from the launch it describes is a
+/// second copy that can disagree with the first.
+pub fn handoff(host: &Host, launch: &Launch) -> Handoff {
+    let suspend = |argv: Vec<String>| Handoff::Suspend {
+        argv,
+        cwd: launch.cwd.clone(),
+    };
+    let session = launch.session.as_str();
+    match (launch.mode, host) {
+        // No multiplexer, so there is no third place for the agent to live: it
+        // runs here, in wf's terminal, and wf must get out of the way of it
+        // whether or not a human asked. An AFK launch never reaches this in
+        // practice — the driver refuses it and [`execute`] bails — and the
+        // `Suspend` it maps to is the third lock: `autostart::start` rejects a
+        // `Suspend` handoff outright.
+        (_, Host::NoZellij) => suspend(launch.agent_argv()),
         (Mode::Afk, _) => Handoff::Stay,
-        (Mode::Hitl, Host::Outside) => Handoff::Suspend(attach_argv(session)),
+        (Mode::Hitl, Host::Outside) => suspend(attach_argv(session)),
         (Mode::Hitl, Host::Inside(current)) if current != session => Handoff::Quit,
         // An unnamed host cannot be compared to the target, so it is treated as
         // the same session: staying is the recoverable guess (a live TUI in a
@@ -591,6 +669,9 @@ pub fn handoff(mode: Mode, host: &Host, session: &str) -> Handoff {
 /// tab was created would otherwise dedupe correctly and then fail to focus.
 pub fn focus_steps(host: &Host, launch: &Launch, tab: &OpenTab) -> Vec<Vec<String>> {
     match (launch.mode, host) {
+        // There is no client to move and no tab it could be moved to; the
+        // `Suspend` handoff runs the agent right here.
+        (_, Host::NoZellij) => Vec::new(),
         (Mode::Afk, _) => Vec::new(),
         (Mode::Hitl, Host::Outside) => Vec::new(),
         (Mode::Hitl, Host::InsideUnnamed) => vec![go_to_tab_argv(&launch.session, &tab.name)],
@@ -655,6 +736,36 @@ impl OpenTab {
     /// The name zellij will answer to for this tab.
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+/// Where a launch's agent ended up — the one thing that differs between a
+/// machine with zellij and one without.
+///
+/// A sum rather than an `Option<OpenTab>`: "no tab" here is not a missing value
+/// to be defaulted or unwrapped, it is a *different, complete* kind of launch,
+/// and the difference decides whether focusing, dedupe and counting mean
+/// anything at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Opened {
+    /// In a zellij tab — created just now, or already there and focused.
+    Tab(OpenTab),
+    /// In `wf`'s own terminal, as its child: no zellij on this machine, so
+    /// there is no tab to name, focus, dedupe against or count.
+    Direct,
+}
+
+impl Opened {
+    /// The word for what just happened, for the notice line. A direct launch is
+    /// always `started`: there was no tab to find already running.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Opened::Tab(tab) => match tab.outcome() {
+                TabOutcome::Created => "started",
+                TabOutcome::Existed => "focused",
+            },
+            Opened::Direct => "started",
+        }
     }
 }
 
@@ -753,10 +864,34 @@ pub async fn create_or_focus_tab(
     }
 }
 
-/// Perform a launch: ensure the session, create-or-focus the ticket's tab,
-/// move the zellij client if that is this host's handoff, and report what the
-/// caller must still do (suspend-and-attach, or nothing).
-pub async fn execute(launch: &Launch, host: &Host) -> Result<(OpenTab, Handoff)> {
+/// Perform a launch and report what the caller must still do.
+///
+/// With zellij: ensure the session, create-or-focus the ticket's tab, move the
+/// client if that is this host's handoff. Without: nothing to prepare at all —
+/// the agent is the child the caller is about to run, so the whole launch *is*
+/// its handoff.
+pub async fn execute(launch: &Launch, host: &Host) -> Result<(Opened, Handoff)> {
+    match host {
+        Host::NoZellij => {
+            // Second lock on the AFK refusal (the driver is the first): a
+            // headless agent with no tab is a process nobody can watch, find or
+            // reap, and #7 makes the tab the whole supervision story.
+            if launch.mode == Mode::Afk {
+                bail!("no zellij: an afk agent needs a tab to be supervised in");
+            }
+            Ok((Opened::Direct, handoff(host, launch)))
+        }
+        Host::Outside | Host::Inside(_) | Host::InsideUnnamed => {
+            let tab = execute_in_zellij(launch, host).await?;
+            let handoff = handoff(host, launch);
+            Ok((Opened::Tab(tab), handoff))
+        }
+    }
+}
+
+/// The zellij half of [`execute`]: session, tab, client. Never reached with
+/// [`Host::NoZellij`], so every `zellij` invocation below has a `zellij` to run.
+async fn execute_in_zellij(launch: &Launch, host: &Host) -> Result<OpenTab> {
     ensure_session(&launch.session, &launch.cwd).await?;
 
     // An AFK tab must not steal focus; remember where focus is so it can be
@@ -784,7 +919,7 @@ pub async fn execute(launch: &Launch, host: &Host) -> Result<(OpenTab, Handoff)>
         run(&go_to_tab_argv(&launch.session, &tab), None).await?;
     }
 
-    Ok((opened, handoff(launch.mode, host, &launch.session)))
+    Ok(opened)
 }
 
 /// Count the agent tabs across the projects' sessions — the AFK status line.
@@ -795,6 +930,11 @@ pub async fn execute(launch: &Launch, host: &Host) -> Result<(OpenTab, Handoff)>
 /// rather than looking any ticket up, and [`is_agent_tab`] recognises a key at
 /// the head of a name whatever follows it.
 pub async fn agent_tab_count(sessions: &[String]) -> usize {
+    // No zellij, so no tabs — a fact about the machine rather than a failed
+    // query, and answered without spawning anything.
+    if detect_host().await == Host::NoZellij {
+        return 0;
+    }
     let listing = match list_sessions().await {
         Ok(listing) => listing,
         Err(_) => return 0,
@@ -826,6 +966,13 @@ pub async fn agent_tab_count(sessions: &[String]) -> usize {
 /// poll reconciles nothing.
 pub async fn tabs_by_session(sessions: &[String]) -> crate::autostart::TabsBySession {
     let mut tabs = crate::autostart::TabsBySession::new();
+    // With no zellij every session's tab state is *unknown*, which is the empty
+    // map — and reconciliation reads that as "sit this poll out", the same
+    // conservative answer it gives an unqueryable session. Auto-start is
+    // therefore off without zellij by the existing rule, not a special case.
+    if detect_host().await == Host::NoZellij {
+        return tabs;
+    }
     let Ok(listing) = list_sessions().await else {
         return tabs;
     };
@@ -1164,12 +1311,15 @@ mod tests {
     fn outside_zellij_hitl_suspends_and_attaches_as_a_child() {
         let launch = launch_for(Mode::Hitl, "wayfinder");
         assert_eq!(
-            handoff(Mode::Hitl, &Host::Outside, "wayfinder"),
-            Handoff::Suspend(vec![
-                "zellij".to_string(),
-                "attach".to_string(),
-                "wayfinder".to_string()
-            ])
+            handoff(&Host::Outside, &launch),
+            Handoff::Suspend {
+                argv: vec![
+                    "zellij".to_string(),
+                    "attach".to_string(),
+                    "wayfinder".to_string()
+                ],
+                cwd: PathBuf::from("/data/proj/wayfinder"),
+            }
         );
         // Nothing else moves the client: the attach does it.
         let tab = opened(TabOutcome::Created, "wayfinder#16 launch seam");
@@ -1181,7 +1331,7 @@ mod tests {
         let launch = launch_for(Mode::Hitl, "wayfinder");
         let host = Host::Inside("wayfinder".to_string());
         let tab = opened(TabOutcome::Created, "wayfinder#16 launch seam");
-        assert_eq!(handoff(Mode::Hitl, &host, "wayfinder"), Handoff::Stay);
+        assert_eq!(handoff(&host, &launch), Handoff::Stay);
         assert_eq!(
             focus_steps(&host, &launch, &tab),
             vec![go_to_tab_argv("wayfinder", "wayfinder#16 launch seam")]
@@ -1211,7 +1361,7 @@ mod tests {
         let tab = opened(TabOutcome::Created, "wayfinder#16 launch seam");
         // The client leaves this session, so the tab wf is drawing in becomes
         // unreachable: it must not be left running there (#22).
-        assert_eq!(handoff(Mode::Hitl, &host, "k1"), Handoff::Quit);
+        assert_eq!(handoff(&host, &launch), Handoff::Quit);
         assert_eq!(
             focus_steps(&host, &launch, &tab),
             vec![
@@ -1225,13 +1375,16 @@ mod tests {
     fn wf_survives_only_a_handoff_it_can_be_navigated_back_from() {
         // Same session: wf's tab is still a tab-switch away, so it stays up.
         let same = Host::Inside("wayfinder".to_string());
-        assert_eq!(handoff(Mode::Hitl, &same, "wayfinder"), Handoff::Stay);
+        assert_eq!(
+            handoff(&same, &launch_for(Mode::Hitl, "wayfinder")),
+            Handoff::Stay
+        );
         // Another session: the client is gone from here, so staying would leak
         // a TUI holding a pane nobody can reach.
-        assert_eq!(handoff(Mode::Hitl, &same, "k1"), Handoff::Quit);
+        assert_eq!(handoff(&same, &launch_for(Mode::Hitl, "k1")), Handoff::Quit);
         // Unnamed: not comparable, so the recoverable guess wins.
         assert_eq!(
-            handoff(Mode::Hitl, &Host::InsideUnnamed, "k1"),
+            handoff(&Host::InsideUnnamed, &launch_for(Mode::Hitl, "k1")),
             Handoff::Stay
         );
     }
@@ -1246,7 +1399,7 @@ mod tests {
         ] {
             let launch = launch_for(Mode::Afk, "wayfinder");
             let tab = opened(TabOutcome::Created, "wayfinder#16 launch seam");
-            assert_eq!(handoff(Mode::Afk, &host, "wayfinder"), Handoff::Stay);
+            assert_eq!(handoff(&host, &launch), Handoff::Stay);
             assert!(
                 focus_steps(&host, &launch, &tab).is_empty(),
                 "host {host:?}"
@@ -1270,6 +1423,81 @@ mod tests {
             &Host::Inside("wayfinder".to_string()),
             &launch_for(Mode::Hitl, "wayfinder")
         ));
+    }
+
+    #[test]
+    fn with_no_zellij_hitl_runs_the_agent_itself_in_the_checkout() {
+        // The whole point of the no-zellij path: a machine with no multiplexer
+        // still launches. The child is `claude`, not `zellij attach`, and it runs in the
+        // checkout — the cwd zellij's `new-tab --cwd` would otherwise have set.
+        let launch = launch_for(Mode::Hitl, "wayfinder");
+        assert_eq!(
+            handoff(&Host::NoZellij, &launch),
+            Handoff::Suspend {
+                argv: vec![
+                    "claude".to_string(),
+                    SKIP_PERMISSIONS.to_string(),
+                    "/wayfinder 1 16".to_string(),
+                ],
+                cwd: PathBuf::from("/data/proj/wayfinder"),
+            }
+        );
+        // The same agent either way: what changes is where it runs, never what
+        // it is handed.
+        match handoff(&Host::NoZellij, &launch) {
+            Handoff::Suspend { argv, .. } => assert_eq!(argv, launch.agent_argv()),
+            other => panic!("expected a suspend, got {other:?}"),
+        }
+        // Nothing to focus and no client to move.
+        let tab = opened(TabOutcome::Created, "wayfinder#16 launch seam");
+        assert!(focus_steps(&Host::NoZellij, &launch, &tab).is_empty());
+        assert!(!afk_steals_focus(&Host::NoZellij, &launch));
+    }
+
+    #[test]
+    fn a_missing_zellij_is_not_the_same_host_as_an_unattached_one() {
+        // `Outside` still gets a tab and attaches to reach it; `NoZellij` has no
+        // tab at all. Collapsing them would attach to a binary that is not there.
+        let launch = launch_for(Mode::Hitl, "wayfinder");
+        let outside = handoff(&Host::Outside, &launch);
+        let none = handoff(&Host::NoZellij, &launch);
+        assert_ne!(outside, none);
+        assert!(matches!(outside, Handoff::Suspend { ref argv, .. } if argv[0] == "zellij"));
+        assert!(matches!(none, Handoff::Suspend { ref argv, .. } if argv[0] == "claude"));
+        // And the env-only classifier never invents it: whether zellij exists is
+        // a question about PATH, which `host_from_env` is not asked about.
+        for (zellij, name) in [(None, None), (Some("0"), Some("wayfinder")), (Some("0"), None)] {
+            assert_ne!(host_from_env(zellij, name), Host::NoZellij);
+        }
+    }
+
+    #[tokio::test]
+    async fn with_no_zellij_an_afk_launch_is_refused_before_anything_runs() {
+        // An AFK agent is supervised by its tab (#7). With no tab there is
+        // nothing to watch it in, so `execute` refuses rather than orphaning a
+        // headless `claude -p` — and refuses without touching the filesystem or
+        // spawning anything, which is why this test needs no zellij.
+        let err = execute(&launch_for(Mode::Afk, "wayfinder"), &Host::NoZellij)
+            .await
+            .expect_err("an afk launch with no zellij must be refused");
+        assert!(err.to_string().contains("afk"), "got {err}");
+        // Third lock: even if that guard were removed, the handoff it maps to is
+        // a `Suspend`, which `autostart::start` rejects outright.
+        assert!(matches!(
+            handoff(&Host::NoZellij, &launch_for(Mode::Afk, "wayfinder")),
+            Handoff::Suspend { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn with_no_zellij_hitl_execute_opens_nothing_and_hands_over() {
+        let launch = launch_for(Mode::Hitl, "wayfinder");
+        let (opened, handoff) = execute(&launch, &Host::NoZellij)
+            .await
+            .expect("a direct launch needs nothing to exist first");
+        assert_eq!(opened, Opened::Direct);
+        assert_eq!(opened.verb(), "started");
+        assert!(matches!(handoff, Handoff::Suspend { .. }));
     }
 
     #[test]

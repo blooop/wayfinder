@@ -9,7 +9,10 @@
 //!
 //! Build 4: the launch seam (see #16/#5/#7) — `enter` creates or focuses the
 //! `<repo>#<n>` zellij tab in the project's session and hands the terminal
-//! over to a HITL agent; `ctrl-a` spawns the same tab headless (AFK).
+//! over to a HITL agent; `ctrl-a` spawns the same tab headless (AFK). With no
+//! zellij on the machine at all, `enter` runs that same agent as `wf`'s own
+//! child in the checkout instead, and the tab-shaped features say so rather
+//! than pretending ([`launch::Host::NoZellij`]).
 //!
 //! Build 6: auto-start (see #19/#18) — after every healthy poll, `wf` reconciles
 //! the invariant "every frontier `research` ticket has a tab" and spawns the

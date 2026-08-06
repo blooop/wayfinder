@@ -13,7 +13,7 @@ schema_version: 1
 
 context:
   # Must equal Cargo.toml's version — CI fails the build if they drift.
-  version: "0.2.1"
+  version: "0.2.2"
 
 package:
   name: wf
@@ -104,6 +104,7 @@ about:
     mapped repo's tickets are read live from GitHub Issues via `gh`, and picking
     a ticket creates or focuses a zellij tab named `<repo>#<n>` running an agent
     on it — `enter` to work it interactively, `ctrl-a` to spawn it headless.
+    zellij is optional: without it, `enter` runs the agent in wf's own terminal.
 
 extra:
   recipe-maintainers:
