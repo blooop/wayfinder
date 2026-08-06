@@ -352,8 +352,13 @@ impl App {
         }
     }
 
-    /// `→`: reveal what the cursor is on — open a shut group, or step into the
-    /// first child of a ticket's subtree. One key, one meaning: *deeper*.
+    /// `→`: reveal — open a shut group, else move *forward* one stop.
+    ///
+    /// Stepping forward one stop is what descending *is*: a plan always emits a
+    /// node's children immediately after it, so the stop after a ticket with a
+    /// subtree is its first child. On a leaf there is nothing to descend into
+    /// and the same step carries on to whatever comes next, which is what keeps
+    /// the key live everywhere — held down, `→` visits every stop in order.
     fn descend(&mut self) {
         if let Some(Stop::Group(id)) = self.cursor_stop() {
             if !self.expanded.contains(&id) {
@@ -361,18 +366,15 @@ impl App {
                 return; // the rows appear beneath; the cursor stays on the line
             }
         }
-        let stops = self.stops();
         let pos = self.cursor_pos();
-        let Some(here) = stops.get(pos) else { return };
-        if let Some(next) = stops.get(pos + 1) {
-            if next.depth == here.depth + 1 {
-                self.cursor = pos + 1;
-            }
+        if pos + 1 < self.stops().len() {
+            self.cursor = pos + 1;
         }
     }
 
-    /// `←`: close what the cursor is on — shut an open group, or come back out
-    /// to the parent. The mirror of [`App::descend`].
+    /// `←`: close — shut an open group, else out to the parent, else back one
+    /// stop. The mirror of [`App::descend`]: it only ever moves earlier in the
+    /// body, and the last clause is what stops it dying at depth 0.
     fn ascend(&mut self) {
         if let Some(Stop::Group(id)) = self.cursor_stop() {
             if self.expanded.remove(&id) {
@@ -384,11 +386,14 @@ impl App {
         let Some(depth) = stops.get(pos).map(|at| at.depth) else {
             return;
         };
-        if depth == 0 {
-            return;
+        if depth > 0 {
+            if let Some(parent) = (0..pos).rev().find(|&i| stops[i].depth == depth - 1) {
+                self.cursor = parent;
+                return;
+            }
         }
-        if let Some(parent) = (0..pos).rev().find(|&i| stops[i].depth == depth - 1) {
-            self.cursor = parent;
+        if pos > 0 {
+            self.cursor = pos - 1;
         }
     }
 
@@ -777,8 +782,10 @@ mod tests {
         assert_eq!(at(&app), "#7");
         app.handle_key(key(KeyCode::Left));
         assert_eq!(at(&app), "#6", "← returns to the parent");
+        // At depth 0 there is no parent to climb to, so ← keeps its promise the
+        // only way left: one stop back.
         app.handle_key(key(KeyCode::Left));
-        assert_eq!(at(&app), "#6", "← at depth 0 is inert, never a wrap");
+        assert_eq!(at(&app), "#103");
     }
 
     #[test]
@@ -809,6 +816,126 @@ mod tests {
         assert_eq!(at(&app), "#9", "held at the last sibling");
         app.handle_key(key(KeyCode::Up));
         assert_eq!(at(&app), "#8");
+    }
+
+    /// A cluster with every awkward shape at once: a root whose only child has
+    /// children of its own (the chain that wedged), a second root with real
+    /// siblings beneath it, a childless root, and done work behind a group.
+    fn knotty_app() -> App {
+        let mut clusters = BTreeMap::new();
+        clusters.insert(
+            MapId::new("blooop/bencher", 1064),
+            Map {
+                title: "Map: endgame".to_string(),
+                tickets: vec![
+                    ticket("blooop/bencher", 1, "done", false, false, vec![]),
+                    ticket("blooop/bencher", 10, "root, chained", true, false, vec![]),
+                    ticket("blooop/bencher", 11, "only child", true, false, vec![10]),
+                    ticket("blooop/bencher", 12, "grandchild a", true, false, vec![11]),
+                    ticket("blooop/bencher", 13, "grandchild b", true, false, vec![11]),
+                    ticket("blooop/bencher", 20, "root, forked", true, false, vec![]),
+                    ticket("blooop/bencher", 21, "child a", true, false, vec![20]),
+                    ticket("blooop/bencher", 22, "child b", true, false, vec![20]),
+                    ticket("blooop/bencher", 30, "root, barren", true, false, vec![]),
+                ],
+            },
+        );
+        App::new(clusters)
+    }
+
+    #[test]
+    fn every_direction_key_always_does_something_unless_it_is_at_that_end() {
+        // The rule the human asked for, as a property rather than an example:
+        // holding *any* direction key down keeps navigating. A key may only sit
+        // still when it is already against its own end of the body — otherwise
+        // it must move the cursor or fold something.
+        for forward in [true, false] {
+            for arrow in [true, false] {
+                let code = match (forward, arrow) {
+                    (true, true) => KeyCode::Down,
+                    (false, true) => KeyCode::Up,
+                    (true, false) => KeyCode::Right,
+                    (false, false) => KeyCode::Left,
+                };
+                // Try it from every reachable position, with the group both
+                // shut and open, since folding changes the stop list.
+                for open_group in [false, true] {
+                    let mut app = knotty_app();
+                    if open_group {
+                        while !matches!(app.cursor_stop(), Some(Stop::Group(_))) {
+                            app.handle_key(key(KeyCode::Down));
+                        }
+                        app.handle_key(key(KeyCode::Right));
+                        app.cursor = 0;
+                    }
+                    let total = app.stops().len();
+                    for start in 0..total {
+                        app.cursor = start;
+                        let before = (app.cursor_pos(), app.stops().len());
+                        app.handle_key(key(code));
+                        let after = (app.cursor_pos(), app.stops().len());
+                        let at_its_end = if forward {
+                            start + 1 == total
+                        } else {
+                            start == 0
+                        };
+                        if at_its_end {
+                            continue; // allowed to hold still, nothing beyond
+                        }
+                        assert_ne!(
+                            before,
+                            after,
+                            "{code:?} stalled at stop {start} of {total} \
+                             (group {}): a direction key must always navigate",
+                            if open_group { "open" } else { "shut" }
+                        );
+                        // …and it must go the way it was asked to go.
+                        if after.1 == before.1 {
+                            if forward {
+                                assert!(after.0 > before.0, "{code:?} went backwards");
+                            } else {
+                                assert!(after.0 < before.0, "{code:?} went forwards");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn holding_a_direction_key_walks_all_the_way_to_the_end() {
+        // The consequence of the property above: each key terminates against
+        // its end rather than looping or stalling part-way. `→` is the one that
+        // visits *every* stop, since it steps one at a time.
+        let mut app = knotty_app();
+        let mut seen = vec![app.cursor_pos()];
+        for _ in 0..40 {
+            app.handle_key(key(KeyCode::Right));
+            seen.push(app.cursor_pos());
+        }
+        // `→` opened the group it passed through, so the body it finished
+        // walking is larger than the one it started on — measure it now.
+        let total = app.stops().len();
+        assert_eq!(app.cursor_pos(), total - 1, "→ reached the end");
+        let visited: BTreeSet<usize> = seen.into_iter().collect();
+        assert_eq!(visited.len(), total, "→ visited every stop");
+
+        // The other three settle against their own end too, from the far side.
+        for (code, forward) in [
+            (KeyCode::Left, false),
+            (KeyCode::Up, false),
+            (KeyCode::Down, true),
+        ] {
+            let mut app = knotty_app();
+            let total = app.stops().len();
+            app.cursor = if forward { 0 } else { total - 1 };
+            for _ in 0..40 {
+                app.handle_key(key(code));
+            }
+            let end = if forward { app.stops().len() - 1 } else { 0 };
+            assert_eq!(app.cursor_pos(), end, "{code:?} settled at its end");
+        }
     }
 
     #[test]
