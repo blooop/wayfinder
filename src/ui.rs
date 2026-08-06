@@ -91,36 +91,56 @@ pub fn body_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-/// The keybinding skeleton (#14): `tab` peek is deferred from v1; `enter`
-/// enters the ticket's agent session and `ctrl-a` spawns it AFK (#16); `esc`
-/// clears the query first and quits on an empty one, and `q` only quits when
-/// the query is empty (mid-query it types).
+/// The keybindings (#14): `tab` peek is deferred; `enter` runs the ticket's
+/// agent right here and `wf` is gone (#34); `esc` clears the query first and
+/// quits on an empty one, and `q` only quits when the query is empty (mid-query
+/// it types).
 const KEY_HINTS: &str =
-    "  enter launch · ctrl-a afk · ctrl-f focus · ctrl-g all · ctrl-r refresh · esc quit";
-
-/// The reserved AFK line (#1/#11): a count of the `<repo>#<n>` agent tabs
-/// zellij is holding, as of the last check. Empty when there are none —
-/// including before anything has been launched.
-pub fn afk_line(app: &App) -> String {
-    match app.agent_tabs {
-        0 => String::new(),
-        1 => "  agents: 1 tab".to_string(),
-        n => format!("  agents: {n} tabs"),
-    }
-}
+    "  enter launch · ctrl-f focus · ctrl-g all · ctrl-r refresh · esc quit";
 
 /// The project heading in the title bar.
 ///
 /// `merge_maps` names the empty case "no projects — run wf inside a checkout to
-/// register it", which is the truth only once the load has finished; before
-/// that the very same emptiness just means the fetch is still out (#27), and
-/// telling a user with three registered projects that they have none is the
-/// exact ambiguity the [`crate::refresh::Startup`] state exists to remove.
+/// register it", and that is the truth in exactly one of the three ways the
+/// list can be empty. It is also still loading (#27), or every fetch failed —
+/// and telling a user with three registered projects that they have none is the
+/// exact ambiguity [`crate::refresh::Startup`] exists to remove. So both other
+/// cases are named before the merged map's own header is trusted.
 pub fn heading(app: &App) -> String {
-    if !app.startup.is_loaded() && app.map.tickets.is_empty() {
-        return "loading…".to_string();
+    if app.map.tickets.is_empty() {
+        if !app.startup.is_loaded() {
+            return "loading…".to_string();
+        }
+        // Naming the repo is the whole value when there is one: "GitHub is
+        // unreachable" and "you have no projects" are different problems with
+        // different fixes, and the empty list looks identical either way.
+        match app.failed.len() {
+            0 => {}
+            1 => {
+                let repo = app.failed.iter().next().expect("len checked");
+                return format!("{repo} — fetch failed, ctrl-r retries");
+            }
+            n => return format!("{n} maps failed to fetch — ctrl-r retries"),
+        }
     }
     app.map.repo.clone()
+}
+
+/// The persistent failure segment on the count line.
+///
+/// Separate from [`heading`] because the case it exists for is the *partial*
+/// one: four maps on screen and a fifth missing draws a perfectly normal
+/// screen, so the only place left to say so is here — and it has to survive
+/// the next keypress, which the one-shot notice does not.
+pub fn failure_note(app: &App) -> String {
+    match app.failed.len() {
+        0 => String::new(),
+        1 => {
+            let repo = app.failed.iter().next().expect("len checked");
+            format!("· {repo} failed")
+        }
+        n => format!("· {n} maps failed"),
+    }
 }
 
 /// A centered box `width`×`height` (clamped) inside `area`.
@@ -134,9 +154,13 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     area
 }
 
-/// The which-checkout modal: one row per registered checkout of the repo
-/// (session name + path), because several checkouts of one repo each have
-/// their own session and the human must say which hosts the tab.
+/// The which-checkout modal: one row per registered checkout of the repo.
+///
+/// The one prompt `wf` still has, and the reason it survived the Build 7
+/// deletion (#34): a repo can have several checkouts, the agent must run in
+/// exactly one, and `wf` cannot guess which. The path *is* the row — it is what
+/// distinguishes the candidates, and with no session to name there is nothing
+/// shorter to show alongside it.
 fn draw_overlay(frame: &mut Frame, app: &App) {
     let Overlay::PickCheckout { launches, cursor } = &app.overlay else {
         return;
@@ -147,10 +171,9 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
         lines.push(Line::from(vec![
             Span::raw(format!("  {marker} ")),
             Span::styled(
-                format!("{:<12}", launch.session),
+                launch.cwd().display().to_string(),
                 Style::new().fg(Color::Cyan),
             ),
-            Span::raw(format!(" {}", launch.cwd.display())),
         ]));
     }
     lines.push(Line::default());
@@ -158,16 +181,13 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
         "  enter launch here · ↑/↓ pick · esc cancel",
         Style::new().add_modifier(Modifier::DIM),
     ));
-    // The key, not the label: this asks *which checkout*, so the ticket only
-    // needs identifying, and the title is already on the row behind the prompt.
-    let tab = launches
-        .first()
-        .map(|l| l.key().to_string())
-        .unwrap_or_default();
+    // This asks *which checkout*, so the ticket only needs identifying — its
+    // title is already on the row behind the prompt.
+    let key = launches.first().map(|l| l.key()).unwrap_or_default();
     let width = lines
         .iter()
         .map(|l| l.width() as u16 + 4)
-        .chain(std::iter::once(tab.len() as u16 + 32))
+        .chain(std::iter::once(key.len() as u16 + 30))
         .max()
         .unwrap_or(40);
     let area = centered(frame.area(), width, lines.len() as u16 + 2);
@@ -175,7 +195,7 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
-                .title(format!(" which checkout hosts {tab}? "))
+                .title(format!(" which checkout runs {key}? "))
                 .border_style(Style::new().fg(Color::Cyan)),
         ),
         area,
@@ -183,12 +203,10 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
 }
 
 /// Draw the full screen: bordered frame with the scope in the title, grouped
-/// list body, then the anchored bottom chrome — the AFK slot line (a count of
-/// live agent tabs, empty when there are none), the match-count line (with
-/// the subtle last-refreshed indicator from the background poll, empty before
-/// the first cycle, plus any one-shot notice), the fzf-style prompt, and the
-/// key hints. The which-checkout picker, when open, floats over all of it.
-pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
+/// list body, then the anchored bottom chrome — the match-count line (with the
+/// load hint and any one-shot notice), the fzf-style prompt, and the key hints.
+/// The which-checkout picker, when open, floats over all of it.
+pub fn draw(frame: &mut Frame, app: &App) {
     let mut block = match &app.scope {
         Scope::All => Block::bordered().title(format!(" wf · {} ", heading(app))),
         // The focused title names the project by its full slug — with one
@@ -201,9 +219,8 @@ pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
     let inner = block.inner(frame.area());
     frame.render_widget(block, frame.area());
 
-    let [body_area, afk_area, count_area, prompt_area, hint_area] = Layout::vertical([
+    let [body_area, count_area, prompt_area, hint_area] = Layout::vertical([
         Constraint::Min(0),
-        Constraint::Length(1), // AFK agents slot (see #7/#11)
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -211,15 +228,11 @@ pub fn draw(frame: &mut Frame, app: &App, refresh_indicator: &str) {
     .areas(inner);
 
     frame.render_widget(Paragraph::new(body_lines(app)), body_area);
-    frame.render_widget(
-        Paragraph::new(afk_line(app)).style(Style::new().fg(Color::Magenta)),
-        afk_area,
-    );
 
-    // The loading hint and the freshness indicator share one dim segment and
-    // can both be live at once (map 2 of 3 has landed, so the data on screen is
-    // fresh *and* incomplete); empty ones drop out rather than leaving gaps.
-    let status = [app.startup.hint(), refresh_indicator.to_string()]
+    // The load hint and the failure note share one dim segment and can both be
+    // live at once (map 2 of 3 is still coming *and* map 1 never arrived);
+    // empty ones drop out rather than leaving gaps.
+    let status = [app.startup.hint(), failure_note(app)]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
@@ -293,13 +306,9 @@ mod tests {
 
     /// Render the app through TestBackend and return the screen as text.
     fn render(app: &App) -> String {
-        render_with_indicator(app, "")
-    }
-
-    fn render_with_indicator(app: &App, indicator: &str) -> String {
         let backend = TestBackend::new(90, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal.draw(|f| draw(f, app, indicator)).expect("draw");
+        terminal.draw(|f| draw(f, app)).expect("draw");
         let buf = terminal.backend().buffer();
         let mut out = String::new();
         for y in 0..buf.area.height {
@@ -397,58 +406,47 @@ mod tests {
     /// The fixture map plus Build 4 launch inputs: two checkouts of the repo,
     /// so `enter` opens the which-checkout picker.
     fn launchable_app() -> App {
-        let checkout = |path: &str, session: &str| crate::projects::Checkout {
+        let checkout = |path: &str| crate::projects::Checkout {
             path: std::path::PathBuf::from(path),
             repo: "blooop/wayfinder".to_string(),
-            session: session.to_string(),
         };
         let mut map_issues = crate::launch::MapIssues::new();
         map_issues.insert("blooop/wayfinder".to_string(), 1);
         App::new(fixture_map()).with_projects(
             vec![
-                checkout("/data/k1/wayfinder", "k1"),
-                checkout("/data/k2/wayfinder", "k2"),
+                checkout("/data/k1/wayfinder"),
+                checkout("/data/k2/wayfinder"),
             ],
             map_issues,
         )
     }
 
     #[test]
-    fn the_hint_line_advertises_both_launch_keys() {
+    fn the_hint_line_advertises_the_one_launch_key_and_no_afk() {
         let screen = render(&App::new(fixture_map()));
         assert!(screen.contains("enter launch"));
-        assert!(screen.contains("ctrl-a afk"));
+        assert!(!screen.contains("ctrl-a"), "{screen}");
+        assert!(!screen.contains("afk"), "{screen}");
     }
 
     #[test]
-    fn the_afk_slot_is_empty_until_agent_tabs_exist() {
-        let mut app = App::new(fixture_map());
-        assert_eq!(afk_line(&app), "");
-        assert!(!render(&app).contains("agents:"));
-        app.agent_tabs = 1;
-        assert_eq!(afk_line(&app), "  agents: 1 tab");
-        app.agent_tabs = 3;
-        assert!(render(&app).contains("agents: 3 tabs"));
+    fn nothing_reserves_a_line_for_agents_any_more() {
+        // The `agents: N tabs` slot went with the tabs it counted (#26).
+        let screen = render(&App::new(fixture_map()));
+        assert!(!screen.contains("agents:"), "{screen}");
     }
 
     #[test]
-    fn the_checkout_picker_floats_over_the_list_with_one_row_per_session() {
+    fn the_checkout_picker_floats_over_the_list_with_one_row_per_tree() {
         let mut app = launchable_app();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let screen = render(&app);
-        assert!(screen.contains("which checkout hosts wayfinder#6?"), "{screen}");
-        assert!(screen.contains("▶ k1"));
-        assert!(screen.contains("/data/k1/wayfinder"));
-        assert!(screen.contains("  k2"));
+        assert!(screen.contains("which checkout runs wayfinder#6?"), "{screen}");
+        assert!(screen.contains("▶ /data/k1/wayfinder"), "{screen}");
+        assert!(screen.contains("/data/k2/wayfinder"), "{screen}");
         assert!(screen.contains("esc cancel"));
         // It is a modal: the rows it covers are overwritten, not blended.
         assert!(!screen.contains("Supervising AFK agents"), "{screen}");
-    }
-
-    #[test]
-    fn count_line_carries_the_refresh_indicator() {
-        let screen = render_with_indicator(&App::new(fixture_map()), "· ↻ 3s ago");
-        assert!(screen.contains("5/5  · ↻ 3s ago"));
     }
 
     #[test]
@@ -459,6 +457,49 @@ mod tests {
         assert!(screen.contains("searching for maps…"), "{screen}");
         assert!(screen.contains("wf · loading…"), "{screen}");
         assert!(!screen.contains("no projects"), "{screen}");
+    }
+
+    #[test]
+    fn an_empty_list_after_a_failed_fetch_does_not_claim_there_are_no_projects() {
+        // Three registered projects and GitHub unreachable draws the same empty
+        // list as no projects at all. Saying "no projects — run wf inside a
+        // checkout" there sends the user to fix the one thing that is not
+        // broken, so the failure has to win the heading.
+        let mut app = App::empty();
+        app.startup = Startup::loaded();
+        app.failed.insert("blooop/wayfinder".to_string());
+        let screen = render(&app);
+        assert!(!screen.contains("no projects"), "{screen}");
+        assert!(
+            screen.contains("blooop/wayfinder — fetch failed, ctrl-r retries"),
+            "{screen}"
+        );
+
+        // Several, and naming them all would not fit: say how many.
+        app.failed.insert("blooop/dotfiles".to_string());
+        let screen = render(&app);
+        assert!(screen.contains("2 maps failed to fetch"), "{screen}");
+        assert!(!screen.contains("no projects"), "{screen}");
+    }
+
+    #[test]
+    fn a_partial_failure_is_visible_and_survives_the_next_keypress() {
+        // The case that hides best: the rows that did load look completely
+        // normal, so the count line is the only place left to say a map is
+        // missing — and `notice` cannot be that place, because `handle_key`
+        // clears it on every keypress and nothing polls to re-announce it.
+        let mut app = App::new(fixture_map());
+        app.failed.insert("blooop/dotfiles".to_string());
+        assert_eq!(failure_note(&app), "· blooop/dotfiles failed");
+        let screen = render(&app);
+        assert!(screen.contains("5/5  · blooop/dotfiles failed"), "{screen}");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(
+            screen.contains("· blooop/dotfiles failed"),
+            "a keypress must not erase it: {screen}"
+        );
     }
 
     #[test]
@@ -483,9 +524,9 @@ mod tests {
         app.startup = Startup::seeded(&found);
         app.startup.searched(&found);
         app.startup.record_arrival("a/one");
-        let screen = render_with_indicator(&app, "· ↻ just now");
+        let screen = render(&app);
         assert!(screen.contains("#6    Re-entry breadcrumbs"), "{screen}");
-        assert!(screen.contains("5/5  · loading maps 1/3 · ↻ just now"), "{screen}");
+        assert!(screen.contains("5/5  · loading maps 1/3"), "{screen}");
         // Rows exist, so the title names the project rather than the wait.
         assert!(screen.contains("wf · blooop/wayfinder"), "{screen}");
     }

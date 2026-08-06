@@ -1,31 +1,24 @@
-//! Background refresh: the live-poll loop behind the TUI (Build 5, #17).
+//! The load: everything the picker needs, arriving after the screen is already
+//! up (#27, #28).
 //!
-//! Strategy (per the #3 data-plane research): `gh api graphql` has no ETags,
-//! so the hot loop is a two-tier hybrid —
+//! `wf` is on screen for seconds and restarts warm in ~0.6 s, so there is
+//! nothing here to keep fresh — [Build 7](https://github.com/blooop/wayfinder/issues/34)
+//! deleted the two-tier ETag poll ([Build 5](https://github.com/blooop/wayfinder/issues/17))
+//! along with the event loop it served. What is left is a **one-shot load per
+//! repo**, streamed:
 //!
-//! 1. Every [`POLL_INTERVAL`], a conditional REST probe of the map's
-//!    `sub_issues` endpoint with `If-None-Match`. A 304 costs zero rate
-//!    limit and means nothing changed; only a 200 triggers rerunning the
-//!    full GraphQL map query (2 points).
-//! 2. Every [`FULL_REFRESH_EVERY`]th cycle, an unconditional GraphQL fetch
-//!    regardless of the probe — the research left unverified whether
-//!    edge-only changes (dependency add/remove) flip the `sub_issues` ETag,
-//!    so this bounds that staleness at ~30 s.
+//! 1. The cached map numbers (#28) start their fetches before the first frame.
+//! 2. One `wayfinder:map` label search runs unconditionally alongside them and
+//!    reconciles that set — the cache is a head start, never a skip.
+//! 3. Each map lands on screen as it arrives; `ctrl-r` is how you ask again.
 //!
-//! Two live-verified `gh` quirks shape the prober: `gh api` exits nonzero on
-//! a 304 (it is not a 2xx), so the status line is parsed instead of the exit
-//! code; and the ETag hashes the response body, so the probe requests
-//! `per_page=100` — a truncated page could miss changes to later children.
-//!
-//! Failures never surface as errors: every outcome is a [`RefreshEvent`],
-//! and a failed poll just leaves the UI on stale data with an indicator.
+//! Failures never surface as errors: every outcome is a [`MapFetch`], and a
+//! failed load leaves the picker up with a notice rather than taking it down.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -34,22 +27,18 @@ use crate::launch::MapIssues;
 use crate::model::Map;
 use crate::projects::ProjectsCache;
 
-/// How often the background loop probes for changes.
-pub const POLL_INTERVAL: Duration = Duration::from_secs(4);
+/// How long the map search waits before trying again. The only recurring timer
+/// left: nothing polls, but a search that never answers would leave `wf`
+/// permanently empty.
+pub const RETRY_INTERVAL: Duration = Duration::from_secs(4);
 
-/// Every Nth cycle skips the probe and fetches unconditionally (the
-/// edge-only-change safety net; see module docs).
-pub const FULL_REFRESH_EVERY: u32 = 8;
-
-/// One poll cycle's outcome, sent to the UI loop. Never an `Err`: refresh
-/// failure is a displayable state, not a crash.
+/// One repo's map load. Two states, because with the conditional probe gone
+/// there is no third: a fetch either produced a map or it did not.
 #[derive(Debug)]
-pub enum RefreshEvent {
-    /// The tracker changed; here is the freshly fetched map.
-    Updated(Map),
-    /// The probe confirmed nothing changed (HTTP 304) — data verified fresh.
-    Unchanged,
-    /// The poll failed (network, auth, parse); keep showing stale data.
+pub enum MapFetch {
+    /// The map came back.
+    Loaded(Map),
+    /// The fetch failed (network, auth, parse); nothing to show for this repo.
     Failed,
 }
 
@@ -57,23 +46,16 @@ pub enum RefreshEvent {
 ///
 /// One channel rather than several, because the loop drains it between frames
 /// and every variant is "something arrived that the screen should reflect".
-/// Note there is no separate notion of an *initial* fetch result: the initial
-/// load and the steady-state poll produce the same per-repo [`RefreshEvent`],
-/// because the initial load **is** each poller's first cycle.
 #[derive(Debug)]
 pub enum LoadEvent {
     /// The one `wayfinder:map` label search returned: these repos have maps.
     /// Empty is a real answer — none of the cached repos is mapped.
     Discovered(MapIssues),
-    /// The label search failed. Nothing can load until it succeeds, so
-    /// [`spawn_discovery`] keeps retrying and this is only ever a status report.
+    /// The label search failed. [`spawn_discovery`] keeps retrying, so this is
+    /// only ever a status report.
     SearchFailed,
-    /// One repo's map fetch reported.
-    Fetched { repo: String, outcome: RefreshEvent },
-    /// The agent-tab recount finished — the AFK slot (#7), kept off the path to
-    /// the first frame because it is `zellij` traffic and `zellij` can wedge
-    /// (#21).
-    AgentTabs(usize),
+    /// One repo's map load reported.
+    Fetched { repo: String, outcome: MapFetch },
 }
 
 /// Has the `wayfinder:map` label search answered yet?
@@ -91,7 +73,7 @@ pub enum Search {
     Answered,
 }
 
-/// How far `wf`'s initial load has got (#27, reshaped by #28).
+/// How far `wf`'s load has got (#27, reshaped by #28).
 ///
 /// The screen is up before any of it has landed, so "no tickets" has to stay
 /// distinguishable from "not loaded yet" — one empty list would otherwise mean
@@ -105,12 +87,9 @@ pub enum Search {
 /// finished before anything had confirmed the map set. Here `is_loaded` is
 /// *derived* from both facts, so it cannot disagree with either.
 ///
-/// `arrived` is a set of repo slugs rather than a count because the pollers run
-/// concurrently on a [`POLL_INTERVAL`] cadence: a fast repo's *second* cycle can
-/// land before a slow repo's first, and a counter cannot tell that from the slow
-/// one arriving. Keeping `expected` and `arrived` as sets — with pending their
-/// difference — also makes the search's answer idempotent over a seed that has
-/// already reported.
+/// `arrived` is a set of repo slugs rather than a count because the loads run
+/// concurrently: naming who is still pending is the only thing that cannot be
+/// fooled by one repo reporting twice.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Startup {
     search: Search,
@@ -148,10 +127,20 @@ impl Startup {
     }
 
     /// Record `repo`'s map reporting. A *failed* fetch counts as reported: the
-    /// wait for that map is over either way, and its failure shows as staleness,
-    /// not as loading.
+    /// wait for that map is over either way, and its failure is carried by
+    /// [`crate::app::App::failed`] rather than by looking unfinished forever.
     pub fn record_arrival(&mut self, repo: &str) {
         self.arrived.insert(repo.to_string());
+    }
+
+    /// `ctrl-r`: every map is being fetched again, so nothing has arrived yet.
+    ///
+    /// The same state a load uses, because it is the same question — how many
+    /// of the maps we expect are in — and answering it once means the count
+    /// line reports a manual refresh exactly as it reports a start, instead of
+    /// a refresh being a silent pause with a stale hint.
+    pub fn reloading(&mut self) {
+        self.arrived.clear();
     }
 
     /// Repos whose maps are still out.
@@ -185,174 +174,46 @@ impl Startup {
     }
 }
 
-/// What the conditional probe learned.
-enum Probe {
-    /// 304 — the stored ETag still matches.
-    Unchanged,
-    /// 200 — something changed; carry the new ETag for the next cycle.
-    Changed { etag: Option<String> },
-}
-
-/// The background poller for one map. Owns the ETag across cycles.
-pub struct Poller {
-    owner: String,
-    repo: String,
-    number: u64,
-    etag: Option<String>,
-    cycle: u32,
-}
-
-impl Poller {
-    /// The full repo slug this poller watches (e.g. "blooop/wayfinder") —
-    /// the tag on every event it emits.
-    pub fn slug(&self) -> String {
-        format!("{}/{}", self.owner, self.repo)
-    }
-
-    pub fn new(owner: &str, repo: &str, number: u64) -> Self {
-        Self {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            number,
-            etag: None,
-            cycle: 0,
-        }
-    }
-
-    /// A poller for an `owner/name` slug — `None` for anything that is not one,
-    /// so a malformed cache entry is skipped rather than panicking the loop.
-    pub fn for_slug(slug: &str, number: u64) -> Option<Self> {
-        let (owner, name) = slug.split_once('/')?;
-        (!owner.is_empty() && !name.is_empty() && !name.contains('/'))
-            .then(|| Self::new(owner, name, number))
-    }
-
-    /// Run one poll cycle: conditional probe, then a full GraphQL fetch only
-    /// if needed. Infallible by design — errors become [`RefreshEvent::Failed`].
-    ///
-    /// Cycle **0** forces the full fetch, which is what makes this poller its
-    /// repo's initial load (#27): the very first cycle skips the probe it would
-    /// certainly fail (there is no ETag yet) and goes straight for the map, so a
-    /// cold start costs one GraphQL round trip rather than a REST probe plus
-    /// one. The unconditional refresh then recurs every [`FULL_REFRESH_EVERY`]
-    /// cycles as before.
-    pub async fn poll_once(&mut self) -> RefreshEvent {
-        let force_full = forces_full_fetch(self.cycle);
-        self.cycle = self.cycle.wrapping_add(1);
-
-        if !force_full {
-            match self.probe().await {
-                Ok(Probe::Unchanged) => return RefreshEvent::Unchanged,
-                Ok(Probe::Changed { etag }) => self.etag = etag,
-                Err(_) => return RefreshEvent::Failed,
-            }
-        }
-
-        match fetch::fetch_map(&self.owner, &self.repo, self.number).await {
-            Ok(map) => RefreshEvent::Updated(map),
-            Err(_) => RefreshEvent::Failed,
-        }
-    }
-
-    /// Conditional REST probe of the map's `sub_issues` list. `-i` prints the
-    /// status line and headers; the body is discarded (the GraphQL query is
-    /// the single source of parsed truth).
-    async fn probe(&self) -> Result<Probe> {
-        let mut args = vec!["api".to_string(), "-i".to_string()];
-        if let Some(etag) = &self.etag {
-            args.push("-H".to_string());
-            args.push(format!("If-None-Match: {etag}"));
-        }
-        args.push(format!(
-            "repos/{}/{}/issues/{}/sub_issues?per_page=100",
-            self.owner, self.repo, self.number
-        ));
-
-        let output = Command::new("gh")
-            .args(&args)
-            .output()
-            .await
-            .context("failed to run `gh` for the refresh probe")?;
-
-        // `gh api` exits 1 on a 304 (non-2xx), so classify by status line.
-        let head = String::from_utf8_lossy(&output.stdout);
-        parse_probe(&head, output.status.success())
-    }
-}
-
-/// Does this cycle skip the conditional probe and fetch outright?
-///
-/// Counting from **zero** is what makes a poller its own initial load (#27) —
-/// cycle 0 is the cold start, where a probe has no ETag to send and so cannot
-/// come back 304. Probing there would buy a guaranteed-200 REST round trip
-/// before the GraphQL fetch it cannot avoid, doubling the time to first paint.
-fn forces_full_fetch(cycle: u32) -> bool {
-    cycle.is_multiple_of(FULL_REFRESH_EVERY)
-}
-
-/// Classify a `gh api -i` response: 304 → unchanged, 2xx → changed (with the
-/// new ETag pulled from the headers). Anything else is a real failure.
-fn parse_probe(response_head: &str, exit_ok: bool) -> Result<Probe> {
-    let status_line = response_head.lines().next().unwrap_or_default();
-    if status_line.contains(" 304") {
-        return Ok(Probe::Unchanged);
-    }
-    if exit_ok {
-        let etag = response_head
-            .lines()
-            .take_while(|l| !l.trim().is_empty()) // headers end at the blank line
-            .find_map(|l| l.strip_prefix("Etag: ").or_else(|| l.strip_prefix("ETag: ")))
-            .map(|v| v.trim().to_string());
-        return Ok(Probe::Changed { etag });
-    }
-    bail!("probe failed: {status_line}");
-}
-
-/// One live poll loop and the map number it was started for.
-struct Running {
+/// One in-flight (or finished) load, and the map number it was started for.
+struct Loading {
     number: u64,
     task: JoinHandle<()>,
 }
 
-/// The live poll loops: **at most one per repo, at the map number currently
+/// The map loads: **at most one per repo, at the map number currently
 /// believed**. That invariant is the whole reason this owns the tasks (#28).
 ///
-/// Before the cache, the map numbers were known once and never changed, so the
-/// pollers could be fire-and-forget. A seeded start can be *wrong* — the number
-/// came from the last run — and the correction arrives later, in the search's
-/// answer. A corrected number that only landed in `App::map_issues` would fix
-/// what `enter` launches while the task actually doing the fetching kept asking
-/// for the old issue forever; so the poller set is reconciled against the truth
-/// instead, and the repo recovers without a restart.
+/// A seeded start can be *wrong* — the number came from the last run — and the
+/// correction arrives later, in the search's answer. A corrected number that
+/// only landed in `App::map_issues` would fix what `enter` launches while the
+/// task actually doing the fetching kept asking for the old issue; so the load
+/// set is reconciled against the truth instead.
 #[derive(Default)]
-pub struct Pollers {
-    running: BTreeMap<String, Running>,
+pub struct Loaders {
+    running: BTreeMap<String, Loading>,
 }
 
-impl Pollers {
+impl Loaders {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Make the live loops match `want`: stop any whose repo is no longer mapped
-    /// or whose map number changed, start one for every repo not already polled
-    /// at the right number, and leave the rest untouched — restarting a poller
-    /// that is already correct would throw away its ETag and re-fetch for
-    /// nothing.
+    /// Make the loads match `want`: drop any whose repo is no longer mapped or
+    /// whose map number changed, start one for every repo not already loaded at
+    /// the right number, and leave the rest untouched — a repo whose map has
+    /// already arrived at the right number has nothing to fetch again.
     ///
-    /// Every event is tagged with the emitting poller's repo slug so the UI loop
-    /// knows which map to swap. The UI drains the channel with `try_recv`
-    /// between frames; tasks also end when the receiver is dropped (quit).
-    /// Probes are conditional 304s, so N repos cost nothing extra at rest.
-    ///
-    /// Each loop **polls before it sleeps** (#27), so this call *is* the load
-    /// for the repos it starts: N maps arrive concurrently, one fetch of wall
-    /// clock rather than N, and each one streams into a UI already on screen.
+    /// Every event is tagged with the loading repo's slug so the UI loop knows
+    /// which map to swap. This call **is** the load for the repos it starts: N
+    /// maps are fetched concurrently, one round trip of wall clock rather than
+    /// N, and each one streams into a UI already on screen.
     pub fn reconcile(&mut self, want: &MapIssues, tx: &mpsc::UnboundedSender<LoadEvent>) {
-        self.running.retain(|slug, running| {
-            let still_wanted = want.get(slug) == Some(&running.number);
+        self.running.retain(|slug, loading| {
+            let still_wanted = want.get(slug) == Some(&loading.number);
             if !still_wanted {
-                running.task.abort();
+                // A no-op for a load that already finished, and the point for
+                // one still in flight against a number that has since moved.
+                loading.task.abort();
             }
             still_wanted
         });
@@ -360,47 +221,92 @@ impl Pollers {
             if self.running.contains_key(slug) {
                 continue;
             }
-            let Some(poller) = Poller::for_slug(slug, number) else {
-                continue;
+            let Some((owner, name)) = split_slug(slug) else {
+                continue; // a malformed cache entry is skipped, never panicked on
             };
-            let task = spawn_poller(poller, tx.clone());
-            self.running.insert(slug.clone(), Running { number, task });
+            let task = spawn_load(owner, name, number, slug.clone(), tx.clone());
+            self.running.insert(slug.clone(), Loading { number, task });
         }
     }
 
-    /// The repos being polled, and at which map issue — the reconciled truth,
+    /// `ctrl-r`: throw every load away and start them all again.
+    ///
+    /// The refetch has to go through *this* rather than fetching alongside it,
+    /// and the reason is ordering. A load started at t₀ and a refetch started
+    /// at t₁ > t₀ both write the same repo's map, and the load can land second
+    /// — so a refetch racing the initial load used to be overwritten by an
+    /// older snapshot while the screen said `refreshed`. Nothing polls now, so
+    /// that stale map would be final. Restarting means every result reaches the
+    /// UI through one channel, in send order, and the newest write wins by
+    /// construction.
+    pub fn restart(&mut self, want: &MapIssues, tx: &mpsc::UnboundedSender<LoadEvent>) {
+        self.abort_all();
+        self.reconcile(want, tx);
+    }
+
+    /// Stop every load and wait for it to actually be gone.
+    ///
+    /// Awaited, not fired and forgotten, because `abort()` only *schedules*
+    /// cancellation: the `gh` child is killed when the task's `Child` is
+    /// dropped, and that drop happens when the runtime next polls the task. On
+    /// the launch path the very next thing this process does is `exec`, so
+    /// without the await there is no "next poll" — the `gh` would survive into
+    /// the agent as a zombie holding its terminal.
+    pub async fn shutdown(&mut self) {
+        self.abort_all();
+        for (_, loading) in std::mem::take(&mut self.running) {
+            // A load that already finished joins immediately; an aborted one
+            // resolves to a `JoinError::Cancelled`. Both mean "gone".
+            let _ = loading.task.await;
+        }
+    }
+
+    fn abort_all(&mut self) {
+        for loading in self.running.values() {
+            loading.task.abort();
+        }
+        self.running.clear();
+    }
+
+    /// The repos being loaded, and at which map issue — the reconciled truth,
     /// for tests and for anything that needs to know what is actually live.
-    pub fn watching(&self) -> MapIssues {
+    pub fn targets(&self) -> MapIssues {
         self.running
             .iter()
-            .map(|(slug, running)| (slug.clone(), running.number))
+            .map(|(slug, loading)| (slug.clone(), loading.number))
             .collect()
     }
 }
 
-/// One repo's poll loop: poll, report, sleep, forever.
-fn spawn_poller(mut poller: Poller, tx: mpsc::UnboundedSender<LoadEvent>) -> JoinHandle<()> {
+/// Split an `owner/name` slug, rejecting anything that is not one.
+fn split_slug(slug: &str) -> Option<(&str, &str)> {
+    let (owner, name) = slug.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty() && !name.contains('/')).then_some((owner, name))
+}
+
+/// Fetch one repo's map and report it. One shot: there is no loop, because
+/// there is nothing to stay fresh for (#26).
+fn spawn_load(
+    owner: &str,
+    name: &str,
+    number: u64,
+    slug: String,
+    tx: mpsc::UnboundedSender<LoadEvent>,
+) -> JoinHandle<()> {
+    let (owner, name) = (owner.to_string(), name.to_string());
     tokio::spawn(async move {
-        let repo = poller.slug();
-        loop {
-            let outcome = poller.poll_once().await;
-            let event = LoadEvent::Fetched {
-                repo: repo.clone(),
-                outcome,
-            };
-            if tx.send(event).is_err() {
-                return; // UI is gone
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
+        let outcome = match fetch::fetch_map(&owner, &name, number).await {
+            Ok(map) => MapFetch::Loaded(map),
+            Err(_) => MapFetch::Failed,
+        };
+        let _ = tx.send(LoadEvent::Fetched { repo: slug, outcome });
     })
 }
 
 /// Find which cached repos have a `wayfinder:map`, off the path to the first
-/// frame (#27). Nothing can load until this returns, so it is the one genuinely
-/// serial step — but the screen no longer waits on it.
+/// frame (#27).
 ///
-/// It **retries** on the poll cadence rather than giving up. A single failed
+/// It **retries** on [`RETRY_INTERVAL`] rather than giving up. A single failed
 /// search would otherwise leave `wf` permanently empty with no way back:
 /// `ctrl-r` refetches the maps it knows about, and after a failed search it
 /// knows about none.
@@ -411,11 +317,14 @@ fn spawn_poller(mut poller: Poller, tx: mpsc::UnboundedSender<LoadEvent>) -> Joi
 /// — so the seed is never trusted for longer than one search round trip. On
 /// success it writes its findings back to `cache_path`, which is what makes the
 /// *next* run warm; a failed write costs only that head start.
+///
+/// Returns its handle so the launch path can stop it and wait: it holds a `gh`
+/// child of its own, and the same reasoning as [`Loaders::shutdown`] applies.
 pub fn spawn_discovery(
     repos: Vec<String>,
     cache_path: PathBuf,
     tx: mpsc::UnboundedSender<LoadEvent>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match fetch::find_maps(&repos).await {
@@ -430,17 +339,17 @@ pub fn spawn_discovery(
                 Err(_) if tx.send(LoadEvent::SearchFailed).is_err() => return, // UI is gone
                 Err(_) => {}
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::time::sleep(RETRY_INTERVAL).await;
         }
-    });
+    })
 }
 
-/// Where the cursor lands after a refresh swaps the ticket list.
+/// Where the cursor lands after a load or a refresh swaps the ticket list.
 ///
 /// Identity wins over position: if the previously selected ticket (by
 /// `(repo, number)`) still exists anywhere in the new order, the cursor
 /// follows it. Only if it vanished does the cursor fall back to the same
-/// index, clamped to the new length. A refresh must never teleport the
+/// index, clamped to the new length. A map arriving must never teleport the
 /// selection just because rows moved between groups.
 pub fn preserve_cursor(
     old_selected: Option<(&str, u64)>,
@@ -455,45 +364,6 @@ pub fn preserve_cursor(
     old_index.min(new_order.len().saturating_sub(1))
 }
 
-/// What the count line's refresh indicator knows: when data was last
-/// verified fresh (an update or a 304), and whether the latest poll failed.
-///
-/// Stale is not the absence of freshness — it is a positive fact (a poll
-/// failed since the last success), so it is its own variant rather than a
-/// bool riding alongside a timestamp.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Freshness {
-    /// No poll has completed yet (initial fetch only).
-    Initial,
-    /// The last poll succeeded `secs_ago` seconds ago.
-    Fresh { secs_ago: u64 },
-    /// Polls are failing; data was last verified `secs_ago` seconds ago
-    /// (`None` if no poll ever succeeded).
-    Stale { secs_ago: Option<u64> },
-}
-
-impl Freshness {
-    /// The subtle indicator text for the count line. Empty before the first
-    /// poll completes.
-    pub fn indicator(&self) -> String {
-        match self {
-            Freshness::Initial => String::new(),
-            Freshness::Fresh { secs_ago } if *secs_ago < 2 => "· ↻ just now".to_string(),
-            Freshness::Fresh { secs_ago } => format!("· ↻ {}", ago(*secs_ago)),
-            Freshness::Stale { secs_ago: Some(s) } => format!("· stale {}", ago(*s)),
-            Freshness::Stale { secs_ago: None } => "· stale".to_string(),
-        }
-    }
-}
-
-fn ago(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else {
-        format!("{}m ago", secs / 60)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,7 +375,7 @@ mod tests {
 
     #[test]
     fn cursor_follows_ticket_identity_when_rows_reorder() {
-        // B was selected at index 1; refresh moves it to the top.
+        // B was selected at index 1; a fresh map moves it to the top.
         assert_eq!(preserve_cursor(Some(B), 1, &[B, A, C]), 0);
         // …or to the bottom.
         assert_eq!(preserve_cursor(Some(B), 1, &[A, C, B]), 2);
@@ -543,30 +413,15 @@ mod tests {
     }
 
     #[test]
-    fn indicator_renders_each_freshness_state() {
-        assert_eq!(Freshness::Initial.indicator(), "");
-        assert_eq!(Freshness::Fresh { secs_ago: 0 }.indicator(), "· ↻ just now");
-        assert_eq!(Freshness::Fresh { secs_ago: 7 }.indicator(), "· ↻ 7s ago");
-        assert_eq!(Freshness::Fresh { secs_ago: 130 }.indicator(), "· ↻ 2m ago");
-        assert_eq!(
-            Freshness::Stale { secs_ago: Some(42) }.indicator(),
-            "· stale 42s ago"
-        );
-        assert_eq!(Freshness::Stale { secs_ago: None }.indicator(), "· stale");
-    }
-
-    #[test]
-    fn the_cold_start_cycle_fetches_without_probing_first() {
-        // Cycle 0 is the initial load: no ETag exists, so a probe could only
-        // 200 and the GraphQL fetch would follow anyway.
-        assert!(forces_full_fetch(0));
-        // …and the safety-net cadence is unchanged: probe in between, full
-        // fetch every FULL_REFRESH_EVERY cycles.
-        for cycle in 1..FULL_REFRESH_EVERY {
-            assert!(!forces_full_fetch(cycle), "cycle {cycle} should probe");
-        }
-        assert!(forces_full_fetch(FULL_REFRESH_EVERY));
-        assert!(forces_full_fetch(FULL_REFRESH_EVERY * 2));
+    fn a_slug_is_owner_slash_name_and_nothing_else() {
+        assert_eq!(split_slug("blooop/wayfinder"), Some(("blooop", "wayfinder")));
+        // A malformed cache entry must be skipped, not fetched and not panicked
+        // on — these are the shapes `Loaders::reconcile` silently drops.
+        assert_eq!(split_slug("wayfinder"), None);
+        assert_eq!(split_slug("/wayfinder"), None);
+        assert_eq!(split_slug("blooop/"), None);
+        assert_eq!(split_slug("a/b/c"), None);
+        assert_eq!(split_slug(""), None);
     }
 
     /// The `Discovered` payload for a set of repo slugs.
@@ -607,27 +462,21 @@ mod tests {
     }
 
     #[test]
-    fn a_fast_repo_polling_twice_does_not_complete_a_slow_repos_load() {
-        // The pollers are concurrent on a 4s cadence, so a fast repo's second
-        // cycle can beat a slow repo's first. Counting arrivals would call that
+    fn one_repo_reporting_twice_does_not_complete_another_repos_load() {
+        // The loads are concurrent, and `ctrl-r` can make a repo report again
+        // while a slow one is still out. Counting arrivals would call that
         // done; naming who is still pending cannot.
         let mut startup = cold();
         startup.searched(&found(&["fast/one", "slow/two"]));
         startup.record_arrival("fast/one");
         startup.record_arrival("fast/one");
-        assert_eq!(
-            startup.hint(),
-            "· loading maps 1/2",
-            "slow/two is still out"
-        );
+        assert_eq!(startup.hint(), "· loading maps 1/2", "slow/two is still out");
         startup.record_arrival("slow/two");
         assert!(startup.is_loaded());
     }
 
     #[test]
-    fn arrivals_after_the_load_are_polls_not_startup() {
-        // The pollers keep reporting for as long as wf runs; none of those
-        // later fetches may push the screen back into a loading state.
+    fn arrivals_after_the_load_do_not_push_the_screen_back_into_loading() {
         let mut startup = cold();
         startup.searched(&found(&["a/one"]));
         startup.record_arrival("a/one");
@@ -666,6 +515,27 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_r_puts_the_load_back_on_the_count_line() {
+        // A refresh refetches every map, so nothing has arrived until it does.
+        // Without this the hint stays empty and `ctrl-r` is a silent pause.
+        let mut startup = cold();
+        let maps = found(&["a/one", "b/two"]);
+        startup.searched(&maps);
+        startup.record_arrival("a/one");
+        startup.record_arrival("b/two");
+        assert!(startup.is_loaded());
+
+        startup.reloading();
+        assert!(!startup.is_loaded());
+        assert_eq!(startup.hint(), "· loading maps 0/2");
+        startup.record_arrival("a/one");
+        assert_eq!(startup.hint(), "· loading maps 1/2");
+        startup.record_arrival("b/two");
+        assert!(startup.is_loaded(), "the search already answered; it stays answered");
+        assert_eq!(startup.hint(), "");
+    }
+
+    #[test]
     fn the_search_overrules_a_seed_it_disagrees_with() {
         // Cached "b/two" lost its map and "c/three" gained one since last run.
         let mut startup = Startup::seeded(&found(&["a/one", "b/two"]));
@@ -680,27 +550,5 @@ mod tests {
         );
         startup.record_arrival("c/three");
         assert!(startup.is_loaded());
-    }
-
-    #[test]
-    fn probe_classifies_304_as_unchanged_despite_nonzero_exit() {
-        // gh api exits 1 on a 304; the status line is the truth.
-        let head = "HTTP/2.0 304 Not Modified\nAccess-Control-Allow-Origin: *\n";
-        assert!(matches!(parse_probe(head, false), Ok(Probe::Unchanged)));
-    }
-
-    #[test]
-    fn probe_extracts_etag_on_200() {
-        let head = "HTTP/2.0 200 OK\nEtag: W/\"abc123\"\nVary: Accept\n\n[{}]";
-        match parse_probe(head, true) {
-            Ok(Probe::Changed { etag }) => assert_eq!(etag.as_deref(), Some("W/\"abc123\"")),
-            other => panic!("expected Changed, got {:?}", other.map(|_| ()).err()),
-        }
-    }
-
-    #[test]
-    fn probe_real_failure_is_an_error() {
-        let head = "HTTP/2.0 502 Bad Gateway\n";
-        assert!(parse_probe(head, false).is_err());
     }
 }

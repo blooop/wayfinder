@@ -8,8 +8,18 @@
 //! points, and this is the one place they are ever looked at as strings: a
 //! sub-issue's labels become a [`TicketType`] here and nothing inward re-sniffs
 //! them (parse, don't validate).
+//!
+//! Both invocations are `stdin`-nulled and `kill_on_drop`. Neither is
+//! decoration. `tokio`'s `Command::output()` pipes only stdout and stderr and
+//! leaves **stdin inherited** — a silent divergence from `std`'s, which nulls
+//! it — so without the first, every `gh` here holds `wf`'s terminal, which is
+//! exactly the fd leak that broke #30. Without the second, a `gh` still in
+//! flight when `wf` `exec`s into the agent is inherited by the agent as a
+//! zombie it will never reap: aborting the task drops the `Child`, and only
+//! `kill_on_drop` turns that into a signal.
 
 use std::collections::HashMap;
+use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -125,6 +135,8 @@ pub async fn fetch_map(owner: &str, name: &str, number: u64) -> Result<Map> {
             "-f",
             &format!("query={MAP_QUERY}"),
         ])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
@@ -239,6 +251,8 @@ pub async fn find_maps(repos: &[String]) -> Result<HashMap<String, u64>> {
             "-F",
             "per_page=100",
         ])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .context("failed to run `gh` for the map search")?;
@@ -318,16 +332,15 @@ mod tests {
             vec![
                 (3, TicketType::Research),
                 (19, TicketType::Task),
-                // No labels at all is Untyped, and Untyped is not startable —
-                // fog graduated without a type is never picked up by itself.
+                // No labels at all is Untyped — one meaning ("no recognised
+                // type"), never a stand-in for several.
                 (21, TicketType::Untyped),
             ]
         );
-        // The type is a *separate* axis from derived status: #3 is a frontier
-        // research ticket, which is exactly what auto-start acts on.
+        // The type is a *separate* axis from derived status: #3 is frontier
+        // *and* research, and neither fact is read off the other.
         let research = map.tickets.iter().find(|t| t.number == 3).expect("#3");
         assert_eq!(research.status, crate::model::Status::Frontier);
-        assert!(research.ticket_type.auto_startable());
     }
 
     /// The same response with the map issue's own state/labels swapped out —

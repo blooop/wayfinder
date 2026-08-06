@@ -48,16 +48,15 @@ pub const GROUP_LABELS: [&str; 4] = ["FRONTIER — ready to claim", "CLAIMED", "
 /// so a ticket that carries no type label is an ordinary value rather than a
 /// missing one. Every site that decides something from a type matches all five
 /// arms with no wildcard, which is what makes a fifth `wayfinder:*` type a
-/// compile error instead of a silent "not auto-startable" (#19).
+/// compile error rather than a silent misreading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketType {
-    /// `wayfinder:research` — AFK by definition, and the only type `wf` starts
-    /// by itself (#18).
+    /// `wayfinder:research` — away-from-keyboard by definition: reading sources
+    /// to surface a fact a decision waits on.
     Research,
-    /// `wayfinder:task` — a build slice. Genuinely AFK-or-HITL, and therefore
-    /// deliberately *not* auto-started: writing code and committing unattended
-    /// is a judgement made on a keystroke now (`ctrl-a`), not on a label set
-    /// weeks ago.
+    /// `wayfinder:task` — manual work that unblocks a decision. Genuinely
+    /// either-way: the agent drives it alone where it can, and hands the human
+    /// a checklist where it cannot.
     Task,
     /// `wayfinder:grilling` — HITL by definition; the agent never stands in for
     /// the human's side of it.
@@ -92,8 +91,9 @@ impl TicketType {
     ///
     /// Labels are a *set*, so several type labels on one issue is a
     /// representable input and needs a rule. It resolves by
-    /// [`TicketType::precedence`], HITL-first, so ambiguity can never *grant*
-    /// auto-start: `wayfinder:research` + `wayfinder:task` is a `Task`.
+    /// [`TicketType::precedence`], HITL-first, so an ambiguous ticket never
+    /// reads as the kind you could walk away from:
+    /// `wayfinder:research` + `wayfinder:task` is a `Task`.
     pub fn from_labels<'a, I: IntoIterator<Item = &'a str>>(labels: I) -> TicketType {
         labels
             .into_iter()
@@ -108,7 +108,7 @@ impl TicketType {
     /// fifth variant left out of an array would make [`TicketType::from_labels`]
     /// unable to ever return it, which is precisely the silent mishandling
     /// exhaustiveness exists to prevent. Here the compiler demands the new type
-    /// be ranked, and ranking it *is* deciding whether it suppresses auto-start.
+    /// be ranked, and ranking it *is* deciding how much of a human it needs.
     fn precedence(self) -> u8 {
         match self {
             TicketType::Grilling => 0,
@@ -121,19 +121,6 @@ impl TicketType {
         }
     }
 
-    /// May `wf` start this kind of ticket's agent with nobody watching?
-    ///
-    /// Only `research` (#18). Listed arm by arm with no wildcard: this is the
-    /// decision a new type must not slip past.
-    pub fn auto_startable(self) -> bool {
-        match self {
-            TicketType::Research => true,
-            TicketType::Task
-            | TicketType::Grilling
-            | TicketType::Prototype
-            | TicketType::Untyped => false,
-        }
-    }
 }
 
 /// One ticket (sub-issue) on a map.
@@ -295,9 +282,9 @@ mod tests {
     }
 
     #[test]
-    fn several_type_labels_resolve_hitl_first_so_ambiguity_never_grants_autostart() {
+    fn several_type_labels_resolve_hitl_first() {
         // The rule that matters: research + anything else is not research, so
-        // an ambiguous ticket is never started unattended.
+        // an ambiguous ticket never reads as the kind nobody has to sit with.
         for other in [
             "wayfinder:task",
             "wayfinder:grilling",
@@ -305,7 +292,6 @@ mod tests {
         ] {
             let both = TicketType::from_labels(["wayfinder:research", other]);
             assert_ne!(both, TicketType::Research, "research + {other}");
-            assert!(!both.auto_startable(), "research + {other}");
             // …and the answer does not depend on which label GitHub lists first.
             assert_eq!(both, TicketType::from_labels([other, "wayfinder:research"]));
         }
@@ -317,17 +303,6 @@ mod tests {
             TicketType::from_labels(["wayfinder:task", "wayfinder:grilling"]),
             TicketType::Grilling
         );
-    }
-
-    #[test]
-    fn only_research_is_auto_startable() {
-        assert!(TicketType::Research.auto_startable());
-        // task is excluded on purpose: unattended code + commits stays a
-        // ctrl-a judgement (#18).
-        assert!(!TicketType::Task.auto_startable());
-        assert!(!TicketType::Grilling.auto_startable());
-        assert!(!TicketType::Prototype.auto_startable());
-        assert!(!TicketType::Untyped.auto_startable());
     }
 
     #[test]

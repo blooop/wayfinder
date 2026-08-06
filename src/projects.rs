@@ -9,11 +9,7 @@
 //! Cache location: `~/.cache/wf/projects.json` (`$XDG_CACHE_HOME`
 //! respected via the `dirs` crate; the home directory is resolved at
 //! runtime, never hardcoded). A missing or corrupt file loads as empty.
-//!
-//! Session names are a pure function of the cached path set, recomputed on
-//! every registration (see [`derive_sessions`] for the rule).
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -22,16 +18,19 @@ use tokio::process::Command;
 
 use crate::launch::MapIssues;
 
-/// One touched checkout: where it lives, which repo its `origin` points at,
-/// and the zellij session name derived for it.
+/// One touched checkout: where it lives, and which repo its `origin` points at.
+///
+/// It used to carry a third field — a short nickname derived from the path set,
+/// which existed only to name the multiplexer session this checkout's tabs
+/// lived in. Build 7 (#34) deleted the multiplexer, and nothing else ever read
+/// it: a launch is *(checkout, ticket, map)*, and where two checkouts of one
+/// repo must be told apart, the path is what tells them apart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkout {
     /// Absolute path to the checkout's toplevel.
     pub path: PathBuf,
     /// Full repo slug from `origin` (e.g. "blooop/wayfinder").
     pub repo: String,
-    /// Derived zellij session name (Build 4 reads this at launch time).
-    pub session: String,
 }
 
 /// The per-machine cache of touched checkouts, plus the last map search's
@@ -75,19 +74,14 @@ impl ProjectsCache {
         std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
     }
 
-    /// Register (or refresh) a touched checkout, then recompute every
-    /// session name so names stay a pure function of the cached path set.
+    /// Register (or refresh) a touched checkout. Sorted by path so the
+    /// which-checkout picker is stable between runs.
     pub fn register(&mut self, path: PathBuf, repo: String) {
         match self.checkouts.iter_mut().find(|c| c.path == path) {
             Some(entry) => entry.repo = repo,
-            None => self.checkouts.push(Checkout {
-                path,
-                repo,
-                session: String::new(),
-            }),
+            None => self.checkouts.push(Checkout { path, repo }),
         }
         self.checkouts.sort_by(|a, b| a.path.cmp(&b.path));
-        self.recompute_sessions();
         self.forget_unknown_maps();
     }
 
@@ -122,32 +116,21 @@ impl ProjectsCache {
             .retain(|repo, _| repos.binary_search(repo).is_ok());
     }
 
-    /// Drop checkouts whose directory no longer exists, then recompute the
-    /// session names. A deleted checkout must stop offering itself as a launch
-    /// host — and because names are a pure function of the *surviving* path
-    /// set, the last checkout of a repo goes back to its plain directory name
-    /// (`~/proj/wayfinder` → `wayfinder`, not `proj`).
+    /// Drop checkouts whose directory no longer exists. A deleted checkout must
+    /// stop offering itself as somewhere an agent could run.
     ///
     /// Returns whether anything was removed, so the caller can skip a write.
     /// Existence is one `stat` per entry: cheap enough for the path that runs
-    /// before the first frame. `exists()` is also the deliberately lenient
+    /// before the first frame. `is_dir()` is also the deliberately lenient
     /// test — a checkout on an unmounted volume comes back when it mounts.
     pub fn prune_missing(&mut self) -> bool {
         let before = self.checkouts.len();
         self.checkouts.retain(|c| c.path.is_dir());
         let removed = self.checkouts.len() != before;
         if removed {
-            self.recompute_sessions();
             self.forget_unknown_maps();
         }
         removed
-    }
-
-    fn recompute_sessions(&mut self) {
-        let paths: Vec<PathBuf> = self.checkouts.iter().map(|c| c.path.clone()).collect();
-        for (checkout, session) in self.checkouts.iter_mut().zip(derive_sessions(&paths)) {
-            checkout.session = session;
-        }
     }
 
     /// Unique repo slugs across all cached checkouts, sorted. Several
@@ -163,66 +146,6 @@ impl ProjectsCache {
 /// The default per-machine cache file: `<XDG cache dir>/wf/projects.json`.
 pub fn default_cache_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("wf").join("projects.json"))
-}
-
-/// Derive zellij session names for a set of checkout paths.
-///
-/// The rule (deterministic, order-independent):
-/// 1. A checkout's session is its directory name (`~/proj/wayfinder` →
-///    `wayfinder`).
-/// 2. If several checkouts share that directory name, each uses its
-///    *parent* directory name instead — the k1–k5 pattern:
-///    `~/k1/kinisi_ros` → `k1`.
-/// 3. Any names still colliding after step 2 fall back to the checkout's
-///    path relative to home (or the filesystem root) with `/` → `-`.
-pub fn derive_sessions(paths: &[PathBuf]) -> Vec<String> {
-    fn component(path: &Path) -> Option<String> {
-        path.file_name().map(|s| s.to_string_lossy().into_owned())
-    }
-    let mut names: Vec<String> = paths
-        .iter()
-        .map(|p| component(p).unwrap_or_else(|| path_slug(p)))
-        .collect();
-
-    // Step 2: duplicate leaf names → parent directory name.
-    let counts = tally(&names);
-    for (i, path) in paths.iter().enumerate() {
-        if counts[&names[i]] > 1 {
-            if let Some(parent) = path.parent().and_then(component) {
-                names[i] = parent;
-            }
-        }
-    }
-
-    // Step 3: anything still colliding → full path slug.
-    let counts = tally(&names);
-    for (i, path) in paths.iter().enumerate() {
-        if counts[&names[i]] > 1 {
-            names[i] = path_slug(path);
-        }
-    }
-    names
-}
-
-fn tally(names: &[String]) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
-    for name in names {
-        *counts.entry(name.clone()).or_insert(0) += 1;
-    }
-    counts
-}
-
-/// A path flattened to a session-safe name: relative to home when under it
-/// (resolved at runtime), separators replaced by `-`.
-fn path_slug(path: &Path) -> String {
-    let rel = dirs::home_dir()
-        .and_then(|home| path.strip_prefix(&home).ok())
-        .unwrap_or(path);
-    rel.components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .filter(|c| c != "/")
-        .collect::<Vec<_>>()
-        .join("-")
 }
 
 /// Parse a GitHub remote URL into an `owner/name` slug. Handles the ssh
@@ -309,9 +232,11 @@ mod tests {
     }
 
     #[test]
-    fn a_cache_file_written_before_the_seed_existed_still_loads() {
-        // The seed shipped after the cache did (#28); an older file simply has
-        // no head start, which is the one thing absence from `maps` ever means.
+    fn an_older_cache_file_still_loads() {
+        // Two shape changes so far, and a cache is not truth: the seed shipped
+        // after the cache did (#28), so an older file simply has no head start;
+        // and the per-checkout session name went with the multiplexer (#34), so
+        // a file that still carries one is read straight past it.
         let dir = std::env::temp_dir().join(format!("wf-test-old-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("projects.json");
@@ -386,9 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn pruning_forgets_deleted_checkouts_and_renames_the_survivor() {
-        // Two checkouts of one repo, so both sessions are disambiguated by
-        // parent dir; delete one and the survivor gets its plain name back.
+    fn pruning_forgets_deleted_checkouts() {
         let root = std::env::temp_dir().join(format!("wf-test-prune-{}", std::process::id()));
         let live = root.join("projects").join("wayfinder");
         let gone = root.join("wayfinder");
@@ -398,60 +321,29 @@ mod tests {
         let mut cache = ProjectsCache::default();
         cache.register(live.clone(), "blooop/wayfinder".to_string());
         cache.register(gone.clone(), "blooop/wayfinder".to_string());
-        let root_name = root.file_name().unwrap().to_string_lossy().into_owned();
-        let sessions: Vec<&str> = cache.checkouts.iter().map(|c| c.session.as_str()).collect();
-        assert_eq!(
-            sessions,
-            vec!["projects", root_name.as_str()],
-            "colliding leaf names are disambiguated by parent dir"
-        );
+        assert_eq!(cache.checkouts.len(), 2);
 
         std::fs::remove_dir_all(&gone).unwrap();
         assert!(cache.prune_missing(), "a deleted checkout is a change");
         assert_eq!(cache.checkouts.len(), 1);
         assert_eq!(cache.checkouts[0].path, live);
-        assert_eq!(cache.checkouts[0].session, "wayfinder");
 
         assert!(!cache.prune_missing(), "nothing left to prune is not a change");
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn unique_dir_names_are_the_session_names() {
-        assert_eq!(
-            derive_sessions(&[p("/data/proj/wayfinder"), p("/data/proj/dotfiles")]),
-            vec!["wayfinder", "dotfiles"]
-        );
-    }
-
-    #[test]
-    fn duplicate_dir_names_use_the_parent_dir() {
-        // The k1–k5 pattern: independent checkouts of one repo.
-        assert_eq!(
-            derive_sessions(&[
-                p("/data/k1/kinisi_ros"),
-                p("/data/k2/kinisi_ros"),
-                p("/data/proj/wayfinder"),
-            ]),
-            vec!["k1", "k2", "wayfinder"]
-        );
-    }
-
-    #[test]
-    fn residual_collisions_fall_back_to_path_slugs() {
-        // Parents collide too: /a/x/proj and /b/x/proj both yield "x".
-        let sessions = derive_sessions(&[p("/a/x/proj"), p("/b/x/proj")]);
-        assert_eq!(sessions, vec!["a-x-proj", "b-x-proj"]);
-    }
-
-    #[test]
-    fn registration_recomputes_existing_session_names() {
+    fn checkouts_stay_sorted_by_path_so_the_picker_is_stable() {
+        // The which-checkout modal lists them in cache order and the human
+        // builds muscle memory on it, so registration order must not show.
         let mut cache = ProjectsCache::default();
-        cache.register(p("/data/k1/kinisi_ros"), "kinisi/kinisi_ros".to_string());
-        assert_eq!(cache.checkouts[0].session, "kinisi_ros");
         cache.register(p("/data/k2/kinisi_ros"), "kinisi/kinisi_ros".to_string());
-        let sessions: Vec<&str> = cache.checkouts.iter().map(|c| c.session.as_str()).collect();
-        assert_eq!(sessions, vec!["k1", "k2"]);
+        cache.register(p("/data/k1/kinisi_ros"), "kinisi/kinisi_ros".to_string());
+        let paths: Vec<&Path> = cache.checkouts.iter().map(|c| c.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            vec![p("/data/k1/kinisi_ros"), p("/data/k2/kinisi_ros")]
+        );
     }
 
     #[test]

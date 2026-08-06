@@ -13,7 +13,7 @@ schema_version: 1
 
 context:
   # Must equal Cargo.toml's version — CI fails the build if they drift.
-  version: "0.2.2"
+  version: "0.3.0"
 
 package:
   name: wf
@@ -72,21 +72,19 @@ requirements:
 
   # No *declared* run requirements, on purpose — the only one the package has is
   # the `libgcc` that the C compiler's run_exports adds above. `wf` shells out to
-  # `gh`, `zellij` and the agent CLI, but it discovers them on PATH: a missing
-  # `gh` or agent CLI degrades to a readable error, and a missing `zellij` is not
-  # an error at all — the launch just happens in wf's own terminal instead of a
-  # tab. That is the same call the sibling `zjsh` recipe makes. Declaring them
-  # would clone zellij and gh into this environment on every machine that already
-  # installs both as their own pixi-global tools, and would still not guarantee
-  # the agent CLI, which does not come from this channel at all.
+  # `gh` and the agent CLI, but it discovers them on PATH, and a missing one
+  # degrades to a readable error. That is the same call the sibling `zjsh` recipe
+  # makes. Declaring `gh` would clone it into this environment on every machine
+  # that already installs it as its own pixi-global tool, and would still not
+  # guarantee the agent CLI, which does not come from this channel at all.
 
 tests:
   - script:
       - if: unix
         then:
-          # The only thing testable without a tty, `gh` auth or a multiplexer:
-          # `wf --version` answers on stdout and exits without touching any of
-          # them. That is exactly why the flag exists.
+          # The only thing testable without a tty or `gh` auth: `wf --version`
+          # answers on stdout and exits without touching either. That is exactly
+          # why the flag exists.
           - wf --version
           - wf --help
   - package_contents:
@@ -98,16 +96,13 @@ about:
   repository: https://github.com/blooop/wayfinder
   license: MIT
   license_file: LICENSE
-  summary: A multi-project wayfinder manager TUI over agentic planning maps
+  summary: A multi-project wayfinder ticket selector over agentic planning maps
   description: |
-    `wf` is a fuzzy-find picker and terminal starmap over the wayfinder planning
-    maps of every project on the machine. Projects accrete as you use it, each
-    mapped repo's tickets are read live from GitHub Issues via `gh`, and picking
-    a ticket runs an agent on it in that project's checkout — `enter` to work it
-    interactively, `ctrl-a` to spawn it headless. With zellij installed each
-    ticket gets its own `<repo>#<n>` tab, which is what makes an agent outlive
-    `wf` and be found again; without it, `enter` runs the agent in wf's own
-    terminal.
+    `wf` is a fuzzy-find picker over the wayfinder planning maps of every project
+    on the machine. Projects accrete as you use it, and each mapped repo's
+    tickets are read live from GitHub Issues via `gh`. Pressing enter on a ticket
+    runs an agent on it in that project's checkout by replacing `wf`'s own
+    process — the picker draws, you pick, and the agent has the terminal.
 
 extra:
   recipe-maintainers:

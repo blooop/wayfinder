@@ -1,25 +1,23 @@
-//! wf — the multi-project wayfinder manager TUI.
+//! wf — the multi-project wayfinder ticket selector.
 //!
-//! Build 3: accretive multi-project discovery (see #4/#15) — running `wf`
-//! inside a checkout registers it in a per-machine cache; every cached
-//! repo's `wayfinder:map` is found with one label search, fetched via
-//! `gh api graphql`, merged into one grouped list behind a nucleo fuzzy
-//! query (groups survive typing per #9), and kept fresh by one poller per
-//! repo (#17). cwd-open focuses that project; `ctrl-g` widens.
+//! Draw the list, pick a ticket, run the agent right there, exit. That is the
+//! whole tool (#26): `wf` owns *selection only*, and the terminal you are
+//! already in owns everything after it.
 //!
-//! Build 4: the launch seam (see #16/#5/#7) — `enter` creates or focuses the
-//! `<repo>#<n>` zellij tab in the project's session and hands the terminal
-//! over to a HITL agent; `ctrl-a` spawns the same tab headless (AFK). With no
-//! zellij on the machine at all, `enter` runs that same agent as `wf`'s own
-//! child in the checkout instead, and the tab-shaped features say so rather
-//! than pretending ([`launch::Host::NoZellij`]).
-//!
-//! Build 6: auto-start (see #19/#18) — after every healthy poll, `wf` reconciles
-//! the invariant "every frontier `research` ticket has a tab" and spawns the
-//! missing ones itself through that same AFK seam ([`autostart`]).
+//! * **Discovery** is accretive (#4/#15): running `wf` inside a checkout
+//!   registers it in a per-machine cache — no registry, no background scan.
+//! * **Data** is GitHub Issues via one `gh api graphql` query per map (#3),
+//!   merged into one grouped list behind a nucleo fuzzy query (#8/#9).
+//! * **Startup** streams (#27): the screen is drawn before any network call,
+//!   and the cached map numbers (#28) are already being fetched when it
+//!   appears. Nothing polls afterwards — a warm start costs ~0.6 s, so
+//!   re-running `wf` is cheaper than keeping it fresh.
+//! * **Launch** replaces this process ([`launch::Launch::exec`]): `wf` gives
+//!   the terminal back and becomes `claude "/wayfinder <map> <n>"` in the
+//!   chosen checkout. Unattended work is not a feature — it is another
+//!   terminal session you start and switch away from.
 
 pub mod app;
-pub mod autostart;
 pub mod fetch;
 pub mod filter;
 pub mod launch;
