@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::app::Row;
 use crate::filter;
-use crate::model::{Map, MapId, Status, Ticket};
+use crate::model::{Map, MapId, RowGlyph, Status, Ticket};
 
 /// The structural screen `tab` toggles between — the half of the view state
 /// that is *stored*. The other half (whether a query is flattening the body)
@@ -120,15 +120,26 @@ pub enum Item {
         also_needs: Vec<u64>,
     },
     /// A collapsible group of held-back rows, always at depth 0 of its
-    /// cluster. Carries what it is holding (`hidden`) and whether it is open,
-    /// so the line can say so without consulting anything else.
+    /// cluster. Carries what it is holding (`hidden`) and its [`Fold`], so
+    /// the line can say so without consulting anything else.
     Group {
         id: GroupId,
         hidden: usize,
-        expanded: bool,
+        fold: Fold,
     },
     /// Spacer between clusters.
     Blank,
+}
+
+/// Whether a group line is folded — and, **only while it is**, the stage
+/// rollup of what it hides (#61): glyph+count pairs in display order, counted
+/// once per held node via the rendered tree, so a DAG that reaches a ticket
+/// twice cannot count it twice. An open group's rows are right on screen, so
+/// a rollup for it is unrepresentable rather than merely unshown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fold {
+    Shut { rollup: Vec<(RowGlyph, usize)> },
+    Open,
 }
 
 /// The body, planned: the lines in on-screen order, plus how many in-scope
@@ -218,10 +229,12 @@ fn ticket_item(
 
 /// Push a collapsible group and, when it is open, the rows it holds — as
 /// depth-1 children of the group line, so `←` from a held row lands on the
-/// group that holds it.
+/// group that holds it. A shut group carries the stage rollup of its held
+/// rows instead: each held node contributes its glyph once.
 fn push_group(
     items: &mut Vec<Item>,
     id: &MapId,
+    map: &Map,
     kind: GroupKind,
     held: &[usize],
     expanded: &Expanded,
@@ -234,10 +247,21 @@ fn push_group(
         kind,
     };
     let is_expanded = expanded.contains(&group);
+    let fold = if is_expanded {
+        Fold::Open
+    } else {
+        let mut counts: BTreeMap<RowGlyph, usize> = BTreeMap::new();
+        for &index in held {
+            *counts.entry(RowGlyph::of(&map.tickets[index])).or_default() += 1;
+        }
+        Fold::Shut {
+            rollup: counts.into_iter().collect(),
+        }
+    };
     items.push(Item::Group {
         id: group,
         hidden: held.len(),
-        expanded: is_expanded,
+        fold,
     });
     if !is_expanded {
         return;
@@ -298,6 +322,7 @@ fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded) -> Plan {
         push_group(
             &mut plan.items,
             id,
+            map,
             GroupKind::BlockedDeeper,
             &deeper,
             expanded,
@@ -310,7 +335,7 @@ fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded) -> Plan {
             .filter(|(_, t)| !is_open(t))
             .map(|(i, _)| i)
             .collect();
-        push_group(&mut plan.items, id, GroupKind::Done, &done, expanded);
+        push_group(&mut plan.items, id, map, GroupKind::Done, &done, expanded);
 
         plan.items.push(Item::Blank);
     }
@@ -531,7 +556,7 @@ fn flattened(clusters: &[(&MapId, &Map)], query: &str) -> Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{classify, TicketType};
+    use crate::model::{classify, Checks, PrLink, PrStatus, Review, Stage, TicketType};
 
     fn ticket(number: u64, open: bool, assigned: bool, blocked_by: Vec<u64>) -> Ticket {
         let open_blockers = blocked_by.clone(); // callers pass open blockers in fixtures
@@ -692,7 +717,7 @@ mod tests {
             i,
             Item::Group {
                 hidden: 2,
-                expanded: false,
+                fold: Fold::Shut { .. },
                 ..
             }
         )));
@@ -709,10 +734,168 @@ mod tests {
                 ("#4".to_string(), 1),
             ]
         );
-        assert!(expanded
+        assert!(expanded.items.iter().any(|i| matches!(
+            i,
+            Item::Group {
+                fold: Fold::Open,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_shut_group_carries_a_stage_rollup_of_what_it_holds() {
+        // The done group holds #2 (plain done) and #4 — closed, but its PR is
+        // still open and approved, so it reads in-review: a closed ticket
+        // whose PR never landed is exactly what the rollup exists to surface.
+        let mut with_pr = ticket(4, false, false, vec![]);
+        with_pr.prs = vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 90,
+            status: PrStatus::Open {
+                checks: Checks::Passing,
+                review: Review::Approved,
+            },
+        }];
+        let m = map(vec![
+            ticket(2, false, false, vec![]),
+            with_pr,
+            ticket(6, true, false, vec![2]),
+            ticket(9, true, false, vec![2]),
+        ]);
+        let binding = id();
+        let shut = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        let fold = shut
             .items
             .iter()
-            .any(|i| matches!(i, Item::Group { expanded: true, .. })));
+            .find_map(|i| match i {
+                Item::Group { hidden, fold, .. } => Some((*hidden, fold.clone())),
+                _ => None,
+            })
+            .expect("the done group");
+        assert_eq!(
+            fold,
+            (
+                2,
+                Fold::Shut {
+                    rollup: vec![
+                        (RowGlyph::Stage(Stage::InReview), 1),
+                        (RowGlyph::Stage(Stage::Done), 1),
+                    ]
+                }
+            ),
+            "glyph+count pairs in display order, once per held node"
+        );
+
+        // Open, the rows are right there — the rollup only exists while shut,
+        // so a rollup on an expanded row is unrepresentable, not just unshown.
+        let open: Expanded = [GroupId {
+            map: binding.clone(),
+            kind: GroupKind::Done,
+        }]
+        .into_iter()
+        .collect();
+        let opened = plan(&[(&binding, &m)], Screen::Structured(Lens::Leverage), &open);
+        assert!(opened.items.iter().any(|i| matches!(
+            i,
+            Item::Group {
+                fold: Fold::Open,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_node_the_rendered_tree_reaches_twice_is_counted_once() {
+        // The DAG's diamond: #6 and #9 are both takeable and both unblock #7,
+        // so the leverage view genuinely renders #7 *twice* — once under each
+        // root. That is the hazard the rollup rule exists for ("counted once
+        // per node via the rendered tree", #61): counts must come from the
+        // set of nodes a group holds, not from the rows on screen.
+        let m = map(vec![
+            ticket(6, true, false, vec![]),
+            ticket(7, true, false, vec![6, 9]),
+            ticket(9, true, false, vec![]),
+            ticket(2, false, false, vec![]),
+        ]);
+        let binding = id();
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        // The premise, pinned: without it the rest of this test proves nothing.
+        assert_eq!(
+            stops(&plan, &m).into_iter().filter(|&n| n == 7).count(),
+            2,
+            "#7 hangs under both #6 and #9"
+        );
+
+        // Every shut group's counts sum to exactly what it holds — one entry
+        // per held node, and #7, rendered twice but held by nobody, is in no
+        // rollup at all.
+        let shut: Vec<(usize, Vec<(RowGlyph, usize)>)> = plan
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Group {
+                    hidden,
+                    fold: Fold::Shut { rollup },
+                    ..
+                } => Some((*hidden, rollup.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shut.len(),
+            1,
+            "only the done group holds anything: {shut:?}"
+        );
+        for (hidden, rollup) in shut {
+            assert_eq!(
+                rollup.iter().map(|(_, n)| n).sum::<usize>(),
+                hidden,
+                "rollup totals what the group holds, not what was drawn"
+            );
+        }
+    }
+
+    #[test]
+    fn the_blocked_deeper_rollup_reads_blocked_not_stage() {
+        // A held-back blocked ticket rolls up as ⊘ — its stage is unactionable
+        // and the override carries into the counts (#62).
+        let m = Map {
+            title: "Map: fixture".to_string(),
+            last_activity: None,
+            tickets: vec![
+                ticket(6, true, false, vec![]),
+                ticket(7, true, false, vec![999]),
+            ],
+        };
+        let binding = id();
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        let fold = plan
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Group { fold, .. } => Some(fold.clone()),
+                _ => None,
+            })
+            .expect("the blocked-deeper group");
+        assert_eq!(
+            fold,
+            Fold::Shut {
+                rollup: vec![(RowGlyph::Blocked, 1)]
+            }
+        );
     }
 
     #[test]
@@ -740,7 +923,7 @@ mod tests {
             .items
             .iter()
             .filter_map(|i| match i {
-                Item::Group { expanded, .. } => Some(*expanded),
+                Item::Group { fold, .. } => Some(matches!(fold, Fold::Open)),
                 _ => None,
             })
             .collect();

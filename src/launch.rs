@@ -3,9 +3,11 @@
 //! `wf` is a selector (#26/#34). There is no multiplexer, no tab, no session
 //! and no supervision: the picked ticket resolves to a checkout, `wf` gives the
 //! terminal back, and its own process image is replaced by
-//! `claude --dangerously-skip-permissions "/wayfinder <map> <n>"` in that
-//! checkout ([`Launch::exec`]). Unattended work is not a feature here — it is
-//! another terminal session you start and switch away from.
+//! `claude --dangerously-skip-permissions "<skill> …"` in that checkout
+//! ([`Launch::exec`]) — which skill is the (type, stage) [`route`], and the
+//! launch line's mode rides the prompt as a suffix (#61/#62). Unattended work
+//! is still not supervised here — a deferred launch is the same exec with
+//! ` defer` in the prompt, watched from another terminal or not at all.
 //!
 //! The one thing that can go wrong is ordering: the terminal must be restored
 //! *before* the image is replaced, because after that there is no `wf` left to
@@ -17,18 +19,165 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::model::Ticket;
+use crate::model::{Stage, Ticket, TicketType};
 use crate::projects::Checkout;
 
-/// A fully-resolved launch: which checkout the agent runs in, and which ticket
-/// of which map it is handed.
+/// Which skill the launched agent runs — the (type, stage) → skill table,
+/// hardcoded in `wf` (#61): not per-ticket config, not a Notes-parsed table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// `/tdd <n>` — build work: ready, resuming, or acting on red checks and
+    /// requested changes (the reviewer's comments live on the PR).
+    Tdd,
+    /// `/review <n>` — a build whose PR awaits its independent look.
+    Review,
+    /// `/wayfinder <map> <n>` — every decision session.
+    Wayfinder,
+}
+
+impl Route {
+    /// How the route reads on the launch line: the slash command it execs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Route::Tdd => "/tdd",
+            Route::Review => "/review",
+            Route::Wayfinder => "/wayfinder",
+        }
+    }
+}
+
+/// What the launch line's typed text meant — parsed once at the second enter
+/// (parse, don't validate: the exec never re-reads a string). The four
+/// meanings of #62's staged prompt step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// An empty line: today's behavior, the default.
+    Interactive,
+    /// `defer` — the whole subtree, resolved unattended (#63).
+    Deferred,
+    /// `defer <text>` — deferred, with a steering prompt.
+    DeferredSteered(String),
+    /// Any other text — a steering prompt on an interactive launch.
+    Steered(String),
+}
+
+impl LaunchMode {
+    /// Parse the launch line. Total: every string means one of the four
+    /// things. `defer` is matched as a *word* — `deferred work` is steering
+    /// text that happens to start with the same letters, not a mode.
+    pub fn parse(text: &str) -> LaunchMode {
+        let text = text.trim();
+        if text.is_empty() {
+            return LaunchMode::Interactive;
+        }
+        match text.strip_prefix("defer") {
+            Some("") => LaunchMode::Deferred,
+            Some(rest) if rest.starts_with(char::is_whitespace) => {
+                LaunchMode::DeferredSteered(rest.trim_start().to_string())
+            }
+            _ => LaunchMode::Steered(text.to_string()),
+        }
+    }
+
+    /// The suffix appended to the exec'd slash command (#62/#63): nothing,
+    /// ` defer`, ` defer: <text>`, or ` steer: <text>`.
+    fn suffix(&self) -> String {
+        match self {
+            LaunchMode::Interactive => String::new(),
+            LaunchMode::Deferred => " defer".to_string(),
+            LaunchMode::DeferredSteered(text) => format!(" defer: {text}"),
+            LaunchMode::Steered(text) => format!(" steer: {text}"),
+        }
+    }
+}
+
+/// Resolve which skill a (type, stage) launches. Total, with `None` as the
+/// one honest refusal: done is not launchable, whatever the type. Blocked is
+/// refused *before* this is consulted — blocked is [`crate::model::Status`],
+/// not a stage, so an illegal blocked route is unrepresentable here.
+///
+/// Every arm is named on both axes: adding a stage or a type without deciding
+/// its route is a compile error, not a silent fall-through.
+pub fn route(ticket_type: TicketType, stage: Stage) -> Option<Route> {
+    match stage {
+        Stage::Done => None,
+        // Build rows of the #61 table: in-review hands off to the fresh-eyes
+        // reviewer; everything else on a build node is code work.
+        Stage::InReview => match ticket_type {
+            TicketType::Build => Some(Route::Review),
+            TicketType::Research
+            | TicketType::Task
+            | TicketType::Grilling
+            | TicketType::Prototype
+            | TicketType::Untyped => Some(Route::Wayfinder),
+        },
+        Stage::Ready | Stage::Building | Stage::NeedsAttention => match ticket_type {
+            TicketType::Build => Some(Route::Tdd),
+            // Decision types (untyped riding along, as it always launched):
+            // /wayfinder at every unfinished stage — PR-dominant derivation
+            // can put a decision node past "in progress" (a prototype's PR
+            // counts), and the skill owns its node's PR state.
+            TicketType::Research
+            | TicketType::Task
+            | TicketType::Grilling
+            | TicketType::Prototype
+            | TicketType::Untyped => Some(Route::Wayfinder),
+        },
+    }
+}
+
+/// A launch the first enter staged but the machine has not answered yet (#62):
+/// everything the launch line draws and the second enter needs, snapshotted
+/// **index-free**.
+///
+/// Index-free is the whole point. `crate::app::Row` is positional — an index
+/// into a `Vec` that the next fetch replaces — and the line stays up while
+/// background map arrivals swap the clusters underneath it (#27). A `Row` held
+/// here would draw, and then launch, whichever ticket had landed at that
+/// index; a shorter map would panic on the next frame. So the staged launch
+/// carries the ticket's own facts, the way [`Targets::Many`] carries complete
+/// [`Launch`]es rather than a choice to re-resolve later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Staged {
+    /// The ticket's repo, full slug (`owner/name`) — what the checkout cache
+    /// is matched on (#15).
+    pub repo: String,
+    /// The ticket the launch line names.
+    pub ticket: u64,
+    /// Its title as it read when the line opened — the line is showing the
+    /// human what they picked, not re-reporting a row that may have moved.
+    pub title: String,
+    /// The map issue of the cluster the row was picked in (#50) — which map a
+    /// ticket listed twice was launched from.
+    pub map_issue: u64,
+    /// Resolved from (type, stage) by [`route`] at the first enter, which is
+    /// also where an unlaunchable node was refused: no `Route`, no `Staged`.
+    pub route: Route,
+}
+
+impl Staged {
+    /// Stage a launch of `ticket`, picked in the cluster of `map_issue`.
+    pub fn new(ticket: &Ticket, map_issue: u64, route: Route) -> Staged {
+        Staged {
+            repo: ticket.repo.clone(),
+            ticket: ticket.number,
+            title: ticket.title.clone(),
+            map_issue,
+            route,
+        }
+    }
+}
+
+/// A fully-resolved launch: which checkout the agent runs in, which ticket of
+/// which map it is handed, and — since the two-step (#62) — which skill it
+/// runs ([`Route`]) and in what mode ([`LaunchMode`]).
 ///
 /// The fields are private and [`plan`] is the only constructor, so a launch
 /// whose checkout belongs to a different repo than its ticket is
-/// unrepresentable rather than merely undocumented. It is also, now, exactly
-/// *(checkout, ticket, map)* and nothing else: with the tab gone there is no
-/// session, no label and no mode for it to carry, and so no way for it to name
-/// a place it cannot run.
+/// unrepresentable rather than merely undocumented. The route arrives already
+/// resolved from (type, stage) by [`route`], which is where an unlaunchable
+/// node was refused — a `Launch` for a done node cannot be built, because no
+/// `Route` for it exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
     /// The ticket's repo, full slug (`owner/name`) — the identity half, kept
@@ -40,6 +189,10 @@ pub struct Launch {
     map_issue: u64,
     /// The checkout the agent works in: the process's working directory.
     cwd: PathBuf,
+    /// The skill this launch execs, resolved from (type, stage).
+    route: Route,
+    /// What the launch line said: interactive, deferred, steered.
+    mode: LaunchMode,
 }
 
 /// Agent sessions are started from a picker rather than from a shell someone is
@@ -64,12 +217,18 @@ impl Launch {
     }
 
     /// What `wf` becomes. `claude` takes a single positional prompt, so the
-    /// slash command and its arguments are one argv entry, not three.
+    /// slash command, its arguments and the mode suffix are one argv entry,
+    /// not several. Only `/wayfinder` takes the map argument — `/tdd` and
+    /// `/review` resolve the repo from the checkout they run in.
     pub fn agent_argv(&self) -> Vec<String> {
+        let prompt = match self.route {
+            Route::Tdd | Route::Review => format!("{} {}", self.route.label(), self.ticket),
+            Route::Wayfinder => format!("/wayfinder {} {}", self.map_issue, self.ticket),
+        };
         vec![
             "claude".to_string(),
             SKIP_PERMISSIONS.to_string(),
-            format!("/wayfinder {} {}", self.map_issue, self.ticket),
+            format!("{prompt}{}", self.mode.suffix()),
         ]
     }
 
@@ -178,15 +337,18 @@ pub enum Targets {
 }
 
 /// Resolve a launch request against the projects cache. Zero or one candidate
-/// never prompts.
-pub fn plan(checkouts: &[Checkout], ticket: &Ticket, map_issue: u64) -> Targets {
-    let launches: Vec<Launch> = candidate_checkouts(checkouts, &ticket.repo)
+/// never prompts. The route and mode arrive already settled — this function
+/// only answers *where* the agent can run.
+pub fn plan(checkouts: &[Checkout], staged: &Staged, mode: LaunchMode) -> Targets {
+    let launches: Vec<Launch> = candidate_checkouts(checkouts, &staged.repo)
         .into_iter()
         .map(|c| Launch {
-            repo: ticket.repo.clone(),
-            ticket: ticket.number,
-            map_issue,
+            repo: staged.repo.clone(),
+            ticket: staged.ticket,
+            map_issue: staged.map_issue,
             cwd: c.path.clone(),
+            route: staged.route,
+            mode: mode.clone(),
         })
         .collect();
     match launches.len() {
@@ -220,6 +382,17 @@ mod tests {
         }
     }
 
+    /// An interactive `/wayfinder` plan — the default launch, and the shape
+    /// every checkout-resolution test wants (route and mode are orthogonal to
+    /// which trees are candidates).
+    fn plan_wf(checkouts: &[Checkout], ticket: &Ticket, map_issue: u64) -> Targets {
+        plan(
+            checkouts,
+            &Staged::new(ticket, map_issue, Route::Wayfinder),
+            LaunchMode::Interactive,
+        )
+    }
+
     fn cache() -> Vec<Checkout> {
         vec![
             checkout("/data/k1/kinisi_ros", "kinisi/kinisi_ros"),
@@ -249,7 +422,7 @@ mod tests {
     #[test]
     fn one_candidate_never_prompts_and_none_is_unregistered() {
         let cache = cache();
-        match plan(&cache, &ticket("blooop/wayfinder", 16), 1) {
+        match plan_wf(&cache, &ticket("blooop/wayfinder", 16), 1) {
             Targets::One(launch) => {
                 assert_eq!(launch.cwd(), Path::new("/data/proj/wayfinder"));
                 assert_eq!(launch.key(), "wayfinder#16");
@@ -259,18 +432,18 @@ mod tests {
             other => panic!("expected One, got {other:?}"),
         }
         assert_eq!(
-            plan(&cache, &ticket("blooop/dotfiles", 3), 2),
+            plan_wf(&cache, &ticket("blooop/dotfiles", 3), 2),
             Targets::Unregistered
         );
         assert_eq!(
-            plan(&[], &ticket("blooop/wayfinder", 16), 1),
+            plan_wf(&[], &ticket("blooop/wayfinder", 16), 1),
             Targets::Unregistered
         );
     }
 
     #[test]
     fn several_checkouts_of_one_repo_offer_a_choice_of_trees() {
-        let launches = match plan(&cache(), &ticket("kinisi/kinisi_ros", 42), 7) {
+        let launches = match plan_wf(&cache(), &ticket("kinisi/kinisi_ros", 42), 7) {
             Targets::Many(launches) => launches,
             other => panic!("expected Many, got {other:?}"),
         };
@@ -288,7 +461,7 @@ mod tests {
 
     #[test]
     fn the_agent_runs_interactive_claude_with_one_prompt_argument() {
-        let launch = match plan(&cache(), &ticket("blooop/wayfinder", 16), 1) {
+        let launch = match plan_wf(&cache(), &ticket("blooop/wayfinder", 16), 1) {
             Targets::One(l) => l,
             other => panic!("{other:?}"),
         };
@@ -303,10 +476,71 @@ mod tests {
     }
 
     #[test]
+    fn the_launch_line_text_parses_to_its_mode() {
+        // The four meanings of the typed line (#62): empty is the interactive
+        // default, `defer` alone is the deferred subtree, `defer <text>` adds
+        // steering to it, anything else steers an interactive launch.
+        assert_eq!(LaunchMode::parse(""), LaunchMode::Interactive);
+        assert_eq!(LaunchMode::parse("   "), LaunchMode::Interactive);
+        assert_eq!(LaunchMode::parse("defer"), LaunchMode::Deferred);
+        assert_eq!(LaunchMode::parse("defer "), LaunchMode::Deferred);
+        assert_eq!(
+            LaunchMode::parse("defer skip the flaky suite"),
+            LaunchMode::DeferredSteered("skip the flaky suite".to_string())
+        );
+        assert_eq!(
+            LaunchMode::parse("try the other approach"),
+            LaunchMode::Steered("try the other approach".to_string())
+        );
+        // `defer` is a word, not a prefix: no fuzzy matching.
+        assert_eq!(
+            LaunchMode::parse("deferred work first"),
+            LaunchMode::Steered("deferred work first".to_string())
+        );
+    }
+
+    #[test]
+    fn the_agent_command_is_the_route_plus_the_mode_suffix() {
+        let launch = |route: Route, mode: LaunchMode| -> String {
+            let staged = Staged::new(&ticket("blooop/wayfinder", 16), 1, route);
+            match plan(&cache(), &staged, mode) {
+                Targets::One(l) => l.agent_argv().last().expect("a prompt").clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        // The route picks the skill; only /wayfinder takes the map argument.
+        assert_eq!(launch(Route::Tdd, LaunchMode::Interactive), "/tdd 16");
+        assert_eq!(launch(Route::Review, LaunchMode::Interactive), "/review 16");
+        assert_eq!(
+            launch(Route::Wayfinder, LaunchMode::Interactive),
+            "/wayfinder 1 16"
+        );
+        // The mode rides as a suffix, whatever the route (#62/#63).
+        assert_eq!(
+            launch(Route::Wayfinder, LaunchMode::Deferred),
+            "/wayfinder 1 16 defer"
+        );
+        assert_eq!(
+            launch(
+                Route::Wayfinder,
+                LaunchMode::DeferredSteered("skip the flaky suite".to_string())
+            ),
+            "/wayfinder 1 16 defer: skip the flaky suite"
+        );
+        assert_eq!(
+            launch(
+                Route::Tdd,
+                LaunchMode::Steered("try the other approach".to_string())
+            ),
+            "/tdd 16 steer: try the other approach"
+        );
+    }
+
+    #[test]
     fn the_notice_names_the_ticket_and_the_tree_it_runs_in() {
         // With several checkouts, *which tree* is the only thing that varies —
         // so it is what the notice has to say.
-        let launches = match plan(&cache(), &ticket("kinisi/kinisi_ros", 42), 7) {
+        let launches = match plan_wf(&cache(), &ticket("kinisi/kinisi_ros", 42), 7) {
             Targets::Many(l) => l,
             other => panic!("{other:?}"),
         };
@@ -322,7 +556,7 @@ mod tests {
 
     #[test]
     fn the_key_is_the_short_repo_but_identity_stays_the_full_slug() {
-        let launch = match plan(&cache(), &ticket("upstream/dotfiles", 5), 4) {
+        let launch = match plan_wf(&cache(), &ticket("upstream/dotfiles", 5), 4) {
             Targets::One(l) => l,
             other => panic!("{other:?}"),
         };
@@ -331,6 +565,65 @@ mod tests {
         assert_eq!(short_repo("blooop/wayfinder"), "wayfinder");
         // Not a slug at all: the whole thing is the name.
         assert_eq!(short_repo("wayfinder"), "wayfinder");
+    }
+
+    #[test]
+    fn build_nodes_route_to_tdd_except_in_review_which_routes_to_review() {
+        // The #61 routing table's build rows: failing checks and requested
+        // changes are code work, so needs-attention goes back to /tdd.
+        assert_eq!(route(TicketType::Build, Stage::Ready), Some(Route::Tdd));
+        assert_eq!(route(TicketType::Build, Stage::Building), Some(Route::Tdd));
+        assert_eq!(
+            route(TicketType::Build, Stage::NeedsAttention),
+            Some(Route::Tdd)
+        );
+        assert_eq!(
+            route(TicketType::Build, Stage::InReview),
+            Some(Route::Review)
+        );
+    }
+
+    #[test]
+    fn decision_types_route_to_wayfinder_at_every_unfinished_stage() {
+        // The table lists decision types at ready/in-progress, but PR-dominant
+        // derivation can put one at in-review or needs-attention (a
+        // prototype's PR counts) — the skill owns its node's PR state, so the
+        // route stays /wayfinder at every stage short of done. Untyped rides
+        // along: launching untyped tickets is today's behavior, kept.
+        for ticket_type in [
+            TicketType::Research,
+            TicketType::Task,
+            TicketType::Grilling,
+            TicketType::Prototype,
+            TicketType::Untyped,
+        ] {
+            for stage in [
+                Stage::Ready,
+                Stage::Building,
+                Stage::InReview,
+                Stage::NeedsAttention,
+            ] {
+                assert_eq!(
+                    route(ticket_type, stage),
+                    Some(Route::Wayfinder),
+                    "{ticket_type:?} at {stage:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn done_is_not_launchable_whatever_the_type() {
+        for ticket_type in [
+            TicketType::Build,
+            TicketType::Research,
+            TicketType::Task,
+            TicketType::Grilling,
+            TicketType::Prototype,
+            TicketType::Untyped,
+        ] {
+            assert_eq!(route(ticket_type, Stage::Done), None, "{ticket_type:?}");
+        }
     }
 
     #[test]
@@ -344,7 +637,7 @@ mod tests {
             blocked_by: vec![],
             prs: vec![],
         };
-        match plan(&cache(), &done, 1) {
+        match plan_wf(&cache(), &done, 1) {
             Targets::One(launch) => assert_eq!(launch.key(), "wayfinder#2"),
             other => panic!("a done ticket still launches, got {other:?}"),
         }
