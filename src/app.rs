@@ -302,15 +302,23 @@ impl App {
         self.cursor = pos.unwrap_or(0);
     }
 
-    /// `↑`/`↓`: the next stop at the cursor's own depth (#57).
+    /// `↑`/`↓`: the next stop at the cursor's own depth, else simply the next
+    /// stop (#57).
     ///
-    /// Walking *siblings* rather than lines is what makes the default screen a
-    /// pick list: at depth 0 the stops are the takeable tickets and the group
-    /// lines, so `↓` moves between things you can act on and steps over the
-    /// blocked context hanging beneath them. The search stops at a shallower
-    /// stop because that means leaving the parent — except at depth 0, where
-    /// nothing is shallower and the walk therefore spans clusters, keeping the
+    /// Preferring *siblings* is what makes the default screen a pick list: at
+    /// depth 0 the stops are the takeable tickets and the group lines, so `↓`
+    /// moves between things you can act on and steps over the blocked context
+    /// hanging beneath them. The scan gives up at a shallower stop, because
+    /// that means leaving the parent — except at depth 0, where nothing is
+    /// shallower and the walk therefore spans clusters, keeping the
     /// multi-project list one axis.
+    ///
+    /// The fallback is not a nicety. A ticket that is an **only child** has no
+    /// sibling in either direction, and long single-file chains are the normal
+    /// shape of a real map — so a strict sibling walk left the cursor wedged on
+    /// them, unable to move at all. Falling through to the adjacent stop means
+    /// `↑`/`↓` can always walk the tree and no stop is ever unreachable by them
+    /// alone, while a genuine sibling still wins whenever there is one.
     fn move_sibling(&mut self, delta: isize) {
         let stops = self.stops();
         if stops.is_empty() {
@@ -319,19 +327,28 @@ impl App {
         }
         let pos = self.cursor_pos();
         let depth = stops[pos].depth;
+        let mut adjacent = None;
         let mut i = pos as isize;
         loop {
             i += delta;
             let Some(at) = usize::try_from(i).ok().and_then(|i| stops.get(i)) else {
-                return; // ran off the end: stay put rather than wrap
+                break; // ran off the end
             };
+            let i = i as usize;
+            adjacent.get_or_insert(i);
             if at.depth == depth {
-                self.cursor = i as usize;
+                self.cursor = i;
                 return;
             }
             if at.depth < depth {
-                return; // left the parent
+                break; // left the parent
             }
+        }
+        // No sibling that way: step one stop, so the cursor is never wedged.
+        // `None` only when there is nothing at all in that direction, which is
+        // the one case where holding still is the honest answer.
+        if let Some(next) = adjacent {
+            self.cursor = next;
         }
     }
 
@@ -748,10 +765,15 @@ mod tests {
         assert_eq!(at(&app), "#6");
         app.handle_key(key(KeyCode::Right));
         assert_eq!(at(&app), "#7", "→ steps into what #6 unblocks");
-        // Down inside the subtree walks *siblings at that depth* — #7 is an
-        // only child, so there is nowhere to go and the cursor holds rather
-        // than escaping to another depth.
+        // #7 is an only child, so there is no sibling to walk to — and ↓ must
+        // still move rather than wedge, so it steps to the adjacent stop.
         app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "#9");
+        // ↑ from #9 finds *its* own sibling #6 rather than diving back into
+        // #6's subtree: a real sibling always beats the fallback.
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(at(&app), "#6");
+        app.handle_key(key(KeyCode::Right));
         assert_eq!(at(&app), "#7");
         app.handle_key(key(KeyCode::Left));
         assert_eq!(at(&app), "#6", "← returns to the parent");
@@ -787,6 +809,78 @@ mod tests {
         assert_eq!(at(&app), "#9", "held at the last sibling");
         app.handle_key(key(KeyCode::Up));
         assert_eq!(at(&app), "#8");
+    }
+
+    #[test]
+    fn an_only_child_never_wedges_the_cursor() {
+        // The live shape that exposed this (bencher#1064): a root whose single
+        // dependent has dependents of its own, so the middle ticket has no
+        // sibling in either direction. A strict sibling walk left ↑/↓ inert
+        // there — every stop must stay reachable by them alone.
+        let mut clusters = BTreeMap::new();
+        clusters.insert(
+            MapId::new("blooop/bencher", 1064),
+            Map {
+                title: "Map: endgame".to_string(),
+                tickets: vec![
+                    ticket("blooop/bencher", 1069, "root", true, false, vec![]),
+                    ticket(
+                        "blooop/bencher",
+                        1070,
+                        "only child",
+                        true,
+                        false,
+                        vec![1069],
+                    ),
+                    ticket(
+                        "blooop/bencher",
+                        1071,
+                        "grandchild a",
+                        true,
+                        false,
+                        vec![1070],
+                    ),
+                    ticket(
+                        "blooop/bencher",
+                        1072,
+                        "grandchild b",
+                        true,
+                        false,
+                        vec![1070],
+                    ),
+                ],
+            },
+        );
+        let mut app = App::new(clusters);
+        app.handle_key(key(KeyCode::Right)); // into #1070
+        assert_eq!(at(&app), "#1070");
+
+        // Down has no depth-1 sibling ahead: it steps on rather than freezing.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "#1071");
+        // …and now there *is* a sibling, so the sibling wins.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "#1072");
+        // Up back out the same way: sibling first, then the adjacent stop.
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(at(&app), "#1071");
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(at(&app), "#1070");
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(at(&app), "#1069");
+
+        // Every stop is reachable by ↓ alone — the property that was broken.
+        let total = app.stops().len();
+        let mut seen = vec![at(&app)];
+        for _ in 1..total {
+            app.handle_key(key(KeyCode::Down));
+            seen.push(at(&app));
+        }
+        assert_eq!(
+            seen,
+            vec!["#1069", "#1070", "#1071", "#1072"],
+            "↓ walked the whole tree"
+        );
     }
 
     #[test]
