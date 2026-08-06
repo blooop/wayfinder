@@ -17,11 +17,18 @@ use tokio::process::Command;
 
 use crate::model::{classify, Map, Ticket, TicketType};
 
+/// The label that makes an issue a map. Both the search that *finds* a map and
+/// the fetch that *reads* one test for this, so a cached number can never be
+/// believed on its own (#28).
+pub const MAP_LABEL: &str = "wayfinder:map";
+
 const MAP_QUERY: &str = "\
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       title
+      state
+      labels(first: 20) { nodes { name } }
       subIssues(first: 100) {
         nodes {
           number title state
@@ -59,6 +66,8 @@ struct Repository {
 #[derive(Deserialize)]
 struct MapIssue {
     title: String,
+    state: String,
+    labels: Nodes<Label>,
     #[serde(rename = "subIssues")]
     sub_issues: Nodes<SubIssue>,
 }
@@ -146,6 +155,16 @@ fn parse_map(body: &[u8], owner: &str, name: &str, number: u64) -> Result<Map> {
         .and_then(|r| r.issue)
         .with_context(|| format!("map issue {owner}/{name}#{number} not found"))?;
 
+    // The number may have come from the cache (#28), so the issue it names has
+    // to prove it is still a map rather than be taken at its word. A map that
+    // was closed, relabelled, or never was one fails here — the repo then shows
+    // as stale, which is honest, instead of rendering some unrelated issue's
+    // sub-issues as its map. The unconditional search corrects the number
+    // moments later.
+    if !is_open(&issue.state) || !issue.labels.nodes.iter().any(|l| l.name == MAP_LABEL) {
+        bail!("{owner}/{name}#{number} is no longer an open `{MAP_LABEL}` issue");
+    }
+
     let mut tickets: Vec<Ticket> = issue
         .sub_issues
         .nodes
@@ -207,7 +226,7 @@ pub async fn find_maps(repos: &[String]) -> Result<HashMap<String, u64>> {
     // Multiple `repo:` qualifiers OR together in GitHub issue search, so
     // the whole cached set is one query.
     let scope: Vec<String> = repos.iter().map(|r| format!("repo:{r}")).collect();
-    let query = format!("label:\"wayfinder:map\" is:issue is:open {}", scope.join(" "));
+    let query = format!("label:\"{MAP_LABEL}\" is:issue is:open {}", scope.join(" "));
 
     let output = Command::new("gh")
         .args([
@@ -269,6 +288,8 @@ mod tests {
     /// #19 added — the sub-issue types wf now reads.
     const MAP_RESPONSE: &str = r#"{"data": {"repository": {"issue": {
         "title": "Map: wf",
+        "state": "OPEN",
+        "labels": {"nodes": [{"name": "wayfinder:map"}]},
         "subIssues": {"nodes": [
             {"number": 19, "title": "Build 6", "state": "OPEN",
              "labels": {"nodes": [{"name": "wayfinder:task"}]},
@@ -307,6 +328,38 @@ mod tests {
         let research = map.tickets.iter().find(|t| t.number == 3).expect("#3");
         assert_eq!(research.status, crate::model::Status::Frontier);
         assert!(research.ticket_type.auto_startable());
+    }
+
+    /// The same response with the map issue's own state/labels swapped out —
+    /// what a cached number that has gone stale actually fetches back.
+    fn map_response_with(state: &str, labels: &str) -> String {
+        MAP_RESPONSE
+            .replace(r#""state": "OPEN","#, &format!(r#""state": "{state}","#))
+            .replacen(
+                r#""labels": {"nodes": [{"name": "wayfinder:map"}]},"#,
+                &format!(r#""labels": {{"nodes": [{labels}]}},"#),
+                1,
+            )
+    }
+
+    #[test]
+    fn a_stale_cached_number_is_rejected_rather_than_rendered_as_a_map() {
+        // The three ways a cached number goes wrong (#28): the map was closed,
+        // it lost its label, or the number now names a wholly unrelated issue.
+        // None may render — a wrong map is worse than no map.
+        for (state, labels) in [
+            ("CLOSED", r#"{"name": "wayfinder:map"}"#),
+            ("OPEN", r#"{"name": "enhancement"}"#),
+            ("OPEN", ""),
+        ] {
+            let body = map_response_with(state, labels);
+            let err = parse_map(body.as_bytes(), "blooop", "wayfinder", 1)
+                .expect_err("a non-map must not parse as a map");
+            assert!(
+                err.to_string().contains("no longer an open"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]

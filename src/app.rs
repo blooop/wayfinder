@@ -85,7 +85,7 @@ impl App {
             checkouts: Vec::new(),
             map_issues: MapIssues::new(),
             agent_tabs: 0,
-            startup: Startup::Loaded,
+            startup: Startup::loaded(),
             overlay: Overlay::None,
             cursor: 0,
         }
@@ -97,7 +97,7 @@ impl App {
     /// to the reader.
     pub fn empty() -> Self {
         Self {
-            startup: Startup::Searching,
+            startup: Startup::default(),
             ..Self::new(merge_maps(&BTreeMap::new()))
         }
     }

@@ -20,6 +20,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::launch::MapIssues;
+
 /// One touched checkout: where it lives, which repo its `origin` points at,
 /// and the zellij session name derived for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,10 +34,25 @@ pub struct Checkout {
     pub session: String,
 }
 
-/// The per-machine cache of touched checkouts.
+/// The per-machine cache of touched checkouts, plus the last map search's
+/// findings (#28).
+///
+/// The findings are keyed by **repo slug**, not held on a [`Checkout`]: which
+/// issue is a repo's map is a property of the repo, and two checkouts of one
+/// repo would otherwise each carry a copy that can disagree with the other.
+///
+/// There is deliberately no third "not yet searched" state. The search is
+/// unconditional — the cache is a head start, never a skip (see
+/// [`crate::refresh::spawn_discovery`]) — so nothing ever branches on *why* a
+/// repo is absent from `maps`, only on the fact that it has no head start.
+/// A state nothing can observe is a state not worth modelling.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectsCache {
     pub checkouts: Vec<Checkout>,
+    /// `repo slug → map issue number`, as of the last successful search.
+    /// Absent from an older cache file, which simply means no head start.
+    #[serde(default)]
+    pub maps: MapIssues,
 }
 
 impl ProjectsCache {
@@ -71,6 +88,38 @@ impl ProjectsCache {
         }
         self.checkouts.sort_by(|a, b| a.path.cmp(&b.path));
         self.recompute_sessions();
+        self.forget_unknown_maps();
+    }
+
+    /// The head start (#28): every map issue number the last search found, for
+    /// repos still in the cache. Read before the first frame, so the pollers
+    /// start fetching at `t≈0` instead of after the ~2.5 s search.
+    pub fn map_seed(&self) -> MapIssues {
+        self.maps.clone()
+    }
+
+    /// Record what a search over `searched` found, so the next run has a head
+    /// start. Repos that were searched and have no map are simply dropped —
+    /// absence *is* "no head start", and that is all this table means.
+    pub fn record_search(&mut self, searched: &[String], found: &MapIssues) {
+        for repo in searched {
+            match found.get(repo) {
+                Some(&number) => {
+                    self.maps.insert(repo.clone(), number);
+                }
+                None => {
+                    self.maps.remove(repo);
+                }
+            }
+        }
+    }
+
+    /// Drop findings for repos no checkout points at any more — the seed must
+    /// not outlive the checkouts that justify fetching it.
+    fn forget_unknown_maps(&mut self) {
+        let repos = self.repos();
+        self.maps
+            .retain(|repo, _| repos.binary_search(repo).is_ok());
     }
 
     /// Drop checkouts whose directory no longer exists, then recompute the
@@ -89,6 +138,7 @@ impl ProjectsCache {
         let removed = self.checkouts.len() != before;
         if removed {
             self.recompute_sessions();
+            self.forget_unknown_maps();
         }
         removed
     }
@@ -256,6 +306,73 @@ mod tests {
         std::fs::write(&file, b"{ not json").unwrap();
         assert_eq!(ProjectsCache::load_or_default(&file), ProjectsCache::default());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cache_file_written_before_the_seed_existed_still_loads() {
+        // The seed shipped after the cache did (#28); an older file simply has
+        // no head start, which is the one thing absence from `maps` ever means.
+        let dir = std::env::temp_dir().join(format!("wf-test-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("projects.json");
+        std::fs::write(
+            &file,
+            br#"{"checkouts": [{"path": "/data/proj/wayfinder",
+                 "repo": "blooop/wayfinder", "session": "wayfinder"}]}"#,
+        )
+        .unwrap();
+        let cache = ProjectsCache::load_or_default(&file);
+        assert_eq!(cache.checkouts.len(), 1, "the checkouts must survive");
+        assert!(cache.map_seed().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_seed_is_what_the_last_search_found_for_the_repos_it_searched() {
+        let mut cache = ProjectsCache::default();
+        cache.register(p("/data/proj/wayfinder"), "blooop/wayfinder".to_string());
+        cache.register(p("/data/proj/dotfiles"), "blooop/dotfiles".to_string());
+        let searched = cache.repos();
+
+        let found: MapIssues = [("blooop/wayfinder".to_string(), 1)].into_iter().collect();
+        cache.record_search(&searched, &found);
+        assert_eq!(cache.map_seed(), found, "an unmapped repo is simply absent");
+
+        // The map moved and the other repo gained one: the search is the
+        // authority, so the seed follows it rather than accumulating.
+        let found: MapIssues = [
+            ("blooop/wayfinder".to_string(), 42),
+            ("blooop/dotfiles".to_string(), 7),
+        ]
+        .into_iter()
+        .collect();
+        cache.record_search(&searched, &found);
+        assert_eq!(cache.map_seed(), found);
+
+        // And a map that has gone stops being a head start.
+        cache.record_search(&searched, &MapIssues::new());
+        assert!(cache.map_seed().is_empty());
+    }
+
+    #[test]
+    fn a_repo_with_no_checkouts_left_keeps_no_head_start() {
+        // Nothing would ever fetch it, and a seed nothing fetches is just a
+        // stale number waiting to be believed by a future version.
+        let root = std::env::temp_dir().join(format!("wf-test-seed-{}", std::process::id()));
+        let gone = root.join("wayfinder");
+        std::fs::create_dir_all(&gone).unwrap();
+        let mut cache = ProjectsCache::default();
+        cache.register(gone.clone(), "blooop/wayfinder".to_string());
+        cache.record_search(
+            &cache.repos(),
+            &[("blooop/wayfinder".to_string(), 1)].into_iter().collect(),
+        );
+        assert!(!cache.map_seed().is_empty());
+
+        std::fs::remove_dir_all(&gone).unwrap();
+        assert!(cache.prune_missing());
+        assert!(cache.map_seed().is_empty());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -35,8 +35,10 @@ known project, `ctrl-f` re-focuses the row's project). Run outside a checkout
 to open on all of them.
 
 The registry is a per-machine cache at `~/.cache/wf/projects.json`
-(`$XDG_CACHE_HOME` respected) holding `{path, repo, session}` per checkout.
-Deleting it is safe — projects re-accrete as you open them.
+(`$XDG_CACHE_HOME` respected) holding `{path, repo, session}` per checkout, plus
+the map issue number the last search found for each repo. Deleting it is safe —
+projects re-accrete as you open them, and the map numbers are re-found on the
+next start.
 
 Session names derive from the checkout path: the directory name, or the
 *parent* directory name when several checkouts share a directory name
@@ -54,12 +56,21 @@ that register the checkout, so the picker is up and answering keys immediately
 — the count line says `searching for maps…`, then `loading maps 1/3`, then goes
 quiet once everything is in.
 
-Which repos have maps takes one `wayfinder:map` label search, and it is the only
-genuinely serial step: nothing can load until it returns. Every map is then
-fetched concurrently, so N projects cost one round trip rather than N. A search
-that fails is retried rather than fatal, and the cwd focus applies as soon as
-the search answers whether this repo has a map — unless you have already chosen
-a scope yourself with `ctrl-f`/`ctrl-g`, which wins.
+Which repos have maps takes one `wayfinder:map` label search, and it used to be
+the only genuinely serial step: nothing could load until it returned, which was
+~2.5 s of a ~3 s start. So the map numbers are cached, and a warm start begins
+fetching the maps themselves immediately — real tickets in ~0.6 s, and the cwd
+focus applied on the *first* frame rather than a couple of seconds in. Every map
+is fetched concurrently, so N projects cost one round trip rather than N.
+
+The cache is a head start, never a skip: the search still runs on every start,
+and its answer is what adds a repo mapped since last time, drops one whose map
+was closed, and corrects a number that moved. A cached number is never taken at
+its word either — a map fetch checks the issue is still an open `wayfinder:map`
+and refuses it otherwise, so a stale number shows that project as stale for a
+moment rather than rendering the wrong issue as its map. A search that fails is
+retried rather than fatal, and the cwd focus yields to a scope you have already
+chosen yourself with `ctrl-f`/`ctrl-g`.
 
 ## Launching
 

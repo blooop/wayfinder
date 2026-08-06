@@ -11,7 +11,6 @@ use ratatui::Frame;
 
 use crate::app::{App, Overlay, Scope};
 use crate::model::{Status, GROUP_LABELS};
-use crate::refresh::Startup;
 
 fn glyph_style(status: &Status) -> Style {
     match status {
@@ -116,9 +115,9 @@ pub fn afk_line(app: &App) -> String {
 /// register it", which is the truth only once the load has finished; before
 /// that the very same emptiness just means the fetch is still out (#27), and
 /// telling a user with three registered projects that they have none is the
-/// exact ambiguity the [`Startup`] state exists to remove.
+/// exact ambiguity the [`crate::refresh::Startup`] state exists to remove.
 pub fn heading(app: &App) -> String {
-    if app.startup != Startup::Loaded && app.map.tickets.is_empty() {
+    if !app.startup.is_loaded() && app.map.tickets.is_empty() {
         return "loading…".to_string();
     }
     app.map.repo.clone()
@@ -260,6 +259,7 @@ mod tests {
     use super::*;
     use crate::launch::MapIssues;
     use crate::model::{classify, Map, Ticket, TicketType};
+    use crate::refresh::Startup;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -465,7 +465,7 @@ mod tests {
     fn an_empty_list_reads_as_empty_only_once_the_load_finished() {
         // Same empty map, opposite meaning — told apart by Startup alone.
         let mut app = App::empty();
-        app.startup = Startup::Loaded;
+        app.startup = Startup::loaded();
         let screen = render(&app);
         assert!(screen.contains("no projects — run wf inside a checkout"), "{screen}");
         assert!(!screen.contains("loading"), "{screen}");
@@ -480,7 +480,8 @@ mod tests {
             .into_iter()
             .map(|(slug, n)| (slug.to_string(), n))
             .collect();
-        app.startup = Startup::discovered(&found);
+        app.startup = Startup::seeded(&found);
+        app.startup.searched(&found);
         app.startup.record_arrival("a/one");
         let screen = render_with_indicator(&app, "· ↻ just now");
         assert!(screen.contains("#6    Re-entry breadcrumbs"), "{screen}");

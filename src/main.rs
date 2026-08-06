@@ -36,7 +36,7 @@ use wf::autostart::{self, PollHealthByRepo};
 use wf::launch::{self, Handoff, Launch, MapIssues, TabOutcome};
 use wf::model::{merge_maps, Map};
 use wf::projects::{self, ProjectsCache};
-use wf::refresh::{Freshness, LoadEvent, Poller, RefreshEvent, Startup};
+use wf::refresh::{Freshness, LoadEvent, Pollers, RefreshEvent, Startup};
 
 /// Everything `wf`'s argv can mean. Only one shape opens the TUI; the others
 /// answer on a stream and exit, touching neither the terminal, `gh`, nor
@@ -121,7 +121,15 @@ async fn main() -> Result<()> {
     }
     let repos = cache.repos();
     let sessions = launch::sessions_of(&cache.checkouts);
-    let app = App::empty().with_projects(cache.checkouts.clone(), MapIssues::new());
+    // The head start (#28): the map numbers the last search found. Reading them
+    // is one local file read that has already happened, so the pollers can start
+    // fetching before the first frame instead of after the ~2.5 s search — which
+    // is where time-to-*data* actually went. The search still runs (see
+    // [`wf::refresh::spawn_discovery`]); this only decides what `wf` fetches
+    // while waiting for it.
+    let seed = cache.map_seed();
+    let mut app = App::empty().with_projects(cache.checkouts.clone(), seed.clone());
+    app.startup = Startup::seeded(&seed);
 
     // The screen goes up *before* any network or zellij call (#27). Everything
     // that used to run here — the map search, a serial fetch per repo, the
@@ -132,14 +140,19 @@ async fn main() -> Result<()> {
     spawn_terminal_guard();
 
     let (tx, updates) = mpsc::unbounded_channel();
-    wf::refresh::spawn_discovery(repos, tx.clone());
+    wf::refresh::spawn_discovery(repos, cache_path, tx.clone());
     spawn_agent_tab_count(sessions.clone(), tx.clone());
 
-    // cwd-open focuses the project (lazygit-style), but only the map *search*
-    // can say whether this repo has a map, so the focus is handed to the loop
-    // to apply the moment discovery lands — rather than after every map has
-    // been fetched, as it used to, and still before there are rows to watch move.
+    // cwd-open focuses the project (lazygit-style). Only the map *search* can
+    // say authoritatively whether this repo has a map, so the focus is handed to
+    // the loop to apply the moment discovery lands — but a seeded repo can be
+    // focused from the first frame, and usually is, so the picker no longer
+    // opens wide and jumps a couple of seconds later. `focus` is kept either
+    // way: the search still gets to overrule a seed that has gone stale.
     let focus = here.map(|(_, slug)| slug);
+    if let Some(slug) = focus.as_ref().filter(|slug| seed.contains_key(*slug)) {
+        app.scope = Scope::Project(slug.clone());
+    }
     let result = run(&mut terminal, app, sessions, tx, updates, focus).await;
     ratatui::restore();
     if let Ending::HandedOver(parting) = result? {
@@ -414,6 +427,12 @@ async fn run(
     mut focus: Option<String>,
 ) -> Result<Ending> {
     let mut maps: BTreeMap<String, Map> = BTreeMap::new();
+    // The cached seed starts fetching immediately (#28); the search's answer
+    // reconciles this set rather than adding to it, so a number that moved is
+    // corrected in the task actually doing the fetching, not just in the state
+    // `enter` reads.
+    let mut pollers = Pollers::new();
+    pollers.reconcile(&app.map_issues, &tx);
     let mut refresh = RefreshState {
         last_verified: None,
         failing: false,
@@ -430,27 +449,33 @@ async fn run(
         while let Ok(event) = updates.try_recv() {
             match event {
                 LoadEvent::Discovered(map_issues) => {
-                    // Spawning the pollers *is* the initial load: each one's
-                    // first cycle fetches unconditionally, so every map is in
-                    // flight at once and each lands on screen as it arrives.
-                    let pollers: Vec<Poller> = map_issues
-                        .iter()
-                        .map(|(slug, &number)| {
-                            let (owner, name) = slug.split_once('/').expect("slug is owner/name");
-                            Poller::new(owner, name, number)
-                        })
-                        .collect();
-                    wf::refresh::spawn_all(pollers, tx.clone());
-                    app.startup = Startup::discovered(&map_issues);
+                    // Reconciling the pollers *is* the load for every repo the
+                    // seed did not already cover: each new poller's first cycle
+                    // fetches unconditionally, so those maps are all in flight at
+                    // once and each lands on screen as it arrives. Repos the seed
+                    // got right keep polling untouched — and keep their ETag.
+                    pollers.reconcile(&map_issues, &tx);
+                    app.startup.searched(&map_issues);
                     if let Some(slug) = focus.take() {
                         if map_issues.contains_key(&slug) {
                             app.scope = Scope::Project(slug);
                         } else {
-                            app.notice =
-                                Some(format!("{slug} has no wayfinder:map — showing all projects"));
+                            // The seed may have focused this repo a moment ago on
+                            // a map that is gone; the search is the authority, so
+                            // the focus goes back.
+                            if app.scope == Scope::Project(slug.clone()) {
+                                app.scope = Scope::All;
+                            }
+                            app.notice = Some(format!(
+                                "{slug} has no wayfinder:map — showing all projects"
+                            ));
                         }
                     }
+                    // Maps the search dropped must stop being rendered as well as
+                    // stop being polled — their rows are as stale as their poller.
+                    maps.retain(|slug, _| map_issues.contains_key(slug));
                     app.map_issues = map_issues;
+                    app.replace_map(merge_maps(&maps));
                 }
                 // Discovery retries, so this is a status report and not an end
                 // state: `wf` stays on screen and recovers when the search does.

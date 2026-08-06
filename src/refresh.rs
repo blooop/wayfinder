@@ -20,16 +20,19 @@
 //! Failures never surface as errors: every outcome is a [`RefreshEvent`],
 //! and a failed poll just leaves the UI on stale data with an indicator.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::fetch;
 use crate::launch::MapIssues;
 use crate::model::Map;
+use crate::projects::ProjectsCache;
 
 /// How often the background loop probes for changes.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(4);
@@ -73,70 +76,112 @@ pub enum LoadEvent {
     AgentTabs(usize),
 }
 
-/// How far `wf`'s initial load has got (#27).
+/// Has the `wayfinder:map` label search answered yet?
+///
+/// Its own axis since #28, because the cached seed makes maps arrive *before*
+/// the search does: "which repos are mapped" and "have their maps landed" stop
+/// happening in that order, so one cannot stand in for the other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Search {
+    /// Still out. A failed search waits here too, since discovery retries, so a
+    /// network blip at startup simply looks like a slow start.
+    #[default]
+    Out,
+    /// Answered — the set of mapped repos is now authoritative.
+    Answered,
+}
+
+/// How far `wf`'s initial load has got (#27, reshaped by #28).
 ///
 /// The screen is up before any of it has landed, so "no tickets" has to stay
 /// distinguishable from "not loaded yet" — one empty list would otherwise mean
 /// both, which is exactly the sentinel this project's modelling rules out.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Startup {
-    /// The `wayfinder:map` label search is still out — not even the *set* of
-    /// mapped repos is known. A failed search waits here too, since discovery
-    /// retries, so a network blip at startup simply looks like a slow start.
-    Searching,
-    /// The search found `total` mapped repos and the ones in `pending` have yet
-    /// to report. A *failed* fetch counts as reported: the wait for that map is
-    /// over either way, and its failure shows as staleness, not as loading.
-    ///
-    /// `pending` is a set of repo slugs rather than a count because the pollers
-    /// run concurrently on a [`POLL_INTERVAL`] cadence: a fast repo's *second*
-    /// cycle can land before a slow repo's first, and a counter cannot tell that
-    /// from the slow one arriving. Naming who is still out makes the miscount
-    /// unrepresentable — `total` is only ever the initial `pending.len()`, kept
-    /// so the hint can say `1/3` while the set shrinks.
-    Loading {
-        pending: BTreeSet<String>,
-        total: usize,
-    },
-    /// Every map the search found has reported. A search that found none lands
-    /// here immediately — no cached repo is mapped, which is an answer, not a
-    /// wait.
-    Loaded,
+///
+/// A struct rather than a `Searching | Loading | Loaded` enum because the cache
+/// seed splits what used to be one sequence into two independent facts: maps can
+/// be known (and even fully arrived) while the search is still out. The old enum
+/// could represent "loaded" with the search still running — a state a seeded
+/// start reaches immediately and which would then have claimed the load was
+/// finished before anything had confirmed the map set. Here `is_loaded` is
+/// *derived* from both facts, so it cannot disagree with either.
+///
+/// `arrived` is a set of repo slugs rather than a count because the pollers run
+/// concurrently on a [`POLL_INTERVAL`] cadence: a fast repo's *second* cycle can
+/// land before a slow repo's first, and a counter cannot tell that from the slow
+/// one arriving. Keeping `expected` and `arrived` as sets — with pending their
+/// difference — also makes the search's answer idempotent over a seed that has
+/// already reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Startup {
+    search: Search,
+    expected: BTreeSet<String>,
+    arrived: BTreeSet<String>,
 }
 
 impl Startup {
-    /// Enter the loading phase, waiting on every repo discovery found, or go
-    /// straight to [`Startup::Loaded`] when there are none to wait for.
-    pub fn discovered(map_issues: &MapIssues) -> Self {
-        let pending: BTreeSet<String> = map_issues.keys().cloned().collect();
-        match pending.len() {
-            0 => Startup::Loaded,
-            total => Startup::Loading { pending, total },
+    /// Start from the cached head start (#28): these maps are believed to exist
+    /// and are already being fetched, but the search has yet to confirm them. An
+    /// empty seed is the cold start, identical to the pre-cache behaviour.
+    pub fn seeded(map_issues: &MapIssues) -> Self {
+        Self {
+            search: Search::Out,
+            expected: map_issues.keys().cloned().collect(),
+            arrived: BTreeSet::new(),
         }
     }
 
-    /// Record `repo`'s map reporting. Meaningful only while that repo is still
-    /// pending: the pollers go on emitting fetches for as long as `wf` runs, and
-    /// none of those later ones is a startup arrival.
-    pub fn record_arrival(&mut self, repo: &str) {
-        if let Startup::Loading { pending, .. } = self {
-            pending.remove(repo);
-            if pending.is_empty() {
-                *self = Startup::Loaded;
-            }
+    /// Nothing is being waited on — for an [`crate::app::App`] handed a map it
+    /// already has, and for tests.
+    pub fn loaded() -> Self {
+        Self {
+            search: Search::Answered,
+            ..Self::default()
         }
+    }
+
+    /// The search answered: `map_issues` is now the authoritative set of mapped
+    /// repos. A seeded repo it omits stops being waited on; one it adds joins
+    /// the wait unless it has already reported.
+    pub fn searched(&mut self, map_issues: &MapIssues) {
+        self.search = Search::Answered;
+        self.expected = map_issues.keys().cloned().collect();
+    }
+
+    /// Record `repo`'s map reporting. A *failed* fetch counts as reported: the
+    /// wait for that map is over either way, and its failure shows as staleness,
+    /// not as loading.
+    pub fn record_arrival(&mut self, repo: &str) {
+        self.arrived.insert(repo.to_string());
+    }
+
+    /// Repos whose maps are still out.
+    fn pending(&self) -> impl Iterator<Item = &String> {
+        self.expected.difference(&self.arrived)
+    }
+
+    /// Is there nothing left to wait for? Every expected map has reported *and*
+    /// the search has answered — a seeded start satisfies the first long before
+    /// the second, and the search is what may still add a repo mapped since the
+    /// last run, so both are required.
+    pub fn is_loaded(&self) -> bool {
+        self.pending().next().is_none() && self.search == Search::Answered
     }
 
     /// The count line's loading hint, empty once loaded — this is what keeps an
     /// empty list from reading as "nothing to do" while the fetch is still out.
     pub fn hint(&self) -> String {
-        match self {
-            Startup::Searching => "· searching for maps…".to_string(),
-            Startup::Loading { pending, total } => {
-                format!("· loading maps {}/{total}", total - pending.len())
-            }
-            Startup::Loaded => String::new(),
+        if self.is_loaded() {
+            return String::new();
         }
+        let total = self.expected.len();
+        let arrived = total - self.pending().count();
+        if arrived == total {
+            // Nothing left to fetch, so the search is the only thing still out —
+            // whether that is the cold start with nothing known, or a seeded one
+            // whose cached maps are all on screen already.
+            return "· searching for maps…".to_string();
+        }
+        format!("· loading maps {arrived}/{total}")
     }
 }
 
@@ -172,6 +217,14 @@ impl Poller {
             etag: None,
             cycle: 0,
         }
+    }
+
+    /// A poller for an `owner/name` slug — `None` for anything that is not one,
+    /// so a malformed cache entry is skipped rather than panicking the loop.
+    pub fn for_slug(slug: &str, number: u64) -> Option<Self> {
+        let (owner, name) = slug.split_once('/')?;
+        (!owner.is_empty() && !name.is_empty() && !name.contains('/'))
+            .then(|| Self::new(owner, name, number))
     }
 
     /// Run one poll cycle: conditional probe, then a full GraphQL fetch only
@@ -255,35 +308,92 @@ fn parse_probe(response_head: &str, exit_ok: bool) -> Result<Probe> {
     bail!("probe failed: {status_line}");
 }
 
-/// Spawn one poll loop per map on the tokio runtime, all feeding the caller's
-/// channel; every event is tagged with the emitting poller's repo slug so the
-/// UI loop knows which repo's map to swap. The UI drains the channel with
-/// `try_recv` between frames; the tasks end when the receiver is dropped
-/// (quit). Probes are conditional 304s, so N repos cost nothing extra at rest.
+/// One live poll loop and the map number it was started for.
+struct Running {
+    number: u64,
+    task: JoinHandle<()>,
+}
+
+/// The live poll loops: **at most one per repo, at the map number currently
+/// believed**. That invariant is the whole reason this owns the tasks (#28).
 ///
-/// Each loop **polls before it sleeps** (#27), so spawning these *is* the
-/// initial load: N maps arrive concurrently, one fetch of wall clock rather
-/// than N, and each one streams into a UI that is already on screen. The
-/// channel is passed in rather than created here because discovery feeds the
-/// same one — the loop has a single place to learn things.
-pub fn spawn_all(pollers: Vec<Poller>, tx: mpsc::UnboundedSender<LoadEvent>) {
-    for mut poller in pollers {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let repo = poller.slug();
-            loop {
-                let outcome = poller.poll_once().await;
-                let event = LoadEvent::Fetched {
-                    repo: repo.clone(),
-                    outcome,
-                };
-                if tx.send(event).is_err() {
-                    return; // UI is gone
-                }
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-        });
+/// Before the cache, the map numbers were known once and never changed, so the
+/// pollers could be fire-and-forget. A seeded start can be *wrong* — the number
+/// came from the last run — and the correction arrives later, in the search's
+/// answer. A corrected number that only landed in `App::map_issues` would fix
+/// what `enter` launches while the task actually doing the fetching kept asking
+/// for the old issue forever; so the poller set is reconciled against the truth
+/// instead, and the repo recovers without a restart.
+#[derive(Default)]
+pub struct Pollers {
+    running: BTreeMap<String, Running>,
+}
+
+impl Pollers {
+    pub fn new() -> Self {
+        Self::default()
     }
+
+    /// Make the live loops match `want`: stop any whose repo is no longer mapped
+    /// or whose map number changed, start one for every repo not already polled
+    /// at the right number, and leave the rest untouched — restarting a poller
+    /// that is already correct would throw away its ETag and re-fetch for
+    /// nothing.
+    ///
+    /// Every event is tagged with the emitting poller's repo slug so the UI loop
+    /// knows which map to swap. The UI drains the channel with `try_recv`
+    /// between frames; tasks also end when the receiver is dropped (quit).
+    /// Probes are conditional 304s, so N repos cost nothing extra at rest.
+    ///
+    /// Each loop **polls before it sleeps** (#27), so this call *is* the load
+    /// for the repos it starts: N maps arrive concurrently, one fetch of wall
+    /// clock rather than N, and each one streams into a UI already on screen.
+    pub fn reconcile(&mut self, want: &MapIssues, tx: &mpsc::UnboundedSender<LoadEvent>) {
+        self.running.retain(|slug, running| {
+            let still_wanted = want.get(slug) == Some(&running.number);
+            if !still_wanted {
+                running.task.abort();
+            }
+            still_wanted
+        });
+        for (slug, &number) in want {
+            if self.running.contains_key(slug) {
+                continue;
+            }
+            let Some(poller) = Poller::for_slug(slug, number) else {
+                continue;
+            };
+            let task = spawn_poller(poller, tx.clone());
+            self.running.insert(slug.clone(), Running { number, task });
+        }
+    }
+
+    /// The repos being polled, and at which map issue — the reconciled truth,
+    /// for tests and for anything that needs to know what is actually live.
+    pub fn watching(&self) -> MapIssues {
+        self.running
+            .iter()
+            .map(|(slug, running)| (slug.clone(), running.number))
+            .collect()
+    }
+}
+
+/// One repo's poll loop: poll, report, sleep, forever.
+fn spawn_poller(mut poller: Poller, tx: mpsc::UnboundedSender<LoadEvent>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let repo = poller.slug();
+        loop {
+            let outcome = poller.poll_once().await;
+            let event = LoadEvent::Fetched {
+                repo: repo.clone(),
+                outcome,
+            };
+            if tx.send(event).is_err() {
+                return; // UI is gone
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    })
 }
 
 /// Find which cached repos have a `wayfinder:map`, off the path to the first
@@ -294,12 +404,27 @@ pub fn spawn_all(pollers: Vec<Poller>, tx: mpsc::UnboundedSender<LoadEvent>) {
 /// search would otherwise leave `wf` permanently empty with no way back:
 /// `ctrl-r` refetches the maps it knows about, and after a failed search it
 /// knows about none.
-pub fn spawn_discovery(repos: Vec<String>, tx: mpsc::UnboundedSender<LoadEvent>) {
+///
+/// It runs **unconditionally**, warm cache or cold (#28). The cache is a head
+/// start, never a skip: this is the one thing that can add a repo mapped since
+/// the last run, drop one whose map was closed, and correct a number that moved
+/// — so the seed is never trusted for longer than one search round trip. On
+/// success it writes its findings back to `cache_path`, which is what makes the
+/// *next* run warm; a failed write costs only that head start.
+pub fn spawn_discovery(
+    repos: Vec<String>,
+    cache_path: PathBuf,
+    tx: mpsc::UnboundedSender<LoadEvent>,
+) {
     tokio::spawn(async move {
         loop {
             match fetch::find_maps(&repos).await {
                 Ok(found) => {
-                    let _ = tx.send(LoadEvent::Discovered(found.into_iter().collect()));
+                    let found: MapIssues = found.into_iter().collect();
+                    let mut cache = ProjectsCache::load_or_default(&cache_path);
+                    cache.record_search(&repos, &found);
+                    let _ = cache.save(&cache_path);
+                    let _ = tx.send(LoadEvent::Discovered(found));
                     return; // the set of mapped repos is fixed for this run
                 }
                 Err(_) if tx.send(LoadEvent::SearchFailed).is_err() => return, // UI is gone
@@ -453,24 +578,32 @@ mod tests {
             .collect()
     }
 
+    /// A cold start: no cached seed, search still out.
+    fn cold() -> Startup {
+        Startup::seeded(&found(&[]))
+    }
+
     #[test]
     fn a_search_that_found_no_maps_is_loaded_not_loading() {
         // Zero mapped repos is an *answer*: there is nothing to wait for, so
         // the screen must stop claiming to be loading.
-        assert_eq!(Startup::discovered(&found(&[])), Startup::Loaded);
-        assert_eq!(Startup::discovered(&found(&[])).hint(), "");
+        let mut startup = cold();
+        startup.searched(&found(&[]));
+        assert!(startup.is_loaded());
+        assert_eq!(startup.hint(), "");
     }
 
     #[test]
     fn loading_completes_when_every_discovered_map_has_reported() {
-        let mut startup = Startup::discovered(&found(&["a/one", "a/two", "a/three"]));
+        let mut startup = cold();
+        startup.searched(&found(&["a/one", "a/two", "a/three"]));
         assert_eq!(startup.hint(), "· loading maps 0/3");
         startup.record_arrival("a/one");
         assert_eq!(startup.hint(), "· loading maps 1/3");
         startup.record_arrival("a/two");
         assert_eq!(startup.hint(), "· loading maps 2/3");
         startup.record_arrival("a/three");
-        assert_eq!(startup, Startup::Loaded);
+        assert!(startup.is_loaded());
     }
 
     #[test]
@@ -478,33 +611,75 @@ mod tests {
         // The pollers are concurrent on a 4s cadence, so a fast repo's second
         // cycle can beat a slow repo's first. Counting arrivals would call that
         // done; naming who is still pending cannot.
-        let mut startup = Startup::discovered(&found(&["fast/one", "slow/two"]));
+        let mut startup = cold();
+        startup.searched(&found(&["fast/one", "slow/two"]));
         startup.record_arrival("fast/one");
         startup.record_arrival("fast/one");
-        assert_eq!(startup.hint(), "· loading maps 1/2", "slow/two is still out");
+        assert_eq!(
+            startup.hint(),
+            "· loading maps 1/2",
+            "slow/two is still out"
+        );
         startup.record_arrival("slow/two");
-        assert_eq!(startup, Startup::Loaded);
+        assert!(startup.is_loaded());
     }
 
     #[test]
     fn arrivals_after_the_load_are_polls_not_startup() {
         // The pollers keep reporting for as long as wf runs; none of those
         // later fetches may push the screen back into a loading state.
-        let mut startup = Startup::Loaded;
+        let mut startup = cold();
+        startup.searched(&found(&["a/one"]));
         startup.record_arrival("a/one");
-        startup.record_arrival("b/two");
-        assert_eq!(startup, Startup::Loaded);
+        startup.record_arrival("a/one");
+        startup.record_arrival("b/two"); // never expected; not a regression
+        assert!(startup.is_loaded());
         assert_eq!(startup.hint(), "");
     }
 
     #[test]
     fn the_hint_tells_the_two_pre_data_states_apart() {
         // Both draw an empty list; only the hint says why it is empty.
-        assert_eq!(Startup::Searching.hint(), "· searching for maps…");
+        assert_eq!(cold().hint(), "· searching for maps…");
         assert_eq!(
-            Startup::discovered(&found(&["a/one", "a/two"])).hint(),
+            Startup::seeded(&found(&["a/one", "a/two"])).hint(),
             "· loading maps 0/2"
         );
+    }
+
+    #[test]
+    fn a_seeded_start_is_loading_its_cached_maps_not_searching() {
+        // The #28 head start: the cache already named these maps, so the screen
+        // says what it is waiting for from the first frame rather than spending
+        // the search's ~2.5s claiming to be looking for maps at all.
+        let mut startup = Startup::seeded(&found(&["a/one", "b/two"]));
+        assert_eq!(startup.hint(), "· loading maps 0/2");
+        startup.record_arrival("a/one");
+        startup.record_arrival("b/two");
+        // Every *cached* map is in, but the search has yet to confirm the set —
+        // and confirming it is exactly what may add a repo mapped since the last
+        // run, so the load is not over until both are true.
+        assert!(!startup.is_loaded(), "the search has not answered yet");
+        assert_eq!(startup.hint(), "· searching for maps…");
+        startup.searched(&found(&["a/one", "b/two"]));
+        assert!(startup.is_loaded());
+    }
+
+    #[test]
+    fn the_search_overrules_a_seed_it_disagrees_with() {
+        // Cached "b/two" lost its map and "c/three" gained one since last run.
+        let mut startup = Startup::seeded(&found(&["a/one", "b/two"]));
+        startup.record_arrival("a/one");
+        let mut authoritative = found(&["a/one"]);
+        authoritative.insert("c/three".to_string(), 9);
+        startup.searched(&authoritative);
+        assert_eq!(
+            startup.hint(),
+            "· loading maps 1/2",
+            "b/two is no longer waited on; c/three now is"
+        );
+        startup.record_arrival("c/three");
+        assert!(startup.is_loaded());
     }
 
     #[test]
