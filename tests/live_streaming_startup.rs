@@ -3,21 +3,26 @@
 //! `gh`.
 //!
 //! What it pins down is the *shape* `main` now relies on: nothing is fetched
-//! before the loop exists, and everything the loop needs — which repos have
-//! maps, and each map — arrives afterwards through one channel. Before #27 the
+//! before the loop exists, and everything the loop needs — which maps are
+//! open, and each map — arrives afterwards through one channel. Before #27 the
 //! same information could only be had by awaiting it up front, which is exactly
 //! why the terminal stayed blank for it; before #28 the *search* still had to
-//! answer before a single map could be asked for.
+//! answer before a single map could be asked for. Since #50 every load is
+//! keyed by [`MapId`], and a repo with several open maps is several loads.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
-use wf::launch::MapIssues;
+use wf::model::{MapId, MapSet};
 use wf::projects::ProjectsCache;
 use wf::refresh::{spawn_discovery, LoadEvent, Loaders, MapFetch};
 
 const THIS_REPO: &str = "blooop/wayfinder";
+
+fn map_1() -> MapId {
+    MapId::new(THIS_REPO, 1)
+}
 
 /// Take the next event, failing loudly rather than hanging a CI run forever.
 async fn next(rx: &mut mpsc::UnboundedReceiver<LoadEvent>) -> LoadEvent {
@@ -43,7 +48,7 @@ async fn discovery_then_every_map_arrives_through_one_channel() {
     // could be drawing a screen instead of blocking on this.
     spawn_discovery(vec![THIS_REPO.to_string()], cache_path.clone(), tx.clone());
 
-    let map_issues = loop {
+    let found = loop {
         match next(&mut rx).await {
             LoadEvent::Discovered(found) => break found,
             // The search retries, so a blip is survivable rather than fatal.
@@ -51,51 +56,58 @@ async fn discovery_then_every_map_arrives_through_one_channel() {
             other => panic!("expected discovery first, got {other:?}"),
         }
     };
-    assert_eq!(
-        map_issues.get(THIS_REPO),
-        Some(&1),
-        "this repo's map is issue #1"
+    assert!(
+        found.contains(&map_1()),
+        "this repo's original map is issue #1; found {found:?}"
+    );
+    assert!(
+        found.len() > 1,
+        "every open map is discovered, not one per repo (#50); found {found:?}"
     );
 
     // Reconciling the loaders *is* the initial load: no separate fetch happens
-    // anywhere, and the one thing each one emits is its repo's map.
+    // anywhere, and the one thing each one emits is its map.
     let mut loaders = Loaders::new();
-    loaders.reconcile(&map_issues, &tx);
-    assert_eq!(loaders.targets(), map_issues);
+    loaders.reconcile(&found, &tx);
+    assert_eq!(loaders.targets(), found);
 
-    match next(&mut rx).await {
-        LoadEvent::Fetched {
-            repo,
-            outcome: MapFetch::Loaded(map),
-        } => {
-            assert_eq!(repo, THIS_REPO);
-            assert_eq!(map.repo, THIS_REPO);
-            assert!(
-                map.tickets.len() >= 7,
-                "expected the real map's tickets, got {}",
-                map.tickets.len()
-            );
+    // Every discovered map reports — including the several on this one repo.
+    let mut arrived = MapSet::new();
+    while arrived.len() < found.len() {
+        match next(&mut rx).await {
+            LoadEvent::Fetched {
+                id,
+                outcome: MapFetch::Loaded(map),
+            } => {
+                assert!(found.contains(&id), "unexpected map {id:?}");
+                assert!(
+                    !map.tickets.is_empty(),
+                    "every open map on this repo has tickets"
+                );
+                arrived.insert(id);
+            }
+            other => panic!("a loader's one event must be its map, got {other:?}"),
         }
-        other => panic!("a loader's one event must be its map, got {other:?}"),
     }
+    assert_eq!(arrived, found);
 
     // The search's findings are written back — that is what makes the *next*
     // run warm, and it is the only thing that ever populates the seed.
     let saved = ProjectsCache::load_or_default(&cache_path);
     assert_eq!(
-        saved.map_seed().get(THIS_REPO),
-        Some(&1),
-        "the search must leave a head start behind"
+        saved.map_seed(),
+        found,
+        "the search must leave the full head start behind"
     );
     std::fs::remove_dir_all(cache_path.parent().expect("scratch dir")).ok();
 }
 
 #[tokio::test]
 async fn a_cached_seed_fetches_the_map_without_waiting_for_the_search() {
-    // The #28 claim, end to end: with the map number already in hand, the map
+    // The #28 claim, end to end: with the map id already in hand, the map
     // itself lands in one round trip — no ~2.5s search in front of it.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let seed: MapIssues = [(THIS_REPO.to_string(), 1)].into_iter().collect();
+    let seed: MapSet = [map_1()].into_iter().collect();
 
     let started = Instant::now();
     let mut loaders = Loaders::new();
@@ -103,10 +115,10 @@ async fn a_cached_seed_fetches_the_map_without_waiting_for_the_search() {
 
     match next(&mut rx).await {
         LoadEvent::Fetched {
-            repo,
+            id,
             outcome: MapFetch::Loaded(map),
         } => {
-            assert_eq!(repo, THIS_REPO);
+            assert_eq!(id, map_1());
             assert!(!map.tickets.is_empty());
         }
         other => panic!("the seeded loader must fetch the map, got {other:?}"),
@@ -120,12 +132,12 @@ async fn a_cached_seed_fetches_the_map_without_waiting_for_the_search() {
 
 #[tokio::test]
 async fn a_stale_seed_reports_failure_and_is_replaced_by_the_search() {
-    // A cached number that no longer names a map — here the map's own *first
+    // A cached id that no longer names a map — here the map's own *first
     // ticket*, an issue that exists and is a sub-issue rather than a map. The
     // fetch must refuse it (a wrong map is worse than no map) and the search's
-    // answer must move the load onto the real number.
+    // answer must move the load onto the real id.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let stale: MapIssues = [(THIS_REPO.to_string(), 2)].into_iter().collect();
+    let stale: MapSet = [MapId::new(THIS_REPO, 2)].into_iter().collect();
 
     let mut loaders = Loaders::new();
     loaders.reconcile(&stale, &tx);
@@ -137,12 +149,12 @@ async fn a_stale_seed_reports_failure_and_is_replaced_by_the_search() {
         other => panic!("a non-map must not fetch as a map, got {other:?}"),
     }
 
-    let truth: MapIssues = [(THIS_REPO.to_string(), 1)].into_iter().collect();
+    let truth: MapSet = [map_1()].into_iter().collect();
     loaders.reconcile(&truth, &tx);
     assert_eq!(
         loaders.targets(),
         truth,
-        "the corrected number must reach the task doing the fetching"
+        "the corrected id must reach the task doing the fetching"
     );
     loop {
         match next(&mut rx).await {
@@ -164,12 +176,12 @@ async fn a_stale_seed_reports_failure_and_is_replaced_by_the_search() {
 async fn restarting_the_loaders_refetches_and_cannot_be_beaten_by_the_load_it_replaced() {
     // `ctrl-r`'s path. It goes through `Loaders` rather than fetching alongside
     // them for one reason: a refetch started at t₁ and a load started at t₀ < t₁
-    // both write the same repo's map, and the *older* one can land second.
+    // both write the same map's cluster, and the *older* one can land second.
     // Nothing polls any more, so that stale map would be the last word. Every
     // result reaching the UI through one channel in send order is what makes
     // the newest write win, and that is what this pins.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let seed: MapIssues = [(THIS_REPO.to_string(), 1)].into_iter().collect();
+    let seed: MapSet = [map_1()].into_iter().collect();
 
     let mut loaders = Loaders::new();
     loaders.reconcile(&seed, &tx);
@@ -181,17 +193,17 @@ async fn restarting_the_loaders_refetches_and_cannot_be_beaten_by_the_load_it_re
         other => panic!("the initial load must land first, got {other:?}"),
     }
 
-    // The refresh: same repo, same number, and it must fetch again rather than
-    // skip a repo it has already loaded — the `continue` in `reconcile` is
-    // exactly what `restart` exists to get past.
+    // The refresh: same map, and it must fetch again rather than skip a map it
+    // has already loaded — the `continue` in `reconcile` is exactly what
+    // `restart` exists to get past.
     loaders.restart(&seed, &tx);
     assert_eq!(loaders.targets(), seed);
     match next(&mut rx).await {
         LoadEvent::Fetched {
-            repo,
+            id,
             outcome: MapFetch::Loaded(map),
         } => {
-            assert_eq!(repo, THIS_REPO);
+            assert_eq!(id, map_1());
             assert!(!map.tickets.is_empty());
         }
         other => panic!("ctrl-r must refetch, got {other:?}"),
@@ -213,7 +225,7 @@ async fn shutdown_leaves_nothing_in_flight() {
     // task's `Child` is dropped, which only happens if someone waits for the
     // cancellation to actually run.
     let (tx, _rx) = mpsc::unbounded_channel();
-    let seed: MapIssues = [(THIS_REPO.to_string(), 1)].into_iter().collect();
+    let seed: MapSet = [map_1()].into_iter().collect();
 
     let mut loaders = Loaders::new();
     loaders.reconcile(&seed, &tx);

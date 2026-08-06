@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 
 use wf::app::{App, Outcome, Scope};
 use wf::launch::Launch;
-use wf::model::{merge_maps, Map};
+use wf::model::{Map, MapId};
 use wf::projects::{self, ProjectsCache};
 use wf::refresh::{LoadEvent, Loaders, MapFetch, Startup};
 
@@ -124,7 +124,8 @@ async fn main() -> Result<()> {
     // [`wf::refresh::spawn_discovery`]); this only decides what `wf` fetches
     // while waiting for it.
     let seed = cache.map_seed();
-    let mut app = App::empty().with_projects(cache.checkouts.clone(), seed.clone());
+    let mut app = App::empty().with_checkouts(cache.checkouts.clone());
+    app.open_maps = seed.clone();
     app.startup = Startup::seeded(&seed);
 
     // The screen goes up *before* any network call (#27). Everything that used
@@ -143,7 +144,10 @@ async fn main() -> Result<()> {
     // opens wide and jumps a couple of seconds later. `focus` is kept either
     // way: the search still gets to overrule a seed that has gone stale.
     let focus = here.map(|(_, slug)| slug);
-    if let Some(slug) = focus.as_ref().filter(|slug| seed.contains_key(*slug)) {
+    if let Some(slug) = focus
+        .as_ref()
+        .filter(|slug| seed.iter().any(|id| &id.repo == *slug))
+    {
         app.scope = Scope::Project(slug.clone());
     }
     let ending = run(&mut terminal, app, discovery, tx, updates, focus).await;
@@ -245,27 +249,27 @@ async fn run(
     mut updates: UnboundedReceiver<LoadEvent>,
     mut focus: Option<String>,
 ) -> Result<Ending> {
-    let mut maps: BTreeMap<String, Map> = BTreeMap::new();
+    let mut clusters: BTreeMap<MapId, Map> = BTreeMap::new();
     // The cached seed starts fetching immediately (#28); the search's answer
-    // reconciles this set rather than adding to it, so a number that moved is
-    // corrected in the task actually doing the fetching, not just in the state
-    // `enter` reads.
+    // reconciles this set rather than adding to it, so a map that closed or
+    // opened is corrected in the tasks actually doing the fetching, not just
+    // in the state the screen reads.
     let mut loaders = Loaders::new();
-    loaders.reconcile(&app.map_issues, &tx);
+    loaders.reconcile(&app.open_maps, &tx);
     loop {
-        // Drain everything that landed before drawing. A fetch swaps one repo's
-        // map in the merged view; App::replace_map keeps the cursor pinned to
-        // ticket identity, query and scope untouched.
+        // Drain everything that landed before drawing. A fetch swaps one map's
+        // cluster; App::replace_clusters keeps the cursor pinned to row
+        // identity, query and scope untouched.
         while let Ok(event) = updates.try_recv() {
             match event {
-                LoadEvent::Discovered(map_issues) => {
-                    // Reconciling the loaders *is* the load for every repo the
+                LoadEvent::Discovered(found) => {
+                    // Reconciling the loaders *is* the load for every map the
                     // seed did not already cover: those fetches are all in
                     // flight at once and each lands on screen as it arrives.
-                    loaders.reconcile(&map_issues, &tx);
-                    app.startup.searched(&map_issues);
+                    loaders.reconcile(&found, &tx);
+                    app.startup.searched(&found);
                     if let Some(slug) = focus.take() {
-                        if map_issues.contains_key(&slug) {
+                        if found.iter().any(|id| id.repo == slug) {
                             app.scope = Scope::Project(slug);
                         } else {
                             // The seed may have focused this repo a moment ago on
@@ -281,33 +285,33 @@ async fn run(
                     }
                     // Maps the search dropped must stop being rendered as well as
                     // stop being fetched — their rows are as stale as their load.
-                    // A repo that is no longer mapped also stops being a
-                    // *failure*: there is nothing left to have failed.
-                    maps.retain(|slug, _| map_issues.contains_key(slug));
-                    app.failed.retain(|slug| map_issues.contains_key(slug));
-                    app.map_issues = map_issues;
-                    app.replace_map(merge_maps(&maps));
+                    // A map that is no longer open also stops being a *failure*:
+                    // there is nothing left to have failed.
+                    clusters.retain(|id, _| found.contains(id));
+                    app.failed.retain(|id| found.contains(id));
+                    app.open_maps = found;
+                    app.replace_clusters(clusters.clone());
                 }
                 // Discovery retries, so this is a status report and not an end
                 // state: `wf` stays on screen and recovers when the search does.
                 LoadEvent::SearchFailed => {
                     app.notice = Some("map search failed — retrying".to_string());
                 }
-                LoadEvent::Fetched { repo, outcome } => {
-                    app.startup.record_arrival(&repo);
+                LoadEvent::Fetched { id, outcome } => {
+                    app.startup.record_arrival(&id);
                     match outcome {
                         MapFetch::Loaded(new_map) => {
-                            app.failed.remove(&repo);
-                            maps.insert(repo, new_map);
-                            app.replace_map(merge_maps(&maps));
+                            app.failed.remove(&id);
+                            clusters.insert(id, new_map);
+                            app.replace_clusters(clusters.clone());
                         }
                         // Nothing polls any more, so a failed load is not a blip
                         // the next cycle papers over — it is the final word on
-                        // that repo until someone asks again. Recorded as state
+                        // that map until someone asks again. Recorded as state
                         // rather than announced as a notice, because a notice
                         // is gone on the next keypress and this is not.
                         MapFetch::Failed => {
-                            app.failed.insert(repo);
+                            app.failed.insert(id);
                         }
                     }
                 }
@@ -336,7 +340,7 @@ async fn run(
                     // write wins. Results stream in as they land, so the last
                     // word on how it went is the count line, not this notice.
                     Outcome::Refresh => {
-                        loaders.restart(&app.map_issues, &tx);
+                        loaders.restart(&app.open_maps, &tx);
                         app.startup.reloading();
                         app.failed.clear();
                     }

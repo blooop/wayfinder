@@ -7,7 +7,7 @@
 //! * **Discovery** is accretive (#4/#15): running `wf` inside a checkout
 //!   registers it in a per-machine cache — no registry, no background scan.
 //! * **Data** is GitHub Issues via one `gh api graphql` query per map (#3),
-//!   merged into one grouped list behind a nucleo fuzzy query (#8/#9).
+//!   rendered as one cluster per open map (#50) behind a nucleo fuzzy query.
 //! * **Startup** streams (#27): the screen is drawn before any network call,
 //!   and the cached map numbers (#28) are already being fetched when it
 //!   appears. Nothing polls afterwards — a warm start costs ~0.6 s, so

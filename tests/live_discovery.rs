@@ -30,18 +30,24 @@ async fn registering_this_checkout_finds_and_fetches_its_map() {
     assert_eq!(reloaded.checkouts[0].path, toplevel);
     std::fs::remove_dir_all(cache_file.parent().unwrap()).ok();
 
-    // Detect: one label search across the cached remotes finds the map.
+    // Detect: one label search across the cached remotes finds every open map
+    // (#50) — this repo keeps several open at once, and all of them must
+    // survive rather than only the lowest-numbered.
     let maps = wf::fetch::find_maps(&reloaded.repos())
         .await
         .expect("map label search");
-    let map_issue = *maps
-        .get(&slug)
-        .expect("blooop/wayfinder must have a wayfinder:map issue");
-    assert_eq!(map_issue, 1);
+    let map_id = wf::model::MapId::new(slug.clone(), 1);
+    assert!(
+        maps.contains(&map_id),
+        "blooop/wayfinder must have wayfinder:map issue #1; found {maps:?}"
+    );
+    assert!(
+        maps.iter().filter(|id| id.repo == slug).count() > 1,
+        "every open map must be found, not one per repo; found {maps:?}"
+    );
 
     // Render-ready: the discovered map fetches with real tickets.
-    let (owner, name) = slug.split_once('/').unwrap();
-    let map = wf::fetch::fetch_map(owner, name, map_issue)
+    let map = wf::fetch::fetch_map(&map_id)
         .await
         .expect("fetch the discovered map");
     assert!(

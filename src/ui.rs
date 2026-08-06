@@ -1,7 +1,10 @@
-//! The main screen: grouped flat list (frontier / claimed / blocked / done)
-//! with the minimal row — state glyph, repo, number, title, `— needs #N` on
-//! blocked rows — per the #8 and #9 resolutions. Build 2 adds the fuzzy
-//! query (2a: groups survive typing), the cursor, and the bottom prompt.
+//! The main screen: one cluster per open map (#50) — a `▌ repo · map title`
+//! header carrying the per-status counts, with the map's tickets grouped
+//! beneath it (frontier / claimed / blocked / done) in the minimal row —
+//! state glyph, number, title, `— needs #N` on blocked rows. The repo column
+//! is gone: every row sits under a header that names its repo. Build 2's
+//! fuzzy query (2a: groups survive typing), the cursor, and the bottom prompt
+//! are unchanged.
 
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -9,8 +12,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Overlay, Scope};
-use crate::model::{Status, GROUP_LABELS};
+use crate::app::{App, Overlay, Row, Scope};
+use crate::model::{Map, MapId, Status, GROUP_LABELS};
 
 fn glyph_style(status: &Status) -> Style {
     match status {
@@ -21,74 +24,107 @@ fn glyph_style(status: &Status) -> Style {
     }
 }
 
-/// The grouped list body as styled lines (header + surviving rows per group,
-/// in fixed group order). Shared by the live draw and the TestBackend tests.
+/// The cluster header: `▌ <repo> · <map title>  ○n ◐n ⊘n ●n`. The counts are
+/// the whole map's, not the query's — they describe the cluster's shape, and
+/// the group headers already carry `matched/total` while a query is live.
+fn cluster_header(id: &MapId, map: &Map) -> Line<'static> {
+    let [frontier, claimed, blocked, done] = map.counts();
+    let count_style = [
+        Style::new().fg(Color::Green),
+        Style::new().fg(Color::Yellow),
+        Style::new().fg(Color::Red),
+        Style::new().add_modifier(Modifier::DIM),
+    ];
+    let glyphs = ['○', '◐', '⊘', '●'];
+    let mut spans = vec![Span::styled(
+        format!("▌ {} · {}", id.short_repo(), map.title),
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )];
+    for (i, count) in [frontier, claimed, blocked, done].into_iter().enumerate() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(format!("{}{count}", glyphs[i]), count_style[i]));
+    }
+    Line::from(spans)
+}
+
+/// The cluster body as styled lines: one header per in-scope map, its groups
+/// beneath it in fixed order. Shared by the live draw and the TestBackend
+/// tests.
 ///
-/// Filtering is 2a per the #9 resolution: non-matching rows drop, every
-/// group header stays (showing `matched/total` while a query is live), and
-/// group order never changes. Focus mode drops the repo column — the
-/// header already names the project.
+/// Filtering is 2a per the #9 resolution: non-matching rows drop, group
+/// headers stay (showing `matched/total` while a query is live), and group
+/// order never changes. A group the cluster has no tickets in at all is
+/// skipped — with several clusters on screen, empty headers would outnumber
+/// the rows.
 pub fn body_lines(app: &App) -> Vec<Line<'static>> {
+    body_with_cursor(app).0
+}
+
+/// [`body_lines`] plus which line the cursor row landed on — what the draw
+/// scrolls to. `None` when no row is visible. Needed since #50: several
+/// clusters can be taller than the screen, and a cursor the body cannot show
+/// is a picker that cannot pick.
+fn body_with_cursor(app: &App) -> (Vec<Line<'static>>, Option<usize>) {
     let visible = app.visible();
-    let scoped = app.scoped();
-    let cursor_idx = visible.get(app.cursor_pos()).copied();
-    let show_repo = app.scope == Scope::All;
+    let cursor_row = visible.get(app.cursor_pos()).cloned();
+    let mut cursor_line = None;
     let filtering = !app.query.is_empty();
 
     let mut lines = vec![Line::default()];
-    for (group, label) in GROUP_LABELS.iter().enumerate() {
-        let total = scoped
-            .iter()
-            .filter(|&&i| app.map.tickets[i].status.group() == group)
-            .count();
-        let members: Vec<usize> = visible
-            .iter()
-            .copied()
-            .filter(|&i| app.map.tickets[i].status.group() == group)
-            .collect();
-        let header = if filtering {
-            format!("  {label} — {}/{}", members.len(), total)
-        } else {
-            format!("  {label} — {total}")
-        };
-        lines.push(Line::styled(
-            header,
-            Style::new().add_modifier(Modifier::BOLD),
-        ));
-        for idx in members {
-            let ticket = &app.map.tickets[idx];
-            let cursor = if cursor_idx == Some(idx) { '▶' } else { ' ' };
-            let mut spans = vec![
-                Span::raw(format!("  {cursor} ")),
-                Span::styled(ticket.status.glyph().to_string(), glyph_style(&ticket.status)),
-            ];
-            if show_repo {
-                spans.push(Span::raw(format!(
-                    " {:<10} #{:<4} {}",
-                    ticket.short_repo(),
-                    ticket.number,
-                    ticket.title
-                )));
+    for (id, map) in app.scoped_clusters() {
+        lines.push(cluster_header(id, map));
+        for (group, label) in GROUP_LABELS.iter().enumerate() {
+            let total = map
+                .tickets
+                .iter()
+                .filter(|t| t.status.group() == group)
+                .count();
+            if total == 0 {
+                continue;
+            }
+            let members: Vec<&Row> = visible
+                .iter()
+                .filter(|(row_id, i)| row_id == id && map.tickets[*i].status.group() == group)
+                .collect();
+            let header = if filtering {
+                format!("  {label} — {}/{}", members.len(), total)
             } else {
-                spans.push(Span::raw(format!(" #{:<4} {}", ticket.number, ticket.title)));
-            }
-            if let Status::Blocked { needs } = &ticket.status {
-                let needs: Vec<String> = needs.iter().map(|n| format!("#{n}")).collect();
-                spans.push(Span::styled(
-                    format!("  — needs {}", needs.join(", ")),
-                    Style::new().add_modifier(Modifier::DIM),
-                ));
-            }
-            let style = match ticket.status {
-                Status::Done => Style::new().add_modifier(Modifier::DIM),
-                _ => Style::new(),
+                format!("  {label} — {total}")
             };
-            lines.push(Line::from(spans).style(style));
+            lines.push(Line::styled(
+                header,
+                Style::new().add_modifier(Modifier::BOLD),
+            ));
+            for row in members {
+                let ticket = &map.tickets[row.1];
+                let under_cursor = cursor_row.as_ref() == Some(row);
+                if under_cursor {
+                    cursor_line = Some(lines.len());
+                }
+                let cursor = if under_cursor { '▶' } else { ' ' };
+                let mut spans = vec![
+                    Span::raw(format!("  {cursor} ")),
+                    Span::styled(ticket.status.glyph().to_string(), glyph_style(&ticket.status)),
+                    Span::raw(format!(" #{:<4} {}", ticket.number, ticket.title)),
+                ];
+                if let Status::Blocked { needs } = &ticket.status {
+                    let needs: Vec<String> = needs.iter().map(|n| format!("#{n}")).collect();
+                    spans.push(Span::styled(
+                        format!("  — needs {}", needs.join(", ")),
+                        Style::new().add_modifier(Modifier::DIM),
+                    ));
+                }
+                let style = match ticket.status {
+                    Status::Done => Style::new().add_modifier(Modifier::DIM),
+                    _ => Style::new(),
+                };
+                lines.push(Line::from(spans).style(style));
+            }
         }
         lines.push(Line::default());
     }
     lines.pop();
-    lines
+    (lines, cursor_line)
 }
 
 /// The keybindings (#14): `tab` peek is deferred; `enter` runs the ticket's
@@ -100,44 +136,50 @@ const KEY_HINTS: &str =
 
 /// The project heading in the title bar.
 ///
-/// `merge_maps` names the empty case "no projects — run wf inside a checkout to
-/// register it", and that is the truth in exactly one of the three ways the
-/// list can be empty. It is also still loading (#27), or every fetch failed —
-/// and telling a user with three registered projects that they have none is the
-/// exact ambiguity [`crate::refresh::Startup`] exists to remove. So both other
-/// cases are named before the merged map's own header is trusted.
+/// An empty screen has three meanings — still loading (#27), every fetch
+/// failed, or genuinely no projects — and telling a user with three registered
+/// projects that they have none is the exact ambiguity
+/// [`crate::refresh::Startup`] exists to remove. So both other cases are named
+/// before "no projects" is claimed. With clusters on screen, the heading
+/// counts the ground they cover: the one repo's slug, or how many projects.
 pub fn heading(app: &App) -> String {
-    if app.map.tickets.is_empty() {
+    if app.clusters.is_empty() {
         if !app.startup.is_loaded() {
             return "loading…".to_string();
         }
-        // Naming the repo is the whole value when there is one: "GitHub is
+        // Naming the map is the whole value when there is one: "GitHub is
         // unreachable" and "you have no projects" are different problems with
         // different fixes, and the empty list looks identical either way.
         match app.failed.len() {
             0 => {}
             1 => {
-                let repo = app.failed.iter().next().expect("len checked");
-                return format!("{repo} — fetch failed, ctrl-r retries");
+                let id = app.failed.iter().next().expect("len checked");
+                return format!("{}#{} — fetch failed, ctrl-r retries", id.repo, id.number);
             }
             n => return format!("{n} maps failed to fetch — ctrl-r retries"),
         }
+        return "no projects — run wf inside a checkout to register it".to_string();
     }
-    app.map.repo.clone()
+    let repos: std::collections::BTreeSet<&str> =
+        app.clusters.keys().map(|id| id.repo.as_str()).collect();
+    match repos.len() {
+        1 => (*repos.iter().next().expect("len checked")).to_string(),
+        n => format!("{n} projects"),
+    }
 }
 
 /// The persistent failure segment on the count line.
 ///
 /// Separate from [`heading`] because the case it exists for is the *partial*
-/// one: four maps on screen and a fifth missing draws a perfectly normal
+/// one: four clusters on screen and a fifth missing draws a perfectly normal
 /// screen, so the only place left to say so is here — and it has to survive
 /// the next keypress, which the one-shot notice does not.
 pub fn failure_note(app: &App) -> String {
     match app.failed.len() {
         0 => String::new(),
         1 => {
-            let repo = app.failed.iter().next().expect("len checked");
-            format!("· {repo} failed")
+            let id = app.failed.iter().next().expect("len checked");
+            format!("· {}#{} failed", id.repo, id.number)
         }
         n => format!("· {n} maps failed"),
     }
@@ -202,8 +244,8 @@ fn draw_overlay(frame: &mut Frame, app: &App) {
     );
 }
 
-/// Draw the full screen: bordered frame with the scope in the title, grouped
-/// list body, then the anchored bottom chrome — the match-count line (with the
+/// Draw the full screen: bordered frame with the scope in the title, the
+/// clusters, then the anchored bottom chrome — the match-count line (with the
 /// load hint and any one-shot notice), the fzf-style prompt, and the key hints.
 /// The which-checkout picker, when open, floats over all of it.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -227,7 +269,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
     ])
     .areas(inner);
 
-    frame.render_widget(Paragraph::new(body_lines(app)), body_area);
+    // Scroll only as far as it takes to keep the cursor's line on screen —
+    // several clusters can be taller than the body area (#50), and a cursor
+    // below the fold would leave the picker unable to show what `enter` picks.
+    let (lines, cursor_line) = body_with_cursor(app);
+    let mut body = Paragraph::new(lines);
+    if let Some(line) = cursor_line {
+        let height = body_area.height as usize;
+        if height > 0 && line >= height {
+            body = body.scroll(((line + 1 - height) as u16, 0));
+        }
+    }
+    frame.render_widget(body, body_area);
 
     // The load hint and the failure note share one dim segment and can both be
     // live at once (map 2 of 3 is still coming *and* map 1 never arrived);
@@ -270,23 +323,36 @@ pub fn draw(frame: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::launch::MapIssues;
-    use crate::model::{classify, Map, Ticket, TicketType};
+    use crate::model::{classify, Map, MapId, MapSet, Ticket, TicketType};
     use crate::refresh::Startup;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
+    use std::collections::BTreeMap;
 
-    fn fixture_map() -> Map {
-        let t = |number: u64, title: &str, open: bool, assigned: bool, needs: Vec<u64>| Ticket {
-            repo: "blooop/wayfinder".to_string(),
+    fn ticket(
+        repo: &str,
+        number: u64,
+        title: &str,
+        open: bool,
+        assigned: bool,
+        needs: Vec<u64>,
+    ) -> Ticket {
+        Ticket {
+            repo: repo.to_string(),
             number,
             title: title.to_string(),
-            status: classify(open, assigned, needs),
+            status: classify(open, assigned, needs.clone()),
             ticket_type: TicketType::Task,
+            blocked_by: needs,
+        }
+    }
+
+    fn wf_map() -> Map {
+        let t = |number, title: &str, open, assigned, needs: Vec<u64>| {
+            ticket("blooop/wayfinder", number, title, open, assigned, needs)
         };
         Map {
-            repo: "blooop/wayfinder".to_string(),
             title: "Map: wf".to_string(),
             tickets: vec![
                 t(2, "Choose the stack", false, true, vec![]),
@@ -296,6 +362,12 @@ mod tests {
                 t(14, "Breadcrumb markers", true, false, vec![6, 9]),
             ],
         }
+    }
+
+    fn fixture_app() -> App {
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
+        App::new(clusters)
     }
 
     fn type_str(app: &mut App, s: &str) {
@@ -321,34 +393,78 @@ mod tests {
     }
 
     #[test]
-    fn groups_render_in_fixed_order_with_counts() {
-        let screen = render(&App::new(fixture_map()));
+    fn the_cluster_header_names_the_map_and_carries_the_counts() {
+        let screen = render(&fixture_app());
+        assert!(
+            screen.contains("▌ wayfinder · Map: wf  ○1  ◐1  ⊘2  ●1"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn groups_render_in_fixed_order_within_the_cluster() {
+        let screen = render(&fixture_app());
+        let cluster = screen.find("▌ wayfinder").expect("cluster header");
         let frontier = screen.find("FRONTIER — ready to claim — 1").expect("frontier header");
         let claimed = screen.find("CLAIMED — 1").expect("claimed header");
         let blocked = screen.find("BLOCKED — 2").expect("blocked header");
         let done = screen.find("DONE — 1").expect("done header");
-        assert!(frontier < claimed && claimed < blocked && blocked < done);
+        assert!(cluster < frontier && frontier < claimed && claimed < blocked && blocked < done);
     }
 
     #[test]
-    fn rows_carry_state_glyph_repo_number_title() {
-        let screen = render(&App::new(fixture_map()));
-        assert!(screen.contains("○ wayfinder  #6    Re-entry breadcrumbs"));
-        assert!(screen.contains("◐ wayfinder  #9    Main screen design"));
-        assert!(screen.contains("⊘ wayfinder  #7    Supervising AFK agents"));
-        assert!(screen.contains("● wayfinder  #2    Choose the stack"));
+    fn every_open_map_renders_as_its_own_cluster_even_on_one_repo() {
+        // The #50 acceptance case: two open maps on one repo are two clusters,
+        // where the old lowest-number rule showed only one.
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
+        clusters.insert(
+            MapId::new("blooop/wayfinder", 47),
+            Map {
+                title: "Map: the selection view".to_string(),
+                tickets: vec![ticket(
+                    "blooop/wayfinder",
+                    50,
+                    "Build: clusters",
+                    true,
+                    false,
+                    vec![],
+                )],
+            },
+        );
+        let app = App::new(clusters);
+        let screen = render(&app);
+        let first = screen.find("▌ wayfinder · Map: wf").expect("map #1's cluster");
+        let second = screen
+            .find("▌ wayfinder · Map: the selection view")
+            .expect("map #47's cluster");
+        assert!(first < second, "clusters order by (repo, number)");
+        assert!(screen.contains("#50   Build: clusters"), "{screen}");
+        // One repo on screen, however many maps: the title names the repo.
+        assert!(screen.contains("wf · blooop/wayfinder"), "{screen}");
+    }
+
+    #[test]
+    fn rows_carry_state_glyph_number_title_without_a_repo_column() {
+        // The repo column is gone: the cluster header names the repo.
+        let screen = render(&fixture_app());
+        assert!(screen.contains("○ #6    Re-entry breadcrumbs"), "{screen}");
+        assert!(screen.contains("◐ #9    Main screen design"), "{screen}");
+        assert!(screen.contains("⊘ #7    Supervising AFK agents"), "{screen}");
+        assert!(screen.contains("● #2    Choose the stack"), "{screen}");
+        assert!(!screen.contains("○ wayfinder"), "{screen}");
     }
 
     #[test]
     fn blocked_rows_show_needs_suffix() {
-        let screen = render(&App::new(fixture_map()));
+        let screen = render(&fixture_app());
         assert!(screen.contains("#7    Supervising AFK agents  — needs #6"));
         assert!(screen.contains("#14   Breadcrumb markers  — needs #6, #9"));
     }
 
     #[test]
     fn bottom_chrome_has_count_prompt_and_hint_lines() {
-        let screen = render(&App::new(fixture_map()));
+        let screen = render(&fixture_app());
         assert!(screen.contains("5/5"));
         assert!(screen.contains("> █"));
         assert!(screen.contains("enter launch"));
@@ -359,7 +475,7 @@ mod tests {
 
     #[test]
     fn query_drops_nonmatching_rows_but_groups_persist() {
-        let mut app = App::new(fixture_map());
+        let mut app = fixture_app();
         type_str(&mut app, "bread");
         let screen = render(&app);
         // Surviving rows: #6 (frontier) and #14 (blocked).
@@ -369,14 +485,16 @@ mod tests {
         assert!(!screen.contains("Main screen design"));
         assert!(!screen.contains("Choose the stack"));
         assert!(!screen.contains("Supervising AFK agents"));
-        // Every group header persists, as matched/total — 2a, no flattening.
+        // Group headers persist as matched/total — 2a, no flattening — and the
+        // cluster header stays put above them.
+        let cluster = screen.find("▌ wayfinder").expect("cluster header");
         let frontier = screen
             .find("FRONTIER — ready to claim — 1/1")
             .expect("frontier header");
         let claimed = screen.find("CLAIMED — 0/1").expect("claimed header");
         let blocked = screen.find("BLOCKED — 1/2").expect("blocked header");
         let done = screen.find("DONE — 0/1").expect("done header");
-        assert!(frontier < claimed && claimed < blocked && blocked < done);
+        assert!(cluster < frontier && frontier < claimed && claimed < blocked && blocked < done);
         // Count line and prompt reflect the live query.
         assert!(screen.contains("2/5"));
         assert!(screen.contains("> bread█"));
@@ -384,23 +502,23 @@ mod tests {
 
     #[test]
     fn cursor_marks_first_visible_row_after_typing() {
-        let mut app = App::new(fixture_map());
+        let mut app = fixture_app();
         // Park the cursor lower first; typing must snap it to the first hit.
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         type_str(&mut app, "bread");
         let screen = render(&app);
-        assert!(screen.contains("▶ ○ wayfinder  #6    Re-entry breadcrumbs"));
+        assert!(screen.contains("▶ ○ #6    Re-entry breadcrumbs"));
         assert!(!screen.contains("▶ ⊘"));
     }
 
     #[test]
     fn cursor_moves_across_visible_rows_only() {
-        let mut app = App::new(fixture_map());
+        let mut app = fixture_app();
         type_str(&mut app, "bread");
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let screen = render(&app);
         // Cursor skipped the emptied CLAIMED group straight to blocked #14.
-        assert!(screen.contains("▶ ⊘ wayfinder  #14   Breadcrumb markers"));
+        assert!(screen.contains("▶ ⊘ #14   Breadcrumb markers"));
     }
 
     /// The fixture map plus Build 4 launch inputs: two checkouts of the repo,
@@ -410,20 +528,15 @@ mod tests {
             path: std::path::PathBuf::from(path),
             repo: "blooop/wayfinder".to_string(),
         };
-        let mut map_issues = crate::launch::MapIssues::new();
-        map_issues.insert("blooop/wayfinder".to_string(), 1);
-        App::new(fixture_map()).with_projects(
-            vec![
-                checkout("/data/k1/wayfinder"),
-                checkout("/data/k2/wayfinder"),
-            ],
-            map_issues,
-        )
+        fixture_app().with_checkouts(vec![
+            checkout("/data/k1/wayfinder"),
+            checkout("/data/k2/wayfinder"),
+        ])
     }
 
     #[test]
     fn the_hint_line_advertises_the_one_launch_key_and_no_afk() {
-        let screen = render(&App::new(fixture_map()));
+        let screen = render(&fixture_app());
         assert!(screen.contains("enter launch"));
         assert!(!screen.contains("ctrl-a"), "{screen}");
         assert!(!screen.contains("afk"), "{screen}");
@@ -432,7 +545,7 @@ mod tests {
     #[test]
     fn nothing_reserves_a_line_for_agents_any_more() {
         // The `agents: N tabs` slot went with the tabs it counted (#26).
-        let screen = render(&App::new(fixture_map()));
+        let screen = render(&fixture_app());
         assert!(!screen.contains("agents:"), "{screen}");
     }
 
@@ -446,7 +559,7 @@ mod tests {
         assert!(screen.contains("/data/k2/wayfinder"), "{screen}");
         assert!(screen.contains("esc cancel"));
         // It is a modal: the rows it covers are overwritten, not blended.
-        assert!(!screen.contains("Supervising AFK agents"), "{screen}");
+        assert!(!screen.contains("Breadcrumb markers"), "{screen}");
     }
 
     #[test]
@@ -464,19 +577,20 @@ mod tests {
         // Three registered projects and GitHub unreachable draws the same empty
         // list as no projects at all. Saying "no projects — run wf inside a
         // checkout" there sends the user to fix the one thing that is not
-        // broken, so the failure has to win the heading.
+        // broken, so the failure has to win the heading — and it names the
+        // *map*, because with several on one repo the repo alone is ambiguous.
         let mut app = App::empty();
         app.startup = Startup::loaded();
-        app.failed.insert("blooop/wayfinder".to_string());
+        app.failed.insert(MapId::new("blooop/wayfinder", 35));
         let screen = render(&app);
         assert!(!screen.contains("no projects"), "{screen}");
         assert!(
-            screen.contains("blooop/wayfinder — fetch failed, ctrl-r retries"),
+            screen.contains("blooop/wayfinder#35 — fetch failed, ctrl-r retries"),
             "{screen}"
         );
 
         // Several, and naming them all would not fit: say how many.
-        app.failed.insert("blooop/dotfiles".to_string());
+        app.failed.insert(MapId::new("blooop/dotfiles", 4));
         let screen = render(&app);
         assert!(screen.contains("2 maps failed to fetch"), "{screen}");
         assert!(!screen.contains("no projects"), "{screen}");
@@ -484,27 +598,27 @@ mod tests {
 
     #[test]
     fn a_partial_failure_is_visible_and_survives_the_next_keypress() {
-        // The case that hides best: the rows that did load look completely
+        // The case that hides best: the clusters that did load look completely
         // normal, so the count line is the only place left to say a map is
         // missing — and `notice` cannot be that place, because `handle_key`
         // clears it on every keypress and nothing polls to re-announce it.
-        let mut app = App::new(fixture_map());
-        app.failed.insert("blooop/dotfiles".to_string());
-        assert_eq!(failure_note(&app), "· blooop/dotfiles failed");
+        let mut app = fixture_app();
+        app.failed.insert(MapId::new("blooop/dotfiles", 4));
+        assert_eq!(failure_note(&app), "· blooop/dotfiles#4 failed");
         let screen = render(&app);
-        assert!(screen.contains("5/5  · blooop/dotfiles failed"), "{screen}");
+        assert!(screen.contains("5/5  · blooop/dotfiles#4 failed"), "{screen}");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         let screen = render(&app);
         assert!(
-            screen.contains("· blooop/dotfiles failed"),
+            screen.contains("· blooop/dotfiles#4 failed"),
             "a keypress must not erase it: {screen}"
         );
     }
 
     #[test]
     fn an_empty_list_reads_as_empty_only_once_the_load_finished() {
-        // Same empty map, opposite meaning — told apart by Startup alone.
+        // Same empty screen, opposite meaning — told apart by Startup alone.
         let mut app = App::empty();
         app.startup = Startup::loaded();
         let screen = render(&app);
@@ -513,17 +627,20 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_load_shows_progress_beside_the_tickets_already_in() {
+    fn a_partial_load_shows_progress_beside_the_clusters_already_in() {
         // One map of three has landed: the rows are real and fresh, and the
         // count line still says more is coming.
-        let mut app = App::new(fixture_map());
-        let found: MapIssues = [("a/one", 1), ("b/two", 2), ("c/three", 3)]
-            .into_iter()
-            .map(|(slug, n)| (slug.to_string(), n))
-            .collect();
+        let mut app = fixture_app();
+        let found: MapSet = [
+            MapId::new("blooop/wayfinder", 1),
+            MapId::new("b/two", 2),
+            MapId::new("c/three", 3),
+        ]
+        .into_iter()
+        .collect();
         app.startup = Startup::seeded(&found);
         app.startup.searched(&found);
-        app.startup.record_arrival("a/one");
+        app.startup.record_arrival(&MapId::new("blooop/wayfinder", 1));
         let screen = render(&app);
         assert!(screen.contains("#6    Re-entry breadcrumbs"), "{screen}");
         assert!(screen.contains("5/5  · loading maps 1/3"), "{screen}");
@@ -532,13 +649,50 @@ mod tests {
     }
 
     #[test]
-    fn focus_mode_drops_repo_column_and_names_scope_in_title() {
-        let mut app = App::new(fixture_map());
+    fn the_body_scrolls_to_keep_the_cursor_on_screen() {
+        // One cluster of 30 done tickets ahead of a one-ticket cluster: the
+        // second cluster's rows start past the 24-row screen, and that is where
+        // the cursor must still be *visible* — a picker that cannot show what
+        // `enter` would pick is broken (the live 3-map repo hits exactly this).
+        let mut clusters = BTreeMap::new();
+        clusters.insert(
+            MapId::new("blooop/wayfinder", 1),
+            Map {
+                title: "Map: wf".to_string(),
+                tickets: (1..=30)
+                    .map(|n| ticket("blooop/wayfinder", n, &format!("Done {n}"), false, false, vec![]))
+                    .collect(),
+            },
+        );
+        clusters.insert(
+            MapId::new("blooop/wayfinder", 47),
+            Map {
+                title: "Map: the selection view".to_string(),
+                tickets: vec![ticket("blooop/wayfinder", 50, "Build: clusters", true, false, vec![])],
+            },
+        );
+        let mut app = App::new(clusters);
+        for _ in 0..40 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(app.cursor_ticket().unwrap().number, 50);
+        let screen = render(&app);
+        assert!(screen.contains("▶ ○ #50   Build: clusters"), "{screen}");
+        // And with the cursor back at the top, the top is what shows.
+        for _ in 0..40 {
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
+        let screen = render(&app);
+        assert!(screen.contains("▶ ● #1    Done 1"), "{screen}");
+    }
+
+    #[test]
+    fn focus_mode_names_the_scope_in_the_title() {
+        let mut app = fixture_app();
         app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
         let screen = render(&app);
         assert!(screen.contains("wf · blooop/wayfinder — focused"));
         assert!(screen.contains("ctrl-g all projects"));
         assert!(screen.contains("▶ ○ #6    Re-entry breadcrumbs"));
-        assert!(!screen.contains("○ wayfinder  #6"));
     }
 }
