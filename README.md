@@ -85,8 +85,21 @@ then it *is* the process you started.
 
 | key | what it does |
 | --- | --- |
+| *type anything* | fuzzy-filter the list; group headers stay, showing `matched/total` |
+| `↑`/`↓`, `ctrl-j`/`ctrl-k` | move the cursor over ticket rows (headers are never a stop) |
 | `enter` | run the agent on the ticket under the cursor, here, and exit |
-| `↑`/`↓`, `enter`, `esc` | in the which-checkout picker: pick which tree the agent runs in, or cancel |
+| `ctrl-f` | focus the cursor row's project — drops the repo column |
+| `ctrl-g` | widen back to every project |
+| `ctrl-r` | refetch every map in place, keeping your query, scope and cursor |
+| `esc` | clear the query; on an empty query, quit |
+| `q` | quit — on an empty query only, since mid-query it types |
+| `ctrl-c` | quit from anywhere, including the which-checkout picker |
+| `↑`/`↓` or `j`/`k`, `enter`, `esc`/`q` | in the which-checkout picker: pick which tree the agent runs in, or cancel |
+
+`ctrl-r` is the only thing that updates the list in place. Quitting and running
+`wf` again is nearly as fast (~0.6 s warm) but throws away the query, the scope
+and where the cursor was, which is the whole reason the key still exists now
+that nothing polls.
 
 That picker is the one prompt left, and only a repo with several registered
 checkouts (the `~/k1/kinisi_ros`, `~/k2/kinisi_ros` pattern) ever sees it: the
