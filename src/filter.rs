@@ -1,9 +1,11 @@
-//! Nucleo fuzzy filtering over the ticket list.
+//! Nucleo fuzzy scoring over the ticket list.
 //!
-//! Query behavior is 2a per the #9 resolution — groups survive typing: the
-//! matcher only decides *which* rows survive; the caller keeps group
-//! structure and order. Matching is scored against `"repo #num title"`, so
-//! typing a repo name narrows to that project too.
+//! A live query *flattens* the body (#51, retiring the 2a groups-survive-typing
+//! rule with the groups themselves): the matcher scores every ticket, and the
+//! flattened screen orders rows best-score-first. This module only scores; the
+//! ordering — and everything else about what the query does to the screen —
+//! lives in [`crate::view`]. Matching is scored against `"repo #num title"`,
+//! so typing a repo name narrows to that project too.
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -11,31 +13,32 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use crate::model::Ticket;
 
 /// The haystack a ticket is matched against: the short repo name (what the
-/// row shows) plus the number and title. The owner is left out — typing an
-/// owner name is not how projects are picked, and including it would let
-/// unrelated repos match on a shared owner.
+/// flattened row shows) plus the number and title. The owner is left out —
+/// typing an owner name is not how projects are picked, and including it would
+/// let unrelated repos match on a shared owner.
 fn haystack(ticket: &Ticket) -> String {
-    format!("{} #{} {}", ticket.short_repo(), ticket.number, ticket.title)
+    format!(
+        "{} #{} {}",
+        ticket.short_repo(),
+        ticket.number,
+        ticket.title
+    )
 }
 
-/// Indices into `tickets` of the rows matching `query`, in input order.
-/// The empty query matches everything.
-pub fn matching_indices(tickets: &[Ticket], query: &str) -> Vec<usize> {
+/// Score every ticket against `query`, in input order: `None` is no match,
+/// and a higher score is a better one. The empty query matches everything
+/// (at an equal score), though no caller renders that case — an empty query
+/// means the structured screen, not a flattened one.
+pub fn scores(tickets: &[Ticket], query: &str) -> Vec<Option<u32>> {
     if query.is_empty() {
-        return (0..tickets.len()).collect();
+        return vec![Some(0); tickets.len()];
     }
     let mut matcher = Matcher::new(Config::DEFAULT);
     let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
     let mut buf = Vec::new();
     tickets
         .iter()
-        .enumerate()
-        .filter(|(_, t)| {
-            pattern
-                .score(Utf32Str::new(&haystack(t), &mut buf), &mut matcher)
-                .is_some()
-        })
-        .map(|(i, _)| i)
+        .map(|t| pattern.score(Utf32Str::new(&haystack(t), &mut buf), &mut matcher))
         .collect()
 }
 
@@ -63,31 +66,50 @@ mod tests {
         ]
     }
 
+    /// Indices of the matching tickets, in input order.
+    fn matching(tickets: &[Ticket], query: &str) -> Vec<usize> {
+        scores(tickets, query)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|_| i))
+            .collect()
+    }
+
     #[test]
     fn empty_query_matches_all() {
-        assert_eq!(matching_indices(&fixture(), ""), vec![0, 1, 2]);
+        assert_eq!(matching(&fixture(), ""), vec![0, 1, 2]);
     }
 
     #[test]
     fn query_narrows_to_fuzzy_title_matches() {
-        assert_eq!(matching_indices(&fixture(), "bread"), vec![0]);
+        assert_eq!(matching(&fixture(), "bread"), vec![0]);
     }
 
     #[test]
     fn repo_name_and_number_are_matchable() {
-        assert_eq!(matching_indices(&fixture(), "dotf"), vec![2]);
-        assert_eq!(matching_indices(&fixture(), "#9"), vec![1]);
+        assert_eq!(matching(&fixture(), "dotf"), vec![2]);
+        assert_eq!(matching(&fixture(), "#9"), vec![1]);
     }
 
     #[test]
     fn the_owner_half_of_the_slug_is_not_matched() {
         // Every fixture ticket is owned by blooop; matching on the owner
         // would make a shared owner narrow to nothing useful.
-        assert!(matching_indices(&fixture(), "blooop").is_empty());
+        assert!(matching(&fixture(), "blooop").is_empty());
     }
 
     #[test]
     fn hopeless_query_matches_nothing() {
-        assert!(matching_indices(&fixture(), "zzzzqx").is_empty());
+        assert!(matching(&fixture(), "zzzzqx").is_empty());
+    }
+
+    #[test]
+    fn a_tighter_match_scores_higher() {
+        let tickets = vec![
+            ticket("blooop/wayfinder", 1, "breadcrumbs"),
+            ticket("blooop/wayfinder", 2, "b r e a d spelled out, crumbs later"),
+        ];
+        let scored = scores(&tickets, "bread");
+        assert!(scored[0].expect("exact-ish match") > scored[1].expect("scattered match"));
     }
 }

@@ -456,7 +456,11 @@ mod tests {
         startup.searched(&found(&[("fast/one", 1), ("slow/two", 2)]));
         startup.record_arrival(&MapId::new("fast/one", 1));
         startup.record_arrival(&MapId::new("fast/one", 1));
-        assert_eq!(startup.hint(), "· loading maps 1/2", "slow/two is still out");
+        assert_eq!(
+            startup.hint(),
+            "· loading maps 1/2",
+            "slow/two is still out"
+        );
         startup.record_arrival(&MapId::new("slow/two", 2));
         assert!(startup.is_loaded());
     }
@@ -517,7 +521,10 @@ mod tests {
         startup.record_arrival(&MapId::new("a/one", 1));
         assert_eq!(startup.hint(), "· loading maps 1/2");
         startup.record_arrival(&MapId::new("b/two", 2));
-        assert!(startup.is_loaded(), "the search already answered; it stays answered");
+        assert!(
+            startup.is_loaded(),
+            "the search already answered; it stays answered"
+        );
         assert_eq!(startup.hint(), "");
     }
 
@@ -544,7 +551,10 @@ mod tests {
         let mut startup = Startup::seeded(&found(&[("a/one", 2)]));
         startup.record_arrival(&MapId::new("a/one", 2));
         startup.searched(&found(&[("a/one", 1)]));
-        assert!(!startup.is_loaded(), "#1 has not arrived; #2 no longer counts");
+        assert!(
+            !startup.is_loaded(),
+            "#1 has not arrived; #2 no longer counts"
+        );
         assert_eq!(startup.hint(), "· loading maps 0/1");
         startup.record_arrival(&MapId::new("a/one", 1));
         assert!(startup.is_loaded());

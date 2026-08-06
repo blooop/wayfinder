@@ -64,7 +64,7 @@ impl Status {
         }
     }
 
-    /// Position of this status's group within a cluster
+    /// Position of this status within the cluster header's counts
     /// (frontier / claimed / blocked / done).
     pub fn group(&self) -> usize {
         match self {
@@ -75,9 +75,6 @@ impl Status {
         }
     }
 }
-
-/// Group headers, indexed by [`Status::group`].
-pub const GROUP_LABELS: [&str; 4] = ["FRONTIER — ready to claim", "CLAIMED", "BLOCKED", "DONE"];
 
 /// What *kind* of work a ticket is — the `wayfinder:*` type label, parsed once
 /// at the `gh` boundary ([`TicketType::from_labels`]) and never re-sniffed from
@@ -139,6 +136,20 @@ impl TicketType {
             .filter_map(TicketType::from_label)
             .min_by_key(|t| t.precedence())
             .unwrap_or(TicketType::Untyped)
+    }
+
+    /// The short name shown on a row's `[type]` suffix (#51). `None` for
+    /// [`TicketType::Untyped`]: an untyped ticket shows nothing rather than a
+    /// placeholder — the suffix exists to say what kind of session the ticket
+    /// wants, and "untyped" answers a question nobody asked.
+    pub fn short_name(self) -> Option<&'static str> {
+        match self {
+            TicketType::Research => Some("research"),
+            TicketType::Task => Some("task"),
+            TicketType::Grilling => Some("grilling"),
+            TicketType::Prototype => Some("prototype"),
+            TicketType::Untyped => None,
+        }
     }
 
     /// Tie-break rank when an issue carries several type labels — lower wins.
@@ -205,6 +216,13 @@ pub struct Map {
 }
 
 impl Map {
+    /// Where `number`'s ticket sits in `tickets` — the row-index half of a
+    /// [`crate::app::Row`]. `None` for a number that is not on this map (a
+    /// blocking edge may name any issue).
+    pub fn index_of(&self, number: u64) -> Option<usize> {
+        self.tickets.iter().position(|t| t.number == number)
+    }
+
     /// The tickets this ticket unblocks — the reverse of [`Ticket::blocked_by`],
     /// derived by inversion over the map's own tickets (#50). Direct dependents
     /// only; edges pointing outside the map never show up here because the
@@ -239,7 +257,9 @@ pub fn classify(is_open: bool, is_assigned: bool, open_blockers: Vec<u64>) -> St
     } else if is_assigned {
         Status::Claimed
     } else if !open_blockers.is_empty() {
-        Status::Blocked { needs: open_blockers }
+        Status::Blocked {
+            needs: open_blockers,
+        }
     } else {
         Status::Frontier
     }
@@ -280,7 +300,10 @@ mod tests {
             TicketType::from_labels(["wayfinder:research"]),
             TicketType::Research
         );
-        assert_eq!(TicketType::from_labels(["wayfinder:task"]), TicketType::Task);
+        assert_eq!(
+            TicketType::from_labels(["wayfinder:task"]),
+            TicketType::Task
+        );
         assert_eq!(
             TicketType::from_labels(["wayfinder:grilling"]),
             TicketType::Grilling
@@ -300,7 +323,10 @@ mod tests {
     #[test]
     fn no_recognised_label_is_untyped_not_a_guess() {
         // No labels at all.
-        assert_eq!(TicketType::from_labels(Vec::<&str>::new()), TicketType::Untyped);
+        assert_eq!(
+            TicketType::from_labels(Vec::<&str>::new()),
+            TicketType::Untyped
+        );
         // Labels, none of them types.
         assert_eq!(
             TicketType::from_labels(["bug", "documentation"]),
@@ -308,11 +334,20 @@ mod tests {
         );
         // A `wayfinder:` label that is not a *type*: the map label itself, and
         // a type invented after this binary shipped.
-        assert_eq!(TicketType::from_labels(["wayfinder:map"]), TicketType::Untyped);
-        assert_eq!(TicketType::from_labels(["wayfinder:spike"]), TicketType::Untyped);
+        assert_eq!(
+            TicketType::from_labels(["wayfinder:map"]),
+            TicketType::Untyped
+        );
+        assert_eq!(
+            TicketType::from_labels(["wayfinder:spike"]),
+            TicketType::Untyped
+        );
         // Near-misses are not fuzzy-matched: a type label is exact.
         assert_eq!(TicketType::from_labels(["research"]), TicketType::Untyped);
-        assert_eq!(TicketType::from_labels(["Wayfinder:Research"]), TicketType::Untyped);
+        assert_eq!(
+            TicketType::from_labels(["Wayfinder:Research"]),
+            TicketType::Untyped
+        );
         assert_eq!(TicketType::from_label("wayfinder:research!"), None);
     }
 
@@ -397,7 +432,11 @@ mod tests {
             ],
         };
         assert_eq!(map.unblocks(50), vec![51, 52]);
-        assert_eq!(map.unblocks(48), vec![50], "closed blockers keep their edges");
+        assert_eq!(
+            map.unblocks(48),
+            vec![50],
+            "closed blockers keep their edges"
+        );
         assert_eq!(map.unblocks(52), Vec::<u64>::new());
         // An edge pointing outside the map inverts to nothing rather than
         // panicking or inventing a ticket.

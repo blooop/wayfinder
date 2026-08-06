@@ -352,8 +352,11 @@ mod tests {
     fn the_map_parse_carries_each_sub_issues_type_through_from_its_labels() {
         let map = parse_map(MAP_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
         assert_eq!(map.title, "Map: wf");
-        let types: Vec<(u64, TicketType)> =
-            map.tickets.iter().map(|t| (t.number, t.ticket_type)).collect();
+        let types: Vec<(u64, TicketType)> = map
+            .tickets
+            .iter()
+            .map(|t| (t.number, t.ticket_type))
+            .collect();
         assert_eq!(
             types,
             vec![
@@ -376,7 +379,11 @@ mod tests {
         // edge survives on `blocked_by` — the DAG the selection views draw.
         let map = parse_map(MAP_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
         let t19 = map.tickets.iter().find(|t| t.number == 19).expect("#19");
-        assert_eq!(t19.status, Status::Frontier, "a closed blocker doesn't block");
+        assert_eq!(
+            t19.status,
+            Status::Frontier,
+            "a closed blocker doesn't block"
+        );
         assert_eq!(t19.blocked_by, vec![18], "…but its edge is kept");
         // #21 mixes one closed and one open blocker: status sees only the open
         // one, structure sees both.

@@ -11,11 +11,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::filter::matching_indices;
 use crate::launch::{self, Launch, Targets};
-use crate::model::{Map, MapId, MapSet, Ticket, GROUP_LABELS};
+use crate::model::{Map, MapId, MapSet, Ticket};
 use crate::projects::Checkout;
 use crate::refresh::Startup;
+use crate::view::{self, Lens, Plan, Screen};
 
 /// Project scope: everything, or one repo focused via `ctrl-f`. A repo, not a
 /// map: focusing where you stand means seeing every open map of that repo.
@@ -46,7 +46,10 @@ pub enum Overlay {
     None,
     /// Candidates are complete launches, so the pick cannot produce an
     /// inconsistent one.
-    PickCheckout { launches: Vec<Launch>, cursor: usize },
+    PickCheckout {
+        launches: Vec<Launch>,
+        cursor: usize,
+    },
 }
 
 /// One on-screen row: which map's cluster it is in, and the ticket's position
@@ -108,6 +111,10 @@ pub struct App {
     /// "no tickets" while the fetch is still out.
     pub startup: Startup,
     pub overlay: Overlay,
+    /// The structural screen `tab` toggles (#51). Only the lens is stored;
+    /// whether the body is currently *flattened* is derived from the query in
+    /// [`App::screen`], so the two can never disagree.
+    lens: Lens,
     cursor: usize,
 }
 
@@ -124,6 +131,7 @@ impl App {
             failed: BTreeSet::new(),
             startup: Startup::loaded(),
             overlay: Overlay::None,
+            lens: Lens::Leverage,
             cursor: 0,
         }
     }
@@ -175,28 +183,28 @@ impl App {
             .collect()
     }
 
-    /// Rows visible right now, in on-screen order: cluster-major (maps in
-    /// (repo, number) order), group-major within a cluster (frontier / claimed
-    /// / blocked / done), map order within a group. The cursor indexes this
-    /// list — cluster and group headers are never cursor stops.
-    pub fn visible(&self) -> Vec<Row> {
-        let mut out = Vec::new();
-        for (id, map) in self.scoped_clusters() {
-            let matched = matching_indices(&map.tickets, &self.query);
-            for group in 0..GROUP_LABELS.len() {
-                out.extend(
-                    matched
-                        .iter()
-                        .copied()
-                        .filter(|&i| map.tickets[i].status.group() == group)
-                        .map(|index| Row {
-                            map: id.clone(),
-                            index,
-                        }),
-                );
-            }
+    /// What the body renders this frame (#51): the toggled lens, unless a live
+    /// query flattens it. Derived, never stored.
+    pub fn screen(&self) -> Screen<'_> {
+        if self.query.is_empty() {
+            Screen::Structured(self.lens)
+        } else {
+            Screen::Flattened { query: &self.query }
         }
-        out
+    }
+
+    /// The body, planned: every line the screen shows, in on-screen order —
+    /// what the draw walks, and what [`App::visible`] takes its cursor stops
+    /// from, so the two can never disagree about order.
+    pub fn plan(&self) -> Plan {
+        view::plan(&self.scoped_clusters(), self.screen())
+    }
+
+    /// Rows visible right now, in on-screen order — the plan's ticket rows.
+    /// The cursor indexes this list; headers, counts, and spacers are never
+    /// cursor stops.
+    pub fn visible(&self) -> Vec<Row> {
+        self.plan().rows()
     }
 
     /// The ticket a row names.
@@ -261,11 +269,7 @@ impl App {
         let anchor = self.cursor_key();
         let old_index = self.cursor_pos();
         self.clusters = clusters;
-        let new_order: Vec<RowKey> = self
-            .visible()
-            .iter()
-            .map(|row| self.row_key(row))
-            .collect();
+        let new_order: Vec<RowKey> = self.visible().iter().map(|row| self.row_key(row)).collect();
         self.cursor = crate::refresh::preserve_cursor(anchor.as_ref(), old_index, &new_order);
     }
 
@@ -294,8 +298,14 @@ impl App {
                 Outcome::Launch(launch)
             }
             Targets::Many(launches) => {
-                self.notice = Some(format!("{}#{}: which checkout?", ticket.repo, ticket.number));
-                self.overlay = Overlay::PickCheckout { launches, cursor: 0 };
+                self.notice = Some(format!(
+                    "{}#{}: which checkout?",
+                    ticket.repo, ticket.number
+                ));
+                self.overlay = Overlay::PickCheckout {
+                    launches,
+                    cursor: 0,
+                };
                 Outcome::Continue
             }
         }
@@ -303,7 +313,12 @@ impl App {
 
     /// Keys while the checkout picker is up. The modal owns every key: no
     /// typing leaks into the query behind it.
-    fn handle_overlay_key(&mut self, key: KeyEvent, launches: Vec<Launch>, cursor: usize) -> Outcome {
+    fn handle_overlay_key(
+        &mut self,
+        key: KeyEvent,
+        launches: Vec<Launch>,
+        cursor: usize,
+    ) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let last = launches.len().saturating_sub(1);
         let moved = |cursor: usize, delta: isize| {
@@ -373,6 +388,17 @@ impl App {
             KeyCode::Char('g') if ctrl => {
                 let anchor = self.cursor_key();
                 self.scope = Scope::All;
+                if let Some(key) = anchor {
+                    self.point_at(&key);
+                }
+                Outcome::Continue
+            }
+            // Toggle the structural lens (#51): leverage ⇄ forest. The cursor
+            // stays on its ticket if the other screen shows it; a live query
+            // keeps flattening either lens until it is cleared.
+            KeyCode::Tab => {
+                let anchor = self.cursor_key();
+                self.lens = self.lens.toggled();
                 if let Some(key) = anchor {
                     self.point_at(&key);
                 }
@@ -462,10 +488,38 @@ mod tests {
             Map {
                 title: "Map: wf".to_string(),
                 tickets: vec![
-                    ticket("blooop/wayfinder", 2, "Choose the stack", false, true, vec![]),
-                    ticket("blooop/wayfinder", 6, "Re-entry breadcrumbs", true, false, vec![]),
-                    ticket("blooop/wayfinder", 7, "Supervising AFK agents", true, false, vec![6]),
-                    ticket("blooop/wayfinder", 9, "Main screen design", true, true, vec![]),
+                    ticket(
+                        "blooop/wayfinder",
+                        2,
+                        "Choose the stack",
+                        false,
+                        true,
+                        vec![],
+                    ),
+                    ticket(
+                        "blooop/wayfinder",
+                        6,
+                        "Re-entry breadcrumbs",
+                        true,
+                        false,
+                        vec![],
+                    ),
+                    ticket(
+                        "blooop/wayfinder",
+                        7,
+                        "Supervising AFK agents",
+                        true,
+                        false,
+                        vec![6],
+                    ),
+                    ticket(
+                        "blooop/wayfinder",
+                        9,
+                        "Main screen design",
+                        true,
+                        true,
+                        vec![],
+                    ),
                 ],
             },
         );
@@ -505,26 +559,61 @@ mod tests {
     }
 
     #[test]
-    fn cursor_moves_cluster_major_then_group_major_and_clamps() {
+    fn cursor_moves_in_leverage_order_and_clamps() {
         let mut app = fixture_app();
         // Clusters order by (repo, number): dotfiles#4 before wayfinder#1.
-        // On-screen: dotfiles frontier #103 · wayfinder frontier #6, claimed #9,
-        // blocked #7, done #2.
+        // Leverage order within wayfinder: root #6 (it unblocks #7), #7 as its
+        // subtree, then root #9; done #2 is not a row at all.
         assert_eq!(app.cursor_ticket().unwrap().number, 103);
         app.handle_key(key(KeyCode::Down));
         assert_eq!(app.cursor_ticket().unwrap().number, 6);
         app.handle_key(ctrl('j'));
-        assert_eq!(app.cursor_ticket().unwrap().number, 9);
+        assert_eq!(app.cursor_ticket().unwrap().number, 7);
         for _ in 0..10 {
             app.handle_key(key(KeyCode::Down));
         }
-        assert_eq!(app.cursor_ticket().unwrap().number, 2); // clamped at last row
+        assert_eq!(app.cursor_ticket().unwrap().number, 9); // clamped at last row
         app.handle_key(ctrl('k'));
         assert_eq!(app.cursor_ticket().unwrap().number, 7);
         for _ in 0..10 {
             app.handle_key(key(KeyCode::Up));
         }
         assert_eq!(app.cursor_ticket().unwrap().number, 103); // clamped at first row
+    }
+
+    #[test]
+    fn tab_toggles_the_lens_and_the_cursor_stays_on_its_ticket() {
+        let mut app = fixture_app();
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down)); // leverage: 103, 6, ▶7, 9
+        assert_eq!(app.cursor_ticket().unwrap().number, 7);
+        assert_eq!(app.screen(), Screen::Structured(Lens::Leverage));
+
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::Structured(Lens::Forest));
+        // The forest shows done #2 as a row and reorders — the cursor follows
+        // its ticket, not its old position.
+        assert_eq!(app.cursor_ticket().unwrap().number, 7);
+        assert_eq!(app.visible().len(), 5, "the forest is total");
+
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.screen(), Screen::Structured(Lens::Leverage));
+        assert_eq!(app.cursor_ticket().unwrap().number, 7);
+    }
+
+    #[test]
+    fn a_live_query_flattens_and_clearing_it_restores_the_lens() {
+        let mut app = fixture_app();
+        app.handle_key(key(KeyCode::Tab)); // forest
+        type_str(&mut app, "bread");
+        assert_eq!(app.screen(), Screen::Flattened { query: "bread" });
+        assert_eq!(app.visible().len(), 1);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(
+            app.screen(),
+            Screen::Structured(Lens::Forest),
+            "esc clears the query back to the lens it flattened"
+        );
     }
 
     #[test]
@@ -591,7 +680,14 @@ mod tests {
                 MapId::new("blooop/wayfinder", map_number),
                 Map {
                     title: format!("Map: {map_number}"),
-                    tickets: vec![ticket("blooop/wayfinder", 6, "Shared ticket", true, false, vec![])],
+                    tickets: vec![ticket(
+                        "blooop/wayfinder",
+                        6,
+                        "Shared ticket",
+                        true,
+                        false,
+                        vec![],
+                    )],
                 },
             );
         }
@@ -669,7 +765,10 @@ mod tests {
         let mut app = fixture_app();
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         let notice = app.notice.as_deref().unwrap();
-        assert!(notice.contains("no registered checkout"), "notice: {notice}");
+        assert!(
+            notice.contains("no registered checkout"),
+            "notice: {notice}"
+        );
     }
 
     #[test]
@@ -687,11 +786,15 @@ mod tests {
         app.handle_key(key(KeyCode::Down)); // cursor on wayfinder #6
         app.handle_key(ctrl('f'));
         assert_eq!(app.scope, Scope::Project("blooop/wayfinder".to_string()));
-        assert_eq!(app.visible().len(), 4);
+        assert_eq!(
+            app.visible().len(),
+            3,
+            "leverage rows: #6, #7 beneath it, #9"
+        );
         assert_eq!(app.cursor_ticket().unwrap().number, 6);
         app.handle_key(ctrl('g'));
         assert_eq!(app.scope, Scope::All);
-        assert_eq!(app.visible().len(), 5);
+        assert_eq!(app.visible().len(), 4);
         // cursor stayed anchored on the same ticket
         assert_eq!(app.cursor_ticket().unwrap().number, 6);
     }
@@ -782,7 +885,11 @@ mod tests {
         assert_eq!(app.cursor_ticket().unwrap().repo, "upstream/dotfiles");
         app.handle_key(ctrl('f'));
         assert_eq!(app.scope, Scope::Project("upstream/dotfiles".to_string()));
-        assert_eq!(app.visible().len(), 1, "the fork's identically-numbered row must not show");
+        assert_eq!(
+            app.visible().len(),
+            1,
+            "the fork's identically-numbered row must not show"
+        );
         assert_eq!(app.cursor_ticket().unwrap().repo, "upstream/dotfiles");
     }
 

@@ -16,7 +16,10 @@ async fn registering_this_checkout_finds_and_fetches_its_map() {
         .await
         .expect("this test must run inside the wayfinder checkout");
     assert_eq!(slug, "blooop/wayfinder");
-    assert!(toplevel.join("Cargo.toml").exists(), "toplevel: {toplevel:?}");
+    assert!(
+        toplevel.join("Cargo.toml").exists(),
+        "toplevel: {toplevel:?}"
+    );
 
     // Register: the explicit-open act, into a throwaway cache file.
     let cache_file = std::env::temp_dir()

@@ -104,8 +104,12 @@ impl ProjectsCache {
     pub fn record_search(&mut self, searched: &[String], found: &MapSet) {
         self.open_maps
             .retain(|id| !searched.contains(&id.repo) || found.contains(id));
-        self.open_maps
-            .extend(found.iter().filter(|id| searched.contains(&id.repo)).cloned());
+        self.open_maps.extend(
+            found
+                .iter()
+                .filter(|id| searched.contains(&id.repo))
+                .cloned(),
+        );
     }
 
     /// Drop findings for repos no checkout points at any more — the seed must
@@ -228,7 +232,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("projects.json");
         std::fs::write(&file, b"{ not json").unwrap();
-        assert_eq!(ProjectsCache::load_or_default(&file), ProjectsCache::default());
+        assert_eq!(
+            ProjectsCache::load_or_default(&file),
+            ProjectsCache::default()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -252,7 +259,10 @@ mod tests {
         .unwrap();
         let cache = ProjectsCache::load_or_default(&file);
         assert_eq!(cache.checkouts.len(), 1, "the checkouts must survive");
-        assert!(cache.map_seed().is_empty(), "the pre-#50 table is not a seed");
+        assert!(
+            cache.map_seed().is_empty(),
+            "the pre-#50 table is not a seed"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -316,7 +326,11 @@ mod tests {
         cache.register(p("/data/k1/kinisi_ros"), "kinisi/kinisi_ros".to_string());
         cache.register(p("/data/k2/kinisi_ros"), "kinisi/kinisi_ros".to_string());
         cache.register(p("/data/k1/kinisi_ros"), "kinisi/kinisi_ros".to_string());
-        assert_eq!(cache.checkouts.len(), 2, "re-registering must not duplicate");
+        assert_eq!(
+            cache.checkouts.len(),
+            2,
+            "re-registering must not duplicate"
+        );
         assert_eq!(cache.repos(), vec!["kinisi/kinisi_ros".to_string()]);
     }
 
@@ -338,7 +352,10 @@ mod tests {
         assert_eq!(cache.checkouts.len(), 1);
         assert_eq!(cache.checkouts[0].path, live);
 
-        assert!(!cache.prune_missing(), "nothing left to prune is not a change");
+        assert!(
+            !cache.prune_missing(),
+            "nothing left to prune is not a change"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

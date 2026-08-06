@@ -143,7 +143,10 @@ fn spawn_reader(master: OwnedFd) -> Arc<Mutex<Vec<u8>>> {
                 // The child exited, or the pty master gave `EIO` because the
                 // last slave closed. Both mean "no more output".
                 Ok(0) | Err(_) => break,
-                Ok(n) => sink.lock().expect("reader mutex").extend_from_slice(&buf[..n]),
+                Ok(n) => sink
+                    .lock()
+                    .expect("reader mutex")
+                    .extend_from_slice(&buf[..n]),
             }
         }
     });

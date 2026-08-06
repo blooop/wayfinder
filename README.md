@@ -45,9 +45,26 @@ Only repos with an open `wayfinder:map`-labelled issue show tickets; other
 checkouts stay cached but hidden.
 
 **Every open map renders as its own cluster** — a `▌ repo · map title` header
-carrying the per-status counts (`○` frontier `◐` claimed `⊘` blocked `●` done),
-with the map's tickets grouped beneath it. A repo can keep several maps open at
-once and each gets its own cluster; focusing a project shows all of them.
+carrying the per-status counts (`○` frontier `◐` claimed `⊘` blocked `●` done).
+A repo can keep several maps open at once and each gets its own cluster;
+focusing a project shows all of them.
+
+**The default screen is the leverage view**: each cluster shows its takeable
+tickets (frontier and claimed), sorted by how many open tickets each one
+unblocks, with that unblocks-subtree drawn beneath it — so the next ticket is
+chosen by what taking it unlocks, not by status alone. Rows are
+`<glyph> #n <title> [type]`. Done work collapses to a per-cluster
+`● N done (hidden)` count; blocked tickets no subtree reaches collapse to
+`⊘ N blocked deeper down`; a map with nothing takeable leaves the body
+entirely, counted on the bottom line as `· N idle maps hidden`.
+
+**`tab` shows the structure forest** instead: the whole blocking DAG, done
+tickets dimmed in place. A ticket's tree parent is its lowest-numbered in-map
+blocker; edges the tree cannot show are annotated `⤷ also needs #n`.
+
+**Typing flattens**: a live query replaces the tree with one flat list ordered
+by fuzzy-match score across every project (rows name their repo); clearing it
+restores whichever screen `tab` had toggled.
 
 ## Startup
 
@@ -90,7 +107,8 @@ then it *is* the process you started.
 
 | key | what it does |
 | --- | --- |
-| *type anything* | fuzzy-filter the list; group headers stay, showing `matched/total` |
+| *type anything* | fuzzy-filter: the tree flattens to one score-ordered list; clearing restores it |
+| `tab` | toggle the leverage view ⇄ the structure forest |
 | `↑`/`↓`, `ctrl-j`/`ctrl-k` | move the cursor over ticket rows (headers are never a stop) |
 | `enter` | run the agent on the ticket under the cursor, here, and exit |
 | `ctrl-f` | focus the cursor row's project — only its clusters stay on screen |
