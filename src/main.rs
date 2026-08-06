@@ -156,9 +156,7 @@ async fn main() -> Result<()> {
     }
     let result = run(&mut terminal, app, sessions, tx, updates, focus).await;
     ratatui::restore();
-    if let Ending::HandedOver(parting) = result? {
-        println!("wf: {parting}");
-    }
+    result?;
     Ok(())
 }
 
@@ -271,9 +269,9 @@ enum LaunchReport {
     /// `wf` is still up; this is its notice line.
     Notice(String),
     /// The zellij client left for another session, so this launch was `wf`'s
-    /// last act: the line is printed on the way out instead (see
-    /// [`launch::Handoff::Quit`]).
-    HandedOver(String),
+    /// last act — and its notice has nowhere to land (see
+    /// [`launch::Handoff::Quit`] and [`Ending::HandedOver`]).
+    HandedOver,
 }
 
 /// Perform one launch (#16): give the agent somewhere to run, then hand over as
@@ -308,10 +306,7 @@ async fn perform_launch(
             "{verb} {}",
             launch.describe()
         ))),
-        Handoff::Quit => Ok(LaunchReport::HandedOver(format!(
-            "{verb} {} — run `wf` in that session to pick another ticket",
-            launch.describe()
-        ))),
+        Handoff::Quit => Ok(LaunchReport::HandedOver),
         Handoff::Suspend { argv, cwd } => {
             let (program, args) = argv.split_first().expect("a handoff argv is non-empty");
             // What was handed over decides what "back" means: a whole session,
@@ -426,9 +421,13 @@ enum Ending {
     /// The user quit.
     Quit,
     /// A launch moved the zellij client to another session, so `wf` handed the
-    /// terminal over; this line is printed once the terminal is restored,
-    /// because by then there is no TUI left to show a notice in.
-    HandedOver(String),
+    /// terminal over.
+    ///
+    /// Carries **nothing** to say on the way out, because there is nobody left
+    /// to say it to (#30): the client is already in the other session, so the
+    /// pane `wf` would print into is an abandoned pty in the session it just
+    /// left. The line this used to carry was unreadable by construction.
+    HandedOver,
 }
 
 /// The event loop. It starts with **no data at all** (#27): the maps, which
@@ -563,9 +562,7 @@ async fn run(
                             LaunchReport::Notice(notice) => notice,
                             // Nothing after this can be seen from here: the
                             // client is in another session now.
-                            LaunchReport::HandedOver(parting) => {
-                                return Ok(Ending::HandedOver(parting))
-                            }
+                            LaunchReport::HandedOver => return Ok(Ending::HandedOver),
                         };
                         app.replace_map(merge_maps(&maps));
                         app.notice = Some(notice);

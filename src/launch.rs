@@ -36,6 +36,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
@@ -107,18 +108,19 @@ pub fn host_from_env(zellij: Option<&str>, session_name: Option<&str>) -> Host {
 /// Probed by *running* it rather than by searching `$PATH`, because the question
 /// that matters is whether this module's invocations will work — a `zellij` that
 /// is on PATH but cannot start is no more usable than an absent one. `--version`
-/// is the one invocation that touches no session, and the inherited zellij
-/// variables are scrubbed as everywhere else so a stale `ZELLIJ_SESSION_NAME`
-/// cannot make even this hang (#5 findings).
+/// is the one invocation that touches no session, and it goes through
+/// [`zellij_command`] like every other, so the inherited zellij variables are
+/// scrubbed — a stale `ZELLIJ_SESSION_NAME` cannot make even this hang (#5
+/// findings) — and `wf`'s raw tty stays out of its stdin (#30).
 pub async fn zellij_available() -> bool {
-    Command::new("zellij")
-        .arg("--version")
-        .env_remove("ZELLIJ")
-        .env_remove("ZELLIJ_SESSION_NAME")
-        .env_remove("ZELLIJ_PANE_ID")
-        .output()
-        .await
-        .is_ok_and(|output| output.status.success())
+    let argv = ["zellij".to_string(), "--version".to_string()];
+    match zellij_command(&argv, None) {
+        Ok(mut command) => command
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success()),
+        Err(_) => false,
+    }
 }
 
 /// The answer to [`detect_host`], computed at most once per process.
@@ -769,22 +771,44 @@ impl Opened {
     }
 }
 
-/// Run a zellij invocation, scrubbing the inherited zellij variables so it
-/// cannot be silently retargeted at — or hang on — the session those name.
-/// The exit status is *not* trusted (`zellij action` returns 0 on failure);
-/// callers verify by re-reading state.
-async fn run(argv: &[String], cwd: Option<&Path>) -> Result<String> {
+/// Prepare a `zellij` invocation: scrub the inherited zellij variables so it
+/// cannot be silently retargeted at — or hang on — the session those name, and
+/// **detach it from `wf`'s terminal**.
+///
+/// The stdin part is not hygiene, it is the #30 fix. `wf` is a ratatui TUI, so
+/// its tty is in **raw** mode for as long as the picker is up. A zellij client
+/// reads the termios it gives new panes **from its own stdin**, and the server
+/// then stamps that state onto every pane it ever creates — permanently, for the
+/// server's whole lifetime. So a session `wf` created while holding a raw tty
+/// produced panes born `-echo -icanon -isig -opost`: the agent's keys did not
+/// echo, `Ctrl-c` was inert, and `\n` moved down without a carriage return, which
+/// is the "broken terminal after a cross-session launch" of #30.
+///
+/// `tokio`'s `Command::output()` is what let this through: unlike
+/// `std::process::Command::output()`, it sets **only** stdout and stderr to
+/// piped, leaving stdin *inherited*. Nulling stdin here is the whole fix, and it
+/// belongs on every invocation rather than just session creation — the leak is a
+/// property of the tty `wf` holds, not of which subcommand runs.
+fn zellij_command(argv: &[String], cwd: Option<&Path>) -> Result<Command> {
     let (program, args) = argv.split_first().context("empty zellij invocation")?;
     let mut command = Command::new(program);
     command
         .args(args)
         .env_remove("ZELLIJ")
         .env_remove("ZELLIJ_SESSION_NAME")
-        .env_remove("ZELLIJ_PANE_ID");
+        .env_remove("ZELLIJ_PANE_ID")
+        .stdin(Stdio::null());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = command
+    Ok(command)
+}
+
+/// Run a zellij invocation via [`zellij_command`]. The exit status is *not*
+/// trusted (`zellij action` returns 0 on failure); callers verify by re-reading
+/// state.
+async fn run(argv: &[String], cwd: Option<&Path>) -> Result<String> {
+    let output = zellij_command(argv, cwd)?
         .output()
         .await
         .with_context(|| format!("running `{}`", argv.join(" ")))?;

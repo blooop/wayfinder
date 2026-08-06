@@ -673,6 +673,7 @@ version = "0.2.2"
 dependencies = [
  "anyhow",
  "dirs",
+ "libc",
  "nucleo-matcher",
  "ratatui",
  "serde",

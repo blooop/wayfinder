@@ -128,7 +128,9 @@ How `wf` hands over depends on where it is itself running, decided from its own
 - **inside another session** — zellij's session switcher gesture
   (`switch-session`) moves you over, and `wf` exits as it goes: the tab it was
   drawing in belongs to the session you just left, so nothing could reach it to
-  quit it. Run `wf` again in the session you land in to pick the next ticket.
+  quit it. It prints no parting line either, for the same reason — you are
+  already elsewhere, so the only pane it could print into is one you have left.
+  Run `wf` again in the session you land in to pick the next ticket.
 
 No new navigation keybindings: getting back is zellij's standard detach or
 tab/session switching. The project's session is created detached if it does not
