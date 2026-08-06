@@ -8,8 +8,18 @@
 //! points, and this is the one place they are ever looked at as strings: a
 //! sub-issue's labels become a [`TicketType`] here and nothing inward re-sniffs
 //! them (parse, don't validate).
+//!
+//! Both invocations are `stdin`-nulled and `kill_on_drop`. Neither is
+//! decoration. `tokio`'s `Command::output()` pipes only stdout and stderr and
+//! leaves **stdin inherited** — a silent divergence from `std`'s, which nulls
+//! it — so without the first, every `gh` here holds `wf`'s terminal, which is
+//! exactly the fd leak that broke #30. Without the second, a `gh` still in
+//! flight when `wf` `exec`s into the agent is inherited by the agent as a
+//! zombie it will never reap: aborting the task drops the `Child`, and only
+//! `kill_on_drop` turns that into a signal.
 
 use std::collections::HashMap;
+use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -125,6 +135,8 @@ pub async fn fetch_map(owner: &str, name: &str, number: u64) -> Result<Map> {
             "-f",
             &format!("query={MAP_QUERY}"),
         ])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
@@ -239,6 +251,8 @@ pub async fn find_maps(repos: &[String]) -> Result<HashMap<String, u64>> {
             "-F",
             "per_page=100",
         ])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .context("failed to run `gh` for the map search")?;

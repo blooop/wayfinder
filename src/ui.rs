@@ -101,15 +101,46 @@ const KEY_HINTS: &str =
 /// The project heading in the title bar.
 ///
 /// `merge_maps` names the empty case "no projects — run wf inside a checkout to
-/// register it", which is the truth only once the load has finished; before
-/// that the very same emptiness just means the fetch is still out (#27), and
-/// telling a user with three registered projects that they have none is the
-/// exact ambiguity the [`crate::refresh::Startup`] state exists to remove.
+/// register it", and that is the truth in exactly one of the three ways the
+/// list can be empty. It is also still loading (#27), or every fetch failed —
+/// and telling a user with three registered projects that they have none is the
+/// exact ambiguity [`crate::refresh::Startup`] exists to remove. So both other
+/// cases are named before the merged map's own header is trusted.
 pub fn heading(app: &App) -> String {
-    if !app.startup.is_loaded() && app.map.tickets.is_empty() {
-        return "loading…".to_string();
+    if app.map.tickets.is_empty() {
+        if !app.startup.is_loaded() {
+            return "loading…".to_string();
+        }
+        // Naming the repo is the whole value when there is one: "GitHub is
+        // unreachable" and "you have no projects" are different problems with
+        // different fixes, and the empty list looks identical either way.
+        match app.failed.len() {
+            0 => {}
+            1 => {
+                let repo = app.failed.iter().next().expect("len checked");
+                return format!("{repo} — fetch failed, ctrl-r retries");
+            }
+            n => return format!("{n} maps failed to fetch — ctrl-r retries"),
+        }
     }
     app.map.repo.clone()
+}
+
+/// The persistent failure segment on the count line.
+///
+/// Separate from [`heading`] because the case it exists for is the *partial*
+/// one: four maps on screen and a fifth missing draws a perfectly normal
+/// screen, so the only place left to say so is here — and it has to survive
+/// the next keypress, which the one-shot notice does not.
+pub fn failure_note(app: &App) -> String {
+    match app.failed.len() {
+        0 => String::new(),
+        1 => {
+            let repo = app.failed.iter().next().expect("len checked");
+            format!("· {repo} failed")
+        }
+        n => format!("· {n} maps failed"),
+    }
 }
 
 /// A centered box `width`×`height` (clamped) inside `area`.
@@ -198,10 +229,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Paragraph::new(body_lines(app)), body_area);
 
+    // The load hint and the failure note share one dim segment and can both be
+    // live at once (map 2 of 3 is still coming *and* map 1 never arrived);
+    // empty ones drop out rather than leaving gaps.
+    let status = [app.startup.hint(), failure_note(app)]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut count_spans = vec![
         Span::raw(format!("  {}/{}", app.visible().len(), app.scoped().len())),
         Span::styled(
-            format!("  {}", app.startup.hint()),
+            format!("  {status}"),
             Style::new().add_modifier(Modifier::DIM),
         ),
     ];
@@ -418,6 +457,49 @@ mod tests {
         assert!(screen.contains("searching for maps…"), "{screen}");
         assert!(screen.contains("wf · loading…"), "{screen}");
         assert!(!screen.contains("no projects"), "{screen}");
+    }
+
+    #[test]
+    fn an_empty_list_after_a_failed_fetch_does_not_claim_there_are_no_projects() {
+        // Three registered projects and GitHub unreachable draws the same empty
+        // list as no projects at all. Saying "no projects — run wf inside a
+        // checkout" there sends the user to fix the one thing that is not
+        // broken, so the failure has to win the heading.
+        let mut app = App::empty();
+        app.startup = Startup::loaded();
+        app.failed.insert("blooop/wayfinder".to_string());
+        let screen = render(&app);
+        assert!(!screen.contains("no projects"), "{screen}");
+        assert!(
+            screen.contains("blooop/wayfinder — fetch failed, ctrl-r retries"),
+            "{screen}"
+        );
+
+        // Several, and naming them all would not fit: say how many.
+        app.failed.insert("blooop/dotfiles".to_string());
+        let screen = render(&app);
+        assert!(screen.contains("2 maps failed to fetch"), "{screen}");
+        assert!(!screen.contains("no projects"), "{screen}");
+    }
+
+    #[test]
+    fn a_partial_failure_is_visible_and_survives_the_next_keypress() {
+        // The case that hides best: the rows that did load look completely
+        // normal, so the count line is the only place left to say a map is
+        // missing — and `notice` cannot be that place, because `handle_key`
+        // clears it on every keypress and nothing polls to re-announce it.
+        let mut app = App::new(fixture_map());
+        app.failed.insert("blooop/dotfiles".to_string());
+        assert_eq!(failure_note(&app), "· blooop/dotfiles failed");
+        let screen = render(&app);
+        assert!(screen.contains("5/5  · blooop/dotfiles failed"), "{screen}");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(
+            screen.contains("· blooop/dotfiles failed"),
+            "a keypress must not erase it: {screen}"
+        );
     }
 
     #[test]

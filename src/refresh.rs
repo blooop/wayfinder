@@ -127,10 +127,20 @@ impl Startup {
     }
 
     /// Record `repo`'s map reporting. A *failed* fetch counts as reported: the
-    /// wait for that map is over either way, and its failure shows as a notice,
-    /// not as loading.
+    /// wait for that map is over either way, and its failure is carried by
+    /// [`crate::app::App::failed`] rather than by looking unfinished forever.
     pub fn record_arrival(&mut self, repo: &str) {
         self.arrived.insert(repo.to_string());
+    }
+
+    /// `ctrl-r`: every map is being fetched again, so nothing has arrived yet.
+    ///
+    /// The same state a load uses, because it is the same question — how many
+    /// of the maps we expect are in — and answering it once means the count
+    /// line reports a manual refresh exactly as it reports a start, instead of
+    /// a refresh being a silent pause with a stale hint.
+    pub fn reloading(&mut self) {
+        self.arrived.clear();
     }
 
     /// Repos whose maps are still out.
@@ -219,6 +229,45 @@ impl Loaders {
         }
     }
 
+    /// `ctrl-r`: throw every load away and start them all again.
+    ///
+    /// The refetch has to go through *this* rather than fetching alongside it,
+    /// and the reason is ordering. A load started at t₀ and a refetch started
+    /// at t₁ > t₀ both write the same repo's map, and the load can land second
+    /// — so a refetch racing the initial load used to be overwritten by an
+    /// older snapshot while the screen said `refreshed`. Nothing polls now, so
+    /// that stale map would be final. Restarting means every result reaches the
+    /// UI through one channel, in send order, and the newest write wins by
+    /// construction.
+    pub fn restart(&mut self, want: &MapIssues, tx: &mpsc::UnboundedSender<LoadEvent>) {
+        self.abort_all();
+        self.reconcile(want, tx);
+    }
+
+    /// Stop every load and wait for it to actually be gone.
+    ///
+    /// Awaited, not fired and forgotten, because `abort()` only *schedules*
+    /// cancellation: the `gh` child is killed when the task's `Child` is
+    /// dropped, and that drop happens when the runtime next polls the task. On
+    /// the launch path the very next thing this process does is `exec`, so
+    /// without the await there is no "next poll" — the `gh` would survive into
+    /// the agent as a zombie holding its terminal.
+    pub async fn shutdown(&mut self) {
+        self.abort_all();
+        for (_, loading) in std::mem::take(&mut self.running) {
+            // A load that already finished joins immediately; an aborted one
+            // resolves to a `JoinError::Cancelled`. Both mean "gone".
+            let _ = loading.task.await;
+        }
+    }
+
+    fn abort_all(&mut self) {
+        for loading in self.running.values() {
+            loading.task.abort();
+        }
+        self.running.clear();
+    }
+
     /// The repos being loaded, and at which map issue — the reconciled truth,
     /// for tests and for anything that needs to know what is actually live.
     pub fn targets(&self) -> MapIssues {
@@ -268,11 +317,14 @@ fn spawn_load(
 /// — so the seed is never trusted for longer than one search round trip. On
 /// success it writes its findings back to `cache_path`, which is what makes the
 /// *next* run warm; a failed write costs only that head start.
+///
+/// Returns its handle so the launch path can stop it and wait: it holds a `gh`
+/// child of its own, and the same reasoning as [`Loaders::shutdown`] applies.
 pub fn spawn_discovery(
     repos: Vec<String>,
     cache_path: PathBuf,
     tx: mpsc::UnboundedSender<LoadEvent>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match fetch::find_maps(&repos).await {
@@ -289,7 +341,7 @@ pub fn spawn_discovery(
             }
             tokio::time::sleep(RETRY_INTERVAL).await;
         }
-    });
+    })
 }
 
 /// Where the cursor lands after a load or a refresh swaps the ticket list.
@@ -460,6 +512,27 @@ mod tests {
         assert_eq!(startup.hint(), "· searching for maps…");
         startup.searched(&found(&["a/one", "b/two"]));
         assert!(startup.is_loaded());
+    }
+
+    #[test]
+    fn ctrl_r_puts_the_load_back_on_the_count_line() {
+        // A refresh refetches every map, so nothing has arrived until it does.
+        // Without this the hint stays empty and `ctrl-r` is a silent pause.
+        let mut startup = cold();
+        let maps = found(&["a/one", "b/two"]);
+        startup.searched(&maps);
+        startup.record_arrival("a/one");
+        startup.record_arrival("b/two");
+        assert!(startup.is_loaded());
+
+        startup.reloading();
+        assert!(!startup.is_loaded());
+        assert_eq!(startup.hint(), "· loading maps 0/2");
+        startup.record_arrival("a/one");
+        assert_eq!(startup.hint(), "· loading maps 1/2");
+        startup.record_arrival("b/two");
+        assert!(startup.is_loaded(), "the search already answered; it stays answered");
+        assert_eq!(startup.hint(), "");
     }
 
     #[test]

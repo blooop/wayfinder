@@ -70,11 +70,12 @@ impl Scratch {
     }
 
     /// Write the `claude` shim. **No agent is ever launched by this test**: the
-    /// shim records what it was handed and the tty it landed on, then says so.
+    /// shim records what it was handed, the pid it is, and the tty it landed
+    /// on, then says so.
     fn write_shim(&self) {
         let script = format!(
             "#!/usr/bin/env bash\n\
-             {{ echo \"cwd=$PWD\"; echo \"argv=$*\"; stty -a; }} > {report} 2>&1\n\
+             {{ echo \"pid=$$\"; echo \"cwd=$PWD\"; echo \"argv=$*\"; stty -a; }} > {report} 2>&1\n\
              printf '{RAN}\\n'\n",
             report = self.report().display(),
         );
@@ -125,21 +126,25 @@ fn openpty_sized(rows: u16, cols: u16) -> (OwnedFd, OwnedFd) {
 /// blocks until the child writes, and the test needs to *wait for* particular
 /// output with a deadline, which is a much simpler thing to express against a
 /// buffer somebody else is filling.
-fn spawn_reader(master: OwnedFd) -> Arc<Mutex<String>> {
-    let seen = Arc::new(Mutex::new(String::new()));
+///
+/// Bytes, not a `String`. Decoding each 4096-byte chunk on its own would turn
+/// any multi-byte character straddling a read boundary into `U+FFFD` — and the
+/// needle this waits on is `▶`. ratatui writes *diffs*, so a row mangled once
+/// is never redrawn and the wait would hang out its full deadline. The escape
+/// sequences asserted on later are likewise byte facts, not text.
+fn spawn_reader(master: OwnedFd) -> Arc<Mutex<Vec<u8>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&seen);
     std::thread::spawn(move || {
         let mut file = std::fs::File::from(master);
         let mut buf = [0u8; 4096];
-        // A read of 0 is the child's exit; an error is the `EIO` a pty master
-        // gives once the last slave is closed. Both mean "no more output".
-        while let Ok(n) = file.read(&mut buf) {
-            if n == 0 {
-                break;
+        loop {
+            match file.read(&mut buf) {
+                // The child exited, or the pty master gave `EIO` because the
+                // last slave closed. Both mean "no more output".
+                Ok(0) | Err(_) => break,
+                Ok(n) => sink.lock().expect("reader mutex").extend_from_slice(&buf[..n]),
             }
-            sink.lock()
-                .expect("reader mutex")
-                .push_str(&String::from_utf8_lossy(&buf[..n]));
         }
     });
     seen
@@ -147,20 +152,25 @@ fn spawn_reader(master: OwnedFd) -> Arc<Mutex<String>> {
 
 /// Wait for `needle` to appear in the child's output, or fail with everything
 /// that did arrive — a screen dump is the only useful diagnostic here.
-fn wait_for(seen: &Arc<Mutex<String>>, needle: &str, within: Duration, what: &str) -> String {
+fn wait_for(seen: &Arc<Mutex<Vec<u8>>>, needle: &str, within: Duration, what: &str) -> Vec<u8> {
     let deadline = Instant::now() + within;
     loop {
         let so_far = seen.lock().expect("reader mutex").clone();
-        if so_far.contains(needle) {
+        if contains(&so_far, needle.as_bytes()) {
             return so_far;
         }
         assert!(
             Instant::now() < deadline,
             "timed out waiting for {what} ({needle:?} never appeared).\n\
-             --- what the terminal got ---\n{so_far}"
+             --- what the terminal got ---\n{}",
+            String::from_utf8_lossy(&so_far)
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Split `stty -a` output into flag tokens (`echo`, `-icanon`, …), dropping the
@@ -225,24 +235,34 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
     keys.write_all(b"\r").expect("send enter");
     keys.flush().expect("flush enter");
 
-    let screen = wait_for(&seen, RAN, Duration::from_secs(30), "the agent to run");
+    let stream = wait_for(&seen, RAN, Duration::from_secs(30), "the agent to run");
+    let screen = String::from_utf8_lossy(&stream).into_owned();
 
-    // Claim 2: the pid the test spawned is the agent now. An `exec` replaced
-    // the image, so this is the *shim's* exit status, not a `wf` that outlived
-    // it — and there is no second process left running the picker.
+    let wf_pid = child.id();
     let status = child.wait().expect("wait for the exec'd agent");
     assert!(status.success(), "the agent exited {status}\n{screen}");
 
-    // Claim 1: what the agent was actually handed.
     let report = std::fs::read_to_string(scratch.report()).expect("the shim's report");
-    let cwd = report
-        .lines()
-        .find_map(|l| l.strip_prefix("cwd="))
-        .expect("the shim records its cwd");
-    let argv = report
-        .lines()
-        .find_map(|l| l.strip_prefix("argv="))
-        .expect("the shim records its argv");
+    let field = |key: &str| {
+        report
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("the shim records {key:?}\n{report}"))
+    };
+
+    // Claim 2: the pid the test spawned *is* the agent. Asserted on the pid and
+    // not on the exit status, because the shim exits 0 either way — under
+    // spawn-and-wait `wf` would have waited for it and exited 0 too, so a
+    // status check passes without distinguishing the two designs at all.
+    assert_eq!(
+        field("pid=").parse::<u32>().ok(),
+        Some(wf_pid),
+        "the agent must be the same process as wf, not a child of it"
+    );
+
+    // Claim 1: what the agent was actually handed.
+    let cwd = field("cwd=");
+    let argv = field("argv=");
     assert_eq!(
         Path::new(cwd).canonicalize().ok(),
         repo.canonicalize().ok(),
@@ -260,9 +280,9 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
         "prompt was {prompt:?}"
     );
 
-    // Claim 3: the terminal came back before the image was replaced. `wf` runs
-    // raw the whole time it is up, so an agent that finds a raw tty here is one
-    // that would have found a dead keyboard in daily use.
+    // Claim 3a: the tty itself came back. `wf` runs raw the whole time it is
+    // up, so an agent that finds a raw tty here is one that would have found a
+    // dead keyboard in daily use.
     let stty = flags(&report);
     for flag in COOKED {
         assert!(
@@ -271,4 +291,25 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
              stty: {stty:?}"
         );
     }
+
+    // Claim 3b: and so did the *screen*. Alternate-screen and cursor visibility
+    // are DEC private modes held by the emulator, not termios — `stty` cannot
+    // see either, so the check above passes with the cursor still hidden. That
+    // is not hypothetical: every frame writes `?25l` (nothing in the picker
+    // positions a cursor) and the only thing that writes `?25h` back is
+    // `Terminal`'s `Drop`, which an `exec` skips. Both modes outlive the
+    // process, so whatever `wf` leaves set is what the agent runs inside.
+    let handover = &stream[..stream
+        .windows(RAN.len())
+        .position(|w| w == RAN.as_bytes())
+        .expect("the marker is in the stream")];
+    assert!(
+        contains(handover, b"\x1b[?1049l"),
+        "wf never left the alternate screen before handing over"
+    );
+    assert!(
+        contains(handover, b"\x1b[?25h"),
+        "wf never made the cursor visible again before handing over — \
+         the agent inherits an invisible cursor"
+    );
 }

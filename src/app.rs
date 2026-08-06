@@ -7,7 +7,7 @@
 //! thing that may act on it, because acting on it means giving the terminal
 //! back and never coming here again (#34).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -62,6 +62,20 @@ pub struct App {
     pub checkouts: Vec<Checkout>,
     /// Each repo's map issue number — `/wayfinder`'s first argument.
     pub map_issues: MapIssues,
+    /// Repos whose last map fetch failed — **state, not a message.**
+    ///
+    /// A failure has to be drawn on every frame, and the one-shot `notice` is
+    /// cleared by the very next keypress. Nothing polls any more either, so a
+    /// failed fetch is the final word on that repo until `ctrl-r`: with only a
+    /// notice, one keystroke turns "GitHub is down" into a screen that says
+    /// *no projects — run wf inside a checkout to register it*, which is the
+    /// exact lie [`crate::refresh::Startup`] exists to prevent for the
+    /// still-loading case.
+    ///
+    /// A set of slugs rather than a flag, because the flag it replaces could
+    /// not say *which* repo, and a partial failure — four maps on screen, one
+    /// missing — is the case that hides best.
+    pub failed: BTreeSet<String>,
     /// How much of the initial load has landed (#27). The screen is drawn
     /// before any of it, so this is what stops an empty list from reading as
     /// "no tickets" while the fetch is still out.
@@ -80,6 +94,7 @@ impl App {
             notice: None,
             checkouts: Vec::new(),
             map_issues: MapIssues::new(),
+            failed: BTreeSet::new(),
             startup: Startup::loaded(),
             overlay: Overlay::None,
             cursor: 0,

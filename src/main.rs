@@ -24,9 +24,10 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::DefaultTerminal;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
 
 use wf::app::{App, Outcome, Scope};
-use wf::launch::{Launch, MapIssues};
+use wf::launch::Launch;
 use wf::model::{merge_maps, Map};
 use wf::projects::{self, ProjectsCache};
 use wf::refresh::{LoadEvent, Loaders, MapFetch, Startup};
@@ -133,7 +134,7 @@ async fn main() -> Result<()> {
     spawn_terminal_guard();
 
     let (tx, updates) = mpsc::unbounded_channel();
-    wf::refresh::spawn_discovery(repos, cache_path, tx.clone());
+    let discovery = wf::refresh::spawn_discovery(repos, cache_path, tx.clone());
 
     // cwd-open focuses the project (lazygit-style). Only the map *search* can
     // say authoritatively whether this repo has a map, so the focus is handed to
@@ -145,12 +146,22 @@ async fn main() -> Result<()> {
     if let Some(slug) = focus.as_ref().filter(|slug| seed.contains_key(*slug)) {
         app.scope = Scope::Project(slug.clone());
     }
-    let ending = run(&mut terminal, app, tx, updates, focus).await;
+    let ending = run(&mut terminal, app, discovery, tx, updates, focus).await;
 
     // The one ordering that matters, and the reason the exec is here rather
     // than in the loop: the terminal must be back in the shell's hands before
     // the process image is replaced, because afterwards there is no `wf` left
     // to put it back.
+    //
+    // `show_cursor` is part of that and not a flourish. Nothing in the picker
+    // ever positions a cursor, so every `Terminal::draw` writes `ESC[?25l`, and
+    // the only thing that writes it back is `Terminal`'s `Drop` —
+    // `ratatui::restore()` is just raw-mode-off plus leave-alternate-screen.
+    // On the quit path `Drop` runs at the end of `main`; on the handover path
+    // `exec` replaces the image first and it never runs. So the agent would
+    // inherit an invisible cursor, on a terminal-global mode that outlives the
+    // alternate screen. This is the line the deleted `suspend()` had.
+    let _ = terminal.show_cursor();
     ratatui::restore();
     match ending? {
         Ending::Quit => Ok(()),
@@ -205,36 +216,6 @@ fn spawn_terminal_guard() {
     }
 }
 
-/// Refetch every map in place (`ctrl-r`). True if any fetch failed.
-///
-/// Concurrent, not sequential (#27): the fetches are independent `gh`
-/// subprocesses keyed by slug, so N repos cost one round trip of wall clock
-/// rather than N. Awaited rather than streamed, unlike the initial load,
-/// because it is an explicit act whose notice has to describe what happened.
-async fn refetch_all(maps: &mut BTreeMap<String, Map>, map_issues: &MapIssues) -> bool {
-    let mut fetches = tokio::task::JoinSet::new();
-    for (slug, &number) in map_issues {
-        let slug = slug.clone();
-        fetches.spawn(async move {
-            let (owner, name) = slug.split_once('/').expect("slug is owner/name");
-            let fetched = wf::fetch::fetch_map(owner, name, number).await;
-            (slug, fetched)
-        });
-    }
-    let mut failed = false;
-    while let Some(joined) = fetches.join_next().await {
-        match joined {
-            Ok((slug, Ok(map))) => {
-                maps.insert(slug, map);
-            }
-            // A failed fetch and a panicked task are the same fact here: this
-            // repo's map did not come back.
-            Ok((_, Err(_))) | Err(_) => failed = true,
-        }
-    }
-    failed
-}
-
 /// Why the event loop ended — the two ways `wf` gives the terminal back.
 ///
 /// A sum rather than "quit, plus maybe a launch on the side": these are the
@@ -259,6 +240,7 @@ enum Ending {
 async fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
+    discovery: JoinHandle<()>,
     tx: UnboundedSender<LoadEvent>,
     mut updates: UnboundedReceiver<LoadEvent>,
     mut focus: Option<String>,
@@ -299,7 +281,10 @@ async fn run(
                     }
                     // Maps the search dropped must stop being rendered as well as
                     // stop being fetched — their rows are as stale as their load.
+                    // A repo that is no longer mapped also stops being a
+                    // *failure*: there is nothing left to have failed.
                     maps.retain(|slug, _| map_issues.contains_key(slug));
+                    app.failed.retain(|slug| map_issues.contains_key(slug));
                     app.map_issues = map_issues;
                     app.replace_map(merge_maps(&maps));
                 }
@@ -312,15 +297,17 @@ async fn run(
                     app.startup.record_arrival(&repo);
                     match outcome {
                         MapFetch::Loaded(new_map) => {
+                            app.failed.remove(&repo);
                             maps.insert(repo, new_map);
                             app.replace_map(merge_maps(&maps));
                         }
                         // Nothing polls any more, so a failed load is not a blip
-                        // that the next cycle will paper over — it is the final
-                        // word on that repo until someone asks again. Say so on
-                        // the line rather than leaving a silently missing map.
+                        // the next cycle papers over — it is the final word on
+                        // that repo until someone asks again. Recorded as state
+                        // rather than announced as a notice, because a notice
+                        // is gone on the next keypress and this is not.
                         MapFetch::Failed => {
-                            app.notice = Some(format!("{repo}: map fetch failed — ctrl-r retries"));
+                            app.failed.insert(repo);
                         }
                     }
                 }
@@ -343,18 +330,26 @@ async fn run(
                 }
                 match outcome {
                     Outcome::Quit => return Ok(Ending::Quit),
+                    // Through the loaders, not alongside them: a refetch that
+                    // raced an in-flight load used to be silently overwritten
+                    // by the older snapshot. One channel, send order, newest
+                    // write wins. Results stream in as they land, so the last
+                    // word on how it went is the count line, not this notice.
                     Outcome::Refresh => {
-                        let failed = refetch_all(&mut maps, &app.map_issues).await;
-                        app.replace_map(merge_maps(&maps));
-                        app.notice = Some(if failed {
-                            "refresh failed for some projects".to_string()
-                        } else {
-                            "refreshed".to_string()
-                        });
+                        loaders.restart(&app.map_issues, &tx);
+                        app.startup.reloading();
+                        app.failed.clear();
                     }
-                    // Nothing after this can be drawn: the caller restores the
-                    // terminal and this process becomes the agent.
-                    Outcome::Launch(launch) => return Ok(Ending::Handover(launch)),
+                    // Nothing after this can be drawn. Stop the background work
+                    // *and wait for it* before handing over: an in-flight `gh`
+                    // outlives the `exec` otherwise, and the agent inherits it
+                    // as a zombie holding the terminal it just took over.
+                    Outcome::Launch(launch) => {
+                        loaders.shutdown().await;
+                        discovery.abort();
+                        let _ = discovery.await;
+                        return Ok(Ending::Handover(launch));
+                    }
                     Outcome::Continue => {}
                 }
             }

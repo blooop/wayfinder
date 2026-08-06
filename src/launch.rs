@@ -91,17 +91,65 @@ impl Launch {
     pub fn exec(&self) -> anyhow::Error {
         let argv = self.agent_argv();
         let (program, args) = argv.split_first().expect("agent argv is never empty");
+
+        // Resolved against `$PATH` *before* the chdir, deliberately. `exec`
+        // chdirs into `cwd` and only then runs `execvp`, so a `$PATH` holding
+        // an empty entry — a leading, trailing or doubled `:`, which is an
+        // everyday `.bashrc` accident — resolves the agent out of **the
+        // checkout**. Cloning a repo and running `wf` in it would be enough to
+        // run its `./claude` with `--dangerously-skip-permissions`. Empty
+        // entries are dropped rather than read as `.`, which is the one place
+        // this deliberately differs from `execvp`.
+        let program = match resolve_on_path(program) {
+            Ok(program) => program,
+            Err(err) => return err,
+        };
+        // Checked because the two failures are both `ENOENT` and the fix for
+        // each is completely different. The cache is pruned once at startup and
+        // the picker holds a snapshot, so a `git worktree remove` in another
+        // terminal during the session lands here.
+        if !self.cwd.is_dir() {
+            return anyhow::anyhow!(
+                "the checkout {} is gone — nothing to run the agent in",
+                self.cwd.display()
+            );
+        }
+
         // `CommandExt::exec` only ever returns on failure.
-        let err = Command::new(program)
+        let err = Command::new(&program)
             .args(args)
             .current_dir(&self.cwd)
             .exec();
+        // Quoted, so the prompt reads as the single argument it is — the whole
+        // invariant `agent_argv` exists to hold.
+        let quoted: Vec<String> = std::iter::once(program.display().to_string())
+            .chain(args.iter().cloned())
+            .map(|a| format!("{a:?}"))
+            .collect();
         anyhow::Error::new(err).context(format!(
-            "running `{}` in {}",
-            argv.join(" "),
+            "running {} in {}",
+            quoted.join(" "),
             self.cwd.display()
         ))
     }
+}
+
+/// Find `program` on `$PATH`, skipping empty entries.
+///
+/// A name containing a separator is a path already and is taken as given —
+/// that is the caller naming a file, not `$PATH` resolution.
+fn resolve_on_path(program: &str) -> Result<PathBuf, anyhow::Error> {
+    if program.contains('/') {
+        return Ok(PathBuf::from(program));
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            anyhow::anyhow!("`{program}` is not on PATH — is the agent CLI installed?")
+        })
 }
 
 /// The name half of a repo slug (`blooop/wayfinder` → `wayfinder`). Display
