@@ -146,9 +146,7 @@ fn resolve_on_path(program: &str) -> Result<PathBuf, anyhow::Error> {
         .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
-        .ok_or_else(|| {
-            anyhow::anyhow!("`{program}` is not on PATH — is the agent CLI installed?")
-        })
+        .ok_or_else(|| anyhow::anyhow!("`{program}` is not on PATH — is the agent CLI installed?"))
 }
 
 /// The name half of a repo slug (`blooop/wayfinder` → `wayfinder`). Display
@@ -311,8 +309,14 @@ mod tests {
             Targets::Many(l) => l,
             other => panic!("{other:?}"),
         };
-        assert_eq!(launches[0].describe(), "kinisi_ros#42 in /data/k1/kinisi_ros");
-        assert_eq!(launches[1].describe(), "kinisi_ros#42 in /data/k2/kinisi_ros");
+        assert_eq!(
+            launches[0].describe(),
+            "kinisi_ros#42 in /data/k1/kinisi_ros"
+        );
+        assert_eq!(
+            launches[1].describe(),
+            "kinisi_ros#42 in /data/k2/kinisi_ros"
+        );
     }
 
     #[test]

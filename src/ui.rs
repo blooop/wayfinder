@@ -1,10 +1,9 @@
-//! The main screen: one cluster per open map (#50) — a `▌ repo · map title`
-//! header carrying the per-status counts, with the map's tickets grouped
-//! beneath it (frontier / claimed / blocked / done) in the minimal row —
-//! state glyph, number, title, `— needs #N` on blocked rows. The repo column
-//! is gone: every row sits under a header that names its repo. Build 2's
-//! fuzzy query (2a: groups survive typing), the cursor, and the bottom prompt
-//! are unchanged.
+//! The main screen: one cluster per open map (#50), rendered from the body
+//! [`Plan`] (#51). The default is the leverage view — takeable tickets,
+//! most-dependents-first, each with the subtree it unblocks — with the full
+//! blocking forest on `tab` and a live query flattening either into one
+//! score-ordered list. Rows are `<glyph> #n <title> [type]`; done work is a
+//! per-cluster count on the default screen and dimmed in place on the forest.
 
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -12,8 +11,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Overlay, Row, Scope};
-use crate::model::{Map, MapId, Status, GROUP_LABELS};
+use crate::app::{App, Overlay, Scope};
+use crate::model::{Map, MapId, Status, Ticket};
+use crate::view::{Item, Plan, Screen};
 
 fn glyph_style(status: &Status) -> Style {
     match status {
@@ -42,88 +42,114 @@ fn cluster_header(id: &MapId, map: &Map) -> Line<'static> {
     )];
     for (i, count) in [frontier, claimed, blocked, done].into_iter().enumerate() {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(format!("{}{count}", glyphs[i]), count_style[i]));
+        spans.push(Span::styled(
+            format!("{}{count}", glyphs[i]),
+            count_style[i],
+        ));
     }
     Line::from(spans)
 }
 
-/// The cluster body as styled lines: one header per in-scope map, its groups
-/// beneath it in fixed order. Shared by the live draw and the TestBackend
-/// tests.
-///
-/// Filtering is 2a per the #9 resolution: non-matching rows drop, group
-/// headers stay (showing `matched/total` while a query is live), and group
-/// order never changes. A group the cluster has no tickets in at all is
-/// skipped — with several clusters on screen, empty headers would outnumber
-/// the rows.
+/// One ticket row: cursor marker, tree furniture, state glyph, `#n title`,
+/// then the dim `[type]` suffix — and on the forest, the extra blocking edges
+/// the tree position cannot show (`⤷ also needs #n`). The flattened screen has
+/// no cluster header above the row, so the row names its repo itself.
+fn ticket_line(
+    ticket: &Ticket,
+    prefix: &str,
+    also_needs: &[u64],
+    name_repo: bool,
+    under_cursor: bool,
+) -> Line<'static> {
+    let cursor = if under_cursor { '▶' } else { ' ' };
+    let repo = if name_repo {
+        ticket.short_repo().to_string()
+    } else {
+        String::new()
+    };
+    let mut spans = vec![
+        Span::raw(format!("  {cursor} ")),
+        Span::styled(prefix.to_string(), Style::new().add_modifier(Modifier::DIM)),
+        Span::styled(
+            ticket.status.glyph().to_string(),
+            glyph_style(&ticket.status),
+        ),
+        Span::raw(format!(" {repo}#{} {}", ticket.number, ticket.title)),
+    ];
+    if let Some(name) = ticket.ticket_type.short_name() {
+        spans.push(Span::styled(
+            format!(" [{name}]"),
+            Style::new().add_modifier(Modifier::DIM),
+        ));
+    }
+    if !also_needs.is_empty() {
+        let needs: Vec<String> = also_needs.iter().map(|n| format!("#{n}")).collect();
+        spans.push(Span::styled(
+            format!("  ⤷ also needs {}", needs.join(", ")),
+            Style::new().add_modifier(Modifier::DIM),
+        ));
+    }
+    let style = match ticket.status {
+        Status::Done => Style::new().add_modifier(Modifier::DIM),
+        _ => Style::new(),
+    };
+    Line::from(spans).style(style)
+}
+
+/// The body as styled lines: the [`Plan`] walked in order. Shared by the live
+/// draw and the TestBackend tests.
 pub fn body_lines(app: &App) -> Vec<Line<'static>> {
-    body_with_cursor(app).0
+    body_with_cursor(app, &app.plan()).0
 }
 
 /// [`body_lines`] plus which line the cursor row landed on — what the draw
 /// scrolls to. `None` when no row is visible. Needed since #50: several
 /// clusters can be taller than the screen, and a cursor the body cannot show
 /// is a picker that cannot pick.
-fn body_with_cursor(app: &App) -> (Vec<Line<'static>>, Option<usize>) {
-    let visible = app.visible();
-    let cursor_row = visible.get(app.cursor_pos()).cloned();
+///
+/// The cursor is matched by *stop position*, not row identity: the leverage
+/// view can legitimately show one ticket twice (as a takeable root and inside
+/// another root's subtree), and only one of those occurrences is under the
+/// cursor.
+fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize>) {
+    let name_repo = matches!(app.screen(), Screen::Flattened { .. });
+    let cursor_pos = app.cursor_pos();
+    let mut stop = 0usize;
     let mut cursor_line = None;
-    let filtering = !app.query.is_empty();
 
     let mut lines = vec![Line::default()];
-    for (id, map) in app.scoped_clusters() {
-        lines.push(cluster_header(id, map));
-        for (group, label) in GROUP_LABELS.iter().enumerate() {
-            let total = map
-                .tickets
-                .iter()
-                .filter(|t| t.status.group() == group)
-                .count();
-            if total == 0 {
-                continue;
-            }
-            let members: Vec<&Row> = visible
-                .iter()
-                .filter(|row| &row.map == id && map.tickets[row.index].status.group() == group)
-                .collect();
-            let header = if filtering {
-                format!("  {label} — {}/{}", members.len(), total)
-            } else {
-                format!("  {label} — {total}")
-            };
-            lines.push(Line::styled(
-                header,
-                Style::new().add_modifier(Modifier::BOLD),
-            ));
-            for row in members {
-                let ticket = &map.tickets[row.index];
-                let under_cursor = cursor_row.as_ref() == Some(row);
+    for item in &plan.items {
+        match item {
+            Item::Header(id) => lines.push(cluster_header(id, &app.clusters[id])),
+            Item::Ticket {
+                row,
+                prefix,
+                also_needs,
+            } => {
+                let under_cursor = stop == cursor_pos;
                 if under_cursor {
                     cursor_line = Some(lines.len());
                 }
-                let cursor = if under_cursor { '▶' } else { ' ' };
-                let mut spans = vec![
-                    Span::raw(format!("  {cursor} ")),
-                    Span::styled(ticket.status.glyph().to_string(), glyph_style(&ticket.status)),
-                    Span::raw(format!(" #{:<4} {}", ticket.number, ticket.title)),
-                ];
-                if let Status::Blocked { needs } = &ticket.status {
-                    let needs: Vec<String> = needs.iter().map(|n| format!("#{n}")).collect();
-                    spans.push(Span::styled(
-                        format!("  — needs {}", needs.join(", ")),
-                        Style::new().add_modifier(Modifier::DIM),
-                    ));
-                }
-                let style = match ticket.status {
-                    Status::Done => Style::new().add_modifier(Modifier::DIM),
-                    _ => Style::new(),
-                };
-                lines.push(Line::from(spans).style(style));
+                lines.push(ticket_line(
+                    app.ticket(row),
+                    prefix,
+                    also_needs,
+                    name_repo,
+                    under_cursor,
+                ));
+                stop += 1;
             }
+            Item::BlockedDeeper(n) => lines.push(Line::styled(
+                format!("     ⊘ {n} blocked deeper down"),
+                Style::new().fg(Color::Red).add_modifier(Modifier::DIM),
+            )),
+            Item::DoneHidden(n) => lines.push(Line::styled(
+                format!("     ● {n} done (hidden)"),
+                Style::new().add_modifier(Modifier::DIM),
+            )),
+            Item::Blank => lines.push(Line::default()),
         }
-        lines.push(Line::default());
     }
-    lines.pop();
     (lines, cursor_line)
 }
 
@@ -132,7 +158,7 @@ fn body_with_cursor(app: &App) -> (Vec<Line<'static>>, Option<usize>) {
 /// quits on an empty one, and `q` only quits when the query is empty (mid-query
 /// it types).
 const KEY_HINTS: &str =
-    "  enter launch · ctrl-f focus · ctrl-g all · ctrl-r refresh · esc quit";
+    "  enter launch · tab structure · ctrl-f focus · ctrl-g all · ctrl-r refresh · esc quit";
 
 /// The project heading in the title bar.
 ///
@@ -182,6 +208,18 @@ pub fn failure_note(app: &App) -> String {
             format!("· {}#{} failed", id.repo, id.number)
         }
         n => format!("· {n} maps failed"),
+    }
+}
+
+/// The `· N idle maps hidden` segment on the count line (#51): the leverage
+/// view drops a map with nothing takeable from the body, and the count is the
+/// only trace of it — silence would read as the map not existing at all. The
+/// forest (`tab`) shows the dropped maps in full.
+pub fn idle_note(plan: &Plan) -> String {
+    match plan.idle_hidden {
+        0 => String::new(),
+        1 => "· 1 idle map hidden".to_string(),
+        n => format!("· {n} idle maps hidden"),
     }
 }
 
@@ -272,7 +310,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // Scroll only as far as it takes to keep the cursor's line on screen —
     // several clusters can be taller than the body area (#50), and a cursor
     // below the fold would leave the picker unable to show what `enter` picks.
-    let (lines, cursor_line) = body_with_cursor(app);
+    let plan = app.plan();
+    let (lines, cursor_line) = body_with_cursor(app, &plan);
     let mut body = Paragraph::new(lines);
     if let Some(line) = cursor_line {
         let height = body_area.height as usize;
@@ -282,10 +321,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     frame.render_widget(body, body_area);
 
-    // The load hint and the failure note share one dim segment and can both be
-    // live at once (map 2 of 3 is still coming *and* map 1 never arrived);
-    // empty ones drop out rather than leaving gaps.
-    let status = [app.startup.hint(), failure_note(app)]
+    // The load hint, the failure note, and the idle count share one dim
+    // segment, and any of them can be live at once; empty ones drop out
+    // rather than leaving gaps.
+    let status = [app.startup.hint(), failure_note(app), idle_note(&plan)]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
@@ -402,14 +441,100 @@ mod tests {
     }
 
     #[test]
-    fn groups_render_in_fixed_order_within_the_cluster() {
+    fn the_default_screen_is_the_leverage_view_not_the_groups() {
         let screen = render(&fixture_app());
-        let cluster = screen.find("▌ wayfinder").expect("cluster header");
-        let frontier = screen.find("FRONTIER — ready to claim — 1").expect("frontier header");
-        let claimed = screen.find("CLAIMED — 1").expect("claimed header");
-        let blocked = screen.find("BLOCKED — 2").expect("blocked header");
-        let done = screen.find("DONE — 1").expect("done header");
-        assert!(cluster < frontier && frontier < claimed && claimed < blocked && blocked < done);
+        // Takeable roots, most-open-dependents-first: #6 (unblocks #7 and #14)
+        // before #9 (unblocks #14) — each with its subtree drawn beneath it.
+        let root6 = screen.find("○ #6 Re-entry breadcrumbs").expect("root #6");
+        let sub7 = screen
+            .find("├─⊘ #7 Supervising AFK agents")
+            .expect("#7 under #6");
+        let sub14 = screen
+            .find("└─⊘ #14 Breadcrumb markers")
+            .expect("#14 under #6");
+        let root9 = screen.find("◐ #9 Main screen design").expect("root #9");
+        assert!(root6 < sub7 && sub7 < sub14 && sub14 < root9, "{screen}");
+        // Done work is a count, not rows; the group headers retired with #51.
+        assert!(screen.contains("● 1 done (hidden)"), "{screen}");
+        assert!(!screen.contains("Choose the stack"), "{screen}");
+        assert!(!screen.contains("FRONTIER"), "{screen}");
+        assert!(!screen.contains("CLAIMED"), "{screen}");
+        assert!(!screen.contains("BLOCKED —"), "{screen}");
+        assert!(!screen.contains("DONE"), "{screen}");
+    }
+
+    #[test]
+    fn tab_shows_the_structure_forest_with_done_in_place() {
+        let mut app = fixture_app();
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let screen = render(&app);
+        // The whole DAG: done #2 back in place, roots ascending (#2, #6, #9),
+        // #7 and #14 as children of #6 — and #14's second blocking edge, which
+        // the tree position cannot show, annotated on the row.
+        let done = screen.find("● #2 Choose the stack").expect("done in place");
+        let root6 = screen.find("○ #6 Re-entry breadcrumbs").expect("root #6");
+        let sub7 = screen
+            .find("├─⊘ #7 Supervising AFK agents")
+            .expect("#7 under #6");
+        let sub14 = screen
+            .find("└─⊘ #14 Breadcrumb markers")
+            .expect("#14 under #6");
+        let root9 = screen.find("◐ #9 Main screen design").expect("root #9");
+        assert!(
+            done < root6 && root6 < sub7 && sub7 < sub14 && sub14 < root9,
+            "{screen}"
+        );
+        assert!(screen.contains("⤷ also needs #9"), "{screen}");
+        assert!(
+            !screen.contains("(hidden)"),
+            "the forest hides nothing: {screen}"
+        );
+        // Tab again restores the leverage view.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("● 1 done (hidden)"), "{screen}");
+    }
+
+    #[test]
+    fn rows_show_the_ticket_type() {
+        // The fixture tickets are all tasks; the suffix is on every row.
+        let screen = render(&fixture_app());
+        assert!(
+            screen.contains("#6 Re-entry breadcrumbs [task]"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn idle_maps_drop_to_the_count_line_and_tab_brings_them_back() {
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
+        clusters.insert(
+            MapId::new("blooop/dotfiles", 4),
+            Map {
+                title: "Map: dotfiles".to_string(),
+                tickets: vec![ticket(
+                    "blooop/dotfiles",
+                    103,
+                    "All done here",
+                    false,
+                    false,
+                    vec![],
+                )],
+            },
+        );
+        let mut app = App::new(clusters);
+        let screen = render(&app);
+        assert!(
+            !screen.contains("▌ dotfiles"),
+            "an idle map leaves the body: {screen}"
+        );
+        assert!(screen.contains("· 1 idle map hidden"), "{screen}");
+        // The forest is the escape hatch: everything renders there.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("▌ dotfiles · Map: dotfiles"), "{screen}");
+        assert!(!screen.contains("idle map"), "{screen}");
     }
 
     #[test]
@@ -434,32 +559,27 @@ mod tests {
         );
         let app = App::new(clusters);
         let screen = render(&app);
-        let first = screen.find("▌ wayfinder · Map: wf").expect("map #1's cluster");
+        let first = screen
+            .find("▌ wayfinder · Map: wf")
+            .expect("map #1's cluster");
         let second = screen
             .find("▌ wayfinder · Map: the selection view")
             .expect("map #47's cluster");
         assert!(first < second, "clusters order by (repo, number)");
-        assert!(screen.contains("#50   Build: clusters"), "{screen}");
+        assert!(screen.contains("#50 Build: clusters"), "{screen}");
         // One repo on screen, however many maps: the title names the repo.
         assert!(screen.contains("wf · blooop/wayfinder"), "{screen}");
     }
 
     #[test]
     fn rows_carry_state_glyph_number_title_without_a_repo_column() {
-        // The repo column is gone: the cluster header names the repo.
+        // The repo column is gone: the cluster header names the repo, and the
+        // structured rows never repeat it.
         let screen = render(&fixture_app());
-        assert!(screen.contains("○ #6    Re-entry breadcrumbs"), "{screen}");
-        assert!(screen.contains("◐ #9    Main screen design"), "{screen}");
-        assert!(screen.contains("⊘ #7    Supervising AFK agents"), "{screen}");
-        assert!(screen.contains("● #2    Choose the stack"), "{screen}");
+        assert!(screen.contains("○ #6 Re-entry breadcrumbs"), "{screen}");
+        assert!(screen.contains("◐ #9 Main screen design"), "{screen}");
+        assert!(screen.contains("⊘ #7 Supervising AFK agents"), "{screen}");
         assert!(!screen.contains("○ wayfinder"), "{screen}");
-    }
-
-    #[test]
-    fn blocked_rows_show_needs_suffix() {
-        let screen = render(&fixture_app());
-        assert!(screen.contains("#7    Supervising AFK agents  — needs #6"));
-        assert!(screen.contains("#14   Breadcrumb markers  — needs #6, #9"));
     }
 
     #[test]
@@ -468,36 +588,44 @@ mod tests {
         assert!(screen.contains("5/5"));
         assert!(screen.contains("> █"));
         assert!(screen.contains("enter launch"));
+        assert!(screen.contains("tab structure"));
         assert!(screen.contains("ctrl-r refresh"));
         assert!(screen.contains("esc quit"));
         assert!(screen.contains("wf · blooop/wayfinder"));
     }
 
     #[test]
-    fn query_drops_nonmatching_rows_but_groups_persist() {
+    fn a_query_flattens_to_a_scored_list_whose_rows_name_their_repo() {
         let mut app = fixture_app();
         type_str(&mut app, "bread");
         let screen = render(&app);
-        // Surviving rows: #6 (frontier) and #14 (blocked).
-        assert!(screen.contains("#6    Re-entry breadcrumbs"));
-        assert!(screen.contains("#14   Breadcrumb markers"));
+        // Surviving rows — flat, with no cluster header above them, so each
+        // names its repo itself.
+        assert!(
+            screen.contains("○ wayfinder#6 Re-entry breadcrumbs"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("⊘ wayfinder#14 Breadcrumb markers"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("▌"),
+            "no cluster furniture while flattened: {screen}"
+        );
+        assert!(!screen.contains("(hidden)"), "{screen}");
         // Dropped rows are gone.
         assert!(!screen.contains("Main screen design"));
         assert!(!screen.contains("Choose the stack"));
         assert!(!screen.contains("Supervising AFK agents"));
-        // Group headers persist as matched/total — 2a, no flattening — and the
-        // cluster header stays put above them.
-        let cluster = screen.find("▌ wayfinder").expect("cluster header");
-        let frontier = screen
-            .find("FRONTIER — ready to claim — 1/1")
-            .expect("frontier header");
-        let claimed = screen.find("CLAIMED — 0/1").expect("claimed header");
-        let blocked = screen.find("BLOCKED — 1/2").expect("blocked header");
-        let done = screen.find("DONE — 0/1").expect("done header");
-        assert!(cluster < frontier && frontier < claimed && claimed < blocked && blocked < done);
-        // Count line and prompt reflect the live query.
+        // Count line and prompt reflect the live query; the denominator is
+        // the map's tickets, not the leverage rows.
         assert!(screen.contains("2/5"));
         assert!(screen.contains("> bread█"));
+        // Clearing the query restores the structured screen.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("▌ wayfinder · Map: wf"), "{screen}");
     }
 
     #[test]
@@ -507,18 +635,36 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         type_str(&mut app, "bread");
         let screen = render(&app);
-        assert!(screen.contains("▶ ○ #6    Re-entry breadcrumbs"));
-        assert!(!screen.contains("▶ ⊘"));
+        assert_eq!(screen.matches('▶').count(), 1, "{screen}");
+        let marked = screen
+            .lines()
+            .find(|l| l.contains('▶'))
+            .expect("cursor row");
+        assert_eq!(
+            marked.contains("#6"),
+            app.cursor_ticket().unwrap().number == 6,
+            "the ▶ sits on the ticket the cursor names: {screen}"
+        );
+        assert_eq!(
+            app.cursor_pos(),
+            0,
+            "typing snaps the cursor to the best hit"
+        );
     }
 
     #[test]
     fn cursor_moves_across_visible_rows_only() {
         let mut app = fixture_app();
         type_str(&mut app, "bread");
+        let first = app.cursor_ticket().expect("a match").number;
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let second = app.cursor_ticket().expect("a match").number;
+        // Two matches (#6 and #14): down moves to the other, skipping every
+        // ticket the query dropped.
+        assert_ne!(first, second);
+        assert!([6, 14].contains(&first) && [6, 14].contains(&second));
         let screen = render(&app);
-        // Cursor skipped the emptied CLAIMED group straight to blocked #14.
-        assert!(screen.contains("▶ ⊘ #14   Breadcrumb markers"));
+        assert_eq!(screen.matches('▶').count(), 1, "{screen}");
     }
 
     /// The fixture map plus Build 4 launch inputs: two checkouts of the repo,
@@ -554,12 +700,13 @@ mod tests {
         let mut app = launchable_app();
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let screen = render(&app);
-        assert!(screen.contains("which checkout runs wayfinder#6?"), "{screen}");
+        assert!(
+            screen.contains("which checkout runs wayfinder#6?"),
+            "{screen}"
+        );
         assert!(screen.contains("▶ /data/k1/wayfinder"), "{screen}");
         assert!(screen.contains("/data/k2/wayfinder"), "{screen}");
         assert!(screen.contains("esc cancel"));
-        // It is a modal: the rows it covers are overwritten, not blended.
-        assert!(!screen.contains("Breadcrumb markers"), "{screen}");
     }
 
     #[test]
@@ -606,7 +753,10 @@ mod tests {
         app.failed.insert(MapId::new("blooop/dotfiles", 4));
         assert_eq!(failure_note(&app), "· blooop/dotfiles#4 failed");
         let screen = render(&app);
-        assert!(screen.contains("5/5  · blooop/dotfiles#4 failed"), "{screen}");
+        assert!(
+            screen.contains("5/5  · blooop/dotfiles#4 failed"),
+            "{screen}"
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         let screen = render(&app);
@@ -622,7 +772,10 @@ mod tests {
         let mut app = App::empty();
         app.startup = Startup::loaded();
         let screen = render(&app);
-        assert!(screen.contains("no projects — run wf inside a checkout"), "{screen}");
+        assert!(
+            screen.contains("no projects — run wf inside a checkout"),
+            "{screen}"
+        );
         assert!(!screen.contains("loading"), "{screen}");
     }
 
@@ -640,9 +793,10 @@ mod tests {
         .collect();
         app.startup = Startup::seeded(&found);
         app.startup.searched(&found);
-        app.startup.record_arrival(&MapId::new("blooop/wayfinder", 1));
+        app.startup
+            .record_arrival(&MapId::new("blooop/wayfinder", 1));
         let screen = render(&app);
-        assert!(screen.contains("#6    Re-entry breadcrumbs"), "{screen}");
+        assert!(screen.contains("#6 Re-entry breadcrumbs"), "{screen}");
         assert!(screen.contains("5/5  · loading maps 1/3"), "{screen}");
         // Rows exist, so the title names the project rather than the wait.
         assert!(screen.contains("wf · blooop/wayfinder"), "{screen}");
@@ -650,17 +804,26 @@ mod tests {
 
     #[test]
     fn the_body_scrolls_to_keep_the_cursor_on_screen() {
-        // One cluster of 30 done tickets ahead of a one-ticket cluster: the
-        // second cluster's rows start past the 24-row screen, and that is where
-        // the cursor must still be *visible* — a picker that cannot show what
-        // `enter` would pick is broken (the live 3-map repo hits exactly this).
+        // One cluster of 30 takeable tickets ahead of a one-ticket cluster:
+        // the second cluster's rows start past the 24-row screen, and that is
+        // where the cursor must still be *visible* — a picker that cannot show
+        // what `enter` would pick is broken.
         let mut clusters = BTreeMap::new();
         clusters.insert(
             MapId::new("blooop/wayfinder", 1),
             Map {
                 title: "Map: wf".to_string(),
                 tickets: (1..=30)
-                    .map(|n| ticket("blooop/wayfinder", n, &format!("Done {n}"), false, false, vec![]))
+                    .map(|n| {
+                        ticket(
+                            "blooop/wayfinder",
+                            n,
+                            &format!("Open {n}"),
+                            true,
+                            false,
+                            vec![],
+                        )
+                    })
                     .collect(),
             },
         );
@@ -668,7 +831,14 @@ mod tests {
             MapId::new("blooop/wayfinder", 47),
             Map {
                 title: "Map: the selection view".to_string(),
-                tickets: vec![ticket("blooop/wayfinder", 50, "Build: clusters", true, false, vec![])],
+                tickets: vec![ticket(
+                    "blooop/wayfinder",
+                    50,
+                    "Build: clusters",
+                    true,
+                    false,
+                    vec![],
+                )],
             },
         );
         let mut app = App::new(clusters);
@@ -677,13 +847,13 @@ mod tests {
         }
         assert_eq!(app.cursor_ticket().unwrap().number, 50);
         let screen = render(&app);
-        assert!(screen.contains("▶ ○ #50   Build: clusters"), "{screen}");
+        assert!(screen.contains("▶ ○ #50 Build: clusters"), "{screen}");
         // And with the cursor back at the top, the top is what shows.
         for _ in 0..40 {
             app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         }
         let screen = render(&app);
-        assert!(screen.contains("▶ ● #1    Done 1"), "{screen}");
+        assert!(screen.contains("▶ ○ #1 Open 1"), "{screen}");
     }
 
     #[test]
@@ -693,6 +863,6 @@ mod tests {
         let screen = render(&app);
         assert!(screen.contains("wf · blooop/wayfinder — focused"));
         assert!(screen.contains("ctrl-g all projects"));
-        assert!(screen.contains("▶ ○ #6    Re-entry breadcrumbs"));
+        assert!(screen.contains("▶ ○ #6 Re-entry breadcrumbs"));
     }
 }

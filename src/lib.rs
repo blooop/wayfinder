@@ -7,7 +7,10 @@
 //! * **Discovery** is accretive (#4/#15): running `wf` inside a checkout
 //!   registers it in a per-machine cache — no registry, no background scan.
 //! * **Data** is GitHub Issues via one `gh api graphql` query per map (#3),
-//!   rendered as one cluster per open map (#50) behind a nucleo fuzzy query.
+//!   rendered as one cluster per open map (#50). The default screen is the
+//!   leverage view (#51) — what can be taken now and what taking it unlocks —
+//!   with the full blocking forest on `tab` and a nucleo query flattening
+//!   either into one score-ordered list.
 //! * **Startup** streams (#27): the screen is drawn before any network call,
 //!   and the cached map numbers (#28) are already being fetched when it
 //!   appears. Nothing polls afterwards — a warm start costs ~0.6 s, so
@@ -25,3 +28,4 @@ pub mod model;
 pub mod projects;
 pub mod refresh;
 pub mod ui;
+pub mod view;

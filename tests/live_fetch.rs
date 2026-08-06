@@ -10,7 +10,11 @@ async fn fetches_the_live_wayfinder_map() {
         .await
         .expect("live fetch of blooop/wayfinder map #1");
 
-    assert!(map.title.starts_with("Map:"), "map issue title: {}", map.title);
+    assert!(
+        map.title.starts_with("Map:"),
+        "map issue title: {}",
+        map.title
+    );
     assert!(
         map.tickets.len() >= 7,
         "expected the real map's tickets, got {}",
@@ -42,15 +46,34 @@ async fn fetches_the_live_wayfinder_map() {
     // every ticket's `wayfinder:*` type comes back parsed. This map's types are
     // known facts — #3 is research, #19 is the build task, #18 is a grilling —
     // so a query GitHub silently dropped labels from would show up as Untyped.
-    let typed = |n: u64| map.tickets.iter().find(|t| t.number == n).map(|t| t.ticket_type);
-    assert_eq!(typed(3), Some(TicketType::Research), "#3 is wayfinder:research");
+    let typed = |n: u64| {
+        map.tickets
+            .iter()
+            .find(|t| t.number == n)
+            .map(|t| t.ticket_type)
+    };
+    assert_eq!(
+        typed(3),
+        Some(TicketType::Research),
+        "#3 is wayfinder:research"
+    );
     assert_eq!(typed(19), Some(TicketType::Task), "#19 is wayfinder:task");
-    assert_eq!(typed(18), Some(TicketType::Grilling), "#18 is wayfinder:grilling");
-    assert_eq!(typed(9), Some(TicketType::Prototype), "#9 is wayfinder:prototype");
+    assert_eq!(
+        typed(18),
+        Some(TicketType::Grilling),
+        "#18 is wayfinder:grilling"
+    );
+    assert_eq!(
+        typed(9),
+        Some(TicketType::Prototype),
+        "#9 is wayfinder:prototype"
+    );
     // The map issue itself is not a sub-issue, so nothing on the map carries
     // `wayfinder:map`; every ticket here is one of the four real types.
     assert!(
-        map.tickets.iter().all(|t| t.ticket_type != TicketType::Untyped),
+        map.tickets
+            .iter()
+            .all(|t| t.ticket_type != TicketType::Untyped),
         "every ticket on this map is labelled: {:?}",
         map.tickets
             .iter()
