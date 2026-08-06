@@ -10,12 +10,13 @@ below):
 pixi global install -c https://prefix.dev/blooop -c conda-forge wf
 ```
 
-The package declares no run dependencies. `wf` finds `gh` (authenticated),
-`zellij` and the agent CLI on PATH and says so plainly when one is missing,
-rather than dragging second copies of them into its own environment.
+The package declares no run dependencies. `wf` finds what it needs on PATH and
+says so plainly when something is missing, rather than dragging second copies
+into its own environment. It wants an authenticated `gh` and the agent CLI.
 
-`zellij` is optional: without it `enter` runs the agent in `wf`'s own terminal
-instead of in a tab (see [Without zellij](#without-zellij)).
+`zellij` is optional. With it, every ticket gets its own tab; without it, `enter`
+runs the agent in `wf`'s own terminal and the tab-shaped features step aside —
+see [Launching](#launching).
 
 `wf --version` and `wf --help` are the only arguments; everything else is keys
 in the TUI.
@@ -77,11 +78,35 @@ chosen yourself with `ctrl-f`/`ctrl-g`.
 
 ## Launching
 
-With zellij, picking a ticket creates or focuses a zellij tab in that project's session,
-with the checkout as its cwd, running the `/wayfinder` skill on the ticket. The
-tab is the unit of work and the unit of supervision: it survives `wf` exiting,
-it is reachable by normal zellij navigation, and re-picking a ticket focuses its
-existing tab instead of starting a second agent on it.
+Picking a ticket runs an agent on it — `claude --dangerously-skip-permissions
+"/wayfinder <map> <n>"`, with that project's checkout as its cwd. That much is
+the same everywhere. What `zellij` changes is *where* the agent runs, and
+therefore how much `wf` can promise about it afterwards.
+
+| key | what it does |
+| --- | --- |
+| `enter` | HITL: take you into the ticket's agent, interactively |
+| `ctrl-a` | AFK: spawn it headless (`claude -p …`) — no attach, no focus steal. Needs zellij |
+| `↑`/`↓`, `enter`, `esc` | in the which-checkout picker: pick which project hosts the agent, or cancel |
+
+Both modes pass `--dangerously-skip-permissions`. For AFK that is closer to a
+correctness requirement than a convenience: a headless agent that stops on a
+permission prompt waits forever with nobody to answer it, and the only symptom
+would be an agent that never finishes — indistinguishable from slow work. HITL
+gets it too, so entering an agent is the same session whether you opened it or
+auto-start did.
+
+Which of the two cases below you are in is settled by one `zellij --version`, on
+the first launch or poll that needs the answer and cached for the rest of the process —
+never before the first frame, since every subprocess is kept off that path (#27)
+and a zellij call is exactly the boundary that can wedge (#21).
+
+### With zellij: a tab per ticket
+
+The agent gets a tab in that project's session. The tab is the unit of work and
+the unit of supervision: it survives `wf` exiting, it is reachable by normal
+zellij navigation, and re-picking a ticket focuses its existing tab instead of
+starting a second agent on it.
 
 The tab is named `<repo>#<n> <short title>` — e.g.
 `wayfinder#16 Build 4 — launch…` — with the title capped at 18 characters on a
@@ -92,25 +117,9 @@ recognises an agent tab (including the count in the AFK slot) reads that leading
 key and ignores whatever follows it — the title, zellij's activity markers, or
 both.
 
-| key | what it does |
-| --- | --- |
-| `enter` | HITL: create-or-focus the ticket's tab and take you into it (`claude --dangerously-skip-permissions "/wayfinder <map> <n>"`) — with no zellij, run that agent right here |
-| `ctrl-a` | AFK: spawn the same tab headless (`claude --dangerously-skip-permissions -p "/wayfinder <map> <n>"`) — no attach, no focus steal; needs zellij |
-| `↑`/`↓`, `enter`, `esc` | in the which-checkout picker: pick which project hosts the tab, or cancel |
+How `wf` hands over depends on where it is itself running, decided from its own
+`$ZELLIJ` — never from a `zellij action` exit code, which is `0` even on failure:
 
-Both modes pass `--dangerously-skip-permissions`. For AFK that is closer to a
-correctness requirement than a convenience: a headless agent that stops on a
-permission prompt waits forever with nobody to answer it, and the only symptom
-would be a tab that never finishes — indistinguishable from slow work. HITL gets
-it too, so entering a tab is the same session whether you opened it or auto-start
-did.
-
-How `wf` hands over depends on where it is running, decided from whether there is
-a `zellij` on PATH at all and then from its own `$ZELLIJ` — never from a
-`zellij action` exit code, which is `0` even on failure:
-
-- **no zellij installed** — the TUI suspends and the agent itself runs as a
-  *child* in the checkout (see [Without zellij](#without-zellij));
 - **outside zellij** — the TUI suspends, `zellij attach <session>` runs as a
   *child*, and detaching returns to `wf` (which refetches, since the tracker
   moved while you were away);
@@ -131,31 +140,24 @@ post-mortem, and closing it is yours to do. The line above the match count
 counts the agent tabs zellij is holding, as of the last launch, `ctrl-r`, or
 auto-start; it stays empty when there are none.
 
-## Without zellij
+### Without zellij: in wf's own terminal
 
-`zellij` is a nicety, not a requirement. When there is no `zellij` on PATH at all,
-`enter` skips the tab entirely: `wf` steps out of the terminal and runs the agent
-as its own child in the checkout, exactly the same
-`claude --dangerously-skip-permissions "/wayfinder <map> <n>"`. Quitting the
-agent returns to the picker, which refetches because the tracker moved while you
-were in there. One ticket at a time, no tab strip, nothing to detach from.
+There is no tab to make, so `enter` skips straight to the agent: `wf` steps out
+of the terminal and runs it as its own child in the checkout. Quitting the agent
+returns to the picker, which refetches because the tracker moved while you were
+in there. One ticket at a time, nothing to detach from.
 
 That is a different state from "zellij is installed but this terminal is not in a
 session" — the latter still gets a tab, and `wf` runs `zellij attach` to reach it.
 
-Which of the two it is gets decided by one `zellij --version`, on the first
-launch or poll that needs the answer and cached for the rest of the process —
-never before the first frame, since every subprocess is kept off that path (#27)
-and a zellij call is exactly the boundary that can wedge (#21).
-
-What a tab was carrying is honestly absent rather than faked:
+What the tab was carrying is then honestly absent rather than faked:
 
 - `ctrl-a` is refused (`no zellij — afk needs a tab; enter runs this ticket here
   instead`). A headless agent is supervised by its tab; with no tab it would be a
   process you cannot see, find or reap, so `wf` will not start one;
 - auto-start is off for the same reason — there is nothing to reconcile towards;
 - the agent-tab count line stays empty, and re-picking a ticket starts a fresh
-  agent on it, since there is no tab to find already running.
+  agent on it, since there is no tab to find one already running in.
 
 ## Auto-start
 
@@ -165,6 +167,9 @@ the frontier against the tabs that exist and spawns the missing ones as AFK
 agents — the same `ctrl-a` seam, no keystroke. A research ticket unblocked on
 another machine gets picked up on the next poll, so work happens while you are
 actually away.
+
+Tabs are the whole mechanism here, so this needs zellij; without it there is
+nothing to reconcile towards and auto-start simply does not run.
 
 Only `wayfinder:research` is auto-started. `grilling` and `prototype` are HITL by
 definition, and `task` is excluded on purpose: a build ticket running unattended

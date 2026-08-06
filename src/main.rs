@@ -57,8 +57,9 @@ wf — the multi-project wayfinder manager TUI
 usage: wf [--version | --help]
 
 With no arguments: opens the picker over every mapped project, focused on the
-checkout you are standing in. enter launches (or focuses) a ticket's agent tab,
-ctrl-a spawns it headless, ctrl-f/ctrl-g narrow and widen the scope,
+checkout you are standing in. enter runs an agent on a ticket — in its own zellij
+tab where zellij is installed, in this terminal otherwise; ctrl-a spawns one
+headless (needs zellij), ctrl-f/ctrl-g narrow and widen the scope,
 ctrl-r refreshes, esc quits.";
 
 /// Parse argv (without the program name). `wf` takes at most one argument, and
