@@ -259,7 +259,7 @@ fn forest(clusters: &[(&MapId, &Map)]) -> Plan {
                 id,
                 root,
                 "",
-                None,
+                "",
                 &children,
                 &in_map_blockers,
                 &mut visited,
@@ -280,7 +280,7 @@ fn forest(clusters: &[(&MapId, &Map)]) -> Plan {
                 id,
                 orphan,
                 "",
-                None,
+                "",
                 &children,
                 &in_map_blockers,
                 &mut visited,
@@ -293,13 +293,20 @@ fn forest(clusters: &[(&MapId, &Map)]) -> Plan {
     plan
 }
 
+/// Render `number` and its subtree.
+///
+/// The two prefixes are deliberately separate values. `prefix` is this node's
+/// own line furniture, complete; `stem` is the continuation its *children*
+/// hang from — the ancestors' vertical bars. Deriving one from the other is
+/// what makes deep trees drift a level: a node's line and its children's lines
+/// belong to different depths.
 #[allow(clippy::too_many_arguments)]
 fn walk_forest(
     map: &Map,
     id: &MapId,
     number: u64,
+    prefix: &str,
     stem: &str,
-    branch: Option<&str>,
     children: &BTreeMap<u64, Vec<u64>>,
     in_map_blockers: &dyn Fn(&Ticket) -> Vec<u64>,
     visited: &mut BTreeSet<u64>,
@@ -315,24 +322,24 @@ fn walk_forest(
         .into_iter()
         .skip(1)
         .collect();
-    let prefix = branch.map(|b| format!("{stem}{b}")).unwrap_or_default();
-    items.push(ticket_item(id, index, prefix, also_needs));
+    items.push(ticket_item(id, index, prefix.to_string(), also_needs));
 
     let kids = children.get(&number).cloned().unwrap_or_default();
     for (i, &kid) in kids.iter().enumerate() {
         let last = i + 1 == kids.len();
-        let next = match branch {
-            None => stem.to_string(),
-            Some(_) if last => format!("{stem}  "),
-            Some(_) => format!("{stem}│ "),
+        // The last child closes its branch and its subtree hangs from blank
+        // space; every earlier child keeps the vertical bar running past it.
+        let (branch, continuation) = if last {
+            ("└─", "  ")
+        } else {
+            ("├─", "│ ")
         };
-        let kid_branch = if last { "└─" } else { "├─" };
         walk_forest(
             map,
             id,
             kid,
-            &next,
-            Some(kid_branch),
+            &format!("{stem}{branch}"),
+            &format!("{stem}{continuation}"),
             children,
             in_map_blockers,
             visited,
@@ -536,6 +543,42 @@ mod tests {
         });
         assert!(annotated, "{:?}", plan.items);
         assert_eq!(plan.idle_hidden, 0, "the forest hides nothing");
+    }
+
+    #[test]
+    fn forest_furniture_stays_aligned_three_levels_deep() {
+        // The shape the live wf map exposed: a root with two children, the
+        // *first* of which has a child of its own. The grandchild must hang
+        // from its parent's running bar (`│ └─`) — a node's own line and its
+        // children's lines are different depths, and deriving one from the
+        // other drifts by a level.
+        let m = map(vec![
+            ticket(13, false, false, vec![]),
+            ticket(14, false, false, vec![13]),
+            ticket(15, false, false, vec![14]),
+            ticket(17, false, false, vec![13]),
+        ]);
+        let binding = id();
+        let plan = plan(&[(&binding, &m)], Screen::Structured(Lens::Forest));
+        let furniture: Vec<(u64, String)> = plan
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Ticket { row, prefix, .. } => {
+                    Some((m.tickets[row.index].number, prefix.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            furniture,
+            vec![
+                (13, "".to_string()),
+                (14, "├─".to_string()),
+                (15, "│ └─".to_string()),
+                (17, "└─".to_string()),
+            ]
+        );
     }
 
     #[test]
