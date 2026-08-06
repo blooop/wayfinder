@@ -54,16 +54,6 @@ pub enum Status {
 }
 
 impl Status {
-    /// The state glyph shown at the start of every row.
-    pub fn glyph(&self) -> char {
-        match self {
-            Status::Frontier => '○',
-            Status::Claimed => '◐',
-            Status::Blocked { .. } => '⊘',
-            Status::Done => '●',
-        }
-    }
-
     /// Position of this status within the cluster header's counts
     /// (frontier / claimed / blocked / done).
     pub fn group(&self) -> usize {
@@ -76,17 +66,155 @@ impl Status {
     }
 }
 
+/// Where a node stands in its lifecycle — one five-value lattice for every
+/// node (#61), **derived, never declared**: from its linked PRs when any are
+/// open or merged, from its ticket state otherwise. Blocked is deliberately
+/// not here — it is [`Status`], and the glyph column overrides with `⊘` while
+/// the stage underneath stays whatever the derivation says.
+///
+/// `Ord` follows the lattice `ready → building → in review → needs attention
+/// → done`, which is also the constant max-over-open-PRs order (needs
+/// attention > in review > building): an open PR can only ever contribute the
+/// middle three, so `max` never has to special-case the ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stage {
+    Ready,
+    /// Building for build nodes, "in progress" for decision nodes — one slot,
+    /// two vocabularies, same glyph.
+    Building,
+    InReview,
+    NeedsAttention,
+    Done,
+}
+
+/// What a row's leading glyph column shows (#62): the node's stage, unless
+/// the node is blocked — `⊘` overrides, because a blocked node's stage is
+/// unactionable until its blockers clear. One sum type rather than a char, so
+/// the rollup counts and the row draw share meanings, not symbols.
+///
+/// `Ord` is display order — `○ ◐ ◍ ! ● ⊘` — which the derive gives for free:
+/// stages in lattice order, the blocked override after them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RowGlyph {
+    Stage(Stage),
+    Blocked,
+}
+
+impl RowGlyph {
+    /// The glyph column for one ticket: its stage, blocked overriding.
+    pub fn of(ticket: &Ticket) -> RowGlyph {
+        match ticket.status {
+            Status::Blocked { .. } => RowGlyph::Blocked,
+            Status::Frontier | Status::Claimed | Status::Done => {
+                RowGlyph::Stage(stage(&ticket.prs, &ticket.status))
+            }
+        }
+    }
+
+    /// The character drawn: `○` ready · `◐` building/in progress · `◍` in
+    /// review · `!` needs attention · `●` done · `⊘` blocked.
+    pub fn char(self) -> char {
+        match self {
+            RowGlyph::Stage(Stage::Ready) => '○',
+            RowGlyph::Stage(Stage::Building) => '◐',
+            RowGlyph::Stage(Stage::InReview) => '◍',
+            RowGlyph::Stage(Stage::NeedsAttention) => '!',
+            RowGlyph::Stage(Stage::Done) => '●',
+            RowGlyph::Blocked => '⊘',
+        }
+    }
+}
+
+/// What one **open** PR says about its node — the fixed per-PR table (#61).
+/// `None` for merged and closed PRs, which are not open and speak elsewhere
+/// (merged: the done fallback; closed: nothing at all).
+///
+/// The two axes are read separately and **exhaustively** — every `Checks` and
+/// every `Review` variant is named, and so is every [`Signal`], so adding a
+/// variant to any of the three is a compile error rather than a new value
+/// silently reading as "in review".
+///
+/// Never `Ready` and never `Done`: an open PR is evidence of work in flight,
+/// so [`stage`]'s `max` over open PRs can only ever land in the middle three.
+fn open_pr_stage(status: &PrStatus) -> Option<Stage> {
+    match status {
+        PrStatus::Draft => Some(Stage::Building),
+        PrStatus::Open { checks, review } => {
+            let from_checks = match checks {
+                Checks::Failing => Signal::Red,
+                Checks::Pending => Signal::Moving,
+                // Settled, or none configured at all: nothing left to wait on.
+                Checks::Passing | Checks::Absent => Signal::Settled,
+            };
+            let from_review = match review {
+                Review::ChangesRequested => Signal::Red,
+                // Approved-awaiting-merge included, and a review nobody is
+                // required to give: the PR is still up for its look.
+                Review::Approved | Review::Required | Review::NotRequired => Signal::Settled,
+            };
+            Some(match from_checks.max(from_review) {
+                Signal::Red => Stage::NeedsAttention,
+                Signal::Moving => Stage::Building,
+                Signal::Settled => Stage::InReview,
+            })
+        }
+        PrStatus::Merged | PrStatus::Closed => None,
+    }
+}
+
+/// What one axis of an open PR contributes to its stage — the #61 table read
+/// as two independent readings rather than a chain of `if`s.
+///
+/// `Ord` is the table's precedence, which is *not* the [`Stage`] lattice: a
+/// red signal wins ("checks `Failing` **or** review `ChangesRequested` → needs
+/// attention"), then work still moving ("draft, or checks `Pending` →
+/// building"), and a settled axis speaks last ("otherwise open → in review").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Signal {
+    Settled,
+    Moving,
+    Red,
+}
+
+/// Derive a node's stage from its linked PRs and its derived status (#61).
+///
+/// The node takes the **max over its open PRs** — a red PR anywhere makes the
+/// node red; nothing is silently ignored. With no open PRs, any merged PR
+/// means done, whatever the ticket still says; with no PR evidence at all it
+/// falls through to ticket state: ready (open, unblocked, unclaimed) / in
+/// progress (claimed) / done (closed). PR state dominates when present — a
+/// prototype's PR counts.
+pub fn stage(prs: &[PrLink], status: &Status) -> Stage {
+    if let Some(live) = prs.iter().filter_map(|pr| open_pr_stage(&pr.status)).max() {
+        return live;
+    }
+    if prs.iter().any(|pr| pr.status == PrStatus::Merged) {
+        return Stage::Done;
+    }
+    match status {
+        // A blocked node's work has not begun: ready underneath, with the `⊘`
+        // override and the launch refusal both keyed off status, not stage.
+        Status::Frontier | Status::Blocked { .. } => Stage::Ready,
+        Status::Claimed => Stage::Building,
+        Status::Done => Stage::Done,
+    }
+}
+
 /// What *kind* of work a ticket is — the `wayfinder:*` type label, parsed once
 /// at the `gh` boundary ([`TicketType::from_labels`]) and never re-sniffed from
 /// strings afterwards.
 ///
-/// Total over the four types the skill defines **plus** [`TicketType::Untyped`],
-/// so a ticket that carries no type label is an ordinary value rather than a
-/// missing one. Every site that decides something from a type matches all five
-/// arms with no wildcard, which is what makes a fifth `wayfinder:*` type a
-/// compile error rather than a silent misreading.
+/// Total over the five types the skill suite defines **plus**
+/// [`TicketType::Untyped`], so a ticket that carries no type label is an
+/// ordinary value rather than a missing one. Every site that decides something
+/// from a type matches all six arms with no wildcard, which is what makes a
+/// new `wayfinder:*` type a compile error rather than a silent misreading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketType {
+    /// `wayfinder:build` — the one execution type (#61): a ticket that is a
+    /// build contract, worked by `/tdd` and `/review` across its stages rather
+    /// than resolved in a decision session.
+    Build,
     /// `wayfinder:research` — away-from-keyboard by definition: reading sources
     /// to surface a fact a decision waits on.
     Research,
@@ -114,6 +242,7 @@ impl TicketType {
     /// binary shipped.
     pub fn from_label(label: &str) -> Option<TicketType> {
         match label.trim() {
+            "wayfinder:build" => Some(TicketType::Build),
             "wayfinder:research" => Some(TicketType::Research),
             "wayfinder:task" => Some(TicketType::Task),
             "wayfinder:grilling" => Some(TicketType::Grilling),
@@ -144,6 +273,7 @@ impl TicketType {
     /// wants, and "untyped" answers a question nobody asked.
     pub fn short_name(self) -> Option<&'static str> {
         match self {
+            TicketType::Build => Some("build"),
             TicketType::Research => Some("research"),
             TicketType::Task => Some("task"),
             TicketType::Grilling => Some("grilling"),
@@ -165,9 +295,12 @@ impl TicketType {
             TicketType::Prototype => 1,
             TicketType::Task => 2,
             TicketType::Research => 3,
+            // The most autonomous type of all — its whole lifecycle runs
+            // unattended — so every other real type outranks it.
+            TicketType::Build => 4,
             // Never returned by `from_label`, so this rank is only a
             // total-ordering formality — and last, so a real type always wins.
-            TicketType::Untyped => 4,
+            TicketType::Untyped => 5,
         }
     }
 }
@@ -378,6 +511,32 @@ mod tests {
     }
 
     #[test]
+    fn the_build_type_label_parses_and_ranks_last_among_real_types() {
+        // The vocabulary grows exactly one type (#61): `wayfinder:build`.
+        assert_eq!(
+            TicketType::from_labels(["wayfinder:build"]),
+            TicketType::Build
+        );
+        assert_eq!(TicketType::Build.short_name(), Some("build"));
+        // HITL-first still holds: build is the most autonomous type of all —
+        // its whole lifecycle runs unattended — so every other real type wins
+        // an ambiguous ticket, and build still beats having no type.
+        for other in [
+            "wayfinder:research",
+            "wayfinder:task",
+            "wayfinder:grilling",
+            "wayfinder:prototype",
+        ] {
+            let both = TicketType::from_labels(["wayfinder:build", other]);
+            assert_ne!(both, TicketType::Build, "build + {other}");
+        }
+        assert_eq!(
+            TicketType::from_labels(["bug", "wayfinder:build"]),
+            TicketType::Build
+        );
+    }
+
+    #[test]
     fn no_recognised_label_is_untyped_not_a_guess() {
         // No labels at all.
         assert_eq!(
@@ -429,6 +588,271 @@ mod tests {
         assert_eq!(
             TicketType::from_labels(["wayfinder:task", "wayfinder:grilling"]),
             TicketType::Grilling
+        );
+    }
+
+    fn pr(status: PrStatus) -> PrLink {
+        PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 90,
+            status,
+        }
+    }
+
+    fn open_pr(checks: Checks, review: Review) -> PrLink {
+        pr(PrStatus::Open { checks, review })
+    }
+
+    #[test]
+    fn each_open_pr_maps_to_a_stage_by_the_fixed_table() {
+        // Row 1 of the #61 table: failing checks or a changes-requested review
+        // → needs attention. Either signal alone is enough.
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Failing, Review::NotRequired)],
+                &Status::Frontier
+            ),
+            Stage::NeedsAttention
+        );
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Passing, Review::ChangesRequested)],
+                &Status::Frontier
+            ),
+            Stage::NeedsAttention
+        );
+        // Row 2: a draft, or checks still pending → building.
+        assert_eq!(
+            stage(&[pr(PrStatus::Draft)], &Status::Frontier),
+            Stage::Building
+        );
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Pending, Review::Required)],
+                &Status::Frontier
+            ),
+            Stage::Building
+        );
+        // Row 3: otherwise open — approved-awaiting-merge included → in review.
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Passing, Review::Approved)],
+                &Status::Frontier
+            ),
+            Stage::InReview
+        );
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Absent, Review::NotRequired)],
+                &Status::Frontier
+            ),
+            Stage::InReview
+        );
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Passing, Review::Required)],
+                &Status::Frontier
+            ),
+            Stage::InReview
+        );
+    }
+
+    #[test]
+    fn the_two_axes_of_one_pr_settle_by_the_tables_own_precedence() {
+        // Where the rows overlap, row 1 wins: a changes-requested review is
+        // needs-attention even while the checks are still moving, or already
+        // red. Not the `Stage` lattice — building outranks in review *within
+        // one PR*, which is why the axes have their own order.
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Pending, Review::ChangesRequested)],
+                &Status::Frontier
+            ),
+            Stage::NeedsAttention
+        );
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Failing, Review::ChangesRequested)],
+                &Status::Frontier
+            ),
+            Stage::NeedsAttention
+        );
+        // Row 2 over row 3: pending checks hold the node at building however
+        // settled the review axis is.
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Pending, Review::Approved)],
+                &Status::Frontier
+            ),
+            Stage::Building
+        );
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Pending, Review::NotRequired)],
+                &Status::Frontier
+            ),
+            Stage::Building
+        );
+    }
+
+    #[test]
+    fn an_open_pr_never_speaks_the_ends_of_the_lattice() {
+        // The invariant the max-over-open-PRs rule rests on: an open PR is
+        // work in flight, so it can only ever contribute the middle three.
+        // Were one to yield `Done`, a single open PR would mark the node
+        // finished; were one to yield `Ready`, `max` would silently drop it.
+        let every_open = [PrStatus::Draft].into_iter().chain(
+            [
+                Checks::Absent,
+                Checks::Passing,
+                Checks::Pending,
+                Checks::Failing,
+            ]
+            .into_iter()
+            .flat_map(|checks| {
+                [
+                    Review::NotRequired,
+                    Review::Required,
+                    Review::Approved,
+                    Review::ChangesRequested,
+                ]
+                .into_iter()
+                .map(move |review| PrStatus::Open { checks, review })
+            }),
+        );
+        for status in every_open {
+            let derived = open_pr_stage(&status).expect("an open PR always says something");
+            assert!(
+                matches!(
+                    derived,
+                    Stage::Building | Stage::InReview | Stage::NeedsAttention
+                ),
+                "{status:?} gave {derived:?}"
+            );
+        }
+        // And the two that are not open say nothing at all here.
+        assert_eq!(open_pr_stage(&PrStatus::Merged), None);
+        assert_eq!(open_pr_stage(&PrStatus::Closed), None);
+    }
+
+    #[test]
+    fn the_node_takes_the_max_over_its_open_prs() {
+        // The constant order: needs attention > in review > building. A red PR
+        // anywhere makes the node red, whichever way the tracker lists them.
+        let building = || pr(PrStatus::Draft);
+        let in_review = || open_pr(Checks::Passing, Review::Approved);
+        let attention = || open_pr(Checks::Failing, Review::NotRequired);
+        assert_eq!(
+            stage(&[building(), attention()], &Status::Frontier),
+            Stage::NeedsAttention
+        );
+        assert_eq!(
+            stage(&[attention(), building()], &Status::Frontier),
+            Stage::NeedsAttention
+        );
+        assert_eq!(
+            stage(&[building(), in_review()], &Status::Frontier),
+            Stage::InReview
+        );
+        assert_eq!(
+            stage(&[in_review(), attention()], &Status::Frontier),
+            Stage::NeedsAttention
+        );
+        // A merged PR alongside an open one is not silently ignored either —
+        // the open PR is the live signal and wins.
+        assert_eq!(
+            stage(&[pr(PrStatus::Merged), building()], &Status::Frontier),
+            Stage::Building
+        );
+    }
+
+    #[test]
+    fn with_no_open_prs_a_merged_pr_means_done() {
+        // The work landed: done, whatever the ticket itself still says.
+        assert_eq!(
+            stage(&[pr(PrStatus::Merged)], &Status::Frontier),
+            Stage::Done
+        );
+        assert_eq!(
+            stage(&[pr(PrStatus::Merged)], &Status::Claimed),
+            Stage::Done
+        );
+        assert_eq!(stage(&[pr(PrStatus::Merged)], &Status::Done), Stage::Done);
+    }
+
+    #[test]
+    fn a_closed_unmerged_pr_is_no_evidence_at_all() {
+        // Abandoned PRs neither advance nor hold the node: fall through to
+        // ticket state as if they were never linked.
+        assert_eq!(
+            stage(&[pr(PrStatus::Closed)], &Status::Frontier),
+            Stage::Ready
+        );
+        assert_eq!(
+            stage(&[pr(PrStatus::Closed)], &Status::Claimed),
+            Stage::Building
+        );
+    }
+
+    #[test]
+    fn with_no_prs_stage_derives_from_ticket_state() {
+        // The decision-node half of the lattice: ready (open, unblocked,
+        // unclaimed) / in progress (claimed — the building slot) / done.
+        assert_eq!(stage(&[], &Status::Frontier), Stage::Ready);
+        assert_eq!(stage(&[], &Status::Claimed), Stage::Building);
+        assert_eq!(stage(&[], &Status::Done), Stage::Done);
+        // A blocked node's work has not begun, so its stage is ready — the
+        // glyph column overrides with ⊘ and enter refuses it, but blocked is
+        // status, not a sixth stage.
+        assert_eq!(
+            stage(&[], &Status::Blocked { needs: vec![7] }),
+            Stage::Ready
+        );
+    }
+
+    #[test]
+    fn the_glyph_column_shows_the_stage_with_blocked_overriding() {
+        // The five stage glyphs (#62)…
+        assert_eq!(RowGlyph::Stage(Stage::Ready).char(), '○');
+        assert_eq!(RowGlyph::Stage(Stage::Building).char(), '◐');
+        assert_eq!(RowGlyph::Stage(Stage::InReview).char(), '◍');
+        assert_eq!(RowGlyph::Stage(Stage::NeedsAttention).char(), '!');
+        assert_eq!(RowGlyph::Stage(Stage::Done).char(), '●');
+        // …and the blocked override: whatever the PRs say, a blocked node's
+        // stage is unactionable and the column says so.
+        assert_eq!(RowGlyph::Blocked.char(), '⊘');
+        let mut blocked = Ticket {
+            repo: "blooop/wayfinder".to_string(),
+            number: 7,
+            title: "t7".to_string(),
+            status: Status::Blocked { needs: vec![6] },
+            ticket_type: TicketType::Build,
+            blocked_by: vec![6],
+            prs: vec![open_pr(Checks::Failing, Review::NotRequired)],
+        };
+        assert_eq!(RowGlyph::of(&blocked), RowGlyph::Blocked);
+        // The same ticket unblocked reads as its PR's stage.
+        blocked.status = Status::Frontier;
+        assert_eq!(
+            RowGlyph::of(&blocked),
+            RowGlyph::Stage(Stage::NeedsAttention)
+        );
+    }
+
+    #[test]
+    fn pr_state_dominates_ticket_state_when_present() {
+        // Two derivation sources, one type — a prototype's PR counts (#61),
+        // and even a *closed* ticket with an open PR reads as that PR's stage.
+        assert_eq!(
+            stage(&[open_pr(Checks::Passing, Review::Approved)], &Status::Done),
+            Stage::InReview
+        );
+        assert_eq!(
+            stage(
+                &[open_pr(Checks::Failing, Review::NotRequired)],
+                &Status::Claimed
+            ),
+            Stage::NeedsAttention
         );
     }
 

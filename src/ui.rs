@@ -13,15 +13,20 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Overlay, Scope};
-use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, Status, Ticket};
-use crate::view::{GroupKind, Item, Plan, Screen};
+use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
+use crate::view::{Fold, GroupKind, Item, Plan, Screen};
 
-fn glyph_style(status: &Status) -> Style {
-    match status {
-        Status::Frontier => Style::new().fg(Color::Green),
-        Status::Claimed => Style::new().fg(Color::Yellow),
-        Status::Blocked { .. } => Style::new().fg(Color::Red),
-        Status::Done => Style::new().add_modifier(Modifier::DIM),
+/// One colour per glyph meaning, shared by the row column and the rollup
+/// pairs: calm colours for the flowing stages, red for the two that demand
+/// someone (`!` act, `⊘` unblock), dim for what is finished.
+fn glyph_style(glyph: RowGlyph) -> Style {
+    match glyph {
+        RowGlyph::Stage(Stage::Ready) => Style::new().fg(Color::Green),
+        RowGlyph::Stage(Stage::Building) => Style::new().fg(Color::Yellow),
+        RowGlyph::Stage(Stage::InReview) => Style::new().fg(Color::Magenta),
+        RowGlyph::Stage(Stage::NeedsAttention) => Style::new().fg(Color::Red),
+        RowGlyph::Stage(Stage::Done) => Style::new().add_modifier(Modifier::DIM),
+        RowGlyph::Blocked => Style::new().fg(Color::Red),
     }
 }
 
@@ -150,14 +155,14 @@ fn ticket_line(
     } else {
         format!("  {prefix}")
     };
+    // The glyph column is the node's stage, `⊘` overriding when it is blocked
+    // (#61/#62) — one sum type, so the row and the rollups share meanings.
+    let glyph = RowGlyph::of(ticket);
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(indent, FURNITURE),
         cursor_span(under_cursor),
-        Span::styled(
-            ticket.status.glyph().to_string(),
-            glyph_style(&ticket.status),
-        ),
+        Span::styled(glyph.char().to_string(), glyph_style(glyph)),
         Span::raw(format!(" {repo}#{} {}", ticket.number, ticket.title)),
     ];
     if let Some(name) = ticket.ticket_type.short_name() {
@@ -191,25 +196,42 @@ pub fn body_lines(app: &App) -> Vec<Line<'static>> {
 
 /// A collapsible group's line (#57): the cursor column, a `▸`/`▾` fold marker
 /// where a ticket row's tree furniture would be, then the count it is holding.
-/// It says `(hidden)` only while shut — once open, the rows are right there and
-/// claiming otherwise would be a lie.
-fn group_line(kind: GroupKind, hidden: usize, expanded: bool, under_cursor: bool) -> Line<'static> {
-    let fold = if expanded { '▾' } else { '▸' };
+/// It says `(hidden)` — and carries the stage rollup of what that is (#61) —
+/// only while shut: once open, the rows are right there and claiming otherwise
+/// would be a lie.
+fn group_line(kind: GroupKind, hidden: usize, fold: &Fold, under_cursor: bool) -> Line<'static> {
+    let marker = match fold {
+        Fold::Open => '▾',
+        Fold::Shut { .. } => '▸',
+    };
     let (glyph, label, color) = match kind {
         GroupKind::BlockedDeeper => ('⊘', "blocked deeper down", Color::Red),
         GroupKind::Done => ('●', "done", Color::Reset),
     };
-    let tail = if expanded { "" } else { " (hidden)" };
-    Line::from(vec![
+    let mut spans = vec![
         Span::raw("  "),
         cursor_span(under_cursor),
-        Span::styled(format!("{fold} "), FURNITURE),
+        Span::styled(format!("{marker} "), FURNITURE),
         Span::styled(glyph.to_string(), Style::new().fg(color)),
         Span::styled(
-            format!(" {hidden} {label}{tail}"),
+            format!(" {hidden} {label}"),
             Style::new().add_modifier(Modifier::DIM),
         ),
-    ])
+    ];
+    if let Fold::Shut { rollup } = fold {
+        spans.push(Span::styled(
+            " (hidden)".to_string(),
+            Style::new().add_modifier(Modifier::DIM),
+        ));
+        for (glyph, count) in rollup {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                format!("{}{count}", glyph.char()),
+                glyph_style(*glyph),
+            ));
+        }
+    }
+    Line::from(spans)
 }
 
 /// [`body_lines`] plus which line the cursor landed on — what the draw scrolls
@@ -257,13 +279,9 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                     under_cursor,
                 ));
             }
-            Item::Group {
-                id,
-                hidden,
-                expanded,
-            } => {
+            Item::Group { id, hidden, fold } => {
                 let (_, under_cursor) = mark(&lines, &mut cursor_line);
-                lines.push(group_line(id.kind, *hidden, *expanded, under_cursor));
+                lines.push(group_line(id.kind, *hidden, fold, under_cursor));
             }
             Item::Blank => lines.push(Line::default()),
         }
@@ -439,28 +457,45 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     frame.render_widget(body, body_area);
 
-    // The load hint, the failure note, and the idle count share one dim
-    // segment, and any of them can be live at once; empty ones drop out
-    // rather than leaving gaps.
-    let status = [app.startup.hint(), failure_note(app), idle_note(&plan)]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut count_spans = vec![
-        Span::raw(format!("  {}/{}", app.visible().len(), app.scoped().len())),
-        Span::styled(
-            format!("  {status}"),
-            Style::new().add_modifier(Modifier::DIM),
-        ),
-    ];
-    if let Some(notice) = &app.notice {
-        count_spans.push(Span::styled(
-            format!("   {notice}"),
-            Style::new().add_modifier(Modifier::DIM),
-        ));
+    // The count line's slot is shared: while a launch is staged (#62) the
+    // launch line lives there instead — the resolved route, the ticket it
+    // launches, and the mode text as it is typed.
+    if let Overlay::LaunchLine { staged, text } = &app.overlay {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("  → {}", staged.route.label()),
+                    Style::new().fg(Color::Cyan),
+                ),
+                Span::raw(format!(" · #{} {}  {text}", staged.ticket, staged.title)),
+                Span::styled("█", Style::new().add_modifier(Modifier::DIM)),
+            ])),
+            count_area,
+        );
+    } else {
+        // The load hint, the failure note, and the idle count share one dim
+        // segment, and any of them can be live at once; empty ones drop out
+        // rather than leaving gaps.
+        let status = [app.startup.hint(), failure_note(app), idle_note(&plan)]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut count_spans = vec![
+            Span::raw(format!("  {}/{}", app.visible().len(), app.scoped().len())),
+            Span::styled(
+                format!("  {status}"),
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+        ];
+        if let Some(notice) = &app.notice {
+            count_spans.push(Span::styled(
+                format!("   {notice}"),
+                Style::new().add_modifier(Modifier::DIM),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(count_spans)), count_area);
     }
-    frame.render_widget(Paragraph::new(Line::from(count_spans)), count_area);
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -675,6 +710,82 @@ mod tests {
         assert!(screen.contains("⇄ PR dotfiles#12 open ✗"), "{screen}");
         // ✓ only when nothing is outstanding.
         assert!(screen.contains("⇄ PR#13 open ✓"), "{screen}");
+    }
+
+    #[test]
+    fn stage_glyphs_follow_the_prs_on_the_row() {
+        // The status column *is* the stage column now (#61/#62): an approved
+        // open PR reads ◍ in review, failing checks read ! needs attention —
+        // whatever the ticket's own state says.
+        let mut map = wf_map();
+        map.tickets
+            .iter_mut()
+            .find(|t| t.number == 6)
+            .expect("#6")
+            .prs = vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 90,
+            status: PrStatus::Open {
+                checks: Checks::Passing,
+                review: Review::Approved,
+            },
+        }];
+        map.tickets
+            .iter_mut()
+            .find(|t| t.number == 9)
+            .expect("#9")
+            .prs = vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 91,
+            status: PrStatus::Open {
+                checks: Checks::Failing,
+                review: Review::NotRequired,
+            },
+        }];
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        let screen = render(&App::new(clusters));
+        assert!(screen.contains("◍ #6 Re-entry breadcrumbs"), "{screen}");
+        assert!(screen.contains("! #9 Main screen design"), "{screen}");
+        // Blocked still overrides whatever stage lies beneath.
+        assert!(screen.contains("⊘ #7 Supervising AFK agents"), "{screen}");
+    }
+
+    #[test]
+    fn a_shut_group_line_carries_its_stage_rollup() {
+        // Done ticket #2's PR is still open with pending checks: the shut
+        // group says so as a glyph+count pair, so a closed-but-unlanded branch
+        // is watched at a glance without opening it.
+        let mut map = wf_map();
+        map.tickets
+            .iter_mut()
+            .find(|t| t.number == 2)
+            .expect("#2")
+            .prs = vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 92,
+            status: PrStatus::Open {
+                checks: Checks::Pending,
+                review: Review::Required,
+            },
+        }];
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        let mut app = App::new(clusters);
+        let screen = render(&app);
+        assert!(screen.contains("● 1 done (hidden) ◐1"), "{screen}");
+
+        // Open, the rollup leaves with "(hidden)": the row is right there.
+        while !matches!(app.cursor_stop(), Some(crate::view::Stop::Group(_))) {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let screen = render(&app);
+        let done_line = screen
+            .lines()
+            .find(|l| l.contains("done"))
+            .expect("the group line");
+        assert!(!done_line.contains("◐1"), "{screen}");
     }
 
     #[test]
@@ -919,7 +1030,8 @@ mod tests {
     #[test]
     fn the_checkout_picker_floats_over_the_list_with_one_row_per_tree() {
         let mut app = launchable_app();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // stage
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // resolve
         let screen = render(&app);
         assert!(
             screen.contains("which checkout runs wayfinder#6?"),
@@ -928,6 +1040,37 @@ mod tests {
         assert!(screen.contains("▶ /data/k1/wayfinder"), "{screen}");
         assert!(screen.contains("/data/k2/wayfinder"), "{screen}");
         assert!(screen.contains("esc cancel"));
+    }
+
+    #[test]
+    fn the_launch_line_replaces_the_count_line_and_shows_the_route() {
+        let mut app = fixture_app();
+        let screen = render(&app);
+        assert!(screen.contains("5/5"), "{screen}");
+
+        // Enter on #6 (a task at ready): the line opens where the count was,
+        // naming the resolved route and the ticket it launches.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(
+            screen.contains("→ /wayfinder · #6 Re-entry breadcrumbs"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("5/5"),
+            "the count line is replaced: {screen}"
+        );
+
+        // The typed mode shows on the line as it accumulates.
+        type_str(&mut app, "defer something");
+        let screen = render(&app);
+        assert!(screen.contains("defer something"), "{screen}");
+
+        // Esc gives the count line back.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("5/5"), "{screen}");
+        assert!(!screen.contains("→ /wayfinder"), "{screen}");
     }
 
     #[test]
