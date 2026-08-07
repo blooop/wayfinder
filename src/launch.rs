@@ -9,6 +9,13 @@
 //! is still not supervised here — a deferred launch is the same exec with
 //! ` defer` in the prompt, watched from another terminal or not at all.
 //!
+//! A checkout that declares a devcontainer runs that same agent *inside* it,
+//! by way of `dl` ([`Isolation`], #80): `wf` owns which ticket, which checkout,
+//! which skill and which prompt, and `dl` owns the container, its lifecycle and
+//! its credentials. The seam is the checkout **path** — never `owner/repo@branch`,
+//! which would send `dl` off to clone a second tree and abandon the one the
+//! human picked.
+//!
 //! The one thing that can go wrong is ordering: the terminal must be restored
 //! *before* the image is replaced, because after that there is no `wf` left to
 //! do it. So this module never restores anything and never `exec`s itself off
@@ -168,6 +175,89 @@ impl Staged {
     }
 }
 
+/// Where the agent runs: on the host, as `wf` always has, or inside the
+/// checkout's own devcontainer by way of `dl` (#80).
+///
+/// Two states, not three: there is no "wanted isolation but could not get it".
+/// [`Isolation::detect`] is total — it answers with what will actually happen,
+/// so a launch cannot carry an intention the exec then fails to honour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Isolation {
+    /// No devcontainer in the checkout, or no `dl` on PATH: `claude` runs in
+    /// the checkout directly.
+    Host,
+    /// `dl <checkout> -- claude …`: the agent runs in the container the repo's
+    /// own `devcontainer.json` describes.
+    Devlaunch,
+}
+
+/// The devcontainer configs `wf` looks for — the two locations the
+/// devcontainer spec puts a *default* config in.
+///
+/// A variant-only layout (`.devcontainer/<name>/devcontainer.json` with no
+/// default) is deliberately absent: picking among variants would be `wf`
+/// choosing a container shape, and `wf` has no basis to choose. Those repos
+/// run on the host until someone decides how the variant is named.
+const DEVCONTAINER_CONFIGS: [&str; 2] = [".devcontainer/devcontainer.json", ".devcontainer.json"];
+
+/// The container front door, found on PATH like every other tool `wf` uses.
+const DEVLAUNCH: &str = "dl";
+
+impl Isolation {
+    /// Which environment `checkout` will actually get.
+    ///
+    /// Both halves are required, and a missing `dl` **degrades to the host**
+    /// rather than refusing the launch: a repo may carry a `devcontainer.json`
+    /// for its editor users on a machine that has never heard of `dl`, and
+    /// isolation here is for dependencies, not security (#73), so the host is
+    /// a worse environment rather than an unsafe one. The launch notice names
+    /// the mode ([`Launch::describe`]), so the degradation is visible.
+    pub fn detect(checkout: &Path) -> Isolation {
+        if has_devcontainer(checkout) && resolve_on_path(DEVLAUNCH).is_ok() {
+            Isolation::Devlaunch
+        } else {
+            Isolation::Host
+        }
+    }
+
+    /// How the mode reads on screen — the launch notice and the checkout
+    /// picker, which is where two trees of one repo can differ. The host is
+    /// the default and says nothing; anything else has to announce itself.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Isolation::Host => "",
+            Isolation::Devlaunch => " (devlaunch)",
+        }
+    }
+}
+
+/// Whether `checkout` declares a devcontainer `wf` can hand to `dl` as-is.
+///
+/// Existence only — `wf` never reads a `devcontainer.json`, never parses its
+/// JSONC and never rewrites it (#73). What is inside is the repo's business.
+fn has_devcontainer(checkout: &Path) -> bool {
+    DEVCONTAINER_CONFIGS
+        .iter()
+        .any(|rel| checkout.join(rel).is_file())
+}
+
+/// Wrap one argument so a POSIX shell hands it back unchanged.
+///
+/// Needed because `dl <ws> -- <cmd>` is a **shell command, not an argv**: `dl`
+/// joins everything after `--` with spaces and gives the single string to
+/// `devpod ssh --command`, which runs it through a shell inside the container.
+/// So [`Launch::agent_argv`]'s one-argv-entry-per-prompt invariant does not
+/// survive the trip on its own — unquoted, `/wayfinder 67 80` would arrive as
+/// three arguments.
+///
+/// Single quotes, uniformly, because inside them a POSIX shell interprets
+/// nothing at all; the one thing they cannot hold is a single quote, which
+/// closes, escapes and reopens. Quoting every argument rather than only the
+/// ones that "need" it keeps this total — there is no predicate to get wrong.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
 /// A fully-resolved launch: which checkout the agent runs in, which ticket of
 /// which map it is handed, and — since the two-step (#62) — which skill it
 /// runs ([`Route`]) and in what mode ([`LaunchMode`]).
@@ -193,6 +283,8 @@ pub struct Launch {
     route: Route,
     /// What the launch line said: interactive, deferred, steered.
     mode: LaunchMode,
+    /// Host or container, decided from the checkout at [`plan`] time (#80).
+    isolation: Isolation,
 }
 
 /// Agent sessions are started from a picker rather than from a shell someone is
@@ -211,16 +303,27 @@ impl Launch {
         format!("{}#{}", short_repo(&self.repo), self.ticket)
     }
 
-    /// One-line description for the notice: what is being launched, and where.
-    pub fn describe(&self) -> String {
-        format!("{} in {}", self.key(), self.cwd.display())
+    /// Where this launch's agent runs.
+    pub fn isolation(&self) -> Isolation {
+        self.isolation
     }
 
-    /// What `wf` becomes. `claude` takes a single positional prompt, so the
+    /// One-line description for the notice: what is being launched, where, and
+    /// — when it is not the host default — in what.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} in {}{}",
+            self.key(),
+            self.cwd.display(),
+            self.isolation.suffix()
+        )
+    }
+
+    /// The agent itself. `claude` takes a single positional prompt, so the
     /// slash command, its arguments and the mode suffix are one argv entry,
     /// not several. Only `/wayfinder` takes the map argument — `/tdd` and
     /// `/review` resolve the repo from the checkout they run in.
-    pub fn agent_argv(&self) -> Vec<String> {
+    fn claude_argv(&self) -> Vec<String> {
         let prompt = match self.route {
             Route::Tdd | Route::Review => format!("{} {}", self.route.label(), self.ticket),
             Route::Wayfinder => format!("/wayfinder {} {}", self.map_issue, self.ticket),
@@ -232,8 +335,35 @@ impl Launch {
         ]
     }
 
-    /// Become the agent: replace `wf`'s process image with `claude`, in the
-    /// checkout.
+    /// What `wf` becomes: the agent, or `dl` carrying the agent into the
+    /// container.
+    ///
+    /// The isolated form hands `dl` the checkout **path** — the tree the human
+    /// picked — rather than `owner/repo@branch`, which `dl` would answer by
+    /// cloning a second copy under its own cache and running the agent in
+    /// *that*. The path is a plain argv entry to `dl` and needs no quoting; the
+    /// agent command that follows `--` does, because `dl` runs it through a
+    /// shell (every argument is single-quoted), and it is one entry rather than several
+    /// because "a shell command" is exactly what `dl` documents it to be.
+    pub fn agent_argv(&self) -> Vec<String> {
+        let agent = self.claude_argv();
+        match self.isolation {
+            Isolation::Host => agent,
+            Isolation::Devlaunch => vec![
+                DEVLAUNCH.to_string(),
+                self.cwd.display().to_string(),
+                "--".to_string(),
+                agent
+                    .iter()
+                    .map(|arg| shell_quote(arg))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ],
+        }
+    }
+
+    /// Become the agent: replace `wf`'s process image with `claude` — or with
+    /// the `dl` that carries it into the container — in the checkout.
     ///
     /// Returns **only** on failure — on success there is no `wf` left to return
     /// to, which is why the return type is a bare error rather than a `Result`
@@ -302,6 +432,11 @@ impl Launch {
 ///
 /// A name containing a separator is a path already and is taken as given —
 /// that is the caller naming a file, not `$PATH` resolution.
+///
+/// Two callers, and the difference matters: [`Launch::exec`] resolves the
+/// program it is about to become and reports the miss, while
+/// [`Isolation::detect`] only asks whether `dl` is there and quietly answers
+/// [`Isolation::Host`] when it is not.
 fn resolve_on_path(program: &str) -> Result<PathBuf, anyhow::Error> {
     if program.contains('/') {
         return Ok(PathBuf::from(program));
@@ -311,7 +446,7 @@ fn resolve_on_path(program: &str) -> Result<PathBuf, anyhow::Error> {
         .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
-        .ok_or_else(|| anyhow::anyhow!("`{program}` is not on PATH — is the agent CLI installed?"))
+        .ok_or_else(|| anyhow::anyhow!("`{program}` is not on PATH — is it installed?"))
 }
 
 /// The name half of a repo slug (`blooop/wayfinder` → `wayfinder`). Display
@@ -346,6 +481,12 @@ pub enum Targets {
 /// never prompts. The route and mode arrive already settled — this function
 /// only answers *where* the agent can run.
 ///
+/// Isolation is decided **here**, per candidate, rather than at the exec: a
+/// checkout that has a devcontainer and one that does not can both be
+/// candidates for the same ticket, the notice has to say which is which before
+/// the human picks, and by the exec there is nothing left to tell them with.
+/// It is the one filesystem read in this module's otherwise pure planning path.
+///
 /// # Panics
 ///
 /// Never: the `expect` in the one-candidate arm is guarded by the `match` on
@@ -360,6 +501,7 @@ pub fn plan(checkouts: &[Checkout], staged: &Staged, mode: &LaunchMode) -> Targe
             cwd: c.path.clone(),
             route: staged.route,
             mode: mode.clone(),
+            isolation: Isolation::detect(&c.path),
         })
         .collect();
     match launches.len() {
@@ -634,6 +776,146 @@ mod tests {
             TicketType::Untyped,
         ] {
             assert_eq!(route(ticket_type, Stage::Done), None, "{ticket_type:?}");
+        }
+    }
+
+    /// A scratch directory of our own, removed by the test that made it. No
+    /// `tempfile` dependency for three tests that need a path to exist.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir =
+                std::env::temp_dir().join(format!("wf-isolation-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Scratch(dir)
+        }
+
+        /// Create `rel` (and its parents) as an empty file.
+        fn touch(&self, rel: &str) {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("parents");
+            std::fs::write(&path, "").expect("touch");
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_checkout_declares_isolation_by_carrying_a_default_devcontainer_config() {
+        // Both spec locations count, and only files — a `.devcontainer/`
+        // directory with no config in it is not a declaration.
+        let bare = Scratch::new("bare");
+        assert!(!has_devcontainer(&bare.0));
+        bare.touch(".devcontainer/README.md");
+        assert!(!has_devcontainer(&bare.0));
+
+        let nested = Scratch::new("nested");
+        nested.touch(".devcontainer/devcontainer.json");
+        assert!(has_devcontainer(&nested.0));
+
+        let top = Scratch::new("top");
+        top.touch(".devcontainer.json");
+        assert!(has_devcontainer(&top.0));
+
+        // A variant-only layout is deliberately not a declaration: `wf` would
+        // have to choose the variant, and it has no basis to.
+        let variants = Scratch::new("variants");
+        variants.touch(".devcontainer/gpu/devcontainer.json");
+        assert!(!has_devcontainer(&variants.0));
+    }
+
+    #[test]
+    fn a_checkout_without_a_devcontainer_runs_on_the_host_whatever_is_on_path() {
+        // The other half — a devcontainer but no `dl` — is the degradation
+        // path, and it is what every other test in this module exercises by
+        // running on a machine that may or may not have `dl`. This direction is
+        // the one that must hold unconditionally.
+        let bare = Scratch::new("host");
+        assert_eq!(Isolation::detect(&bare.0), Isolation::Host);
+        assert_eq!(
+            plan_wf(&cache(), &ticket("blooop/wayfinder", 16), 1),
+            plan_wf(&cache(), &ticket("blooop/wayfinder", 16), 1)
+        );
+        // The cache's paths do not exist, so nothing in this module's planning
+        // tests can be anything but Host.
+        match plan_wf(&cache(), &ticket("blooop/wayfinder", 16), 1) {
+            Targets::One(launch) => assert_eq!(launch.isolation(), Isolation::Host),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The same launch, forced into a container — the fields are private and
+    /// `plan` reads the real filesystem, so a test that wants the isolated
+    /// shape builds it here rather than arranging a `dl` on PATH.
+    fn isolated(route: Route, mode: LaunchMode) -> Launch {
+        Launch {
+            repo: "blooop/wayfinder".to_string(),
+            ticket: 80,
+            map_issue: 67,
+            cwd: PathBuf::from("/data/proj/wayfinder"),
+            route,
+            mode,
+            isolation: Isolation::Devlaunch,
+        }
+    }
+
+    #[test]
+    fn an_isolated_launch_hands_dl_the_checkout_path_and_a_quoted_shell_command() {
+        // `dl` joins everything after `--` and runs it through a shell in the
+        // container, so the prompt has to arrive already quoted or it lands as
+        // three arguments. The path is a plain argv entry to `dl` itself and is
+        // not quoted — and it is a path, never `owner/repo@branch`, which would
+        // send `dl` off to clone a second tree.
+        assert_eq!(
+            isolated(Route::Wayfinder, LaunchMode::Interactive).agent_argv(),
+            vec![
+                "dl".to_string(),
+                "/data/proj/wayfinder".to_string(),
+                "--".to_string(),
+                "'claude' '--dangerously-skip-permissions' '/wayfinder 67 80'".to_string(),
+            ]
+        );
+        // The mode suffix rides inside the same quoted argument.
+        assert_eq!(
+            isolated(Route::Wayfinder, LaunchMode::Deferred).agent_argv()[3],
+            "'claude' '--dangerously-skip-permissions' '/wayfinder 67 80 defer'"
+        );
+    }
+
+    #[test]
+    fn steering_text_cannot_break_out_of_the_shell_command() {
+        // The one string a user types that reaches a shell. A single quote
+        // closes, escapes, reopens — the argument stays one argument.
+        let launch = isolated(
+            Route::Tdd,
+            LaunchMode::Steered("don't touch the CI; rm -rf /".to_string()),
+        );
+        assert_eq!(
+            launch.agent_argv()[3],
+            r"'claude' '--dangerously-skip-permissions' '/tdd 80 steer: don'\''t touch the CI; rm -rf /'"
+        );
+        // Every metacharacter a shell would otherwise act on is inside quotes.
+        assert_eq!(shell_quote("a b|c;d&e$f`g"), "'a b|c;d&e$f`g'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn the_notice_names_the_container_when_there_is_one_and_stays_quiet_otherwise() {
+        assert_eq!(
+            isolated(Route::Wayfinder, LaunchMode::Interactive).describe(),
+            "wayfinder#80 in /data/proj/wayfinder (devlaunch)"
+        );
+        match plan_wf(&cache(), &ticket("blooop/wayfinder", 80), 67) {
+            Targets::One(launch) => {
+                assert_eq!(launch.describe(), "wayfinder#80 in /data/proj/wayfinder");
+            }
+            other => panic!("{other:?}"),
         }
     }
 

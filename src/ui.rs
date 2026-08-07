@@ -433,11 +433,18 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     let mut lines = vec![Line::default()];
     for (i, launch) in launches.iter().enumerate() {
         let marker = if i == *cursor { '▶' } else { ' ' };
+        // Two trees of one repo can differ in what the agent will run in —
+        // one carrying a devcontainer and one not — so the choice has to say
+        // so here, where it is being made, not only in the notice after (#80).
         lines.push(Line::from(vec![
             Span::raw(format!("  {marker} ")),
             Span::styled(
                 launch.cwd().display().to_string(),
                 Style::new().fg(Color::Cyan),
+            ),
+            Span::styled(
+                launch.isolation().suffix(),
+                Style::new().add_modifier(Modifier::DIM),
             ),
         ]));
     }
