@@ -75,10 +75,11 @@ Only repos with an open `wayfinder:map`-labelled issue show tickets; other
 checkouts stay cached but hidden.
 
 **Every open map renders as its own cluster** — a `▌ repo · map title` header
-carrying the per-**status** counts (`○` frontier `◐` claimed `⊘` blocked `●`
-done). Those are the ticket's own state, not the stage its rows draw below.
-A repo can keep several maps open at once and each gets its own cluster;
-focusing a project shows all of them.
+carrying the map's **stage** counts, in the same glyph vocabulary the rows
+below it use (`○ ◐ ◍ ! ● ⊘`, described under the leading glyph). A stage the
+map has nobody in is left out rather than shown as a zero. A repo can keep
+several maps open at once and each gets its own cluster; focusing a project
+shows all of them.
 
 **Clusters are ordered by activity, with finished maps last**: the map issue
 touched most recently sits at the top, and a map whose every ticket is done
@@ -130,7 +131,7 @@ descend and the depth axis is something you can see:
 ```
 
 Orange because it is the one hue the screen does not otherwise spend — cyan is
-cluster headers and the prompt, green/yellow/red the status glyphs and counts,
+cluster headers and the prompt, green/yellow/red the stage glyphs and counts,
 magenta the PR badges, dim everything settled — so the selection never competes
 with something that means something else. The branch furniture stays uniformly
 dim: it is structure, not status.
@@ -145,6 +146,13 @@ the cursor on one and `→` opens it in place (`▾`), listing what it held as r
 you can select and launch, and `←` shuts it again — so nothing is ever merely a
 number you cannot reach. A map with nothing takeable
 leaves the body entirely, counted on the bottom line as `· N idle maps hidden`.
+
+**A row that heads a branch carries the same rollup of what is beneath it**,
+written `(beneath) ⊘2` at the end of the line — so a takeable ticket says the
+shape of what taking it unlocks without your reading the subtree. A node is
+counted once however many times the tree drew it: the leverage view draws a
+dependent under every root that unblocks it, so a diamond in the DAG genuinely
+renders one ticket twice inside a single branch.
 
 **`tab` shows the structure forest** instead: the whole blocking DAG, done
 tickets dimmed in place. A ticket's tree parent is its lowest-numbered in-map

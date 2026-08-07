@@ -15,7 +15,7 @@ use ratatui::Frame;
 use crate::app::{App, Overlay, Scope};
 use crate::launch::Launch;
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
-use crate::view::{Fold, GroupKind, Item, Plan, Screen};
+use crate::view::{Branch, Fold, GroupKind, Item, Plan, Screen};
 
 /// One colour per glyph meaning, shared by the row column and the rollup
 /// pairs: calm colours for the flowing stages, red for the two that demand
@@ -32,30 +32,52 @@ fn glyph_style(glyph: RowGlyph) -> Style {
     }
 }
 
-/// The cluster header: `▌ <repo> · <map title>  ○n ◐n ⊘n ●n`. The counts are
-/// the whole map's, not the query's — they describe the cluster's shape, and
-/// the group headers already carry `matched/total` while a query is live.
+/// The cluster header: `▌ <repo> · <map title>  ○n ◐n ◍n !n ●n ⊘n`. The counts
+/// are the whole map's, not the query's — they describe the cluster's shape,
+/// and the group headers already carry `matched/total` while a query is live.
+///
+/// They are **stage** counts (#78), tallied through the same [`RowGlyph`] the
+/// rows below are drawn from and coloured by the same [`glyph_style`]. The
+/// header used to keep its own four-status tally with its own glyph array and
+/// its own colour table, which meant the same characters said different things
+/// a line apart: a node the row drew `!` was counted under `○`, and `◍`/`!`
+/// could not appear here at all. Glyphs the map has nobody in drop out rather
+/// than showing a zero.
 fn cluster_header(id: &MapId, map: &Map) -> Line<'static> {
-    let [frontier, claimed, blocked, done] = map.counts();
-    let count_style = [
-        Style::new().fg(Color::Green),
-        Style::new().fg(Color::Yellow),
-        Style::new().fg(Color::Red),
-        Style::new().add_modifier(Modifier::DIM),
-    ];
-    let glyphs = ['○', '◐', '⊘', '●'];
     let mut spans = vec![Span::styled(
         format!("▌ {} · {}", id.short_repo(), map.title),
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )];
-    for (i, count) in [frontier, claimed, blocked, done].into_iter().enumerate() {
+    for (glyph, count) in map.tally() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            format!("{}{count}", glyphs[i]),
-            count_style[i],
+            format!("{}{count}", glyph.char()),
+            glyph_style(glyph),
         ));
     }
     Line::from(spans)
+}
+
+/// A rollup's trailing spans: a dim word for what the counts are *of*, then
+/// the glyph+count pairs in display order, each in the colour its glyph means.
+///
+/// One function, because a collapsed group and a branch root are asking the
+/// same question of different sets of rows — what is under here, by stage — and
+/// two renderings of one answer is how the screen ended up speaking two glyph
+/// vocabularies in the first place (#78).
+fn rollup_spans(label: &str, rollup: &[(RowGlyph, usize)]) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        format!(" ({label})"),
+        Style::new().add_modifier(Modifier::DIM),
+    )];
+    for &(glyph, count) in rollup {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("{}{count}", glyph.char()),
+            glyph_style(glyph),
+        ));
+    }
+    spans
 }
 
 /// The cursor marker, which sits **after** a row's tree furniture and directly
@@ -79,7 +101,7 @@ fn cursor_span(under_cursor: bool) -> Span<'static> {
 
 /// The marker's colour: orange, and deliberately not one of the six the screen
 /// already spends — cyan on cluster headers and the prompt, green/yellow/red on
-/// the status glyphs and counts, magenta on PR badges, dim on everything
+/// the stage glyphs and counts, magenta on PR badges, dim on everything
 /// settled. A selection drawn in any of those competes with something that means
 /// something else, which is how the cursor got hard to find in the first place.
 ///
@@ -138,10 +160,16 @@ fn pr_badge(ticket_repo: &str, pr: &PrLink) -> Vec<Span<'static>> {
 /// extra blocking edges the tree position cannot show (`⤷ also needs #n`). The
 /// flattened screen has no cluster header above the row, so the row names its
 /// repo itself.
+///
+/// A row that heads a branch closes with the stage rollup of it (#62), so the
+/// shape of a subtree reads off its root without walking the subtree — the
+/// same glyph+count pairs a collapsed group carries, because they mean the
+/// same thing.
 fn ticket_line(
     ticket: &Ticket,
     prefix: &str,
     also_needs: &[u64],
+    branch: &Branch,
     name_repo: bool,
     under_cursor: bool,
 ) -> Line<'static> {
@@ -183,6 +211,9 @@ fn ticket_line(
             Style::new().add_modifier(Modifier::DIM),
         ));
     }
+    if let Branch::Root { rollup } = branch {
+        spans.extend(rollup_spans("beneath", rollup));
+    }
     let style = match ticket.status {
         Status::Done => Style::new().add_modifier(Modifier::DIM),
         _ => Style::new(),
@@ -206,32 +237,36 @@ fn group_line(kind: GroupKind, hidden: usize, fold: &Fold, under_cursor: bool) -
         Fold::Open => '▾',
         Fold::Shut { .. } => '▸',
     };
-    let (glyph, label, color) = match kind {
-        GroupKind::BlockedDeeper => ('⊘', "blocked deeper down", Color::Red),
-        GroupKind::Done => ('●', "done", Color::Reset),
+    // The glyph is never written here: each group stands for one row meaning, so
+    // it names the [`RowGlyph`] and lets that type say which character it draws
+    // (#78). Only the style is a local decision.
+    let (glyph, label, style) = match kind {
+        GroupKind::BlockedDeeper => (
+            RowGlyph::Blocked,
+            "blocked deeper down",
+            glyph_style(RowGlyph::Blocked),
+        ),
+        // Deliberately not [`glyph_style`]'s DIM: that dims a *tally* of finished
+        // rows, and this is a heading for a group you can open — the count beside
+        // it is already dim, and dimming the glyph too would sink the line.
+        GroupKind::Done => (
+            RowGlyph::Stage(Stage::Done),
+            "done",
+            Style::new().fg(Color::Reset),
+        ),
     };
     let mut spans = vec![
         Span::raw("  "),
         cursor_span(under_cursor),
         Span::styled(format!("{marker} "), FURNITURE),
-        Span::styled(glyph.to_string(), Style::new().fg(color)),
+        Span::styled(glyph.char().to_string(), style),
         Span::styled(
             format!(" {hidden} {label}"),
             Style::new().add_modifier(Modifier::DIM),
         ),
     ];
     if let Fold::Shut { rollup } = fold {
-        spans.push(Span::styled(
-            " (hidden)".to_string(),
-            Style::new().add_modifier(Modifier::DIM),
-        ));
-        for (glyph, count) in rollup {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                format!("{}{count}", glyph.char()),
-                glyph_style(*glyph),
-            ));
-        }
+        spans.extend(rollup_spans("hidden", rollup));
     }
     Line::from(spans)
 }
@@ -270,6 +305,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                 row,
                 prefix,
                 also_needs,
+                branch,
                 depth: _,
             } => {
                 let (_, under_cursor) = mark(&lines, &mut cursor_line);
@@ -277,6 +313,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                     app.ticket(row),
                     prefix,
                     also_needs,
+                    branch,
                     name_repo,
                     under_cursor,
                 ));
@@ -601,8 +638,54 @@ mod tests {
     #[test]
     fn the_cluster_header_names_the_map_and_carries_the_counts() {
         let screen = render(&fixture_app());
+        // Glyph display order, the same one the rows and the rollups use:
+        // the stage lattice, then the blocked override after it.
         assert!(
-            screen.contains("▌ wayfinder · Map: wf  ○1  ◐1  ⊘2  ●1"),
+            screen.contains("▌ wayfinder · Map: wf  ○1  ◐1  ●1  ⊘2"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_cluster_header_counts_stages_not_statuses() {
+        // #6 is unblocked and unclaimed — `○` ready — until a PR with failing
+        // checks makes it needs-attention. The row already drew that as `!`;
+        // the header has to agree, because they are one vocabulary. Counting
+        // statuses instead sweeps it back under `○`, and `◍`/`!` could never
+        // appear in a header at all.
+        let mut map = wf_map();
+        map.tickets
+            .iter_mut()
+            .find(|t| t.number == 6)
+            .expect("#6 in the fixture")
+            .prs = vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 46,
+            status: PrStatus::Open {
+                checks: Checks::Failing,
+                review: Review::Required,
+            },
+        }];
+        // #9 is claimed with a passing, approved PR: in review — the other
+        // stage the four-status header had no glyph for.
+        map.tickets
+            .iter_mut()
+            .find(|t| t.number == 9)
+            .expect("#9 in the fixture")
+            .prs = vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 13,
+            status: PrStatus::Open {
+                checks: Checks::Passing,
+                review: Review::Approved,
+            },
+        }];
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        let screen = render(&App::new(clusters));
+        // ○0 is not drawn: the counts name the stages the map is actually in.
+        assert!(
+            screen.contains("▌ wayfinder · Map: wf  ◍1  !1  ●1  ⊘2"),
             "{screen}"
         );
     }
@@ -621,6 +704,17 @@ mod tests {
             .expect("#14 under #6");
         let root9 = screen.find("◐ #9 Main screen design").expect("root #9");
         assert!(root6 < sub7 && sub7 < sub14 && sub14 < root9, "{screen}");
+        // Each root closes with the stage rollup of the branch beneath it, in
+        // the same glyph vocabulary as the header above and the rows below:
+        // #6 unlocks #7 and #14, #9 unlocks #14 alone.
+        assert!(
+            screen.contains("#6 Re-entry breadcrumbs [task] (beneath) ⊘2"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("#9 Main screen design [task] (beneath) ⊘1"),
+            "{screen}"
+        );
         // Done work is a count, not rows; the group headers retired with #51.
         assert!(screen.contains("● 1 done (hidden)"), "{screen}");
         assert!(!screen.contains("Choose the stack"), "{screen}");

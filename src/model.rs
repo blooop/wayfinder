@@ -54,19 +54,6 @@ pub enum Status {
     Done,
 }
 
-impl Status {
-    /// Position of this status within the cluster header's counts
-    /// (frontier / claimed / blocked / done).
-    pub fn group(&self) -> usize {
-        match self {
-            Status::Frontier => 0,
-            Status::Claimed => 1,
-            Status::Blocked { .. } => 2,
-            Status::Done => 3,
-        }
-    }
-}
-
 /// Where a node stands in its lifecycle — one five-value lattice for every
 /// node (#61), **derived, never declared**: from its linked PRs when any are
 /// open or merged, from its ticket state otherwise. Blocked is deliberately
@@ -110,6 +97,22 @@ impl RowGlyph {
                 RowGlyph::Stage(stage(&ticket.prs, &ticket.status))
             }
         }
+    }
+
+    /// Tally a set of tickets by glyph: pairs in display order, one entry per
+    /// ticket, and glyphs nothing is in left out entirely.
+    ///
+    /// The one place counts-by-glyph is computed. Cluster headers and rollups
+    /// are the same question asked of different sets of tickets, so they are
+    /// the same call — a second tally would be a second glyph vocabulary, which
+    /// is exactly what #78 exists to remove.
+    pub fn tally<'a>(tickets: impl IntoIterator<Item = &'a Ticket>) -> Vec<(RowGlyph, usize)> {
+        let mut counts: std::collections::BTreeMap<RowGlyph, usize> =
+            std::collections::BTreeMap::new();
+        for ticket in tickets {
+            *counts.entry(RowGlyph::of(ticket)).or_default() += 1;
+        }
+        counts.into_iter().collect()
     }
 
     /// The character drawn: `○` ready · `◐` building/in progress · `◍` in
@@ -481,14 +484,11 @@ impl Map {
             .any(|t| !matches!(t.status, Status::Done))
     }
 
-    /// Ticket counts by status group (frontier / claimed / blocked / done) —
-    /// the cluster header's `○n ◐n ⊘n ●n`.
-    pub fn counts(&self) -> [usize; 4] {
-        let mut counts = [0; 4];
-        for t in &self.tickets {
-            counts[t.status.group()] += 1;
-        }
-        counts
+    /// The whole map tallied by glyph — the cluster header's counts (#78).
+    /// Stages, through the same [`RowGlyph`] the rows are drawn from, so a
+    /// ticket drawn `!` is counted under `!`.
+    pub fn tally(&self) -> Vec<(RowGlyph, usize)> {
+        RowGlyph::tally(&self.tickets)
     }
 }
 
@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_tally_the_four_status_groups() {
+    fn a_map_tallies_by_glyph_in_display_order() {
         let mut done = ticket(2, false, vec![]);
         done.status = Status::Done;
         let mut claimed = ticket(9, true, vec![]);
@@ -1062,6 +1062,14 @@ mod tests {
             last_activity: None,
             tickets: vec![ticket(6, true, vec![]), claimed, blocked, done],
         };
-        assert_eq!(map.counts(), [1, 1, 1, 1]);
+        assert_eq!(
+            map.tally(),
+            vec![
+                (RowGlyph::Stage(Stage::Ready), 1),
+                (RowGlyph::Stage(Stage::Building), 1),
+                (RowGlyph::Stage(Stage::Done), 1),
+                (RowGlyph::Blocked, 1),
+            ]
+        );
     }
 }

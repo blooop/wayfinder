@@ -119,6 +119,8 @@ pub enum Item {
         prefix: String,
         /// Forest only: in-map blockers beyond the primary parent.
         also_needs: Vec<u64>,
+        /// Whether this row heads a branch, and what is in it.
+        branch: Branch,
     },
     /// A collapsible group of held-back rows, always at depth 0 of its
     /// cluster. Carries what it is holding (`hidden`) and its [`Fold`], so
@@ -141,6 +143,30 @@ pub enum Item {
 pub enum Fold {
     Shut { rollup: Vec<(RowGlyph, usize)> },
     Open,
+}
+
+/// Whether a ticket row **heads a branch** — sits at the top of its cluster
+/// with a subtree drawn beneath it — and, only when it does, the stage rollup
+/// of that subtree (#62): glyph+count pairs in display order.
+///
+/// One entry per *node*, not per row. This is the place the double-count
+/// hazard actually lives: the leverage walk draws a dependent under every root
+/// that unblocks it, so a diamond in the DAG — two dependents of one root that
+/// both unblock the same ticket — genuinely renders that ticket twice inside
+/// the same branch. Counting rows would count it twice; counting the nodes the
+/// branch reached counts it once.
+///
+/// A row inside somebody else's subtree, and a top-level row with nothing
+/// beneath it, head no branch — so a rollup on either is unrepresentable
+/// rather than merely empty, the same shape [`Fold::Shut`] gives the collapsed
+/// groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Branch {
+    /// This row heads no branch: either a row inside another row's subtree, or
+    /// a top-level row with nothing drawn beneath it.
+    Plain,
+    /// A branch root, and the stage counts of what it drew beneath itself.
+    Root { rollup: Vec<(RowGlyph, usize)> },
 }
 
 /// The body, planned: the lines in on-screen order, plus how many in-scope
@@ -185,10 +211,56 @@ impl Plan {
 
 /// Plan the body for the clusters in scope, in their given (render) order.
 pub fn plan(clusters: &[(&MapId, &Map)], screen: Screen<'_>, expanded: &Expanded) -> Plan {
-    match screen {
+    let mut plan = match screen {
         Screen::Structured(Lens::Leverage) => leverage(clusters, expanded),
         Screen::Structured(Lens::Forest) => forest(clusters),
         Screen::Flattened { query } => flattened(clusters, query),
+    };
+    attach_rollups(&mut plan.items, clusters);
+    plan
+}
+
+/// Fill in each branch root's rollup, read off the rows the plan actually laid
+/// out.
+///
+/// A pass over the finished list rather than something the walks carry down:
+/// "what is beneath this row" is a fact about the *rendered* tree, and the
+/// rendered tree is exactly this list — so every screen gets the same answer
+/// from the same code, and there is no second notion of a subtree to drift
+/// from the one on screen. A top-level ticket row opens a branch and every
+/// deeper ticket row until the next top-level one is in it, each node kept
+/// once however many times the walk drew it. A header, a spacer, or a group
+/// line closes the open branch: the rows a group holds hang from the group,
+/// not from the last ticket above it.
+fn attach_rollups(items: &mut [Item], clusters: &[(&MapId, &Map)]) {
+    let maps: BTreeMap<&MapId, &Map> = clusters.iter().copied().collect();
+    let mut branches: Vec<(usize, Vec<Row>)> = Vec::new();
+    let mut open: Option<(usize, Vec<Row>)> = None;
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            Item::Ticket { depth: 0, .. } => {
+                branches.extend(open.replace((i, Vec::new())));
+            }
+            Item::Ticket { row, .. } => {
+                if let Some((_, beneath)) = &mut open {
+                    if !beneath.contains(row) {
+                        beneath.push(row.clone());
+                    }
+                }
+            }
+            Item::Header(_) | Item::Group { .. } | Item::Blank => branches.extend(open.take()),
+        }
+    }
+    branches.extend(open);
+
+    for (i, beneath) in branches {
+        if beneath.is_empty() {
+            continue;
+        }
+        let rollup = RowGlyph::tally(beneath.iter().map(|row| &maps[&row.map].tickets[row.index]));
+        if let Item::Ticket { branch, .. } = &mut items[i] {
+            *branch = Branch::Root { rollup };
+        }
     }
 }
 
@@ -225,6 +297,9 @@ fn ticket_item(
         depth,
         prefix,
         also_needs,
+        // Filled in by `attach_rollups` once the whole list exists: whether a
+        // row heads a branch is a property of the rows that follow it.
+        branch: Branch::Plain,
     }
 }
 
@@ -251,12 +326,8 @@ fn push_group(
     let fold = if is_expanded {
         Fold::Open
     } else {
-        let mut counts: BTreeMap<RowGlyph, usize> = BTreeMap::new();
-        for &index in held {
-            *counts.entry(RowGlyph::of(&map.tickets[index])).or_default() += 1;
-        }
         Fold::Shut {
-            rollup: counts.into_iter().collect(),
+            rollup: RowGlyph::tally(held.iter().map(|&index| &map.tickets[index])),
         }
     };
     items.push(Item::Group {
@@ -626,6 +697,23 @@ mod tests {
             .collect()
     }
 
+    /// Every top-level ticket row as (number, what it heads) — the branch
+    /// roots and what each says about the subtree drawn beneath it.
+    fn roots(plan: &Plan, m: &Map) -> Vec<(u64, Branch)> {
+        plan.items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Ticket {
+                    row,
+                    depth: 0,
+                    branch,
+                    ..
+                } => Some((m.tickets[row.index].number, branch.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn id() -> MapId {
         MapId::new("blooop/wayfinder", 47)
     }
@@ -896,6 +984,80 @@ mod tests {
             Fold::Shut {
                 rollup: vec![(RowGlyph::Blocked, 1)]
             }
+        );
+    }
+
+    #[test]
+    fn a_branch_root_carries_the_stage_rollup_of_its_subtree() {
+        // #6 unblocks blocked #7 and claimed #9; #20 is takeable and unblocks
+        // nothing. So #6 heads a branch and says what is in it, while #20 —
+        // and #9 in its own turn as a root — head nothing and say nothing.
+        let m = map(vec![
+            ticket(6, true, false, vec![]),
+            ticket(7, true, false, vec![6]),
+            ticket(9, true, true, vec![6]),
+            ticket(20, true, false, vec![]),
+        ]);
+        let binding = id();
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        assert_eq!(
+            roots(&plan, &m),
+            vec![
+                (
+                    6,
+                    Branch::Root {
+                        rollup: vec![
+                            (RowGlyph::Stage(Stage::Building), 1),
+                            (RowGlyph::Blocked, 1),
+                        ]
+                    }
+                ),
+                // Claimed #9 is drawn under #6 *and* as its own root. As a
+                // root it heads nothing, so it carries no rollup — the copy
+                // inside #6's branch is what #6 counted.
+                (9, Branch::Plain),
+                (20, Branch::Plain),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_node_the_branch_renders_twice_is_counted_once() {
+        // The diamond, inside one root's branch: #6 unblocks #7 and #8, and
+        // both of those unblock #10 — so the leverage walk genuinely draws #10
+        // twice under #6. Counting the rows drawn would say four; the branch
+        // holds three nodes.
+        let m = map(vec![
+            ticket(6, true, false, vec![]),
+            ticket(7, true, false, vec![6]),
+            ticket(8, true, false, vec![6]),
+            ticket(10, true, false, vec![7, 8]),
+        ]);
+        let binding = id();
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        // The premise, pinned: without it the assertion below proves nothing.
+        assert_eq!(
+            stops(&plan, &m),
+            vec![6, 7, 10, 8, 10],
+            "#10 hangs under both #7 and #8"
+        );
+        assert_eq!(
+            roots(&plan, &m),
+            vec![(
+                6,
+                Branch::Root {
+                    rollup: vec![(RowGlyph::Blocked, 3)]
+                }
+            )],
+            "three nodes beneath #6, not the four rows drawn for them"
         );
     }
 
