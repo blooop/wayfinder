@@ -77,7 +77,9 @@ pub enum Overlay {
 /// half. They are separate named types rather than two same-shaped tuples
 /// because that is the distinction that matters and the one a `.0`/`.1` at a
 /// call site cannot show.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Ord` is (map, index) — screen order within a cluster, and the key the
+/// sifted view looks a row's query score up by.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Row {
     pub map: MapId,
     /// Index into that cluster's `tickets`.
@@ -277,13 +279,16 @@ impl App {
             .collect()
     }
 
-    /// What the body renders this frame (#51): the toggled lens, unless a live
-    /// query flattens it. Derived, never stored.
+    /// What the body renders this frame (#51): the toggled lens, sifted down to
+    /// the matches while a query is live. Derived, never stored.
     pub fn screen(&self) -> Screen<'_> {
         if self.query.is_empty() {
             Screen::Structured(self.lens)
         } else {
-            Screen::Flattened { query: &self.query }
+            Screen::Sifted {
+                lens: self.lens,
+                query: &self.query,
+            }
         }
     }
 
@@ -1525,17 +1530,24 @@ mod tests {
     }
 
     #[test]
-    fn a_live_query_flattens_and_clearing_it_restores_the_lens() {
+    fn a_live_query_sifts_the_lens_and_clearing_it_restores_it() {
         let mut app = fixture_app();
         app.handle_key(key(KeyCode::Tab)); // forest
         type_str(&mut app, "bread");
-        assert_eq!(app.screen(), Screen::Flattened { query: "bread" });
+        assert_eq!(
+            app.screen(),
+            Screen::Sifted {
+                lens: Lens::Forest,
+                query: "bread"
+            },
+            "a query sifts the lens it is typed over, it does not replace it"
+        );
         assert_eq!(app.visible().len(), 1);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(
             app.screen(),
             Screen::Structured(Lens::Forest),
-            "esc clears the query back to the lens it flattened"
+            "esc clears the query back to the lens it sifted"
         );
     }
 

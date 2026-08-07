@@ -13,9 +13,20 @@
 //! - **Forest** (`tab`): the whole DAG, done dimmed in place. Tree parent =
 //!   lowest-numbered in-map blocker; the other in-map blockers annotate the row
 //!   (`⤷ also needs #n`).
-//! - **Flattened** (a live query): one nucleo-score-ordered flat list across
-//!   every cluster in scope — no headers, no tree, every stop at depth 0.
-//!   Clearing the query restores the structured screen.
+//! - **Sifted** (a live query): whichever of those two trees is toggled, pruned
+//!   to the rows that matched. Clearing the query restores it whole.
+//!
+//! Sifting keeps the structure and drops the rows (the earlier rule flattened
+//! both). A cluster keeps its header, a match keeps the branch root it hangs
+//! from — the takeable ticket that unlocks it is the one ancestor that says
+//! something a match cannot say about itself — and everything between them is
+//! chain length: an unmatched link with a single surviving child is elided, and
+//! the `⋯` in the next row's furniture (`├⋯`) is what says a level went
+//! missing. An unmatched link that *forks* is drawn, because two surviving
+//! children need something to hang from. The rows kept only to place other rows
+//! are [`Item::Context`] — drawn, never landed on: under a query the only
+//! cursor stops are matches, all of them at depth 0, so `↑`/`↓` walk the hits
+//! and nothing else, exactly as they did over the flat list.
 //!
 //! Every stop carries its **depth** (#57), because that is what navigation is
 //! expressed in: `↑`/`↓` walk siblings at the cursor's own depth, `→` descends
@@ -31,9 +42,8 @@ use crate::filter;
 use crate::model::{Map, MapId, RowGlyph, Status, Ticket};
 
 /// The structural screen `tab` toggles between — the half of the view state
-/// that is *stored*. The other half (whether a query is flattening the body)
-/// is derived from the query itself in [`Screen`], so the two can never
-/// disagree.
+/// that is *stored*. The other half (whether a query is sifting the body) is
+/// derived from the query itself in [`Screen`], so the two can never disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lens {
     /// The default: what can be taken now, and what taking it unlocks.
@@ -54,13 +64,25 @@ impl Lens {
 }
 
 /// What the body renders this frame. Derived (never stored) from the lens and
-/// the query: a live query flattens whichever lens is toggled, and clearing it
-/// restores that lens. `Flattened` carries the query, so a flattened screen
-/// without one is unrepresentable.
+/// the query: a live query *sifts* whichever lens is toggled — the same tree,
+/// pruned to what matched — and clearing it restores that lens whole. `Sifted`
+/// carries both halves, so a sifted screen without a query, or one that has
+/// forgotten which tree it is pruning, is unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen<'a> {
     Structured(Lens),
-    Flattened { query: &'a str },
+    Sifted { lens: Lens, query: &'a str },
+}
+
+impl Screen<'_> {
+    /// The tree this screen draws, whole or pruned. Sifting changes which rows
+    /// survive, never which shape they are laid out in.
+    #[must_use]
+    pub fn lens(self) -> Lens {
+        match self {
+            Screen::Structured(lens) | Screen::Sifted { lens, .. } => lens,
+        }
+    }
 }
 
 /// Which of a cluster's two collapsible groups. Both are the same *kind* of
@@ -104,8 +126,8 @@ pub struct StopAt {
     pub depth: usize,
 }
 
-/// One line of the body. [`Item::Ticket`] and [`Item::Group`] are cursor
-/// stops; headers and spacers are not.
+/// One line of the body. [`Item::Ticket`] and [`Item::Group`] are cursor stops;
+/// headers, spacers and context rows are not — [`Item::stop_at`] is the rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     /// A cluster header — the map this and the following lines belong to.
@@ -114,24 +136,61 @@ pub enum Item {
     Ticket {
         row: Row,
         depth: usize,
-        /// Tree branch furniture ("├─", "│ └─", …). Empty at depth 0 and on
-        /// every flattened row.
+        /// Tree branch furniture ("├─", "│ └─", …), empty at the top of a
+        /// branch. On a sifted screen it places a match that navigation still
+        /// treats as depth 0, and a `⋯` in it marks an elided ancestor.
         prefix: String,
         /// Forest only: in-map blockers beyond the primary parent.
         also_needs: Vec<u64>,
         /// Whether this row heads a branch, and what is in it.
         branch: Branch,
     },
+    /// A ticket row drawn only to place the rows beneath it: on a sifted
+    /// screen, the branch root a match hangs from, or an unmatched fork two
+    /// matches share. Never a cursor stop and never a match, which is why it is
+    /// its own line rather than a flag on [`Item::Ticket`] — the count line and
+    /// the cursor would both have to remember to check that flag.
+    Context { row: Row, prefix: String },
     /// A collapsible group of held-back rows, always at depth 0 of its
-    /// cluster. Carries what it is holding (`hidden`) and its [`Fold`], so
-    /// the line can say so without consulting anything else.
+    /// cluster. Carries how many rows it stands for (`held`) and its [`Fold`],
+    /// so the line can say so without consulting anything else.
     Group {
         id: GroupId,
-        hidden: usize,
+        held: usize,
         fold: Fold,
     },
     /// Spacer between clusters.
     Blank,
+}
+
+impl Item {
+    /// The cursor stop this line is, if it is one. The single place that rule
+    /// lives: [`Plan::stops`] and the drawn `▶` both read it, so the stop list
+    /// and the marker cannot drift apart.
+    #[must_use]
+    pub fn stop_at(&self) -> Option<StopAt> {
+        match self {
+            Item::Ticket { row, depth, .. } => Some(StopAt {
+                stop: Stop::Ticket(row.clone()),
+                depth: *depth,
+            }),
+            // Nothing to land on. A sifted group leads this arm because it is
+            // the narrower pattern: it is a heading the query wrote, not a fold
+            // anyone can toggle — clearing the query is what puts the group
+            // back — so it is no more a stop than a header is.
+            Item::Group {
+                fold: Fold::Sifted { .. },
+                ..
+            }
+            | Item::Context { .. }
+            | Item::Header(_)
+            | Item::Blank => None,
+            Item::Group { id, .. } => Some(StopAt {
+                stop: Stop::Group(id.clone()),
+                depth: 0,
+            }),
+        }
+    }
 }
 
 /// Whether a group line is folded — and, **only while it is**, the stage
@@ -141,8 +200,18 @@ pub enum Item {
 /// a rollup for it is unrepresentable rather than merely unshown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fold {
-    Shut { rollup: Vec<(RowGlyph, usize)> },
+    Shut {
+        rollup: Vec<(RowGlyph, usize)>,
+    },
     Open,
+    /// A live query is showing `shown` of the group's held rows and holding the
+    /// rest back — `shown` is never zero, because a group with nothing matching
+    /// leaves the body entirely. The rollup is gone here on purpose: a query
+    /// already says what it was looking for, and the group line answers it with
+    /// `shown of held` instead.
+    Sifted {
+        shown: usize,
+    },
 }
 
 /// Whether a ticket row **heads a branch** — sits at the top of its cluster
@@ -180,24 +249,12 @@ pub struct Plan {
 impl Plan {
     /// The cursor stops, in on-screen order, each with its depth.
     pub fn stops(&self) -> Vec<StopAt> {
-        self.items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Ticket { row, depth, .. } => Some(StopAt {
-                    stop: Stop::Ticket(row.clone()),
-                    depth: *depth,
-                }),
-                Item::Group { id, .. } => Some(StopAt {
-                    stop: Stop::Group(id.clone()),
-                    depth: 0,
-                }),
-                Item::Header(_) | Item::Blank => None,
-            })
-            .collect()
+        self.items.iter().filter_map(Item::stop_at).collect()
     }
 
     /// The ticket rows on screen — what the match count counts. A subset of
-    /// [`Plan::stops`]: group lines are stops but not tickets.
+    /// [`Plan::stops`]: group lines are stops but not tickets, and a sifted
+    /// screen's context rows are neither.
     pub fn rows(&self) -> Vec<Row> {
         self.items
             .iter()
@@ -211,13 +268,243 @@ impl Plan {
 
 /// Plan the body for the clusters in scope, in their given (render) order.
 pub fn plan(clusters: &[(&MapId, &Map)], screen: Screen<'_>, expanded: &Expanded) -> Plan {
-    let mut plan = match screen {
-        Screen::Structured(Lens::Leverage) => leverage(clusters, expanded),
-        Screen::Structured(Lens::Forest) => forest(clusters),
-        Screen::Flattened { query } => flattened(clusters, query),
+    let sieve = Sieve::new(clusters, screen);
+    // Under a query the cluster order is the query's to decide: the project
+    // holding the best hit leads, as it did when the hits were one flat list.
+    // Without one the caller's order stands — that is the activity order the
+    // multi-project screen is built on.
+    let by_score;
+    let clusters = match &sieve {
+        Sieve::Everything => clusters,
+        Sieve::Kept(kept) => {
+            by_score = best_first(clusters, kept);
+            &by_score
+        }
     };
-    attach_rollups(&mut plan.items, clusters);
+    let mut plan = match screen.lens() {
+        Lens::Leverage => leverage(clusters, expanded, &sieve),
+        Lens::Forest => forest(clusters, &sieve),
+    };
+    // Rollups describe the tree that was actually drawn, and a sifted tree
+    // draws only the hits: a root there heads its matches, not its subtree, so
+    // there is nothing left for a rollup to summarise honestly.
+    if !sieve.sifting() {
+        attach_rollups(&mut plan.items, clusters);
+    }
     plan
+}
+
+/// What a live query keeps, and how well each surviving row scored — the whole
+/// of what filtering does to a plan. [`Sieve::Everything`] is the no-query
+/// case, so the walks below take a sieve unconditionally instead of threading
+/// an `Option` no screen can tell them the meaning of.
+enum Sieve {
+    Everything,
+    Kept(BTreeMap<Row, u32>),
+}
+
+impl Sieve {
+    fn new(clusters: &[(&MapId, &Map)], screen: Screen<'_>) -> Sieve {
+        let Screen::Sifted { query, .. } = screen else {
+            return Sieve::Everything;
+        };
+        let mut kept = BTreeMap::new();
+        for (id, map) in clusters {
+            for (index, score) in filter::scores(&map.tickets, query).into_iter().enumerate() {
+                if let Some(score) = score {
+                    kept.insert(
+                        Row {
+                            map: (*id).clone(),
+                            index,
+                        },
+                        score,
+                    );
+                }
+            }
+        }
+        Sieve::Kept(kept)
+    }
+
+    fn sifting(&self) -> bool {
+        matches!(self, Sieve::Kept(_))
+    }
+
+    /// One cluster's rendered tree, pruned to what the query kept — or handed
+    /// straight back when there is no query.
+    fn sift(&self, tree: Vec<Item>) -> Vec<Item> {
+        match self {
+            Sieve::Everything => tree,
+            Sieve::Kept(kept) => prune_tree(&tree, kept),
+        }
+    }
+}
+
+/// The clusters ordered by the best score anywhere inside them. Stable, so
+/// clusters that match equally well (or not at all — they are about to leave
+/// the body) keep the order they came in.
+fn best_first<'a>(
+    clusters: &[(&'a MapId, &'a Map)],
+    kept: &BTreeMap<Row, u32>,
+) -> Vec<(&'a MapId, &'a Map)> {
+    let mut ordered = clusters.to_vec();
+    ordered.sort_by_key(|(id, _)| {
+        Reverse(
+            kept.iter()
+                .filter(|(row, _)| &row.map == *id)
+                .map(|(_, score)| *score)
+                .max(),
+        )
+    });
+    ordered
+}
+
+/// One node of a rendered branch, rebuilt from the flat item list so the prune
+/// works on exactly the tree the lens laid out — the same reason
+/// [`attach_rollups`] reads the list rather than the DAG. In the leverage view
+/// those are different trees: a ticket two roots both unblock is genuinely two
+/// nodes here, one under each, and each is pruned on its own.
+struct Node {
+    row: Row,
+    also_needs: Vec<u64>,
+    /// This row's own query score — `None` when it is here only for what hangs
+    /// beneath it.
+    score: Option<u32>,
+    kids: Vec<Node>,
+}
+
+impl Node {
+    /// The best score anywhere in this node's surviving subtree. Sibling order
+    /// is decided by it, so the branch holding the top hit leads the screen the
+    /// way the flat score-ordered list used to.
+    fn best(&self) -> Option<u32> {
+        self.kids
+            .iter()
+            .filter_map(Node::best)
+            .chain(self.score)
+            .max()
+    }
+
+    /// Whether this node earns a line of its own. A match always does; an
+    /// unmatched node does only when it forks, because two surviving children
+    /// need something to hang from. Everything else is chain length.
+    fn drawn(&self) -> bool {
+        self.score.is_some() || self.kids.len() > 1
+    }
+}
+
+/// Rebuild the nodes of a preorder run of ticket rows: a row's subtree is
+/// everything after it that is deeper than it is.
+fn nodes(run: &[(Row, usize, Vec<u64>)], kept: &BTreeMap<Row, u32>) -> Vec<Node> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < run.len() {
+        let (row, depth, also_needs) = &run[i];
+        let mut end = i + 1;
+        while end < run.len() && run[end].1 > *depth {
+            end += 1;
+        }
+        out.push(Node {
+            row: row.clone(),
+            also_needs: also_needs.clone(),
+            score: kept.get(row).copied(),
+            kids: nodes(&run[i + 1..end], kept),
+        });
+        i = end;
+    }
+    out
+}
+
+/// Drop everything the query did not keep or is not needed to place what it
+/// kept, and order what is left best-first at every level.
+fn prune(node: Node) -> Option<Node> {
+    let mut kids: Vec<Node> = node.kids.into_iter().filter_map(prune).collect();
+    if node.score.is_none() && kids.is_empty() {
+        return None;
+    }
+    kids.sort_by_key(|kid| Reverse(kid.best()));
+    Some(Node { kids, ..node })
+}
+
+/// The children that earn a line, each flagged with whether it was reached
+/// through elided ancestors. An unmatched single-child link is not drawn: its
+/// child is pulled up into its place, and the `⋯` on that child's link is the
+/// only trace left of the levels skipped.
+fn drawn_kids(kids: &[Node]) -> Vec<(&Node, bool)> {
+    let mut out = Vec::new();
+    for kid in kids {
+        if kid.drawn() {
+            out.push((kid, false));
+        } else {
+            out.extend(drawn_kids(&kid.kids).into_iter().map(|(n, _)| (n, true)));
+        }
+    }
+    out
+}
+
+/// The two-cell link a child hangs from, and the continuation its own children
+/// hang from — the two prefixes [`walk_forest`] keeps deliberately separate.
+fn link(last: bool, elided: bool) -> (&'static str, &'static str) {
+    match (last, elided) {
+        (false, false) => ("├─", "│ "),
+        (false, true) => ("├⋯", "│ "),
+        (true, false) => ("└─", "  "),
+        (true, true) => ("└⋯", "  "),
+    }
+}
+
+/// Draw a surviving node and what survived beneath it. A match is a depth-0
+/// stop wherever it sits in the tree — the indentation places it, the depth
+/// says only that `↑`/`↓` walk every hit — and everything else is context.
+fn emit(node: &Node, prefix: String, stem: &str, out: &mut Vec<Item>) {
+    out.push(match node.score {
+        Some(_) => Item::Ticket {
+            row: node.row.clone(),
+            depth: 0,
+            prefix,
+            also_needs: node.also_needs.clone(),
+            branch: Branch::Plain,
+        },
+        None => Item::Context {
+            row: node.row.clone(),
+            prefix,
+        },
+    });
+    let kids = drawn_kids(&node.kids);
+    for (i, (kid, elided)) in kids.iter().enumerate() {
+        let (branch, continuation) = link(i + 1 == kids.len(), *elided);
+        emit(
+            kid,
+            format!("{stem}{branch}"),
+            &format!("{stem}{continuation}"),
+            out,
+        );
+    }
+}
+
+/// One cluster's rendered tree, pruned to the matches and the rows that place
+/// them. The branch roots always survive; see the module header for why.
+fn prune_tree(tree: &[Item], kept: &BTreeMap<Row, u32>) -> Vec<Item> {
+    // The trees handed here are built by the lens walks, which push nothing but
+    // ticket rows; headers, groups and spacers are added around them afterwards.
+    let run: Vec<(Row, usize, Vec<u64>)> = tree
+        .iter()
+        .filter_map(|item| match item {
+            Item::Ticket {
+                row,
+                depth,
+                also_needs,
+                ..
+            } => Some((row.clone(), *depth, also_needs.clone())),
+            _ => None,
+        })
+        .collect();
+    let mut roots: Vec<Node> = nodes(&run, kept).into_iter().filter_map(prune).collect();
+    roots.sort_by_key(|root| Reverse(root.best()));
+    let mut out = Vec::new();
+    for root in &roots {
+        emit(root, String::new(), "", &mut out);
+    }
+    out
 }
 
 /// Fill in each branch root's rollup, read off the rows the plan actually laid
@@ -248,7 +535,11 @@ fn attach_rollups(items: &mut [Item], clusters: &[(&MapId, &Map)]) {
                     }
                 }
             }
-            Item::Header(_) | Item::Group { .. } | Item::Blank => branches.extend(open.take()),
+            // `Item::Context` cannot appear here: rollups are attached only to
+            // the unsifted screens, and only a sift produces context rows.
+            Item::Header(_) | Item::Group { .. } | Item::Context { .. } | Item::Blank => {
+                branches.extend(open.take());
+            }
         }
     }
     branches.extend(open);
@@ -307,6 +598,12 @@ fn ticket_item(
 /// depth-1 children of the group line, so `←` from a held row lands on the
 /// group that holds it. A shut group carries the stage rollup of its held
 /// rows instead: each held node contributes its glyph once.
+///
+/// A live query reaches inside: the group renders [`Fold::Sifted`] holding only
+/// its matches (at depth 0, like every other match) and says how many of how
+/// many that is, so done work stays findable by typing without the screen
+/// having to pretend the rest of the group is not there. A group with nothing
+/// matching does not render at all.
 fn push_group(
     items: &mut Vec<Item>,
     id: &MapId,
@@ -314,6 +611,7 @@ fn push_group(
     kind: GroupKind,
     held: &[usize],
     expanded: &Expanded,
+    sieve: &Sieve,
 ) {
     if held.is_empty() {
         return;
@@ -322,50 +620,72 @@ fn push_group(
         map: (*id).clone(),
         kind,
     };
-    let is_expanded = expanded.contains(&group);
-    let fold = if is_expanded {
-        Fold::Open
-    } else {
-        Fold::Shut {
-            rollup: RowGlyph::tally(held.iter().map(|&index| &map.tickets[index])),
+    let (fold, shown, depth) = match sieve {
+        Sieve::Kept(kept) => {
+            let mut matched: Vec<(usize, u32)> = held
+                .iter()
+                .filter_map(|&index| {
+                    let row = Row {
+                        map: (*id).clone(),
+                        index,
+                    };
+                    kept.get(&row).map(|&score| (index, score))
+                })
+                .collect();
+            if matched.is_empty() {
+                return;
+            }
+            // Stable, so held rows that score alike keep the map's own order.
+            matched.sort_by_key(|&(_, score)| Reverse(score));
+            (
+                Fold::Sifted {
+                    shown: matched.len(),
+                },
+                matched.into_iter().map(|(index, _)| index).collect(),
+                0,
+            )
         }
+        Sieve::Everything if expanded.contains(&group) => (Fold::Open, held.to_vec(), 1),
+        Sieve::Everything => (
+            Fold::Shut {
+                rollup: RowGlyph::tally(held.iter().map(|&index| &map.tickets[index])),
+            },
+            vec![],
+            1,
+        ),
     };
     items.push(Item::Group {
         id: group,
-        hidden: held.len(),
+        held: held.len(),
         fold,
     });
-    if !is_expanded {
-        return;
-    }
-    for (i, &index) in held.iter().enumerate() {
-        let branch = if i + 1 == held.len() {
-            "└─"
-        } else {
-            "├─"
-        };
-        items.push(ticket_item(id, index, 1, branch.to_string(), vec![]));
+    for (i, &index) in shown.iter().enumerate() {
+        let (branch, _) = link(i + 1 == shown.len(), false);
+        items.push(ticket_item(id, index, depth, branch.to_string(), vec![]));
     }
 }
 
-fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded) -> Plan {
+fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded, sieve: &Sieve) -> Plan {
     let mut plan = Plan::default();
     for (id, map) in clusters {
         let mut roots: Vec<&Ticket> = map.tickets.iter().filter(|t| takeable(t)).collect();
-        if roots.is_empty() {
+        // A map with nothing takeable leaves the leverage body and is only
+        // counted. Not while a query is live, though: its done and blocked work
+        // is exactly as findable by typing as anyone else's, so the cluster is
+        // built anyway and the sieve decides whether any of it survives.
+        if roots.is_empty() && !sieve.sifting() {
             plan.idle_hidden += 1;
             continue;
         }
         roots.sort_by_key(|t| (Reverse(open_unblocks(map, t.number).len()), t.number));
 
-        plan.items.push(Item::Header((*id).clone()));
+        let mut tree = Vec::new();
         let mut reached = BTreeSet::new();
         for root in roots {
             let index = map
                 .index_of(root.number)
                 .expect("root is one of map.tickets");
-            plan.items
-                .push(ticket_item(id, index, 0, String::new(), vec![]));
+            tree.push(ticket_item(id, index, 0, String::new(), vec![]));
             let mut path = vec![root.number];
             walk_unblocks(
                 map,
@@ -375,13 +695,16 @@ fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded) -> Plan {
                 "",
                 &mut path,
                 &mut reached,
-                &mut plan.items,
+                &mut tree,
             );
         }
+        let mut body = sieve.sift(tree);
 
         // Blocked tickets no subtree reached — blocked only through issues
         // outside the map (or a blocking cycle): the screen owes a count for
-        // what it is not showing, and a way to look.
+        // what it is not showing, and a way to look. Reached-ness is read off
+        // the whole walk, before the sieve, so a query cannot push a ticket
+        // into this group by pruning the branch that reached it.
         let deeper: Vec<usize> = map
             .tickets
             .iter()
@@ -392,12 +715,13 @@ fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded) -> Plan {
             .map(|(i, _)| i)
             .collect();
         push_group(
-            &mut plan.items,
+            &mut body,
             id,
             map,
             GroupKind::BlockedDeeper,
             &deeper,
             expanded,
+            sieve,
         );
 
         let done: Vec<usize> = map
@@ -407,8 +731,16 @@ fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded) -> Plan {
             .filter(|(_, t)| !is_open(t))
             .map(|(i, _)| i)
             .collect();
-        push_group(&mut plan.items, id, map, GroupKind::Done, &done, expanded);
+        push_group(&mut body, id, map, GroupKind::Done, &done, expanded, sieve);
 
+        // Only a sift can empty a cluster — a map with a takeable root always
+        // has a row — and a cluster a query emptied leaves the body header and
+        // all, the way filtering is expected to work.
+        if body.is_empty() {
+            continue;
+        }
+        plan.items.push(Item::Header((*id).clone()));
+        plan.items.append(&mut body);
         plan.items.push(Item::Blank);
     }
     plan.items.pop();
@@ -435,15 +767,10 @@ fn walk_unblocks(
         .filter(|n| !path.contains(n))
         .collect();
     for (i, &child) in children.iter().enumerate() {
-        let last = i + 1 == children.len();
         let index = map
             .index_of(child)
             .expect("dependent is one of map.tickets");
-        let (branch, continuation) = if last {
-            ("└─", "  ")
-        } else {
-            ("├─", "│ ")
-        };
+        let (branch, continuation) = link(i + 1 == children.len(), false);
         items.push(ticket_item(
             id,
             index,
@@ -467,10 +794,10 @@ fn walk_unblocks(
     }
 }
 
-fn forest(clusters: &[(&MapId, &Map)]) -> Plan {
+fn forest(clusters: &[(&MapId, &Map)], sieve: &Sieve) -> Plan {
     let mut plan = Plan::default();
     for (id, map) in clusters {
-        plan.items.push(Item::Header((*id).clone()));
+        let mut tree = Vec::new();
 
         // Primary parent = lowest-numbered in-map blocker; everything else on
         // the edge list annotates the row.
@@ -506,7 +833,7 @@ fn forest(clusters: &[(&MapId, &Map)]) -> Plan {
                 &children,
                 &in_map_blockers,
                 &mut visited,
-                &mut plan.items,
+                &mut tree,
             );
         }
         // A blocking cycle leaves its members parented to each other and
@@ -528,9 +855,17 @@ fn forest(clusters: &[(&MapId, &Map)]) -> Plan {
                 &children,
                 &in_map_blockers,
                 &mut visited,
-                &mut plan.items,
+                &mut tree,
             );
         }
+        let mut body = sieve.sift(tree);
+        // The forest is total, so an empty cluster here is always a query's
+        // doing: nothing in this map matched, and the cluster goes with it.
+        if body.is_empty() {
+            continue;
+        }
+        plan.items.push(Item::Header((*id).clone()));
+        plan.items.append(&mut body);
         plan.items.push(Item::Blank);
     }
     plan.items.pop();
@@ -577,14 +912,9 @@ fn walk_forest(
 
     let kids = children.get(&number).cloned().unwrap_or_default();
     for (i, &kid) in kids.iter().enumerate() {
-        let last = i + 1 == kids.len();
         // The last child closes its branch and its subtree hangs from blank
         // space; every earlier child keeps the vertical bar running past it.
-        let (branch, continuation) = if last {
-            ("└─", "  ")
-        } else {
-            ("├─", "│ ")
-        };
+        let (branch, continuation) = link(i + 1 == kids.len(), false);
         walk_forest(
             map,
             id,
@@ -597,31 +927,6 @@ fn walk_forest(
             visited,
             items,
         );
-    }
-}
-
-fn flattened(clusters: &[(&MapId, &Map)], query: &str) -> Plan {
-    let mut scored: Vec<(Reverse<u32>, &MapId, u64, usize)> = Vec::new();
-    for (id, map) in clusters {
-        for (index, (ticket, score)) in map
-            .tickets
-            .iter()
-            .zip(filter::scores(&map.tickets, query))
-            .enumerate()
-        {
-            if let Some(score) = score {
-                scored.push((Reverse(score), id, ticket.number, index));
-            }
-        }
-    }
-    // Best score first; ties break to the stable (map, number) screen order.
-    scored.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
-    Plan {
-        items: scored
-            .into_iter()
-            .map(|(_, id, _, index)| ticket_item(id, index, 0, String::new(), vec![]))
-            .collect(),
-        idle_hidden: 0,
     }
 }
 
@@ -805,7 +1110,7 @@ mod tests {
         assert!(collapsed.items.iter().any(|i| matches!(
             i,
             Item::Group {
-                hidden: 2,
+                held: 2,
                 fold: Fold::Shut { .. },
                 ..
             }
@@ -862,7 +1167,7 @@ mod tests {
             .items
             .iter()
             .find_map(|i| match i {
-                Item::Group { hidden, fold, .. } => Some((*hidden, fold.clone())),
+                Item::Group { held, fold, .. } => Some((*held, fold.clone())),
                 _ => None,
             })
             .expect("the done group");
@@ -932,10 +1237,10 @@ mod tests {
             .iter()
             .filter_map(|i| match i {
                 Item::Group {
-                    hidden,
+                    held,
                     fold: Fold::Shut { rollup },
                     ..
-                } => Some((*hidden, rollup.clone())),
+                } => Some((*held, rollup.clone())),
                 _ => None,
             })
             .collect();
@@ -1291,48 +1596,248 @@ mod tests {
         );
     }
 
-    #[test]
-    fn flattened_orders_by_score_across_clusters_with_no_furniture() {
-        let a = map(vec![
-            ticket(6, true, false, vec![]),
-            ticket(7, false, false, vec![]),
-        ]);
-        let b = map(vec![ticket(103, true, false, vec![])]);
-        let a_id = id();
-        let b_id = MapId::new("blooop/dotfiles", 4);
-        let plan = plan(
-            &[(&b_id, &b), (&a_id, &a)],
-            Screen::Flattened { query: "t" },
-            &nothing(),
-        );
-        // Everything matches "t"; no headers, blanks, or groups — rows only,
-        // all at depth 0, so `↑`/`↓` walk every hit and `→` has nowhere to go.
-        assert!(
-            plan.items.iter().all(|i| matches!(i, Item::Ticket { .. })),
-            "{:?}",
-            plan.items
-        );
-        assert_eq!(plan.rows().len(), 3, "done tickets stay findable by query");
-        assert!(plan.stops().iter().all(|at| at.depth == 0));
-        assert_eq!(plan.idle_hidden, 0);
+    /// A ticket with a title of its own — the sifting tests are about which
+    /// rows a query keeps, so they need titles a query can tell apart.
+    fn titled(number: u64, title: &str, open: bool, blocked_by: Vec<u64>) -> Ticket {
+        Ticket {
+            title: title.to_string(),
+            ..ticket(number, open, false, blocked_by)
+        }
+    }
+
+    /// The body as one string per line, furniture included: this is a test
+    /// about the *shape* a query leaves behind, so the shape is what it reads.
+    fn shape(plan: &Plan, m: &Map) -> Vec<String> {
+        let number = |row: &Row| m.tickets[row.index].number;
+        plan.items
+            .iter()
+            .map(|item| match item {
+                Item::Header(id) => format!("▌ {}", id.short_repo()),
+                Item::Ticket { row, prefix, .. } => format!("{prefix}#{}", number(row)),
+                Item::Context { row, prefix } => format!("{prefix}#{} dim", number(row)),
+                Item::Group {
+                    id,
+                    held,
+                    fold: Fold::Sifted { shown },
+                } => format!("{:?} {shown}/{held}", id.kind),
+                Item::Group { id, held, .. } => format!("{:?} {held}", id.kind),
+                Item::Blank => String::new(),
+            })
+            .collect()
+    }
+
+    fn sifted(query: &str) -> Screen<'_> {
+        Screen::Sifted {
+            lens: Lens::Leverage,
+            query,
+        }
     }
 
     #[test]
-    fn flattened_puts_the_better_match_first_regardless_of_cluster_order() {
-        let mut exact = ticket(6, true, false, vec![]);
-        exact.title = "breadcrumbs".to_string();
-        let mut loose = ticket(103, true, false, vec![]);
-        loose.title = "b-r-e-a-d spelled out crumbs".to_string();
-        let a = map(vec![loose]);
-        let b = map(vec![exact]);
-        let a_id = MapId::new("blooop/dotfiles", 4); // sorts before wayfinder
-        let b_id = id();
+    fn a_query_keeps_the_cluster_and_the_root_its_match_hangs_from() {
+        // #14 matches, nothing else does. The header stays (which project this
+        // is), the takeable #6 stays as context (what unlocks the match), and
+        // #7 — neither a match nor on the way to one — goes.
+        let m = map(vec![
+            titled(6, "root", true, vec![]),
+            titled(7, "sibling", true, vec![6]),
+            titled(14, "alpha", true, vec![6]),
+        ]);
+        let binding = id();
+        let plan = plan(&[(&binding, &m)], sifted("alpha"), &nothing());
+        assert_eq!(shape(&plan, &m), vec!["▌ wayfinder", "#6 dim", "└─#14"]);
+        // The context row is drawn but not landed on: `↑`/`↓` walk the hits,
+        // all of them depth 0, exactly as they did over the flat list.
+        assert_eq!(nav(&plan, &m), vec![("#14".to_string(), 0)]);
+        assert_eq!(plan.rows().len(), 1, "context rows are not matches");
+    }
+
+    #[test]
+    fn an_unmatched_link_with_one_surviving_child_elides() {
+        // #7 is on the way to the match and nothing else: it is chain length,
+        // and the `⋯` on #14's link is all that is left of it.
+        let m = map(vec![
+            titled(6, "root", true, vec![]),
+            titled(7, "link", true, vec![6]),
+            titled(14, "alpha", true, vec![7]),
+        ]);
+        let binding = id();
+        let plan = plan(&[(&binding, &m)], sifted("alpha"), &nothing());
+        assert_eq!(shape(&plan, &m), vec!["▌ wayfinder", "#6 dim", "└⋯#14"]);
+    }
+
+    #[test]
+    fn an_unmatched_link_that_forks_is_drawn() {
+        // Two matches hang off #7, so #7 earns its line: without it the two
+        // would read as siblings under #6, which is a different tree.
+        let m = map(vec![
+            titled(6, "root", true, vec![]),
+            titled(7, "link", true, vec![6]),
+            titled(12, "alpha", true, vec![7]),
+            titled(13, "alpha", true, vec![7]),
+        ]);
+        let binding = id();
+        let plan = plan(&[(&binding, &m)], sifted("alpha"), &nothing());
+        assert_eq!(
+            shape(&plan, &m),
+            vec!["▌ wayfinder", "#6 dim", "└─#7 dim", "  ├─#12", "  └─#13"]
+        );
+    }
+
+    #[test]
+    fn the_branch_holding_the_best_match_leads_its_cluster() {
+        // #20's title is the query exactly; #14 spells it out scattered. The
+        // branch that holds the better hit comes first, so a query still walks
+        // best-first even though the rows are back in a tree.
+        let m = map(vec![
+            titled(6, "root", true, vec![]),
+            titled(14, "a-l-p-h-a spelled out", true, vec![6]),
+            titled(9, "other root", true, vec![]),
+            titled(20, "alpha", true, vec![9]),
+        ]);
+        let binding = id();
+        let plan = plan(&[(&binding, &m)], sifted("alpha"), &nothing());
+        assert_eq!(
+            shape(&plan, &m),
+            vec!["▌ wayfinder", "#9 dim", "└─#20", "#6 dim", "└─#14"]
+        );
+    }
+
+    #[test]
+    fn the_cluster_holding_the_best_match_leads_the_screen() {
+        // What the flat list used to give for free: score outranks the cluster
+        // order the multi-project screen is otherwise built on.
+        let loose = map(vec![titled(103, "a-l-p-h-a spelled out", true, vec![])]);
+        let exact = map(vec![titled(6, "alpha", true, vec![])]);
+        let loose_id = MapId::new("blooop/dotfiles", 4);
+        let exact_id = id();
         let plan = plan(
-            &[(&a_id, &a), (&b_id, &b)],
-            Screen::Flattened { query: "bread" },
+            &[(&loose_id, &loose), (&exact_id, &exact)],
+            sifted("alpha"),
             &nothing(),
         );
-        let first = plan.rows()[0].clone();
-        assert_eq!(first.map, b_id, "score outranks cluster order");
+        assert_eq!(
+            plan.items.first(),
+            Some(&Item::Header(exact_id)),
+            "{:?}",
+            plan.items
+        );
+    }
+
+    #[test]
+    fn a_cluster_with_nothing_matching_leaves_the_body() {
+        let hit = map(vec![titled(6, "alpha", true, vec![])]);
+        let miss = map(vec![titled(103, "nothing like it", true, vec![])]);
+        let hit_id = id();
+        let miss_id = MapId::new("blooop/dotfiles", 4);
+        let plan = plan(
+            &[(&miss_id, &miss), (&hit_id, &hit)],
+            sifted("alpha"),
+            &nothing(),
+        );
+        assert_eq!(
+            plan.items,
+            vec![
+                Item::Header(hit_id.clone()),
+                Item::Ticket {
+                    row: Row {
+                        map: hit_id,
+                        index: 0
+                    },
+                    depth: 0,
+                    prefix: String::new(),
+                    also_needs: vec![],
+                    branch: Branch::Plain,
+                },
+            ],
+            "no header, no spacer, no trace of the cluster that missed"
+        );
+    }
+
+    #[test]
+    fn a_query_opens_a_group_onto_its_matches_and_says_how_many_of_how_many() {
+        // Done work stays findable by typing (it did when a query flattened
+        // the body, and it has to still). The group line stays too, because
+        // showing one of five done tickets and saying "done" would be a lie.
+        let m = map(vec![
+            titled(2, "alpha", false, vec![]),
+            titled(4, "unrelated", false, vec![]),
+            titled(6, "root", true, vec![]),
+        ]);
+        let binding = id();
+        let plan = plan(&[(&binding, &m)], sifted("alpha"), &nothing());
+        assert_eq!(shape(&plan, &m), vec!["▌ wayfinder", "Done 1/2", "└─#2"]);
+        // The group is a heading here, not a fold: only the match is a stop.
+        assert_eq!(nav(&plan, &m), vec![("#2".to_string(), 0)]);
+    }
+
+    #[test]
+    fn a_query_reaches_into_a_map_the_leverage_screen_drops() {
+        // A map with nothing takeable is not on the leverage screen at all —
+        // but its finished work is exactly as findable by typing as anyone
+        // else's, so the sieve gets to look before the map is dropped.
+        let m = map(vec![titled(2, "alpha", false, vec![])]);
+        let binding = id();
+        let idle = plan(
+            &[(&binding, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        assert_eq!(idle.idle_hidden, 1, "the premise: nothing takeable here");
+        assert!(idle.items.is_empty());
+
+        let found = plan(&[(&binding, &m)], sifted("alpha"), &nothing());
+        assert_eq!(shape(&found, &m), vec!["▌ wayfinder", "Done 1/1", "└─#2"]);
+        assert_eq!(
+            found.idle_hidden, 0,
+            "the map is on screen, so there is nothing to say it is hidden"
+        );
+    }
+
+    #[test]
+    fn sifting_the_forest_prunes_the_forest() {
+        // The lens the query sifts is whichever one is toggled: on the forest
+        // the tree parent is the blocker, and done rows are in place rather
+        // than behind a group — so the same match hangs from a different row.
+        let m = map(vec![
+            titled(2, "finished", false, vec![]),
+            titled(6, "root", true, vec![]),
+            titled(14, "alpha", true, vec![6]),
+        ]);
+        let binding = id();
+        let plan = plan(
+            &[(&binding, &m)],
+            Screen::Sifted {
+                lens: Lens::Forest,
+                query: "alpha",
+            },
+            &nothing(),
+        );
+        assert_eq!(shape(&plan, &m), vec!["▌ wayfinder", "#6 dim", "└─#14"]);
+    }
+
+    #[test]
+    fn a_sifted_screen_carries_no_rollups() {
+        // A rollup says what a row heads. On a sifted screen a row heads its
+        // matches, not its subtree, so the honest rollup is no rollup: #6
+        // unblocks two tickets here and only one of them survived the query.
+        let m = map(vec![
+            titled(6, "root", true, vec![]),
+            titled(7, "sibling", true, vec![6]),
+            titled(14, "alpha", true, vec![6]),
+        ]);
+        let binding = id();
+        let plan = plan(&[(&binding, &m)], sifted("alpha"), &nothing());
+        assert!(
+            plan.items.iter().all(|item| !matches!(
+                item,
+                Item::Ticket {
+                    branch: Branch::Root { .. },
+                    ..
+                }
+            )),
+            "{:?}",
+            plan.items
+        );
     }
 }
