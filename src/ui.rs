@@ -1,10 +1,11 @@
 //! The main screen: one cluster per open map (#50), rendered from the body
 //! [`Plan`] (#51). The default is the leverage view — takeable tickets,
 //! most-dependents-first, each with the subtree it unblocks — with the full
-//! blocking forest on `tab` and a live query flattening either into one
-//! score-ordered list. Rows are `<glyph> #n <title> [type] ⇄ PR#n <state>`;
+//! blocking forest on `tab` and a live query sifting either one down to its
+//! matches, tree and all. Rows are `<glyph> #n <title> [type] ⇄ PR#n <state>`;
 //! done work is a per-cluster count on the default screen and dimmed in place
-//! on the forest.
+//! on the forest. A sifted screen dims whole rows: those are the ones kept only
+//! to place a match, and the cursor cannot land on them.
 
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -15,7 +16,7 @@ use ratatui::Frame;
 use crate::app::{App, Overlay, Scope};
 use crate::launch::Launch;
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
-use crate::view::{Branch, Fold, GroupKind, Item, Plan, Screen};
+use crate::view::{Branch, Fold, GroupKind, Item, Plan};
 
 /// One colour per glyph meaning, shared by the row column and the rollup
 /// pairs: calm colours for the flowing stages, red for the two that demand
@@ -158,8 +159,8 @@ fn pr_badge(ticket_repo: &str, pr: &PrLink) -> Vec<Span<'static>> {
 /// One ticket row: cursor marker, tree furniture, state glyph, `#n title`,
 /// then the dim `[type]` suffix and any `⇄ PR` badges — and on the forest, the
 /// extra blocking edges the tree position cannot show (`⤷ also needs #n`). The
-/// flattened screen has no cluster header above the row, so the row names its
-/// repo itself.
+/// repo is never named here: every screen keeps its cluster headers, and those
+/// name it once for all the rows beneath.
 ///
 /// A row that heads a branch closes with the stage rollup of it (#62), so the
 /// shape of a subtree reads off its root without walking the subtree — the
@@ -170,14 +171,8 @@ fn ticket_line(
     prefix: &str,
     also_needs: &[u64],
     branch: &Branch,
-    name_repo: bool,
     under_cursor: bool,
 ) -> Line<'static> {
-    let repo = if name_repo {
-        ticket.short_repo().to_string()
-    } else {
-        String::new()
-    };
     // Nested rows carry the cursor column as extra indent, so a branch begins
     // directly under the glyph of the row it hangs from instead of to its left.
     let indent = if prefix.is_empty() {
@@ -193,7 +188,7 @@ fn ticket_line(
         Span::styled(indent, FURNITURE),
         cursor_span(under_cursor),
         Span::styled(glyph.char().to_string(), glyph_style(glyph)),
-        Span::raw(format!(" {repo}#{} {}", ticket.number, ticket.title)),
+        Span::raw(format!(" #{} {}", ticket.number, ticket.title)),
     ];
     if let Some(name) = ticket.ticket_type.short_name() {
         spans.push(Span::styled(
@@ -221,6 +216,15 @@ fn ticket_line(
     Line::from(spans).style(style)
 }
 
+/// A context row on a sifted screen: the same row, dimmed whole. It is drawn to
+/// say where the matches under it live — which map, and which takeable ticket
+/// unlocks them — and nothing about it is actionable, so it carries no cursor
+/// marker, no `also needs`, and no rollup.
+fn context_line(ticket: &Ticket, prefix: &str) -> Line<'static> {
+    ticket_line(ticket, prefix, &[], &Branch::Plain, false)
+        .patch_style(Style::new().add_modifier(Modifier::DIM))
+}
+
 /// The body as styled lines: the [`Plan`] walked in order. Shared by the live
 /// draw and the `TestBackend` tests.
 pub fn body_lines(app: &App) -> Vec<Line<'static>> {
@@ -231,10 +235,11 @@ pub fn body_lines(app: &App) -> Vec<Line<'static>> {
 /// where a ticket row's tree furniture would be, then the count it is holding.
 /// It says `(hidden)` — and carries the stage rollup of what that is (#61) —
 /// only while shut: once open, the rows are right there and claiming otherwise
-/// would be a lie.
-fn group_line(kind: GroupKind, hidden: usize, fold: &Fold, under_cursor: bool) -> Line<'static> {
+/// would be a lie. A query opens the group onto its matches alone, and the
+/// count says `n of m` for as long as that leaves anything out.
+fn group_line(kind: GroupKind, held: usize, fold: &Fold, under_cursor: bool) -> Line<'static> {
     let marker = match fold {
-        Fold::Open => '▾',
+        Fold::Open | Fold::Sifted { .. } => '▾',
         Fold::Shut { .. } => '▸',
     };
     // The glyph is never written here: each group stands for one row meaning, so
@@ -255,15 +260,16 @@ fn group_line(kind: GroupKind, hidden: usize, fold: &Fold, under_cursor: bool) -
             Style::new().fg(Color::Reset),
         ),
     };
+    let count = match fold {
+        Fold::Sifted { shown } if *shown < held => format!(" {shown} of {held} {label}"),
+        _ => format!(" {held} {label}"),
+    };
     let mut spans = vec![
         Span::raw("  "),
         cursor_span(under_cursor),
         Span::styled(format!("{marker} "), FURNITURE),
         Span::styled(glyph.char().to_string(), style),
-        Span::styled(
-            format!(" {hidden} {label}"),
-            Style::new().add_modifier(Modifier::DIM),
-        ),
+        Span::styled(count, Style::new().add_modifier(Modifier::DIM)),
     ];
     if let Fold::Shut { rollup } = fold {
         spans.extend(rollup_spans("hidden", rollup));
@@ -281,24 +287,24 @@ fn group_line(kind: GroupKind, hidden: usize, fold: &Fold, under_cursor: bool) -
 /// another root's subtree), and only one of those occurrences is under the
 /// cursor.
 fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize>) {
-    let name_repo = matches!(app.screen(), Screen::Flattened { .. });
     let cursor_pos = app.cursor_pos();
     let mut stop = 0usize;
     let mut cursor_line = None;
     // Every stop the plan lists gets one line, in the same order, so this
     // single counter is what keeps the drawn ▶ and the cursor in agreement.
+    // Which lines are stops is [`Item::stop_at`]'s call, not this loop's.
     let mut mark = |lines: &Vec<Line<'static>>, cursor_line: &mut Option<usize>| {
-        let here = stop;
-        let under_cursor = here == cursor_pos;
+        let under_cursor = stop == cursor_pos;
         if under_cursor {
             *cursor_line = Some(lines.len());
         }
         stop += 1;
-        (here, under_cursor)
+        under_cursor
     };
 
     let mut lines = vec![Line::default()];
     for item in &plan.items {
+        let under_cursor = item.stop_at().is_some() && mark(&lines, &mut cursor_line);
         match item {
             Item::Header(id) => lines.push(cluster_header(id, &app.clusters[id])),
             Item::Ticket {
@@ -307,20 +313,16 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                 also_needs,
                 branch,
                 depth: _,
-            } => {
-                let (_, under_cursor) = mark(&lines, &mut cursor_line);
-                lines.push(ticket_line(
-                    app.ticket(row),
-                    prefix,
-                    also_needs,
-                    branch,
-                    name_repo,
-                    under_cursor,
-                ));
-            }
-            Item::Group { id, hidden, fold } => {
-                let (_, under_cursor) = mark(&lines, &mut cursor_line);
-                lines.push(group_line(id.kind, *hidden, fold, under_cursor));
+            } => lines.push(ticket_line(
+                app.ticket(row),
+                prefix,
+                also_needs,
+                branch,
+                under_cursor,
+            )),
+            Item::Context { row, prefix } => lines.push(context_line(app.ticket(row), prefix)),
+            Item::Group { id, held, fold } => {
+                lines.push(group_line(id.kind, *held, fold, under_cursor));
             }
             Item::Blank => lines.push(Line::default()),
         }
@@ -1092,37 +1094,73 @@ mod tests {
     }
 
     #[test]
-    fn a_query_flattens_to_a_scored_list_whose_rows_name_their_repo() {
+    fn a_query_sifts_the_tree_rather_than_flattening_it() {
         let mut app = fixture_app();
         type_str(&mut app, "bread");
         let screen = render(&app);
-        // Surviving rows — flat, with no cluster header above them, so each
-        // names its repo itself.
-        assert!(
-            screen.contains("○ wayfinder#6 Re-entry breadcrumbs"),
+        // The cluster keeps its header, and each match keeps the takeable row
+        // it hangs from — #14 needs both #6 and #9, so it is drawn under both,
+        // exactly as the unsifted leverage screen draws it.
+        assert!(screen.contains("▌ wayfinder · Map: wf"), "{screen}");
+        let body: Vec<&str> = screen
+            .lines()
+            .filter(|l| l.contains('#'))
+            .map(|l| l.trim_matches('│').trim_end())
+            .collect();
+        assert_eq!(
+            body,
+            vec![
+                "  ▶ ○ #6 Re-entry breadcrumbs [task]",
+                "    └─  ⊘ #14 Breadcrumb markers [task]",
+                "    ◐ #9 Main screen design [task]",
+                "    └─  ⊘ #14 Breadcrumb markers [task]",
+            ],
             "{screen}"
         );
-        assert!(
-            screen.contains("⊘ wayfinder#14 Breadcrumb markers"),
-            "{screen}"
-        );
-        assert!(
-            !screen.contains("▌"),
-            "no cluster furniture while flattened: {screen}"
-        );
-        assert!(!screen.contains("(hidden)"), "{screen}");
-        // Dropped rows are gone.
-        assert!(!screen.contains("Main screen design"));
-        assert!(!screen.contains("Choose the stack"));
-        assert!(!screen.contains("Supervising AFK agents"));
+        // #9 is on screen only to place the match beneath it — the cursor
+        // cannot land on it, and it is not counted as a hit.
+        assert_eq!(screen.matches('▶').count(), 1, "{screen}");
+        // Rows the query dropped are gone, group and all.
+        assert!(!screen.contains("Choose the stack"), "{screen}");
+        assert!(!screen.contains("Supervising AFK agents"), "{screen}");
+        assert!(!screen.contains("done"), "{screen}");
         // Count line and prompt reflect the live query; the denominator is
         // the map's tickets, not the leverage rows.
-        assert!(screen.contains("2/5"));
-        assert!(screen.contains("> bread█"));
-        // Clearing the query restores the structured screen.
+        assert!(screen.contains("3/5"), "{screen}");
+        assert!(screen.contains("> bread█"), "{screen}");
+        // Clearing the query restores the lens whole.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let screen = render(&app);
-        assert!(screen.contains("▌ wayfinder · Map: wf"), "{screen}");
+        assert!(screen.contains("Supervising AFK agents"), "{screen}");
+        assert!(screen.contains("1 done"), "{screen}");
+    }
+
+    #[test]
+    fn a_sifted_group_says_how_many_of_how_many_it_is_showing() {
+        // Two done tickets, one of them matching: typing has to reach inside
+        // the group that holds it, and the group has to stay honest about the
+        // one it is still holding back.
+        let mut map = wf_map();
+        map.tickets.push(ticket(
+            "blooop/wayfinder",
+            3,
+            "Stack the PRs",
+            false,
+            false,
+            vec![],
+        ));
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        let mut app = App::new(clusters);
+        type_str(&mut app, "choose");
+        let screen = render(&app);
+        assert!(screen.contains("▾ ● 1 of 2 done"), "{screen}");
+        assert!(screen.contains("● #2 Choose the stack"), "{screen}");
+        assert!(!screen.contains("Stack the PRs"), "{screen}");
+        // The cursor is on the match, not on the group heading above it —
+        // there is no fold to toggle while a query is what opened it.
+        assert_eq!(app.cursor_ticket().map(|t| t.number), Some(2));
+        assert_eq!(screen.matches('▶').count(), 1, "{screen}");
     }
 
     #[test]

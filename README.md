@@ -158,9 +158,19 @@ renders one ticket twice inside a single branch.
 tickets dimmed in place. A ticket's tree parent is its lowest-numbered in-map
 blocker; edges the tree cannot show are annotated `⤷ also needs #n`.
 
-**Typing flattens**: a live query replaces the tree with one flat list ordered
-by fuzzy-match score across every project (rows name their repo); clearing it
-restores whichever screen `tab` had toggled.
+**Typing sifts**: a live query prunes whichever screen `tab` had toggled down to
+the rows that matched, keeping the tree they sit in; clearing it restores that
+screen whole. What survives with a match is the cluster header (which project)
+and the branch root it hangs from (which takeable ticket unlocks it) — the two
+things a hit cannot say about itself. Everything between them is chain length
+and elides, leaving a `⋯` in the furniture (`├⋯`) where levels went missing; an
+unmatched row that *forks* keeps its line, because two matches need something to
+hang from. Rows kept only to place a match are dimmed whole and cannot be landed
+on: the cursor still visits nothing but hits, in best-score-first order, so
+`↓ ↓ enter` works exactly as it did over a flat list. A query reaches inside the
+collapsed groups too — a done ticket stays findable, and the group opens onto
+its matches alone, saying `▾ ● 1 of 5 done`. Clusters with nothing matching
+leave the body, header and all.
 
 ## Startup
 
@@ -231,7 +241,7 @@ The mode rides whichever route you got, as ` defer`, ` defer: <text>` or
 
 | key | what it does |
 | --- | --- |
-| *type anything* | fuzzy-filter: the tree flattens to one score-ordered list; clearing restores it |
+| *type anything* | fuzzy-filter: the tree is pruned to the matches, best-first, with the rows that place them dimmed; clearing restores it |
 | `tab` | toggle the leverage view ⇄ the structure forest |
 | `↑`/`↓`, `ctrl-j`/`ctrl-k` | move between siblings at the cursor's depth — on the default screen, the tickets you can take (cluster headers are never a stop) |
 | `→` | reveal: open a `▸ done`/`▸ blocked` group, else step forward one stop — which *is* descending, since a subtree's first row follows its parent |
