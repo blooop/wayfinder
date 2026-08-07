@@ -9,6 +9,13 @@ on:
   pull_request:
   push:
     branches: [main]
+  # A trigger that can be pulled by hand, because the automatic ones cannot be
+  # trusted to have fired. The Actions outage of 2026-08-06 (blooop/wayfinder#79)
+  # throttled webhooks to a fraction of deliveries, and three merges to `main`
+  # landed with no run at all — a dropped trigger leaves a commit looking clean
+  # while nothing ever ran, which is indistinguishable from green unless you go
+  # asking. This is how you re-fire one for a ref without an empty commit.
+  workflow_dispatch:
 
 permissions:
   contents: read

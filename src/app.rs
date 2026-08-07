@@ -211,19 +211,21 @@ impl App {
     ///    activity never renders in an arbitrary order that shifts between
     ///    frames.
     pub fn scoped_clusters(&self) -> Vec<(&MapId, &Map)> {
-        let mut clusters: Vec<(&MapId, &Map)> = self
-            .clusters
-            .iter()
-            .filter(|(id, _)| self.in_scope(id))
-            .collect();
         // `!has_open_work` so `false` (live) sorts before `true` (finished), and
         // `Reverse` so the newest activity leads — with `None` last, since
-        // `None < Some` reversed puts the unknown stamps at the end.
+        // `None < Some` reversed puts the unknown stamps at the end. Declared
+        // before the first statement: an item after one is `clippy::pedantic`'s
+        // `items_after_statements`, which CI escalates to an error.
         fn key<'a>(
             (id, map): &(&'a MapId, &'a Map),
         ) -> (bool, Reverse<Option<Activity>>, &'a MapId) {
             (!map.has_open_work(), Reverse(map.last_activity), *id)
         }
+        let mut clusters: Vec<(&MapId, &Map)> = self
+            .clusters
+            .iter()
+            .filter(|(id, _)| self.in_scope(id))
+            .collect();
         clusters.sort_by(|a, b| key(a).cmp(&key(b)));
         clusters
     }
