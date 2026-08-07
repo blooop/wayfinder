@@ -101,7 +101,7 @@ fn cursor_span(under_cursor: bool) -> Span<'static> {
 
 /// The marker's colour: orange, and deliberately not one of the six the screen
 /// already spends — cyan on cluster headers and the prompt, green/yellow/red on
-/// the status glyphs and counts, magenta on PR badges, dim on everything
+/// the stage glyphs and counts, magenta on PR badges, dim on everything
 /// settled. A selection drawn in any of those competes with something that means
 /// something else, which is how the cursor got hard to find in the first place.
 ///
