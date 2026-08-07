@@ -8,8 +8,18 @@
 //! actually be wrong is what happens between the keypress and the agent's first
 //! frame, and that only happens once, in `main`.
 //!
-//! It pins down three claims, in the order they can fail:
+//! It pins down four claims, in the order they can fail:
 //!
+//! 0. **The container carries the agent.** This repo has a
+//!    `.devcontainer/devcontainer.json`, so its launches are isolated (#80):
+//!    `wf` execs `dl`, not `claude`. Both are shimmed, and the `dl` shim is
+//!    what makes the run deterministic — without it a machine with a real `dl`
+//!    installed and a machine without one would take different paths through
+//!    the same test. The shim records what `dl` was handed and then runs the
+//!    quoted command through a real `bash`, which is the only place the
+//!    quoting can be checked at all: `dl` joins everything after `--` and hands
+//!    it to a shell, so an unquoted prompt would arrive at `claude` as three
+//!    arguments and every assertion in claim 1 would fail.
 //! 1. **`enter` execs the agent.** Two enters since the two-step launch (#62):
 //!    the first stages the launch line, the second launches it interactive.
 //!    `claude` is shimmed to a script that records its argv and cwd, so the
@@ -53,8 +63,8 @@ const RAN: &str = "FAKE-CLAUDE-RAN";
 /// *and* not negated, because `stty -a` writes the off state as `-flag`.
 const COOKED: [&str; 4] = ["echo", "icanon", "isig", "opost"];
 
-/// A scratch tree of this test's own: a `claude` shim on PATH and a cache
-/// directory, so neither the user's PATH nor their real projects cache is
+/// A scratch tree of this test's own: `claude` and `dl` shims on PATH and a
+/// cache directory, so neither the user's PATH nor their real projects cache is
 /// touched. Removed on drop, panic or not.
 struct Scratch(PathBuf);
 
@@ -79,23 +89,45 @@ impl Scratch {
         self.0.join("report.txt")
     }
 
-    /// Write the `claude` shim. **No agent is ever launched by this test**: the
-    /// shim records what it was handed, the pid it is, and the tty it landed
-    /// on, then says so.
-    fn write_shim(&self) {
-        let script = format!(
-            "#!/usr/bin/env bash\n\
-             {{ echo \"pid=$$\"; echo \"cwd=$PWD\"; echo \"argv=$*\"; stty -a; }} > {report} 2>&1\n\
-             printf '{RAN}\\n'\n",
-            report = self.report().display(),
+    /// Where the `dl` shim records the container half of the launch.
+    fn dl_report(&self) -> PathBuf {
+        self.0.join("dl-report.txt")
+    }
+
+    /// Write the two shims. **No agent and no container are ever launched by
+    /// this test**: each shim records what it was handed, the pid it is, and
+    /// the tty it landed on.
+    ///
+    /// `dl` then `exec`s the command it was given, through a real `bash` and
+    /// with a real `exec`, which is what makes the chain observable: the whole
+    /// run stays one process, so claim 2's pid check reaches all the way from
+    /// the spawned `wf` to `claude`, and the shell that parses the quoted
+    /// command is a genuine one rather than this test's idea of one.
+    fn write_shims(&self) {
+        let record = |report: &Path| {
+            format!(
+                "{{ echo \"pid=$$\"; echo \"cwd=$PWD\"; echo \"argv=$*\"; stty -a; }} > {} 2>&1\n",
+                report.display()
+            )
+        };
+        let claude = format!(
+            "#!/usr/bin/env bash\n{}printf '{RAN}\\n'\n",
+            record(&self.report())
         );
-        let claude = self.bin().join("claude");
-        std::fs::write(&claude, script).expect("write the claude shim");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod the claude shim");
+        // `dl <path> -- <command>`: $1 is the checkout, $3 the shell command.
+        let dl = format!(
+            "#!/usr/bin/env bash\n{}exec bash -c \"exec $3\"\n",
+            record(&self.dl_report())
+        );
+        for (name, script) in [("claude", claude), ("dl", dl)] {
+            let path = self.bin().join(name);
+            std::fs::write(&path, script).unwrap_or_else(|e| panic!("write the {name} shim: {e}"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .unwrap_or_else(|e| panic!("chmod the {name} shim: {e}"));
+            }
         }
     }
 }
@@ -104,6 +136,14 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// One `key=value` line out of a shim's report.
+fn field<'a>(report: &'a str, key: &str) -> &'a str {
+    report
+        .lines()
+        .find_map(|l| l.strip_prefix(key))
+        .unwrap_or_else(|| panic!("the shim records {key:?}\n{report}"))
 }
 
 /// A pty pair with a real window size.
@@ -204,7 +244,7 @@ fn flags(stty: &str) -> Vec<&str> {
 #[test]
 fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
     let scratch = Scratch::new();
-    scratch.write_shim();
+    scratch.write_shims();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
 
     let (master, slave) = openpty_sized(40, 120);
@@ -266,27 +306,42 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
     let status = child.wait().expect("wait for the exec'd agent");
     assert!(status.success(), "the agent exited {status}\n{screen}");
 
-    let report = std::fs::read_to_string(scratch.report()).expect("the shim's report");
-    let field = |key: &str| {
-        report
-            .lines()
-            .find_map(|l| l.strip_prefix(key))
-            .unwrap_or_else(|| panic!("the shim records {key:?}\n{report}"))
-    };
+    let report = std::fs::read_to_string(scratch.report()).expect("the claude shim's report");
+    let dl_report = std::fs::read_to_string(scratch.dl_report()).expect("the dl shim's report");
+
+    // Claim 0: `wf` handed the whole agent command to `dl`, as one shell
+    // command after `--`, with the checkout — a **path**, never
+    // `owner/repo@branch` — as the workspace. The prompt is the argument that
+    // has to survive a shell, so it is the one that has to be quoted.
+    let dl_argv = field(&dl_report, "argv=");
+    let (workspace, rest) = dl_argv.split_once(' ').expect("a workspace and a command");
+    assert_eq!(
+        Path::new(workspace).canonicalize().ok(),
+        repo.canonicalize().ok(),
+        "dl must be pointed at the checkout wf resolved, not at a repo spec"
+    );
+    let command = rest
+        .strip_prefix("-- ")
+        .unwrap_or_else(|| panic!("the agent command follows a bare `--`: {dl_argv:?}"));
+    assert!(
+        command.starts_with("'claude' '--dangerously-skip-permissions' '/"),
+        "every argument of the agent command must reach the container's shell \
+         quoted, or the prompt arrives as several: {command:?}"
+    );
 
     // Claim 2: the pid the test spawned *is* the agent. Asserted on the pid and
     // not on the exit status, because the shim exits 0 either way — under
     // spawn-and-wait `wf` would have waited for it and exited 0 too, so a
     // status check passes without distinguishing the two designs at all.
     assert_eq!(
-        field("pid=").parse::<u32>().ok(),
+        field(&report, "pid=").parse::<u32>().ok(),
         Some(wf_pid),
         "the agent must be the same process as wf, not a child of it"
     );
 
     // Claim 1: what the agent was actually handed.
-    let cwd = field("cwd=");
-    let argv = field("argv=");
+    let cwd = field(&report, "cwd=");
+    let argv = field(&report, "argv=");
     assert_eq!(
         Path::new(cwd).canonicalize().ok(),
         repo.canonicalize().ok(),

@@ -14,7 +14,10 @@ pixi global install -c https://prefix.dev/blooop -c conda-forge wf
 The package declares no run dependencies. `wf` finds what it needs on PATH and
 says so plainly when something is missing, rather than dragging second copies
 into its own environment. It wants an authenticated `gh` and the agent CLI, and
-nothing else — there is no multiplexer to install.
+nothing else — there is no multiplexer to install. Add
+[`dl`](https://github.com/blooop/devlaunch) if you want the agent to run inside
+your repos' devcontainers ([Isolation](#isolation-the-agent-runs-in-the-repos-devcontainer));
+without it every launch runs on the host, which is what `wf` has always done.
 
 `wf --version` and `wf --help` are the only arguments; everything else is keys
 in the TUI.
@@ -199,7 +202,9 @@ Picking a ticket runs an agent on it — `claude --dangerously-skip-permissions
 `wf`. It restores the terminal and **replaces its own process** with the agent:
 no picker underneath, no parent waiting, nothing to detach from. The agent holds
 the terminal, the exit code and the signals directly, because by then it *is*
-the process you started.
+the process you started. A checkout that declares a devcontainer runs that same
+agent inside it — see
+[Isolation](#isolation-the-agent-runs-in-the-repos-devcontainer).
 
 **Launching is two steps.** `enter` on the cursor's ticket does not launch: it
 opens the **launch line** where the count line was, showing where `enter` will
@@ -261,6 +266,59 @@ picker rather than from a shell you are already watching, and stopping on a
 permission prompt at that moment would just be a stall you did not ask for.
 
 Going back means running `wf` again, which is cheap — a warm start is ~0.6 s.
+
+### Isolation: the agent runs in the repo's devcontainer
+
+A checkout that carries a **`.devcontainer/devcontainer.json`** (or a top-level
+`.devcontainer.json`) launches its agent *inside* that container, by way of
+[`dl`](https://github.com/blooop/devlaunch):
+
+```
+dl <the checkout> -- 'claude' '--dangerously-skip-permissions' '/wayfinder 67 80'
+```
+
+`wf` owns which ticket, which checkout, which skill and which prompt. `dl` owns
+the container — building it, reusing it, forwarding your `gh` login into it,
+keeping an editor from opening over the terminal. `wf` builds no flags, reads no
+`devcontainer.json` and writes none: **the repo's own config is the entire
+opt-in**, and there is nothing to configure on the `wf` side.
+
+The checkout reaches `dl` as a **path**, never as `owner/repo@branch`. Given a
+repo spec `dl` would clone a second copy into its own cache and run the agent
+there — abandoning the tree you picked in the checkout picker.
+
+Two things have to be true, and otherwise the agent runs on the host exactly as
+it always has:
+
+1. the checkout declares one of those two configs, and
+2. `dl` is on PATH.
+
+**A missing `dl` degrades rather than refuses.** Plenty of repos carry a
+`devcontainer.json` for their editor users, and refusing to launch on a machine
+that has never installed `dl` would be a regression for people who never asked
+for any of this. The launch notice names what you got — `→ wayfinder#80 in
+/data/proj/wayfinder (devlaunch)` — and so does each row of the which-checkout
+picker, since two trees of one repo can differ.
+
+A repo whose only configs are **variants**
+(`.devcontainer/<name>/devcontainer.json`, no default) runs on the host:
+choosing among variants would be `wf` picking a container shape, and it has no
+basis to pick. Host access, GPU passthrough and the rest are the repo's
+declarations to make — `wf` injects no `runArgs`.
+
+Container lifecycle is entirely `dl`'s: `wf` never stops, removes or rebuilds
+one, and could not — it `exec`s and is gone, so there is no `wf` left to observe
+an agent exiting. `dl <ws> stop`, `dl <ws> reset` and `dl --prune-worktrees` are
+the tools, and they are yours to run. Containers accumulate until you do.
+
+**This container is not a security boundary, and is not trying to be.** It is
+for reproducible dependencies. Your host `~/.claude` is bind-mounted into it
+read-write and your `gh` login is forwarded as `GH_TOKEN`, so everything running
+in a repo's devcontainer — including a `postCreateCommand` you did not write —
+gets both. That is a deliberate trade for zero-friction auth, taken with eyes
+open ([#73](https://github.com/blooop/wayfinder/issues/73)); the repos this
+exists to serve want `network=host`, X11 and device passthrough anyway, which
+gives away as much again. Don't point `wf` at a repo you have not read.
 
 ### Working while you are away
 
