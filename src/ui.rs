@@ -237,15 +237,29 @@ fn group_line(kind: GroupKind, hidden: usize, fold: &Fold, under_cursor: bool) -
         Fold::Open => '▾',
         Fold::Shut { .. } => '▸',
     };
-    let (glyph, label, color) = match kind {
-        GroupKind::BlockedDeeper => ('⊘', "blocked deeper down", Color::Red),
-        GroupKind::Done => ('●', "done", Color::Reset),
+    // The glyph is never written here: each group stands for one row meaning, so
+    // it names the [`RowGlyph`] and lets that type say which character it draws
+    // (#78). Only the style is a local decision.
+    let (glyph, label, style) = match kind {
+        GroupKind::BlockedDeeper => (
+            RowGlyph::Blocked,
+            "blocked deeper down",
+            glyph_style(RowGlyph::Blocked),
+        ),
+        // Deliberately not [`glyph_style`]'s DIM: that dims a *tally* of finished
+        // rows, and this is a heading for a group you can open — the count beside
+        // it is already dim, and dimming the glyph too would sink the line.
+        GroupKind::Done => (
+            RowGlyph::Stage(Stage::Done),
+            "done",
+            Style::new().fg(Color::Reset),
+        ),
     };
     let mut spans = vec![
         Span::raw("  "),
         cursor_span(under_cursor),
         Span::styled(format!("{marker} "), FURNITURE),
-        Span::styled(glyph.to_string(), Style::new().fg(color)),
+        Span::styled(glyph.char().to_string(), style),
         Span::styled(
             format!(" {hidden} {label}"),
             Style::new().add_modifier(Modifier::DIM),
