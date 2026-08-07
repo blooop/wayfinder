@@ -102,6 +102,40 @@ pub enum StopKey {
     Group(GroupId),
 }
 
+/// Where the cursor is, and — the part that matters — **whether anyone put it
+/// there** (#88).
+///
+/// Two facts used to be one `usize`, and index `0` had to stand for both of
+/// them: the position a fresh screen starts at, and a row the human deliberately
+/// picked. [`App::replace_clusters`] cannot serve both. A chosen row is pinned by
+/// identity, so a map arriving above it must never teleport the selection
+/// (#50/#57); a starting position has no identity to pin, and pinning it anyway
+/// is what dragged the cursor down to the second cluster as the first-arrived map
+/// was outranked by a fresher one.
+///
+/// A sum type rather than a flag beside the index, so the state "untouched, and
+/// also remembering a position" — the one that made a default indistinguishable
+/// from a choice — cannot be written down. [`Cursor::Untouched`] carries no
+/// index because it does not have one: it *means* the top of the list, and the
+/// top is re-read from whatever list is on screen now.
+///
+/// The chosen arm holds a position rather than a [`StopKey`] because the key is
+/// re-derived from the live clusters at the moment they are swapped, and the
+/// index is what carries `preserve_cursor`'s fallback for a stop that vanished
+/// entirely. Holding both would let the two disagree, which is a worse defect
+/// than the one this fixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cursor {
+    /// Never moved. Always means "the first stop on screen", whatever the screen
+    /// becomes — taken literally: the first stop drawn, not the first *takeable*
+    /// one, so an untouched cursor never skips past a cluster whose top rows
+    /// happen to be blocked or done.
+    Untouched,
+    /// Put here deliberately, at this position in [`App::stops`]. Identity is
+    /// preserved across a reorder or a refetch.
+    Chosen(usize),
+}
+
 #[derive(Debug)]
 pub struct App {
     /// The clusters on screen: every open map that has arrived, keyed by id.
@@ -146,7 +180,7 @@ pub struct App {
     /// [`GroupId`], so an expansion survives a refetch, a query and a lens
     /// toggle — it is a choice about a *map*, not about a frame.
     expanded: Expanded,
-    cursor: usize,
+    cursor: Cursor,
 }
 
 impl App {
@@ -164,7 +198,7 @@ impl App {
             overlay: Overlay::None,
             lens: Lens::Leverage,
             expanded: Expanded::new(),
-            cursor: 0,
+            cursor: Cursor::Untouched,
         }
     }
 
@@ -295,9 +329,14 @@ impl App {
         }
     }
 
-    /// Cursor position clamped into the stop list.
+    /// Cursor position clamped into the stop list. An untouched cursor is not a
+    /// remembered position but a *rule* — the top of the list — so it is
+    /// answered from the stops on screen now rather than from anything stored.
     pub fn cursor_pos(&self) -> usize {
-        self.cursor.min(self.stops().len().saturating_sub(1))
+        match self.cursor {
+            Cursor::Untouched => 0,
+            Cursor::Chosen(pos) => pos.min(self.stops().len().saturating_sub(1)),
+        }
     }
 
     /// What the cursor is on, if anything is on screen.
@@ -339,13 +378,25 @@ impl App {
         self.cursor_stop().map(|stop| self.stop_key(&stop))
     }
 
+    /// The stop to hold on to while the list is rebuilt underneath the cursor —
+    /// a scope change, a lens toggle. `None` for an untouched cursor, which has
+    /// no stop to hold: it means the top of whatever list results, and anchoring
+    /// it to the row that merely happens to be first would turn a default into a
+    /// choice the human never made.
+    fn cursor_anchor(&self) -> Option<StopKey> {
+        match self.cursor {
+            Cursor::Untouched => None,
+            Cursor::Chosen(_) => self.cursor_key(),
+        }
+    }
+
     /// Point the cursor at a specific stop if it is on screen.
     fn point_at(&mut self, key: &StopKey) {
         let pos = self
             .stops()
             .iter()
             .position(|at| &self.stop_key(&at.stop) == key);
-        self.cursor = pos.unwrap_or(0);
+        self.cursor = Cursor::Chosen(pos.unwrap_or(0));
     }
 
     /// `↑`/`↓`: the next stop at the cursor's own depth, else simply the next
@@ -368,7 +419,9 @@ impl App {
     fn move_sibling(&mut self, delta: isize) {
         let stops = self.stops();
         if stops.is_empty() {
-            self.cursor = 0;
+            // Nothing on screen, so there is no stop to have chosen — pressing a
+            // key over an empty list is not a selection.
+            self.cursor = Cursor::Untouched;
             return;
         }
         let pos = self.cursor_pos();
@@ -383,7 +436,7 @@ impl App {
             let i = i as usize;
             adjacent.get_or_insert(i);
             if at.depth == depth {
-                self.cursor = i;
+                self.cursor = Cursor::Chosen(i);
                 return;
             }
             if at.depth < depth {
@@ -394,7 +447,7 @@ impl App {
         // `None` only when there is nothing at all in that direction, which is
         // the one case where holding still is the honest answer.
         if let Some(next) = adjacent {
-            self.cursor = next;
+            self.cursor = Cursor::Chosen(next);
         }
     }
 
@@ -414,7 +467,7 @@ impl App {
         }
         let pos = self.cursor_pos();
         if pos + 1 < self.stops().len() {
-            self.cursor = pos + 1;
+            self.cursor = Cursor::Chosen(pos + 1);
         }
     }
 
@@ -434,28 +487,43 @@ impl App {
         };
         if depth > 0 {
             if let Some(parent) = (0..pos).rev().find(|&i| stops[i].depth == depth - 1) {
-                self.cursor = parent;
+                self.cursor = Cursor::Chosen(parent);
                 return;
             }
         }
         if pos > 0 {
-            self.cursor = pos - 1;
+            self.cursor = Cursor::Chosen(pos - 1);
         }
     }
 
-    /// Swap in freshly fetched clusters, keeping query/scope/expansions intact
-    /// and the cursor pinned to stop identity (falling back to the same
-    /// position, clamped, if the stop vanished — see `refresh::preserve_cursor`).
+    /// Swap in freshly fetched clusters, keeping query/scope/expansions intact.
+    ///
+    /// What happens to the cursor depends on how it got where it is (#88). A
+    /// **chosen** stop is pinned by identity, falling back to the same position,
+    /// clamped, if it vanished — see `refresh::preserve_cursor`. An **untouched**
+    /// cursor has nothing to pin: it means the top of the list, so it re-derives
+    /// to the first stop of whatever just arrived. Maps stream in one fetch at a
+    /// time and the order leads on activity, so anchoring the start position too
+    /// would let the first map to land drag the cursor downwards the moment a
+    /// busier map sorted above it.
     pub fn replace_clusters(&mut self, clusters: BTreeMap<MapId, Map>) {
-        let anchor = self.cursor_key();
-        let old_index = self.cursor_pos();
+        let pinned = match self.cursor {
+            Cursor::Untouched => None,
+            Cursor::Chosen(_) => Some((self.cursor_key(), self.cursor_pos())),
+        };
         self.clusters = clusters;
-        let new_order: Vec<StopKey> = self
-            .stops()
-            .iter()
-            .map(|at| self.stop_key(&at.stop))
-            .collect();
-        self.cursor = crate::refresh::preserve_cursor(anchor.as_ref(), old_index, &new_order);
+        if let Some((anchor, old_index)) = pinned {
+            let new_order: Vec<StopKey> = self
+                .stops()
+                .iter()
+                .map(|at| self.stop_key(&at.stop))
+                .collect();
+            self.cursor = Cursor::Chosen(crate::refresh::preserve_cursor(
+                anchor.as_ref(),
+                old_index,
+                &new_order,
+            ));
+        }
     }
 
     /// The first enter (#62): stage a launch of the cursor's ticket by opening
@@ -646,7 +714,7 @@ impl App {
             }
             KeyCode::Char('f') if ctrl => {
                 if let Some(map) = self.cursor_map() {
-                    let anchor = self.cursor_key();
+                    let anchor = self.cursor_anchor();
                     self.scope = Scope::Project(map.repo);
                     if let Some(key) = anchor {
                         self.point_at(&key);
@@ -655,7 +723,7 @@ impl App {
                 Outcome::Continue
             }
             KeyCode::Char('g') if ctrl => {
-                let anchor = self.cursor_key();
+                let anchor = self.cursor_anchor();
                 self.scope = Scope::All;
                 if let Some(key) = anchor {
                     self.point_at(&key);
@@ -666,7 +734,7 @@ impl App {
             // stays on its ticket if the other screen shows it; a live query
             // keeps flattening either lens until it is cleared.
             KeyCode::Tab => {
-                let anchor = self.cursor_key();
+                let anchor = self.cursor_anchor();
                 self.lens = self.lens.toggled();
                 if let Some(key) = anchor {
                     self.point_at(&key);
@@ -710,20 +778,20 @@ impl App {
                     Outcome::Quit
                 } else {
                     self.query.clear();
-                    self.cursor = 0;
+                    self.cursor = Cursor::Untouched;
                     Outcome::Continue
                 }
             }
             KeyCode::Backspace => {
                 self.query.pop();
-                self.cursor = 0;
+                self.cursor = Cursor::Untouched;
                 Outcome::Continue
             }
             // `q` quits only on an empty query; mid-query it types.
             KeyCode::Char('q') if !ctrl && self.query.is_empty() => Outcome::Quit,
             KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
                 self.query.push(c);
-                self.cursor = 0;
+                self.cursor = Cursor::Untouched;
                 Outcome::Continue
             }
             _ => Outcome::Continue,
@@ -894,6 +962,116 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_untouched_cursor_stays_on_the_top_row_as_maps_stream_in() {
+        let mut app = App::new(BTreeMap::from([cluster(
+            "blooop/slow",
+            1,
+            Some("2026-08-01T00:00:00Z"),
+            true,
+        )]));
+        assert_eq!(app.cursor_pos(), 0);
+
+        let mut both = BTreeMap::new();
+        both.extend([cluster(
+            "blooop/slow",
+            1,
+            Some("2026-08-01T00:00:00Z"),
+            true,
+        )]);
+        both.extend([cluster(
+            "blooop/fresh",
+            2,
+            Some("2026-08-07T00:00:00Z"),
+            true,
+        )]);
+        app.replace_clusters(both);
+
+        // the fresher map now renders first
+        assert_eq!(app.cursor_pos(), 0);
+    }
+
+    /// Two live maps, the second of them older, so a map fresher than both sorts
+    /// above the pair and pushes every existing row down by one.
+    fn streaming_pair() -> BTreeMap<MapId, Map> {
+        [
+            cluster("blooop/slow", 1, Some("2026-08-01T00:00:00Z"), true),
+            cluster("blooop/older", 3, Some("2026-07-01T00:00:00Z"), true),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// The pair with a fresher map added — it renders first, so both original
+    /// rows move down one.
+    fn streaming_trio() -> BTreeMap<MapId, Map> {
+        let mut all = streaming_pair();
+        all.extend([cluster(
+            "blooop/fresh",
+            2,
+            Some("2026-08-07T00:00:00Z"),
+            true,
+        )]);
+        all
+    }
+
+    #[test]
+    fn a_chosen_row_stays_with_its_ticket_when_a_map_sorts_above_it() {
+        // The #50/#57 behaviour, which #88 must not cost: a row someone moved to
+        // is pinned by identity, so an arriving map slides it down the screen
+        // rather than stealing the selection.
+        let mut app = App::new(streaming_pair());
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.cursor_pos(), 1);
+        assert_eq!(app.cursor_map(), Some(MapId::new("blooop/older", 3)));
+
+        app.replace_clusters(streaming_trio());
+
+        assert_eq!(app.cursor_pos(), 2, "the fresher map pushed the row down");
+        assert_eq!(
+            app.cursor_map(),
+            Some(MapId::new("blooop/older", 3)),
+            "still the row they chose"
+        );
+    }
+
+    #[test]
+    fn choosing_the_top_row_pins_it_rather_than_re_defaulting_to_the_top() {
+        // The case a sentinel cannot serve. This cursor is at position 0 exactly
+        // like a fresh one, and must behave like the *opposite* of a fresh one:
+        // the human put it there, so a map arriving above carries it down. Read
+        // `cursor == 0` as "untouched" and this test lands on blooop/fresh.
+        let mut app = App::new(streaming_pair());
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Up)); // deliberately back on the top row
+        assert_eq!(app.cursor_pos(), 0);
+        assert_eq!(app.cursor_map(), Some(MapId::new("blooop/slow", 1)));
+
+        app.replace_clusters(streaming_trio());
+
+        assert_eq!(
+            app.cursor_map(),
+            Some(MapId::new("blooop/slow", 1)),
+            "their row, not whatever is on top now"
+        );
+        assert_eq!(app.cursor_pos(), 1);
+    }
+
+    #[test]
+    fn toggling_the_lens_does_not_turn_an_untouched_cursor_into_a_choice() {
+        // `tab`, `ctrl-f` and `ctrl-g` rebuild the list under the cursor and keep
+        // it on its stop — but keeping an *untouched* cursor on the row that
+        // merely happens to be first would anchor a default, letting the bug back
+        // in through a key that was never about the selection at all.
+        let mut app = App::new(streaming_pair());
+        app.handle_key(key(KeyCode::Tab));
+
+        app.replace_clusters(streaming_trio());
+
+        assert_eq!(app.cursor_pos(), 0);
+        assert_eq!(app.cursor_map(), Some(MapId::new("blooop/fresh", 2)));
+    }
+
     fn type_str(app: &mut App, s: &str) {
         for c in s.chars() {
             app.handle_key(key(KeyCode::Char(c)));
@@ -1057,11 +1235,11 @@ mod tests {
                             app.handle_key(key(KeyCode::Down));
                         }
                         app.handle_key(key(KeyCode::Right));
-                        app.cursor = 0;
+                        app.cursor = Cursor::Chosen(0);
                     }
                     let total = app.stops().len();
                     for start in 0..total {
-                        app.cursor = start;
+                        app.cursor = Cursor::Chosen(start);
                         let before = (app.cursor_pos(), app.stops().len());
                         app.handle_key(key(code));
                         let after = (app.cursor_pos(), app.stops().len());
@@ -1120,7 +1298,7 @@ mod tests {
         ] {
             let mut app = knotty_app();
             let total = app.stops().len();
-            app.cursor = if forward { 0 } else { total - 1 };
+            app.cursor = Cursor::Chosen(if forward { 0 } else { total - 1 });
             for _ in 0..40 {
                 app.handle_key(key(code));
             }
