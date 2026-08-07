@@ -28,39 +28,57 @@
     "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
   },
 
-  // These two mounts are what make the container useful and are also the holes
-  // in the containment that justified it, so they are the narrowest pair that
-  // works rather than python_template's full set:
+  // ONE mount, and it is deliberate that there is only one — settled by
+  // blooop/wayfinder#41.
   //
-  //   - `gh` auth is not optional: tests/live_fetch.rs drives the real tracker.
-  //   - the agent's own credentials come from ~/.claude.
+  // The agent's credentials come from ~/.claude, read-write, with
+  // CLAUDE_CONFIG_DIR above pointing at it: `~/.claude.json` carries onboarding
+  // and per-project trust and lives *outside* `~/.claude`, so without that
+  // variable a container re-onboards every time. Read-write because a token
+  // refresh has to persist; the ~7 h access-token life makes any read-only or
+  // copied arrangement drift into a re-auth. Host plus N containers therefore
+  // share one config, which is accepted and does survive concurrent sessions in
+  // practice.
+  //
+  // `gh` auth is NOT a mount. It arrives as `GH_TOKEN`, which `dl` forwards
+  // into every workspace it starts (from `GH_TOKEN`, `GITHUB_TOKEN` or
+  // `gh auth token`, whichever answers first). That is why the old
+  // `~/.config/gh` bind is gone rather than merely unused: it never worked
+  // here — `gh` keeps the token in the system keyring, so hosts.yml holds
+  // `users: {blooop: {}}` and no `oauth_token`, and `gh auth status` inside the
+  // container reported "The token in default is invalid". A mount could not fix
+  // that, an env token does, and one less hole is worth having either way.
+  //
+  // The cost of dropping it, said plainly: brought up by something *other* than
+  // `dl` — plain `devpod up`, or the devcontainer CLI from an editor — this
+  // container has no `gh` login, and tests/live_fetch.rs will fail. `dl` is this
+  // repo's front door (blooop/wayfinder#36) and `wf` itself now launches through
+  // it (blooop/wayfinder#80), so that is the supported path; export `GH_TOKEN`
+  // yourself for the others.
   //
   // `~/.ssh` is deliberately absent — devpod forwards git credentials and can
   // forward an ssh agent, which lends the *use* of a key without handing over
-  // the key itself. Whether these mounts stay, narrow to read-only, or become
-  // injected tokens is blooop/wayfinder#41, which is still open; this is the
-  // working starting point, not the settled answer.
+  // the key itself.
   //
-  // KNOWN GAP, measured: mounting ~/.config/gh does **not** convey gh auth on
-  // this host. `gh` stores the token in the system keyring, so hosts.yml holds
-  // only `users: {blooop: {}}` and no `oauth_token` — inside the container
-  // `gh auth status` reports "The token in default is invalid". Git itself is
-  // fine (devpod forwards credentials); it is only the `gh` CLI that is
-  // unauthenticated, which means tests/live_fetch.rs cannot pass yet. Fixing it
-  // means choosing between injecting `GH_TOKEN` (a long-lived token in the
-  // container's environment) and a one-off `gh auth login` inside the container
-  // (which persists into this bind mount, because the container has no keyring).
-  // That choice is blooop/wayfinder#41 and it gates blooop/wayfinder#42.
+  // The threat model, stated rather than implied: this container is **not** a
+  // confidentiality boundary. Anything running in it — including a
+  // postCreateCommand from a repo you did not read — has your live Claude
+  // credentials and a `gh` token carrying repo/workflow scopes. That is the
+  // accepted trade for zero-friction auth (blooop/wayfinder#73), and the repos
+  // this whole effort exists to serve want host networking, X11 and device
+  // passthrough anyway, which give away as much again. Isolation here buys
+  // reproducible dependencies and non-colliding concurrent work, not safety
+  // against hostile code. Hardening comes later, from experience, as its own
+  // effort.
   "mounts": [
-    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind",
-    "source=${localEnv:HOME}/.config/gh,target=/home/vscode/.config/gh,type=bind"
+    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind"
   ],
 
   // Runs on the *host* before the container is created. Bind-mounting a path
   // that does not exist yet makes docker create it as a root-owned directory,
   // which then fails confusingly inside the container; mkdir -p is idempotent
   // and will not clobber an existing config.
-  "initializeCommand": "mkdir -p \"$HOME/.claude\" \"$HOME/.config/gh\"",
+  "initializeCommand": "mkdir -p \"$HOME/.claude\"",
 
   "customizations": {
     "vscode": {
