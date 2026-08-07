@@ -306,14 +306,19 @@ choosing among variants would be `wf` picking a container shape, and it has no
 basis to pick. Host access, GPU passthrough and the rest are the repo's
 declarations to make — `wf` injects no `runArgs`.
 
-Two `dl` limits worth knowing, neither of them `wf`'s to fix:
+Container lifecycle is entirely `dl`'s: `wf` never stops, removes or rebuilds
+one, and could not — it `exec`s and is gone, so there is no `wf` left to observe
+an agent exiting. `dl <ws> stop`, `dl <ws> reset` and `dl --prune-worktrees` are
+the tools, and they are yours to run. Containers accumulate until you do.
 
-- `dl` names a path workspace after the **directory** alone, so
-  `~/k1/kinisi_ros` and `~/k2/kinisi_ros` collide on one container — the
-  multi-checkout pattern is not yet isolated per tree.
-- Container lifecycle is entirely `dl`'s: `wf` never stops, removes or rebuilds
-  one. `dl <ws> stop`, `dl <ws> reset` and `dl --prune-worktrees` are the tools,
-  and they are yours to run.
+**This container is not a security boundary, and is not trying to be.** It is
+for reproducible dependencies. Your host `~/.claude` is bind-mounted into it
+read-write and your `gh` login is forwarded as `GH_TOKEN`, so everything running
+in a repo's devcontainer — including a `postCreateCommand` you did not write —
+gets both. That is a deliberate trade for zero-friction auth, taken with eyes
+open ([#73](https://github.com/blooop/wayfinder/issues/73)); the repos this
+exists to serve want `network=host`, X11 and device passthrough anyway, which
+gives away as much again. Don't point `wf` at a repo you have not read.
 
 ### Working while you are away
 
