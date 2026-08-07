@@ -15,7 +15,7 @@ use ratatui::Frame;
 use crate::app::{App, Overlay, Scope};
 use crate::launch::Launch;
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
-use crate::view::{Fold, GroupKind, Item, Plan, Screen};
+use crate::view::{Branch, Fold, GroupKind, Item, Plan, Screen};
 
 /// One colour per glyph meaning, shared by the row column and the rollup
 /// pairs: calm colours for the flowing stages, red for the two that demand
@@ -56,6 +56,28 @@ fn cluster_header(id: &MapId, map: &Map) -> Line<'static> {
         ));
     }
     Line::from(spans)
+}
+
+/// A rollup's trailing spans: a dim word for what the counts are *of*, then
+/// the glyph+count pairs in display order, each in the colour its glyph means.
+///
+/// One function, because a collapsed group and a branch root are asking the
+/// same question of different sets of rows — what is under here, by stage — and
+/// two renderings of one answer is how the screen ended up speaking two glyph
+/// vocabularies in the first place (#78).
+fn rollup_spans(label: &str, rollup: &[(RowGlyph, usize)]) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        format!(" ({label})"),
+        Style::new().add_modifier(Modifier::DIM),
+    )];
+    for &(glyph, count) in rollup {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("{}{count}", glyph.char()),
+            glyph_style(glyph),
+        ));
+    }
+    spans
 }
 
 /// The cursor marker, which sits **after** a row's tree furniture and directly
@@ -138,10 +160,16 @@ fn pr_badge(ticket_repo: &str, pr: &PrLink) -> Vec<Span<'static>> {
 /// extra blocking edges the tree position cannot show (`⤷ also needs #n`). The
 /// flattened screen has no cluster header above the row, so the row names its
 /// repo itself.
+///
+/// A row that heads a branch closes with the stage rollup of it (#62), so the
+/// shape of a subtree reads off its root without walking the subtree — the
+/// same glyph+count pairs a collapsed group carries, because they mean the
+/// same thing.
 fn ticket_line(
     ticket: &Ticket,
     prefix: &str,
     also_needs: &[u64],
+    branch: &Branch,
     name_repo: bool,
     under_cursor: bool,
 ) -> Line<'static> {
@@ -183,6 +211,9 @@ fn ticket_line(
             Style::new().add_modifier(Modifier::DIM),
         ));
     }
+    if let Branch::Root { rollup } = branch {
+        spans.extend(rollup_spans("beneath", rollup));
+    }
     let style = match ticket.status {
         Status::Done => Style::new().add_modifier(Modifier::DIM),
         _ => Style::new(),
@@ -221,17 +252,7 @@ fn group_line(kind: GroupKind, hidden: usize, fold: &Fold, under_cursor: bool) -
         ),
     ];
     if let Fold::Shut { rollup } = fold {
-        spans.push(Span::styled(
-            " (hidden)".to_string(),
-            Style::new().add_modifier(Modifier::DIM),
-        ));
-        for (glyph, count) in rollup {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                format!("{}{count}", glyph.char()),
-                glyph_style(*glyph),
-            ));
-        }
+        spans.extend(rollup_spans("hidden", rollup));
     }
     Line::from(spans)
 }
@@ -270,6 +291,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                 row,
                 prefix,
                 also_needs,
+                branch,
                 depth: _,
             } => {
                 let (_, under_cursor) = mark(&lines, &mut cursor_line);
@@ -277,6 +299,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                     app.ticket(row),
                     prefix,
                     also_needs,
+                    branch,
                     name_repo,
                     under_cursor,
                 ));
@@ -667,6 +690,17 @@ mod tests {
             .expect("#14 under #6");
         let root9 = screen.find("◐ #9 Main screen design").expect("root #9");
         assert!(root6 < sub7 && sub7 < sub14 && sub14 < root9, "{screen}");
+        // Each root closes with the stage rollup of the branch beneath it, in
+        // the same glyph vocabulary as the header above and the rows below:
+        // #6 unlocks #7 and #14, #9 unlocks #14 alone.
+        assert!(
+            screen.contains("#6 Re-entry breadcrumbs [task] (beneath) ⊘2"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("#9 Main screen design [task] (beneath) ⊘1"),
+            "{screen}"
+        );
         // Done work is a count, not rows; the group headers retired with #51.
         assert!(screen.contains("● 1 done (hidden)"), "{screen}");
         assert!(!screen.contains("Choose the stack"), "{screen}");
