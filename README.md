@@ -167,7 +167,10 @@ and elides, leaving a `⋯` in the furniture (`├⋯`) where levels went missin
 unmatched row that *forks* keeps its line, because two matches need something to
 hang from. Rows kept only to place a match are dimmed whole and cannot be landed
 on: the cursor still visits nothing but hits, in best-score-first order, so
-`↓ ↓ enter` works exactly as it did over a flat list. A query reaches inside the
+`↓ ↓ enter` works exactly as it did over a flat list. **The characters the query
+actually landed on are underlined** where they were matched — in the row, or in
+the cluster header's repo name, since typing a project name is a match on the
+one part of the haystack no row draws. A query reaches inside the
 collapsed groups too — a done ticket stays findable, and the group opens onto
 its matches alone, saying `▾ ● 1 of 5 done`. Clusters with nothing matching
 leave the body, header and all.

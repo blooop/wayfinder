@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Overlay, Scope};
+use crate::filter;
 use crate::launch::Launch;
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
 use crate::view::{Branch, Fold, GroupKind, Item, Plan};
@@ -44,11 +45,16 @@ fn glyph_style(glyph: RowGlyph) -> Style {
 /// a line apart: a node the row drew `!` was counted under `○`, and `◍`/`!`
 /// could not appear here at all. Glyphs the map has nobody in drop out rather
 /// than showing a zero.
-fn cluster_header(id: &MapId, map: &Map) -> Line<'static> {
-    let mut spans = vec![Span::styled(
-        format!("▌ {} · {}", id.short_repo(), map.title),
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )];
+///
+/// The repo name carries the query's match on it (`lit`), because the repo is
+/// half of what a ticket is matched against and the rows below do not draw it:
+/// typing a project name would otherwise sift the whole screen down to one
+/// cluster while underlining nothing anywhere.
+fn cluster_header(id: &MapId, map: &Map, lit: &[usize]) -> Line<'static> {
+    let cyan = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::styled("▌ ", cyan)];
+    spans.extend(lit_spans(id.short_repo(), lit, cyan));
+    spans.push(Span::styled(format!(" · {}", map.title), cyan));
     for (glyph, count) in map.tally() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -117,6 +123,48 @@ const CURSOR_COLOR: Color = Color::Indexed(208);
 /// marker is what says where the cursor is.
 const FURNITURE: Style = Style::new().add_modifier(Modifier::DIM);
 
+/// What a live query underlines: the characters it actually landed on, bold and
+/// underlined, over whatever the text was already wearing.
+///
+/// Deliberately not a colour. Every colour on this screen already means
+/// something — cyan is a cluster, green/yellow/red are stages, magenta is a PR,
+/// orange is the cursor and nothing else, dim is finished — and a match is not
+/// a *kind* of thing, it is a property any of them can have: the query has to
+/// be able to land on a done row inside a group and a ready row at the top of a
+/// branch and say the same thing about both. A modifier composes with the
+/// colour already there; a seventh colour would have had to overrule it.
+const MATCHED: Modifier = Modifier::BOLD.union(Modifier::UNDERLINED);
+
+/// `text` as spans, with the characters at `lit` wearing [`MATCHED`] over
+/// `base`. Runs are coalesced, so a contiguous match is one span rather than
+/// one per character. `lit` must be sorted and unique — [`filter::Hit`]
+/// guarantees it — because this walks the two in step.
+fn lit_spans(text: &str, lit: &[usize], base: Style) -> Vec<Span<'static>> {
+    if lit.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let matched = base.add_modifier(MATCHED);
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_lit = false;
+    let mut next = 0;
+    for (i, ch) in text.chars().enumerate() {
+        let now = lit.get(next) == Some(&i);
+        if now {
+            next += 1;
+        }
+        if !run.is_empty() && now != run_lit {
+            let style = if run_lit { matched } else { base };
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        run_lit = now;
+        run.push(ch);
+    }
+    let style = if run_lit { matched } else { base };
+    spans.push(Span::styled(run, style));
+    spans
+}
+
 /// The `⇄ PR#n <state>` badge spans for one linked PR (#52) — evidence of the
 /// ticket's progress, riding after the `[type]` suffix. An open PR folds its
 /// two live signals into one glyph: `✗` when something needs acting on (checks
@@ -166,11 +214,16 @@ fn pr_badge(ticket_repo: &str, pr: &PrLink) -> Vec<Span<'static>> {
 /// shape of a subtree reads off its root without walking the subtree — the
 /// same glyph+count pairs a collapsed group carries, because they mean the
 /// same thing.
+///
+/// `lit` is where a live query landed in the `#n title` half — the only part of
+/// the row that was matched against, and so the only part that can honestly
+/// claim to be why the row is on screen.
 fn ticket_line(
     ticket: &Ticket,
     prefix: &str,
     also_needs: &[u64],
     branch: &Branch,
+    lit: &[usize],
     under_cursor: bool,
 ) -> Line<'static> {
     // Nested rows carry the cursor column as extra indent, so a branch begins
@@ -188,8 +241,9 @@ fn ticket_line(
         Span::styled(indent, FURNITURE),
         cursor_span(under_cursor),
         Span::styled(glyph.char().to_string(), glyph_style(glyph)),
-        Span::raw(format!(" #{} {}", ticket.number, ticket.title)),
+        Span::raw(" "),
     ];
+    spans.extend(lit_spans(&filter::row_text(ticket), lit, Style::new()));
     if let Some(name) = ticket.ticket_type.short_name() {
         spans.push(Span::styled(
             format!(" [{name}]"),
@@ -219,9 +273,11 @@ fn ticket_line(
 /// A context row on a sifted screen: the same row, dimmed whole. It is drawn to
 /// say where the matches under it live — which map, and which takeable ticket
 /// unlocks them — and nothing about it is actionable, so it carries no cursor
-/// marker, no `also needs`, and no rollup.
+/// marker, no `also needs`, and no rollup. Nothing lit, either, and not merely
+/// by omission: a row the query landed on is a match, and a match is drawn as
+/// [`Item::Ticket`], never as one of these.
 fn context_line(ticket: &Ticket, prefix: &str) -> Line<'static> {
-    ticket_line(ticket, prefix, &[], &Branch::Plain, false)
+    ticket_line(ticket, prefix, &[], &Branch::Plain, &[], false)
         .patch_style(Style::new().add_modifier(Modifier::DIM))
 }
 
@@ -302,24 +358,41 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
         under_cursor
     };
 
+    // One query for the whole frame, not one per row: it carries the matcher's
+    // scratch buffers. `None` on a structured screen, where there is nothing to
+    // light up, so the rows below ask for a match only when a query is live.
+    let mut query = filter::Query::new(&app.query);
     let mut lines = vec![Line::default()];
     for item in &plan.items {
         let under_cursor = item.stop_at().is_some() && mark(&lines, &mut cursor_line);
         match item {
-            Item::Header(id) => lines.push(cluster_header(id, &app.clusters[id])),
+            Item::Header(id) => {
+                let map = &app.clusters[id];
+                let lit = query.as_mut().map(|q| q.in_repo(map)).unwrap_or_default();
+                lines.push(cluster_header(id, map, &lit));
+            }
             Item::Ticket {
                 row,
                 prefix,
                 also_needs,
                 branch,
                 depth: _,
-            } => lines.push(ticket_line(
-                app.ticket(row),
-                prefix,
-                also_needs,
-                branch,
-                under_cursor,
-            )),
+            } => {
+                let ticket = app.ticket(row);
+                let lit = query
+                    .as_mut()
+                    .and_then(|q| q.hit(ticket))
+                    .map(|hit| hit.in_row)
+                    .unwrap_or_default();
+                lines.push(ticket_line(
+                    ticket,
+                    prefix,
+                    also_needs,
+                    branch,
+                    &lit,
+                    under_cursor,
+                ));
+            }
             Item::Context { row, prefix } => lines.push(context_line(app.ticket(row), prefix)),
             Item::Group { id, held, fold } => {
                 lines.push(group_line(id.kind, *held, fold, under_cursor));
@@ -1133,6 +1206,65 @@ mod tests {
         let screen = render(&app);
         assert!(screen.contains("Supervising AFK agents"), "{screen}");
         assert!(screen.contains("1 done"), "{screen}");
+    }
+
+    /// The body with the characters a live query lit wrapped in `«»` — the
+    /// underlining, in a form a test can read.
+    fn lit_body(app: &App) -> Vec<String> {
+        body_lines(app)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| {
+                        if span.style.add_modifier.contains(MATCHED) {
+                            format!("«{}»", span.content)
+                        } else {
+                            span.content.to_string()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_live_query_underlines_the_characters_it_matched() {
+        let mut app = fixture_app();
+        type_str(&mut app, "bread");
+        assert_eq!(
+            lit_body(&app)
+                .into_iter()
+                .filter(|l| l.contains('#'))
+                .collect::<Vec<_>>(),
+            vec![
+                "  ▶ ○ #6 Re-entry «bread»crumbs [task]",
+                "    └─  ⊘ #14 «Bread»crumb markers [task]",
+                // The context row is why the match above it is on screen, not
+                // a match itself: nothing on it is lit.
+                "    ◐ #9 Main screen design [task]",
+                "    └─  ⊘ #14 «Bread»crumb markers [task]",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_query_that_matched_the_repo_underlines_it_in_the_cluster_header() {
+        // Typing a project name sifts the screen down to that project while
+        // landing on no character any row draws. Without the header answering
+        // for it, the screen would show a wall of matches with no match in it.
+        let mut app = fixture_app();
+        type_str(&mut app, "wayf");
+        let body = lit_body(&app);
+        assert!(
+            body.iter()
+                .any(|l| l.starts_with("▌ «wayf»inder · Map: wf")),
+            "{body:?}"
+        );
+        assert!(
+            body.iter().all(|l| !l.contains('#') || !l.contains('«')),
+            "the match is on the repo, so no row claims it: {body:?}"
+        );
     }
 
     #[test]
