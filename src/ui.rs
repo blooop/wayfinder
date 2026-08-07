@@ -32,27 +32,27 @@ fn glyph_style(glyph: RowGlyph) -> Style {
     }
 }
 
-/// The cluster header: `▌ <repo> · <map title>  ○n ◐n ⊘n ●n`. The counts are
-/// the whole map's, not the query's — they describe the cluster's shape, and
-/// the group headers already carry `matched/total` while a query is live.
+/// The cluster header: `▌ <repo> · <map title>  ○n ◐n ◍n !n ●n ⊘n`. The counts
+/// are the whole map's, not the query's — they describe the cluster's shape,
+/// and the group headers already carry `matched/total` while a query is live.
+///
+/// They are **stage** counts (#78), tallied through the same [`RowGlyph`] the
+/// rows below are drawn from and coloured by the same [`glyph_style`]. The
+/// header used to keep its own four-status tally with its own glyph array and
+/// its own colour table, which meant the same characters said different things
+/// a line apart: a node the row drew `!` was counted under `○`, and `◍`/`!`
+/// could not appear here at all. Glyphs the map has nobody in drop out rather
+/// than showing a zero.
 fn cluster_header(id: &MapId, map: &Map) -> Line<'static> {
-    let [frontier, claimed, blocked, done] = map.counts();
-    let count_style = [
-        Style::new().fg(Color::Green),
-        Style::new().fg(Color::Yellow),
-        Style::new().fg(Color::Red),
-        Style::new().add_modifier(Modifier::DIM),
-    ];
-    let glyphs = ['○', '◐', '⊘', '●'];
     let mut spans = vec![Span::styled(
         format!("▌ {} · {}", id.short_repo(), map.title),
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     )];
-    for (i, count) in [frontier, claimed, blocked, done].into_iter().enumerate() {
+    for (glyph, count) in map.tally() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            format!("{}{count}", glyphs[i]),
-            count_style[i],
+            format!("{}{count}", glyph.char()),
+            glyph_style(glyph),
         ));
     }
     Line::from(spans)
@@ -601,8 +601,54 @@ mod tests {
     #[test]
     fn the_cluster_header_names_the_map_and_carries_the_counts() {
         let screen = render(&fixture_app());
+        // Glyph display order, the same one the rows and the rollups use:
+        // the stage lattice, then the blocked override after it.
         assert!(
-            screen.contains("▌ wayfinder · Map: wf  ○1  ◐1  ⊘2  ●1"),
+            screen.contains("▌ wayfinder · Map: wf  ○1  ◐1  ●1  ⊘2"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_cluster_header_counts_stages_not_statuses() {
+        // #6 is unblocked and unclaimed — `○` ready — until a PR with failing
+        // checks makes it needs-attention. The row already drew that as `!`;
+        // the header has to agree, because they are one vocabulary. Counting
+        // statuses instead sweeps it back under `○`, and `◍`/`!` could never
+        // appear in a header at all.
+        let mut map = wf_map();
+        map.tickets
+            .iter_mut()
+            .find(|t| t.number == 6)
+            .expect("#6 in the fixture")
+            .prs = vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 46,
+            status: PrStatus::Open {
+                checks: Checks::Failing,
+                review: Review::Required,
+            },
+        }];
+        // #9 is claimed with a passing, approved PR: in review — the other
+        // stage the four-status header had no glyph for.
+        map.tickets
+            .iter_mut()
+            .find(|t| t.number == 9)
+            .expect("#9 in the fixture")
+            .prs = vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 13,
+            status: PrStatus::Open {
+                checks: Checks::Passing,
+                review: Review::Approved,
+            },
+        }];
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        let screen = render(&App::new(clusters));
+        // ○0 is not drawn: the counts name the stages the map is actually in.
+        assert!(
+            screen.contains("▌ wayfinder · Map: wf  ◍1  !1  ●1  ⊘2"),
             "{screen}"
         );
     }

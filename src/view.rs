@@ -251,12 +251,8 @@ fn push_group(
     let fold = if is_expanded {
         Fold::Open
     } else {
-        let mut counts: BTreeMap<RowGlyph, usize> = BTreeMap::new();
-        for &index in held {
-            *counts.entry(RowGlyph::of(&map.tickets[index])).or_default() += 1;
-        }
         Fold::Shut {
-            rollup: counts.into_iter().collect(),
+            rollup: RowGlyph::tally(held.iter().map(|&index| &map.tickets[index])),
         }
     };
     items.push(Item::Group {
