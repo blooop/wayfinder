@@ -46,17 +46,22 @@ Two things to know about it:
 
 ## Checks
 
-CI runs four things, in the order they are cheap to fix, with
-`RUSTFLAGS=-D warnings` — so anything that warns locally fails there:
+CI runs four things, in the order they are cheap to fix, with **both**
+`RUSTFLAGS=-D warnings` and `RUSTDOCFLAGS=-D warnings` — so anything that warns
+locally fails there. Set them when you run the checks, or the last one lies to
+you: a doc comment linking to a private item is a warning locally and a failed
+build in CI.
 
 ```
-cargo fmt --all --check
-cargo clippy --all-targets --all-features --locked
-cargo test --locked --lib --bins --examples
-cargo doc --no-deps --all-features --locked
+cargo fmt --all
+RUSTFLAGS=-D\ warnings RUSTDOCFLAGS=-D\ warnings sh -c '
+  cargo fmt --all --check &&
+  cargo clippy --all-targets --all-features --locked &&
+  cargo test --locked --lib --bins --examples &&
+  cargo doc --no-deps --all-features --locked'
 ```
 
-Run all four before pushing. `cargo fmt --all` first — a formatting diff fails
+Run all four before pushing, `cargo fmt --all` first — a formatting diff fails
 the build before any of the interesting checks get a chance to run.
 
 The `tests/live_*.rs` files are excluded from that test command on purpose: they

@@ -7,8 +7,8 @@
 //! screen is built out of the answers.
 //!
 //! Matching is fuzzy but *tight* — a query has to land on word starts or on
-//! runs, never on single letters picked out of the middles of words. [`tight`]
-//! is that rule and says why the screen needs it.
+//! runs, never on single letters picked out of the middles of words. The
+//! private `tight` below is that rule, and says why the screen needs it.
 //!
 //! Matching is scored against `"repo #num title"`, so typing a repo name
 //! narrows to that project too. That haystack spans two things the screen draws
@@ -136,7 +136,7 @@ impl Query {
     }
 
     /// The match, with the characters it landed on — and `None` when it landed
-    /// badly enough not to count, which [`tight`] decides.
+    /// badly enough not to count, which `tight` decides.
     pub fn hit(&mut self, ticket: &Ticket) -> Option<Hit> {
         let hay = haystack(ticket);
         let mut indices = Vec::new();
