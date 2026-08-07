@@ -160,7 +160,13 @@ blocker; edges the tree cannot show are annotated `⤷ also needs #n`.
 
 **Typing sifts**: a live query prunes whichever screen `tab` had toggled down to
 the rows that matched, keeping the tree they sit in; clearing it restores that
-screen whole. What survives with a match is the cluster header (which project)
+screen whole. Matching is fuzzy but **tight** — every character the query lands
+on has to start a word or sit against another matched one, so `map` finds "the
+**m**anager-**a**gent **p**rotocol" and sub`tree` matches mid-word, while
+letters picked out of the middles of three unrelated words do not: `tree`
+matched 23 of 30 real tickets under plain fuzzy matching and matches 3 under
+this rule. The cost is that an abbreviation skipping *inside* a word — `wf` for
+"wayfinder" — no longer matches; `wayf` does. What survives with a match is the cluster header (which project)
 and the branch root it hangs from (which takeable ticket unlocks it) — the two
 things a hit cannot say about itself. Everything between them is chain length
 and elides, leaving a `⋯` in the furniture (`├⋯`) where levels went missing; an

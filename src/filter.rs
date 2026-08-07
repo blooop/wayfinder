@@ -6,6 +6,10 @@
 //! how well it matched, and which characters the query landed on — and the
 //! screen is built out of the answers.
 //!
+//! Matching is fuzzy but *tight* — a query has to land on word starts or on
+//! runs, never on single letters picked out of the middles of words. [`tight`]
+//! is that rule and says why the screen needs it.
+//!
 //! Matching is scored against `"repo #num title"`, so typing a repo name
 //! narrows to that project too. That haystack spans two things the screen draws
 //! in different places: the repo appears once in the cluster header, the rest on
@@ -36,6 +40,40 @@ pub fn row_text(ticket: &Ticket) -> String {
 /// let unrelated repos match on a shared owner.
 fn haystack(ticket: &Ticket) -> String {
     format!("{} {}", ticket.short_repo(), row_text(ticket))
+}
+
+/// Whether a match is *tight* enough to count: every character it landed on
+/// either starts a word or sits against another matched character.
+///
+/// Nucleo, like fzf, will match a query as a subsequence of very nearly
+/// anything — `tree` finds "**T**he stage lattice: de**r**iving stag**e** from
+/// PR stat**e**", three letters plucked out of the middles of three words. On a
+/// ranked flat list that is harmless: junk sorts to the bottom and nobody
+/// scrolls that far. This screen is not a ranked flat list. A sifted tree draws
+/// every row that matched, with its branch root and cluster header around it,
+/// so one junk match costs three lines and a cursor stop rather than a line you
+/// skim past — `tree` kept 23 of 30 real tickets before this rule and 3 after.
+/// Precision is worth more here than recall.
+///
+/// A letter picked out of the middle of a word is what separates the two: it is
+/// never how anyone means to find something, while a letter that *starts* a
+/// word (`m`anager `a`gent `p`rotocol) and a run of letters (sub`tree`) both
+/// are. The cost is real and deliberate: an abbreviation that skips inside a
+/// word — `stgawr` for "stage-aware", `wf` for "wayfinder" — no longer matches.
+/// Typing more of the word, or the word itself, does.
+///
+/// A pattern of nothing but negations (`!bread`) lands on no characters at all,
+/// and vacuously passes: there is nothing there to be loose about.
+fn tight(chars: &[char], indices: &[u32]) -> bool {
+    let matched = |i: usize| indices.binary_search(&(i as u32)).is_ok();
+    indices.iter().all(|&i| {
+        let i = i as usize;
+        let word_start = i == 0
+            || !chars[i - 1].is_alphanumeric()
+            // camelCase: the capital that opens a word inside one.
+            || (!chars[i - 1].is_uppercase() && chars[i].is_uppercase());
+        word_start || (i > 0 && matched(i - 1)) || matched(i + 1)
+    })
 }
 
 /// Where a query landed in one ticket, in char indices into each of the two
@@ -89,16 +127,16 @@ impl Query {
         })
     }
 
-    /// How well this ticket matched, or `None` for no match at all.
+    /// How well this ticket matched, or `None` for no match at all. Defined in
+    /// terms of [`Query::hit`] rather than beside it: whether a row matches now
+    /// depends on *where* the match landed, so the sieve that keeps the row and
+    /// the draw that underlines it have to be reading one answer.
     pub fn score(&mut self, ticket: &Ticket) -> Option<u32> {
-        let hay = haystack(ticket);
-        self.pattern
-            .score(Utf32Str::new(&hay, &mut self.buf), &mut self.matcher)
+        self.hit(ticket).map(|hit| hit.score)
     }
 
-    /// The same match, with the characters it landed on. Strictly more work
-    /// than [`Query::score`], so the sieve asks for the score and only the draw
-    /// asks for this.
+    /// The match, with the characters it landed on — and `None` when it landed
+    /// badly enough not to count, which [`tight`] decides.
     pub fn hit(&mut self, ticket: &Ticket) -> Option<Hit> {
         let hay = haystack(ticket);
         let mut indices = Vec::new();
@@ -108,10 +146,14 @@ impl Query {
             &mut indices,
         )?;
         // Nucleo makes no promise about order and can repeat an index across
-        // atoms of a multi-atom pattern; the screen walks these in step with
-        // the characters, so they have to be sorted and unique.
+        // atoms of a multi-atom pattern; both the tightness rule and the screen
+        // walk these in step with the characters, so they have to be sorted and
+        // unique before either does.
         indices.sort_unstable();
         indices.dedup();
+        if !tight(&hay.chars().collect::<Vec<char>>(), &indices) {
+            return None;
+        }
 
         let repo_len = ticket.short_repo().chars().count();
         let mut hit = Hit {
@@ -316,18 +358,78 @@ mod tests {
 
     #[test]
     fn a_hit_agrees_with_the_score_the_sieve_used() {
-        // Two nucleo calls, one answer: the row the screen lights up has to be
-        // the row the sieve kept, and by the same margin it ranked it on.
+        // One answer, two callers: the row the screen lights up has to be the
+        // row the sieve kept, and by the same margin it ranked it on. Since
+        // whether a row matches now depends on *where* the match landed, these
+        // agreeing is a structural property rather than a lucky one — but the
+        // sieve reaches matching through `scores`, so that path is what is
+        // pinned here.
         let tickets = fixture();
         let mut query = Query::new("bread").expect("a live query");
-        for ticket in &tickets {
-            assert_eq!(
-                query.hit(ticket).map(|hit| hit.score),
-                query.score(ticket),
-                "{}",
-                ticket.title
-            );
-        }
+        let by_hit: Vec<Option<u32>> = tickets
+            .iter()
+            .map(|t| query.hit(t).map(|h| h.score))
+            .collect();
+        assert_eq!(by_hit, scores(&tickets, "bread"));
+    }
+
+    #[test]
+    fn a_letter_picked_out_of_the_middle_of_a_word_is_no_match() {
+        // The subsequence nucleo will happily find and nobody means: `tree`
+        // spelled out of "The … deriving … state". It was 3 lines and a cursor
+        // stop on the sifted screen before this rule.
+        let t = ticket(
+            "blooop/wayfinder",
+            61,
+            "The stage lattice: deriving stage from PR state",
+        );
+        assert_eq!(Query::new("tree").expect("a live query").hit(&t), None);
+    }
+
+    #[test]
+    fn a_run_of_letters_matches_wherever_in_a_word_it_sits() {
+        // The other half of the rule: `tree` inside "subtree" is a real match,
+        // and nothing about it being mid-word makes it less of one.
+        let t = ticket("blooop/wayfinder", 63, "Deferred subtree resolution");
+        assert!(Query::new("tree").expect("a live query").hit(&t).is_some());
+    }
+
+    #[test]
+    fn initials_still_match() {
+        // What the rule is careful to keep: every letter starts a word, which
+        // is exactly how an acronym is meant to be typed.
+        let t = ticket("blooop/wayfinder", 64, "The manager-agent protocol");
+        assert!(Query::new("map").expect("a live query").hit(&t).is_some());
+    }
+
+    #[test]
+    fn an_abbreviation_that_skips_inside_a_word_no_longer_matches() {
+        // The deliberate cost, pinned so it is a decision rather than a
+        // surprise: `stgawr` reads as "stage-aware" to a human and as three
+        // mid-word letters to this rule, and the rule wins. So does `wf` for
+        // "wayfinder" — `wayf` is the shortest thing that still finds it.
+        let t = ticket("blooop/wayfinder", 74, "Build: stage-aware tree");
+        assert_eq!(Query::new("stgawr").expect("a live query").hit(&t), None);
+        assert_eq!(Query::new("wf").expect("a live query").hit(&t), None);
+        assert!(Query::new("wayf").expect("a live query").hit(&t).is_some());
+    }
+
+    #[test]
+    fn the_tightness_rule_reaches_the_sieve_and_not_only_the_draw() {
+        // A loose match dropped at the draw but kept by the sieve would be a
+        // row on screen with nothing lit and no reason to be there.
+        let tickets = vec![
+            ticket("blooop/wayfinder", 61, "The stage lattice: deriving state"),
+            ticket("blooop/wayfinder", 74, "Build: stage-aware tree"),
+        ];
+        assert_eq!(matching(&tickets, "tree"), vec![1]);
+    }
+
+    #[test]
+    fn a_negation_matches_the_rows_it_names_nothing_in() {
+        // fzf's `!` syntax lands on no characters at all, so there is nothing
+        // for the tightness rule to reject — it must not reject everything.
+        assert_eq!(matching(&fixture(), "!bread"), vec![1, 2]);
     }
 
     #[test]
