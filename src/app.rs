@@ -390,13 +390,29 @@ impl App {
         }
     }
 
-    /// Point the cursor at a specific stop if it is on screen.
+    /// Point the cursor at a specific stop — if that stop is on the screen the
+    /// rebuild produced.
+    ///
+    /// When it is not, the cursor goes back to [`Cursor::Untouched`], because an
+    /// anchor that vanished is the *absence* of a choice and not a choice of the
+    /// first row. The forest lens emits no group lines at all, so `tab` from a
+    /// `Done` line deletes the stop being held; writing down `Chosen(0)` there
+    /// would promote a default into a choice through a key that was never about the
+    /// selection, and the next map to sort above would then carry the cursor off
+    /// the top — #88 exactly. `move_sibling` already answers the same fact the same
+    /// way for an empty list.
+    ///
+    /// Hence the exhaustive match rather than `unwrap_or(0)`: the `None` is the
+    /// case that matters here, so it is named instead of being given a value.
     fn point_at(&mut self, key: &StopKey) {
-        let pos = self
+        let found = self
             .stops()
             .iter()
             .position(|at| &self.stop_key(&at.stop) == key);
-        self.cursor = Cursor::Chosen(pos.unwrap_or(0));
+        self.cursor = match found {
+            Some(pos) => Cursor::Chosen(pos),
+            None => Cursor::Untouched,
+        };
     }
 
     /// `↑`/`↓`: the next stop at the cursor's own depth, else simply the next
@@ -1070,6 +1086,58 @@ mod tests {
 
         assert_eq!(app.cursor_pos(), 0);
         assert_eq!(app.cursor_map(), Some(MapId::new("blooop/fresh", 2)));
+    }
+
+    /// One map with finished work in it, so the leverage lens gives it a `Done`
+    /// group line — a stop the forest lens, which has no group lines at all, does
+    /// not have.
+    fn map_with_a_done_group() -> BTreeMap<MapId, Map> {
+        BTreeMap::from([(
+            MapId::new("blooop/slow", 1),
+            Map {
+                title: "Map: blooop/slow".to_string(),
+                last_activity: Some(
+                    Activity::parse("2026-08-01T00:00:00Z").expect("fixture stamp parses"),
+                ),
+                tickets: vec![
+                    ticket("blooop/slow", 1, "takeable", true, false, vec![]),
+                    ticket("blooop/slow", 2, "finished", false, false, vec![]),
+                ],
+            },
+        )])
+    }
+
+    #[test]
+    fn a_lens_toggle_off_a_vanished_group_line_leaves_no_choice_behind() {
+        // #88, re-entered through the lens door. The forest lens emits no group
+        // lines, so `tab` from a `Done` line deletes the very stop being held —
+        // and recording position 0 for the stop that vanished is a default written
+        // down as a choice, the one state `Cursor` exists to forbid. The symptom is
+        // #88's own: the next map to sort above drags the cursor off the top row.
+        let mut app = App::new(map_with_a_done_group());
+        app.handle_key(key(KeyCode::Down));
+        assert!(
+            matches!(app.cursor_stop(), Some(Stop::Group(_))),
+            "the leverage lens shows blooop/slow's Done group"
+        );
+
+        app.handle_key(key(KeyCode::Tab)); // the forest has no group line to keep
+
+        let mut fresher = map_with_a_done_group();
+        fresher.extend([cluster(
+            "blooop/fresh",
+            2,
+            Some("2026-08-07T00:00:00Z"),
+            true,
+        )]);
+        app.replace_clusters(fresher);
+
+        assert_eq!(app.cursor_pos(), 0);
+        assert_eq!(
+            app.cursor_map(),
+            Some(MapId::new("blooop/fresh", 2)),
+            "nothing was chosen, so the cursor still means the top of the list"
+        );
     }
 
     fn type_str(app: &mut App, s: &str) {
