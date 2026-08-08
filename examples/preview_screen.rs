@@ -25,7 +25,7 @@ fn press(app: &mut App, name: &str) {
         "left" => KeyCode::Left,
         "right" => KeyCode::Right,
         "tab" => KeyCode::Tab,
-        // Named so the launch line (#62/#96) is reachable from `$KEYS` —
+        // Named so the launch picker (#62/#96) is reachable from `$KEYS` —
         // without them `enter` would send a bare `e` into the query.
         "enter" => KeyCode::Enter,
         "esc" => KeyCode::Esc,

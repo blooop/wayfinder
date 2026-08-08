@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::launch::{self, Launch, LaunchMode, Staged, Targets};
+use crate::launch::{self, Launch, LaunchMode, Mode, Staged, Targets};
 use crate::model::{stage, Activity, Map, MapId, MapSet, Status, Ticket};
 use crate::projects::Checkout;
 use crate::refresh::Startup;
@@ -45,21 +45,22 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
     None,
-    /// The launch line — enter on a launchable node staged this launch, and
-    /// the line now collects its mode: empty is interactive, `auto [text]`
-    /// hands it to the manager, anything else steers ([`LaunchMode::parse`]).
-    /// The line resolves the route from the staged node and the mode typed so
-    /// far, so it *shows* where enter goes and changes as `auto` is typed — and
-    /// a line for an unlaunchable node is unrepresentable, because
+    /// The launch picker — `enter` on a launchable node staged this launch, and
+    /// the overlay now collects the two things a launch needs beyond the node:
+    /// which [`Mode`] resolves it, picked from a list, and the steering text.
+    /// It resolves the route from the staged node and the picked mode, so it
+    /// *shows* which skill `enter` will run and re-reads as the mode moves — and
+    /// a picker for an unlaunchable node is unrepresentable, because
     /// [`launch::Launchable`] refused it before anything was staged.
     ///
     /// The staged launch is index-free ([`Staged`]) for the same reason the
     /// picker's candidates are complete `Launch`es: a background map arrival
     /// swaps the clusters underneath an open overlay, and a positional [`Row`]
     /// held across that would name a different ticket, or none at all.
-    LaunchLine {
+    PickLaunch {
         staged: Staged,
-        text: String,
+        mode: Mode,
+        steer: String,
     },
     /// Candidates are complete launches, so the pick cannot produce an
     /// inconsistent one.
@@ -67,6 +68,32 @@ pub enum Overlay {
         launches: Vec<Launch>,
         cursor: usize,
     },
+}
+
+/// The mode after `mode` in the launch picker, wrapping.
+///
+/// Derived from [`Mode::all`] rather than written as a toggle: with two modes a
+/// toggle is the same thing, but it stops being the same thing the moment a
+/// third mode exists, and this is the code that would silently keep working
+/// while skipping it.
+fn next_mode(mode: Mode) -> Mode {
+    stepped(mode, 1)
+}
+
+/// The mode before it. Backwards is a forward step of `len - 1`, so there is no
+/// signed arithmetic and no underflow to reason about at index 0.
+fn previous_mode(mode: Mode) -> Mode {
+    let modes = Mode::all();
+    stepped(mode, modes.len() - 1)
+}
+
+/// Step `delta` places along [`Mode::all`], wrapping. Takes a distance rather
+/// than a key, so which key means which direction stays in the key handler
+/// where the rest of the bindings are.
+fn stepped(mode: Mode, delta: usize) -> Mode {
+    let modes = Mode::all();
+    let at = modes.iter().position(|m| *m == mode).unwrap_or(0);
+    modes[(at + delta) % modes.len()]
 }
 
 /// One on-screen row: which map's cluster it is in, and the ticket's position
@@ -565,7 +592,7 @@ impl App {
     }
 
     /// The first enter (#62): stage a launch of whatever the cursor is on by
-    /// opening the launch line — a ticket, or since #96 the cluster header,
+    /// opening the launch picker — a ticket, or since #96 the cluster header,
     /// which stages the **map** as one node.
     ///
     /// Two things still refuse, with a count-line notice, and both are
@@ -588,9 +615,10 @@ impl App {
             }
             Some(Stop::Map(id)) => {
                 let title = self.clusters[&id].title.clone();
-                self.overlay = Overlay::LaunchLine {
+                self.overlay = Overlay::PickLaunch {
                     staged: Staged::map(&id, &title),
-                    text: String::new(),
+                    mode: Mode::default(),
+                    steer: String::new(),
                 };
                 Outcome::Continue
             }
@@ -621,9 +649,10 @@ impl App {
                 Outcome::Continue
             }
             Some(staged) => {
-                self.overlay = Overlay::LaunchLine {
+                self.overlay = Overlay::PickLaunch {
                     staged,
-                    text: String::new(),
+                    mode: Mode::default(),
+                    steer: String::new(),
                 };
                 Outcome::Continue
             }
@@ -663,38 +692,53 @@ impl App {
         }
     }
 
-    /// Keys while the launch line is up (#62). The line owns every printable
-    /// key — filtering already happened, this text is the launch's mode — and
-    /// esc backs out to the list with the query and cursor untouched (they
-    /// were never touched to begin with; the invariant is that nothing here
-    /// may touch them).
-    fn handle_launch_line_key(
+    /// Keys while the launch picker is up (#62, restaged as an overlay). It
+    /// owns every printable key — filtering already happened, and this text
+    /// steers the launch — and esc backs out to the list with the query and
+    /// cursor untouched (they were never touched to begin with; the invariant
+    /// is that nothing here may touch them).
+    ///
+    /// The arrows move the mode and the letters type: no printable key picks a
+    /// mode, so `auto` typed into the steer field steers, and `j`/`k` — which
+    /// walk the which-checkout picker, a modal with nothing to type into — are
+    /// text here.
+    fn handle_pick_launch_key(
         &mut self,
         key: KeyEvent,
         staged: Staged,
-        mut text: String,
+        mut mode: Mode,
+        mut steer: String,
     ) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             // Back to the list; the overlay is already None.
-            KeyCode::Esc => Outcome::Continue,
-            KeyCode::Char('c') if ctrl => Outcome::Quit,
-            KeyCode::Enter => self.resolve_launch(&staged, &LaunchMode::parse(&text)),
+            KeyCode::Esc => return Outcome::Continue,
+            KeyCode::Char('c') if ctrl => return Outcome::Quit,
+            // Returns *before* the overlay is put back, because resolving may
+            // have opened the which-checkout modal over this one — falling
+            // through would overwrite it with the picker the launch just left.
+            KeyCode::Enter => {
+                return self.resolve_launch(&staged, &LaunchMode::picked(mode, &steer))
+            }
+            // With two modes every step is the same step; `tab` joins the
+            // arrows because it is what the rest of the screen uses to move
+            // between two of something.
+            KeyCode::Up => mode = previous_mode(mode),
+            KeyCode::Down | KeyCode::Tab => mode = next_mode(mode),
             KeyCode::Backspace => {
-                text.pop();
-                self.overlay = Overlay::LaunchLine { staged, text };
-                Outcome::Continue
+                steer.pop();
             }
             KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                text.push(c);
-                self.overlay = Overlay::LaunchLine { staged, text };
-                Outcome::Continue
+                steer.push(c);
             }
-            _ => {
-                self.overlay = Overlay::LaunchLine { staged, text };
-                Outcome::Continue
-            }
+            _ => {}
         }
+        self.overlay = Overlay::PickLaunch {
+            staged,
+            mode,
+            steer,
+        };
+        Outcome::Continue
     }
 
     /// Keys while the checkout picker is up. The modal owns every key: no
@@ -756,8 +800,12 @@ impl App {
             Overlay::PickCheckout { launches, cursor } => {
                 return self.handle_overlay_key(key, launches, cursor);
             }
-            Overlay::LaunchLine { staged, text } => {
-                return self.handle_launch_line_key(key, staged, text);
+            Overlay::PickLaunch {
+                staged,
+                mode,
+                steer,
+            } => {
+                return self.handle_pick_launch_key(key, staged, mode, steer);
             }
             Overlay::None => {}
         }
@@ -1658,25 +1706,30 @@ mod tests {
     }
 
     #[test]
-    fn enter_opens_the_launch_line_and_a_second_enter_launches() {
+    fn enter_opens_the_launch_picker_and_a_second_enter_launches() {
         // The two-step (#62): the first enter stages the launch — nothing
-        // execs yet — and an empty line's enter is the interactive default.
+        // execs yet — and enter on the default row is the interactive launch.
         let mut app = launchable_app();
         // wayfinder#6, whose repo has one checkout.
         go_to(&mut app, "#6");
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         match &app.overlay {
-            Overlay::LaunchLine { staged, text } => {
+            Overlay::PickLaunch {
+                staged,
+                mode,
+                steer,
+            } => {
                 assert_eq!(
                     staged.route(Mode::Interactive),
                     Route::Wayfinder,
                     "a task is a decision node"
                 );
                 assert_eq!(staged.key(), "#6");
-                assert_eq!(staged.title, "Re-entry breadcrumbs", "the line names it");
-                assert_eq!(text, "", "the line opens empty");
+                assert_eq!(staged.title, "Re-entry breadcrumbs", "the picker names it");
+                assert_eq!(*mode, Mode::Interactive, "the picker opens on the default");
+                assert_eq!(steer, "", "with nothing steering it");
             }
-            other => panic!("expected the launch line, got {other:?}"),
+            other => panic!("expected the launch picker, got {other:?}"),
         }
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
@@ -1754,7 +1807,7 @@ mod tests {
                 assert_eq!(launches.len(), 2);
                 assert_eq!(*cursor, 0);
             }
-            other @ (Overlay::None | Overlay::LaunchLine { .. }) => {
+            other @ (Overlay::None | Overlay::PickLaunch { .. }) => {
                 panic!("expected the picker, got {other:?}")
             }
         }
@@ -1782,7 +1835,7 @@ mod tests {
         }
         match &app.overlay {
             Overlay::PickCheckout { cursor, .. } => assert_eq!(*cursor, 1),
-            other @ (Overlay::None | Overlay::LaunchLine { .. }) => {
+            other @ (Overlay::None | Overlay::PickLaunch { .. }) => {
                 panic!("expected the picker, got {other:?}")
             }
         }
@@ -1810,8 +1863,45 @@ mod tests {
     }
 
     #[test]
-    fn launch_line_typing_lands_in_the_line_and_esc_restores_the_list() {
-        // The line owns every printable key: nothing leaks into the query.
+    fn the_picker_walks_the_modes_both_ways_and_wraps() {
+        // Up and down are inverses and neither can fall off an end: with two
+        // modes every step lands on the other one, and the mode under the
+        // cursor is the mode `enter` will launch, so a step that went nowhere
+        // (or panicked at index 0) would launch the wrong skill.
+        let mut app = launchable_app();
+        go_to(&mut app, "#6");
+        app.handle_key(key(KeyCode::Enter));
+        let mode = |app: &App| match &app.overlay {
+            Overlay::PickLaunch { mode, .. } => *mode,
+            other => panic!("expected the launch picker, got {other:?}"),
+        };
+        assert_eq!(mode(&app), Mode::Interactive);
+        // Up from the first row wraps to the last rather than sticking.
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(mode(&app), Mode::Auto);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(mode(&app), Mode::Interactive, "and wraps back round");
+        // Tab steps the same way down does — it is not the view toggle in here.
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(mode(&app), Mode::Auto);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(mode(&app), Mode::Interactive);
+        // Steering text is untouched by moving the mode: the two axes are
+        // edited independently, in one overlay.
+        type_str(&mut app, "keep me");
+        app.handle_key(key(KeyCode::Down));
+        match &app.overlay {
+            Overlay::PickLaunch { mode, steer, .. } => {
+                assert_eq!(*mode, Mode::Auto);
+                assert_eq!(steer, "keep me");
+            }
+            other => panic!("expected the launch picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_picker_typing_steers_and_esc_restores_the_list() {
+        // The picker owns every printable key: nothing leaks into the query.
         // Esc backs out with the query and the cursor exactly as they were.
         let mut app = launchable_app();
         type_str(&mut app, "bread"); // flattens to wayfinder#6
@@ -1820,8 +1910,8 @@ mod tests {
         type_str(&mut app, "half a thought");
         app.handle_key(key(KeyCode::Backspace));
         match &app.overlay {
-            Overlay::LaunchLine { text, .. } => assert_eq!(text, "half a though"),
-            other => panic!("expected the launch line, got {other:?}"),
+            Overlay::PickLaunch { steer, .. } => assert_eq!(steer, "half a though"),
+            other => panic!("expected the launch picker, got {other:?}"),
         }
         assert_eq!(app.query, "bread", "typing stayed out of the query");
 
@@ -1833,7 +1923,7 @@ mod tests {
             6,
             "esc kept the cursor"
         );
-        // And esc means *back to the list*, never quit-from-the-line: the next
+        // And esc means *back to the list*, never quit-from-the-picker: the next
         // esc clears the query, the one after quits — the ordinary ladder.
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Outcome::Continue);
         assert!(app.query.is_empty());
@@ -1841,13 +1931,15 @@ mod tests {
     }
 
     #[test]
-    fn auto_text_on_the_launch_line_launches_the_manager_with_steering() {
-        // The acceptance shape (#96): enter → `auto something` → enter
-        // produces the manager skill carrying `steer: something`.
+    fn picking_auto_in_the_overlay_launches_the_manager_with_steering() {
+        // The acceptance shape (#96), through the picker: enter → move to the
+        // `auto` row → type the steer → enter produces the manager skill
+        // carrying `steer: something`.
         let mut app = launchable_app();
         go_to(&mut app, "#6"); // wayfinder#6, one checkout
         app.handle_key(key(KeyCode::Enter));
-        type_str(&mut app, "auto something");
+        app.handle_key(key(KeyCode::Down));
+        type_str(&mut app, "something");
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
@@ -1859,13 +1951,14 @@ mod tests {
     }
 
     #[test]
-    fn the_typed_mode_survives_the_checkout_picker() {
-        // Two checkouts of dotfiles: the mode is settled on the line, the
-        // picker only answers *where* — the pick must not lose the `auto`.
+    fn the_picked_mode_survives_the_checkout_picker() {
+        // Two checkouts of dotfiles: the mode is settled in the launch
+        // overlay, the checkout picker only answers *where* — the pick must
+        // not lose the `auto`.
         let mut app = launchable_app();
         go_to(&mut app, "#103");
         app.handle_key(key(KeyCode::Enter)); // dotfiles#103: stage
-        type_str(&mut app, "auto");
+        app.handle_key(key(KeyCode::Down)); // to the auto row
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         assert!(matches!(app.overlay, Overlay::PickCheckout { .. }));
         let launch = match app.handle_key(key(KeyCode::Enter)) {
@@ -1877,15 +1970,15 @@ mod tests {
 
     #[test]
     fn a_staged_launch_survives_a_refetch_moving_its_ticket() {
-        // The line stays up while background fetches are still landing (#27),
+        // The picker stays up while background fetches are still landing (#27),
         // and each arrival swaps the clusters underneath it. A staged launch
-        // is snapshotted index-free, so the line keeps naming — and launching
+        // is snapshotted index-free, so the picker keeps naming — and launching
         // — the ticket it was opened on, wherever that ticket now sits.
         let staged = || {
             let mut app = launchable_app();
             go_to(&mut app, "#6");
             app.handle_key(key(KeyCode::Enter));
-            type_str(&mut app, "auto");
+            app.handle_key(key(KeyCode::Down)); // to the auto row
             app
         };
         let wf = MapId::new("blooop/wayfinder", 1);
@@ -1936,8 +2029,8 @@ mod tests {
         );
         app.replace_clusters(shrunk);
         match &app.overlay {
-            Overlay::LaunchLine { staged, .. } => assert_eq!(staged.key(), "#6"),
-            other => panic!("expected the launch line, got {other:?}"),
+            Overlay::PickLaunch { staged, .. } => assert_eq!(staged.key(), "#6"),
+            other => panic!("expected the launch picker, got {other:?}"),
         }
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
@@ -1956,13 +2049,13 @@ mod tests {
         go_to(&mut app, "map #1");
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         match &app.overlay {
-            Overlay::LaunchLine { staged, .. } => {
+            Overlay::PickLaunch { staged, .. } => {
                 assert_eq!(staged.key(), "#1");
-                assert_eq!(staged.title, "Map: wf", "the line names the map");
+                assert_eq!(staged.title, "Map: wf", "the picker names the map");
                 assert_eq!(staged.route(Mode::Interactive), Route::Wayfinder);
                 assert_eq!(staged.route(Mode::Auto), Route::WayfinderAuto);
             }
-            other => panic!("expected the launch line, got {other:?}"),
+            other => panic!("expected the launch picker, got {other:?}"),
         }
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
@@ -1974,7 +2067,7 @@ mod tests {
         let mut app = launchable_app();
         go_to(&mut app, "map #1");
         app.handle_key(key(KeyCode::Enter));
-        type_str(&mut app, "auto");
+        app.handle_key(key(KeyCode::Down)); // to the auto row
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
@@ -1983,14 +2076,14 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_a_done_or_blocked_node_is_a_notice_not_a_launch_line() {
+    fn enter_on_a_done_or_blocked_node_is_a_notice_not_a_launch_picker() {
         let mut app = launchable_app();
         // Blocked: #7 hangs under #6 as context.
         go_to(&mut app, "#6");
         app.handle_key(key(KeyCode::Right)); // into #7
         assert_eq!(at(&app), "#7");
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
-        assert_eq!(app.overlay, Overlay::None, "no line on a blocked node");
+        assert_eq!(app.overlay, Overlay::None, "no picker on a blocked node");
         assert!(
             app.notice.as_deref().unwrap().contains("blocked"),
             "{:?}",
@@ -2004,7 +2097,7 @@ mod tests {
         app.handle_key(key(KeyCode::Right)); // onto #2
         assert_eq!(at(&app), "#2");
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
-        assert_eq!(app.overlay, Overlay::None, "no line on a done node");
+        assert_eq!(app.overlay, Overlay::None, "no picker on a done node");
         assert!(
             app.notice.as_deref().unwrap().contains("done"),
             "{:?}",
@@ -2045,10 +2138,10 @@ mod tests {
         let mut ready = build_app(vec![]);
         ready.handle_key(key(KeyCode::Enter));
         match &ready.overlay {
-            Overlay::LaunchLine { staged, .. } => {
+            Overlay::PickLaunch { staged, .. } => {
                 assert_eq!(staged.route(Mode::Interactive), Route::Tdd);
             }
-            other => panic!("expected the launch line, got {other:?}"),
+            other => panic!("expected the launch picker, got {other:?}"),
         }
         let launch = match ready.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
@@ -2066,10 +2159,10 @@ mod tests {
         }]);
         in_review.handle_key(key(KeyCode::Enter));
         match &in_review.overlay {
-            Overlay::LaunchLine { staged, .. } => {
+            Overlay::PickLaunch { staged, .. } => {
                 assert_eq!(staged.route(Mode::Interactive), Route::Review);
             }
-            other => panic!("expected the launch line, got {other:?}"),
+            other => panic!("expected the launch picker, got {other:?}"),
         }
         let launch = match in_review.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
