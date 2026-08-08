@@ -611,6 +611,20 @@ impl Staged {
     /// cluster header, [`Aim::Map`] — adds the creation rows, because creation
     /// is a repo-level act and a ticket picker carrying it would merge
     /// concerns the stop grammar keeps apart.
+    /// The row the picker opens on: the default mode's launch row, whatever
+    /// else this stop offers. Creation is never the default — `enter` on a
+    /// node still means "launch this node" first.
+    ///
+    /// # Panics
+    ///
+    /// Never: [`Staged::candidates`] always leads with the launch rows.
+    pub fn default_candidate(&self) -> Candidate {
+        *self
+            .candidates()
+            .first()
+            .expect("every stop offers its launch rows")
+    }
+
     pub fn candidates(&self) -> Vec<Candidate> {
         let launches = Mode::all().into_iter().map(|mode| Candidate::Launch {
             mode,

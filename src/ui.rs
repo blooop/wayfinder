@@ -15,7 +15,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Overlay, Scope};
 use crate::filter;
-use crate::launch::{Launch, Mode, Staged};
+use crate::launch::{Candidate, Launch, Staged};
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
 use crate::view::{Branch, Fold, GroupKind, Item, Plan};
 
@@ -508,10 +508,10 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// drawn per option rather than once for the cursor's — the difference between
 /// `/wf`, `/wf-auto` and no skill at all (#112) *is* the choice being made, so
 /// every one of them is on screen.
-fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, mode: Mode, steer: &str) {
+fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, candidate: Candidate, steer: &str) {
     let mut lines = vec![Line::default()];
-    for option in Mode::all() {
-        let picked = option == mode;
+    for option in staged.candidates() {
+        let picked = option == candidate;
         let marker = if picked { '▶' } else { ' ' };
         // The cursor's row is the one that will run, so it is the one that reads
         // as bold; the others stay dim enough to scan past.
@@ -521,29 +521,44 @@ fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, mode: Mode, steer:
             Style::new().add_modifier(Modifier::DIM)
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {marker} {:<12}", option.label()), emphasis),
+            Span::styled(format!("  {marker} {:<14}", option.label()), emphasis),
             Span::styled(
-                format!("{:<10}", staged.route(option).label()),
+                format!("{:<10}", option.route().label()),
                 Style::new().fg(Color::Cyan),
             ),
             Span::styled(option.blurb(), Style::new().add_modifier(Modifier::DIM)),
         ]));
     }
     lines.push(Line::default());
-    // The steer field is always shown, empty or not: it is the other half of
+    // The text field is always shown, empty or not: it is the other half of
     // what enter will do, and a field that appears only once you have typed
-    // into it cannot tell you that you may.
+    // into it cannot tell you that you may. Its *name* is the picked row's
+    // (#114) — one field, three meanings, and the row says which one is live:
+    // steering an agent, the task itself, or a seed for a charting session.
     lines.push(Line::from(vec![
-        Span::styled("    steer  ", Style::new().add_modifier(Modifier::DIM)),
+        Span::styled(
+            format!("    {:<6} ", candidate.field()),
+            Style::new().add_modifier(Modifier::DIM),
+        ),
         Span::raw(steer.to_string()),
         Span::styled("█", Style::new().add_modifier(Modifier::DIM)),
     ]));
     lines.push(Line::default());
     lines.push(Line::styled(
-        "  enter launch · ↑/↓ mode · type to steer · esc cancel",
+        "  enter launch · ↑/↓ pick · type to fill · esc cancel",
         Style::new().add_modifier(Modifier::DIM),
     ));
-    let title = format!(" launch {} {} ", staged.key(), staged.title);
+    // The repo leads the title because it is the one fact *every* row shares
+    // (#114): the launch rows work this node, and the creation rows start
+    // something new in the repo it belongs to. Naming only the node would be
+    // true of half the list — and the repo is exactly what creation would
+    // otherwise have to ask for.
+    let title = format!(
+        " launch {} · {} {} ",
+        staged.repo,
+        staged.key(),
+        staged.title
+    );
     let width = lines
         .iter()
         .map(|l| l.width() as u16 + 4)
@@ -570,9 +585,9 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
         Overlay::None => {}
         Overlay::PickLaunch {
             staged,
-            mode,
+            candidate,
             steer,
-        } => draw_launch_picker(frame, staged, *mode, steer),
+        } => draw_launch_picker(frame, staged, *candidate, steer),
         Overlay::PickCheckout { launches, cursor } => {
             draw_checkout_picker(frame, launches, *cursor);
         }
@@ -1481,6 +1496,53 @@ mod tests {
     }
 
     #[test]
+    fn a_header_picker_draws_the_creation_rows_with_their_own_skills() {
+        // #114: on the repo-level stop the list carries both questions, so
+        // every row still has to name the skill it execs — including the rows
+        // that launch nothing on this node.
+        let mut app = fixture_app();
+        while !matches!(app.cursor_stop(), Some(crate::view::Stop::Map(_))) {
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("new task"), "{screen}");
+        assert!(screen.contains("/wf-one"), "{screen}");
+        assert!(screen.contains("one tracked ticket"), "{screen}");
+        assert!(screen.contains("new map"), "{screen}");
+        assert!(screen.contains("new map, auto"), "{screen}");
+        // The field is named `steer` while a launch row is picked…
+        assert!(screen.contains("steer"), "{screen}");
+        // …and renames itself as the pick moves onto the creation rows, which
+        // is the only thing telling you the text means something else there.
+        for _ in 0..3 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let screen = render(&app);
+        assert!(screen.contains("▶ new task"), "{screen}");
+        assert!(screen.contains("task  "), "{screen}");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("▶ new map"), "{screen}");
+        assert!(screen.contains("seed  "), "{screen}");
+    }
+
+    #[test]
+    fn a_ticket_picker_draws_no_creation_rows() {
+        // The other half of the rule: a ticket is not a repo-level stop, so
+        // its picker is the three modes and nothing else.
+        let app = {
+            let mut app = fixture_app();
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            app
+        };
+        let screen = render(&app);
+        assert!(screen.contains("interactive"), "{screen}");
+        assert!(!screen.contains("new task"), "{screen}");
+        assert!(!screen.contains("new map"), "{screen}");
+    }
+
+    #[test]
     fn enter_opens_the_launch_picker_over_the_screen_with_every_mode_on_it() {
         let mut app = fixture_app();
 
@@ -1488,8 +1550,10 @@ mod tests {
         // titled with the node it launches.
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let screen = render(&app);
+        // The repo leads the title (#114): it is the one fact every row shares
+        // once a header's rows can start something new in it.
         assert!(
-            screen.contains("launch #6 Re-entry breadcrumbs"),
+            screen.contains("launch blooop/wayfinder · #6 Re-entry breadcrumbs"),
             "{screen}"
         );
         // Every mode is on screen with the skill each one would run, because
