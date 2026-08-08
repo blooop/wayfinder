@@ -3,12 +3,18 @@ name: wf-auto
 description: Chart and drive a wayfinder map alone — same map, same decision tickets on the tracker, but decisions are settled against declared guiding principles instead of a conversation, and execution is in scope, so one run can walk a map from open questions to merged PRs. Use when the user wants an effort mapped, worked, or implemented autonomously, unattended, or AFK; when they say to use your best judgement on a map; or when wf launches a node in autonomous mode.
 ---
 
-Same artifact as `/wf` — one map issue with decision tickets as its children — with nobody in the loop. Two things change, and everything else follows from them:
+## Cross-agent invocation
+
+This bundle runs in both Claude Code and Codex. Mention a wayfinder skill with
+`/` in Claude Code and `$` in Codex; skill names below are written without a
+sigil.
+
+Same artifact as `wf` — one map issue with decision tickets as its children — with nobody in the loop. Two things change, and everything else follows from them:
 
 - **Answers come from principles, not questions.** The principles below are the human's standing voice. Every resolution cites the one that decided it.
-- **Execution is in scope by default.** `/wf` plans and hands off; here the map runs all the way to merged work, so `wayfinder:build` tickets are ordinary citizens and the map is the single place every ticket — decision and build alike — is tracked.
+- **Execution is in scope by default.** `wf` plans and hands off; here the map runs all the way to merged work, so `wayfinder:build` tickets are ordinary citizens and the map is the single place every ticket — decision and build alike — is tracked.
 
-This is for work with **fog in it** — open questions between here and the destination. One piece of already-known work wants `/wf-one` instead: a single-ticket map, same gates, no charting.
+This is for work with **fog in it** — open questions between here and the destination. One piece of already-known work wants `wf-one` instead: a single-ticket map, same gates, no charting.
 
 ## The principles
 
@@ -17,7 +23,7 @@ In order. When two pull opposite ways, the earlier wins.
 1. **Long-term maintainability** — decide for whoever reads this in a year, not for the session in progress.
 2. **Simplicity** — the smallest thing that resolves the question. Deleting beats adding; one concept beats two that overlap.
 3. **Constructive modeling** — illegal states unrepresentable, sum types over tag-plus-parallel-fields, no sentinels. Run `/constructive-modeling` on any ticket that shapes a type.
-4. **Test-first** — behavior arrives with a failing test that proves it was absent. Build tickets go through `/wf-tdd`; a decision ticket says how its outcome will be tested.
+4. **Test-first** — behavior arrives with a failing test that proves it was absent. Build tickets go through `wf-tdd`; a decision ticket says how its outcome will be tested.
 
 A map's `## Notes` may add principles or reorder these for that effort; a ticket may not. Where the principles are silent, pick what the map's Decisions-so-far already implies — consistency with the route already walked is itself the tiebreak.
 
@@ -53,7 +59,7 @@ A ticket is a child issue whose body is one `## Question`, sized to a single ses
 - **prototype** — make a cheap rough artifact, judge it against the principles, record the judgement and link the artifact.
 - **grilling** — the default decision ticket. Settled by reasoning against the principles and the repo, not by asking.
 - **task** — work that must happen before a decision can be made (provisioning, moving data). Records what was done and any facts later tickets depend on.
-- **build** — an execution slice. `/wf-tdd` to build it, `/wf-review` to review it; its stage is *derived from its PRs*, never declared — see [LIFECYCLE.md](../wf/LIFECYCLE.md) for the lattice, the gates, and the manager protocol.
+- **build** — an execution slice. `wf-tdd` to build it, `wf-review` to review it; its stage is *derived from its PRs*, never declared — see [LIFECYCLE.md](../wf/LIFECYCLE.md) for the lattice, the gates, and the manager protocol.
 
 Blocking is the tracker's native dependency edge, so the frontier renders in the tracker's own UI. The **frontier** is the open, unblocked, unclaimed children. Claiming is assigning the ticket to yourself, before any work on it.
 
@@ -67,7 +73,7 @@ One run may walk a whole map, but it never does the work in its own context: it 
 
 ## Chart
 
-`/wf-auto <loose idea>`
+`wf-auto <loose idea>`
 
 1. **Name the destination** — what reaching the end looks like, derived from the idea, the repo, and the principles. Don't grill for it. If the idea admits several destinations, take the smallest one still worth a map (principle 2) and note in Notes which ones you set aside.
 2. **Sweep breadth-first** for the open decisions: the repo, its docs, its recent history, its existing maps. Fan out across the space rather than deep on one thread.
@@ -78,7 +84,7 @@ One run may walk a whole map, but it never does the work in its own context: it 
 
 ## Work the map
 
-`/wf-auto <map> [<ticket>] [steer: <text>]`
+`wf-auto <map> [<ticket>] [steer: <text>]`
 
 A named ticket scopes the run to it and its unblocks-subtree; no ticket means the whole map. Either way, work in **dependency order**, claiming each ticket as you reach it — a crash then leaves only live claims stale.
 

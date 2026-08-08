@@ -15,7 +15,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Overlay, Scope};
 use crate::filter;
-use crate::launch::{Candidate, Launch, Staged};
+use crate::launch::{Agent, Candidate, Launch, Staged};
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
 use crate::view::{Branch, Fold, GroupKind, Item, Plan};
 
@@ -524,7 +524,16 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// drawn per option rather than once for the cursor's — the difference between
 /// `/wf`, `/wf-auto` and no skill at all (#112) *is* the choice being made, so
 /// every one of them is on screen.
-fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, candidate: Candidate, steer: &str) {
+/// The agent is in the title rather than another row: it applies to every
+/// candidate, and horizontal keys can change it without moving the vertical
+/// cursor.
+fn draw_launch_picker(
+    frame: &mut Frame<'_>,
+    staged: &Staged,
+    agent: Agent,
+    candidate: Candidate,
+    steer: &str,
+) {
     let mut lines = vec![Line::default()];
     for option in staged.candidates() {
         let picked = option == candidate;
@@ -539,7 +548,7 @@ fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, candidate: Candida
         lines.push(Line::from(vec![
             Span::styled(format!("  {marker} {:<14}", option.label()), emphasis),
             Span::styled(
-                format!("{:<10}", option.route().label()),
+                format!("{:<10}", option.route().invocation(agent)),
                 Style::new().fg(Color::Cyan),
             ),
             Span::styled(option.blurb(), Style::new().add_modifier(Modifier::DIM)),
@@ -561,7 +570,7 @@ fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, candidate: Candida
     ]));
     lines.push(Line::default());
     lines.push(Line::styled(
-        "  enter launch · ↑/↓ pick · type to fill · esc cancel",
+        "  enter launch · ←/→ agent · ↑/↓ pick · type to fill · esc cancel",
         Style::new().add_modifier(Modifier::DIM),
     ));
     // The repo leads the title because it is the one fact *every* row shares
@@ -570,7 +579,8 @@ fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, candidate: Candida
     // true of half the list — and the repo is exactly what creation would
     // otherwise have to ask for.
     let title = format!(
-        " launch {} · {} {} ",
+        " launch {} · {} · {} {} ",
+        agent.label(),
         staged.repo,
         staged.key(),
         staged.title
@@ -602,8 +612,9 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
         Overlay::PickLaunch {
             staged,
             candidate,
+            agent,
             steer,
-        } => draw_launch_picker(frame, staged, *candidate, steer),
+        } => draw_launch_picker(frame, staged, *agent, *candidate, steer),
         Overlay::PickCheckout { launches, cursor } => {
             draw_checkout_picker(frame, launches, *cursor);
         }
@@ -1569,7 +1580,7 @@ mod tests {
         // The repo leads the title (#114): it is the one fact every row shares
         // once a header's rows can start something new in it.
         assert!(
-            screen.contains("launch blooop/wayfinder · #6 Re-entry breadcrumbs"),
+            screen.contains("launch Claude · blooop/wayfinder · #6 Re-entry breadcrumbs"),
             "{screen}"
         );
         // Every mode is on screen with the skill each one would run, because
@@ -1587,7 +1598,19 @@ mod tests {
         assert!(screen.contains("claude"), "{screen}");
         assert!(screen.contains("no skill"), "{screen}");
         assert!(screen.contains("steer"), "{screen}");
+        assert!(screen.contains("←/→ agent"), "{screen}");
         assert!(screen.contains("esc cancel"), "{screen}");
+
+        // Horizontal movement changes the agent named in the title and the
+        // invocation syntax together; the vertically selected mode stays put.
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(
+            screen.contains("launch Codex · blooop/wayfinder · #6 Re-entry breadcrumbs"),
+            "{screen}"
+        );
+        assert!(screen.contains("$wf "), "{screen}");
+        assert!(screen.contains("$wf-auto"), "{screen}");
 
         // Down moves the pick; the marker moves with it and nothing about the
         // route line is stale, since each row draws its own.
@@ -1615,7 +1638,8 @@ mod tests {
         // Esc closes it and gives the whole screen back.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let screen = render(&app);
-        assert!(!screen.contains("launch #6"), "{screen}");
+        assert!(!screen.contains("launch Claude"), "{screen}");
+        assert!(!screen.contains("launch Codex"), "{screen}");
         assert!(screen.contains("5/5"), "{screen}");
     }
 

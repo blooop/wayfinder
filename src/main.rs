@@ -27,7 +27,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use wf::app::{App, Outcome, Scope};
-use wf::launch::Launch;
+use wf::launch::{Agent, Launch};
 use wf::model::{Map, MapId};
 use wf::projects::{self, ProjectsCache};
 use wf::reap;
@@ -47,7 +47,8 @@ enum Invocation {
     Tui,
     /// Report where the bundled skills are and whether they are linked.
     SkillsReport,
-    /// Link the bundled skills into Claude Code's personal skills directory.
+    /// Link the bundled skills into Claude Code's and Codex's personal skills
+    /// directories.
     SkillsInstall,
     /// Remove the workspaces whose tickets are closed. `yes` skips the prompt;
     /// `insist` also reaps workspaces holding work that is not pushed anywhere,
@@ -76,17 +77,16 @@ checkout, replacing wf — so wf is gone by the time the agent draws. ctrl-f and
 ctrl-g narrow and widen the scope, ctrl-r refetches, esc quits.
 
 wf skills          report which prompt each route would actually run
-wf skills install  link this build's skills into ~/.claude/skills
+wf skills install  link this build's skills into ~/.claude/skills and ~/.codex/skills
 wf reap            remove the workspaces whose tickets are closed (-y to skip
                    the prompt). Keeps anything running or holding work that is
                    not pushed anywhere; -f reaps the unpushed ones too, naming
                    what it discards. Needs dl 0.0.21 or newer.
 
 The skills wf execs ship in this package, so they update with it. `install`
-links ~/.claude/skills at a copy of them kept beside it, which is the only
-place a launch inside a devcontainer can read them from; every launch brings
-that copy back in step. Set WF_SKILLS_DIR to install a checkout's skills
-instead, while you are editing them.";
+links both agents' skills directories at copies kept beside them; every launch
+brings its selected agent's copy back in step. Set WF_SKILLS_DIR to install a
+checkout's skills instead, while you are editing them.";
 
 /// Parse argv (without the program name). `wf` takes at most one argument, and
 /// anything it does not recognise is rejected rather than ignored, so a typo
@@ -165,54 +165,60 @@ fn run_skills(install: bool) -> Result<()> {
     use std::fmt::Write;
 
     let bundle = skills::Bundle::resolve()?;
-    let target = skills::Target::resolve()?;
-    if !install {
-        emit(&skills::report(&bundle, &target));
-        return Ok(());
-    }
-    // Before linking, not after: a swept name could be one this build ships
-    // under a new spelling, and clearing the old link first keeps the two
-    // steps from racing over the same directory entry.
-    let swept = skills::sweep(&bundle, &target)?;
-    let done = skills::install(&bundle, &target)?;
     let mut out = String::new();
-    for link in &swept {
-        let _ = writeln!(
-            out,
-            "  {:<15} removed — a skill an older wf shipped and this one does not",
-            link.file_name()
-                .unwrap_or(link.as_os_str())
-                .to_string_lossy()
-        );
+    let mut blocked = false;
+    for agent in Agent::all() {
+        let target = skills::Target::resolve(agent)?;
+        let _ = writeln!(out, "{}", agent.label());
+        if install {
+            // Before linking, not after: a swept name could be one this build
+            // ships under a new spelling, and clearing the old link first keeps
+            // the two steps from racing over the same directory entry.
+            let swept = skills::sweep(&bundle, &target)?;
+            let done = skills::install(&bundle, &target)?;
+            for link in &swept {
+                let _ = writeln!(
+                    out,
+                    "  {:<15} removed — a skill an older wf shipped and this one does not",
+                    link.file_name()
+                        .unwrap_or(link.as_os_str())
+                        .to_string_lossy()
+                );
+            }
+            for (name, outcome) in &done {
+                let line = match outcome {
+                    skills::Outcome::AlreadyCurrent => "already current".to_string(),
+                    skills::Outcome::Refreshed => {
+                        "refreshed — the prompt behind the link is now this build's".to_string()
+                    }
+                    skills::Outcome::Linked { was: None } => "linked".to_string(),
+                    skills::Outcome::Linked { was: Some(old) } => {
+                        format!("relinked (was {})", old.display())
+                    }
+                    skills::Outcome::Blocked => format!(
+                        "BLOCKED — {} is a real directory, not a link. Remove it \
+                         (chezmoi may own it) and run this again",
+                        target.links().join(name).display()
+                    ),
+                    skills::Outcome::NotInBundle => {
+                        "NOT IN BUNDLE — this build shipped without it".to_string()
+                    }
+                };
+                let _ = writeln!(out, "  {name:<15} {line}");
+            }
+            blocked |= done.iter().any(|(_, outcome)| {
+                matches!(
+                    outcome,
+                    skills::Outcome::Blocked | skills::Outcome::NotInBundle
+                )
+            });
+            out.push('\n');
+        }
+        out.push_str(&skills::report(&bundle, &target));
+        out.push('\n');
     }
-    for (name, outcome) in &done {
-        let line = match outcome {
-            skills::Outcome::AlreadyCurrent => "already current".to_string(),
-            skills::Outcome::Refreshed => {
-                "refreshed — the prompt behind the link is now this build's".to_string()
-            }
-            skills::Outcome::Linked { was: None } => "linked".to_string(),
-            skills::Outcome::Linked { was: Some(old) } => {
-                format!("relinked (was {})", old.display())
-            }
-            skills::Outcome::Blocked => format!(
-                "BLOCKED — {} is a real directory, not a link. Remove it \
-                 (chezmoi may own it) and run this again",
-                target.links().join(name).display()
-            ),
-            skills::Outcome::NotInBundle => {
-                "NOT IN BUNDLE — this build shipped without it".to_string()
-            }
-        };
-        let _ = writeln!(out, "  {name:<15} {line}");
-    }
-    out.push('\n');
-    out.push_str(&skills::report(&bundle, &target));
     emit(&out);
-    if done
-        .iter()
-        .any(|(_, o)| matches!(o, skills::Outcome::Blocked | skills::Outcome::NotInBundle))
-    {
+    if blocked {
         std::process::exit(1);
     }
     Ok(())
@@ -407,14 +413,13 @@ async fn main() -> Result<()> {
     match ending? {
         Ending::Quit => Ok(()),
         Ending::Handover(launch) => {
-            // The prompts the agent is about to run. `wf skills install` links
-            // `~/.claude/skills` at a *copy* of the bundle, because that is the
-            // only place a devcontainer can read them from, and a copy is a
-            // thing that can fall behind a `pixi global update wf`. This is
-            // where it cannot: the process that refreshes it is the same one
-            // that then execs the prompt, so no launch ever gets ahead by even
-            // one release.
-            refresh_skills();
+            // The prompts the selected agent is about to run. `wf skills
+            // install` links its skills directory at a *copy* of the bundle,
+            // and a copy is a thing that can fall behind a `pixi global update
+            // wf`. This is where it cannot: the process that refreshes it is
+            // the same one that then execs the prompt, so no launch ever gets
+            // ahead by even one release.
+            refresh_skills(launch.agent());
             // Only ever returns an error: on success this process *is* the agent.
             Err(launch.exec())
         }
@@ -430,12 +435,15 @@ async fn main() -> Result<()> {
 /// that could not be *written* is different — the agent is about to run a
 /// prompt that is not the one that was installed — so that one is said out
 /// loud.
-fn refresh_skills() {
-    let Ok(target) = skills::Target::resolve() else {
+fn refresh_skills(agent: Agent) {
+    let Ok(target) = skills::Target::resolve(agent) else {
         return;
     };
     if let Err(err) = skills::refresh(&target) {
-        eprintln!("wf: could not refresh the installed skills: {err:#}");
+        eprintln!(
+            "wf: could not refresh the {} skills: {err:#}",
+            agent.label()
+        );
     }
 }
 

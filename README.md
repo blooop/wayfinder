@@ -16,14 +16,19 @@ says so plainly when something is missing, rather than dragging second copies
 into its own environment. It wants an authenticated `gh` and the agent CLI, and
 nothing else — there is no multiplexer to install. Add
 [`dl`](https://github.com/blooop/devlaunch) if you want the agent to run inside
-your repos' devcontainers ([Isolation](#isolation-the-agent-runs-in-the-repos-devcontainer));
+your repos' devcontainers ([Isolation](#isolation-claude-runs-in-the-repos-devcontainer));
 without it every launch runs on the host, which is what `wf` has always done.
 
-Then link the skills it launches into `~/.claude/skills`:
+Then link the skills it launches into both CLIs' skills directories:
 
 ```
 wf skills install
 ```
+
+This installs the same bundled workflows under `~/.claude/skills` and
+`~/.codex/skills`. The launch picker defaults to Claude Code and can switch to
+Codex; each agent therefore finds the route it is given without a separate
+manual install.
 
 `wf --version`, `wf --help`, `wf skills [install]` and
 [`wf reap [-y] [-f]`](#wf-reap--clearing-away-finished-tickets) are the only
@@ -31,9 +36,9 @@ arguments; everything else is keys in the TUI.
 
 ## The skills ship with the binary
 
-`wf` does not merely *mention* `/wf-tdd` and `/wf-auto` — it hardcodes them
-in its routing table and execs them, which makes those prompt files part of
-`wf`'s interface. So they live in this repo under `skills/`, the package
+`wf` does not merely *mention* the `wf-tdd` and `wf-auto` skills — it hardcodes
+them in its routing table and execs them, which makes those prompt files part
+of `wf`'s interface. So they live in this repo under `skills/`, the package
 installs them at `<prefix>/share/wf/skills`, and one `pixi global update wf`
 moves the binary and the prompts together. An interface split across two repos
 on two release cadences drifts silently, which is exactly what happened before
@@ -43,47 +48,55 @@ notice.
 
 Five skills ship: `wf`, `wf-auto`, `wf-one`, `wf-tdd` and `wf-review` — the four
 `wf` can exec, plus the single-ticket sibling that shares their
-`GITHUB_TRACKER.md` and `LIFECYCLE.md`. A unit test asserts every route's label
-is one of them, so a route can never name a skill the package does not ship.
+`GITHUB_TRACKER.md` and `LIFECYCLE.md`. A unit test asserts every route's skill
+name is one of them, so a route can never name a skill the package does not
+ship.
 
-Every name carries the `wf` prefix because `~/.claude/skills` is one flat
-namespace shared with every other source of skills you have. Unprefixed, `tdd`
-and `review` are names `wf` would *squat on* rather than merely occupy: while it
-held one, you could not have your own. `wf skills install` clears the links an
-older `wf` left under its old names, and touches nothing else — it removes a
-link only when the link points into a `wf` bundle, so a skill of yours can never
-match however dead it looks.
+Every name carries the `wf` prefix because both `~/.claude/skills` and
+`~/.codex/skills` are flat namespaces shared with every other source of skills
+you have. Unprefixed, `tdd` and `review` are names `wf` would *squat on* rather
+than merely occupy: while it held one, you could not have your own. `wf skills
+install` clears the links an older `wf` left under its old names, and touches
+nothing else — it removes a link only when the link points into a `wf` bundle,
+so a skill of yours can never match however dead it looks.
 
-`wf skills install` **symlinks**, so a name under `~/.claude/skills` is `wf`'s
-only when `wf` put it there and a real directory can go on meaning *somebody
-else owns this*. What the link points at is the part worth knowing:
-`~/.claude/wf-skills`, a **copy** of the package's bundle kept beside the links,
-reached *relatively* — `wf-tdd -> ../wf-skills/wf-tdd`.
+`wf skills install` **symlinks**, so a name under either skills directory is
+`wf`'s only when `wf` put it there and a real directory can go on meaning
+*somebody else owns this*. What the links point at is the part worth knowing:
+`~/.claude/wf-skills` and `~/.codex/wf-skills`, **copies** of the package's
+bundle kept beside their links, reached *relatively* —
+`wf-tdd -> ../wf-skills/wf-tdd`.
 
-That indirection exists for the containers. An isolated launch
-([Isolation](#isolation-the-agent-runs-in-the-repos-devcontainer)) mounts your
-`~/.claude` into the devcontainer and nothing else: no pixi prefix, and your home
-at a different path inside (`/home/vscode`) than out. A link into
+That indirection exists for containers. An isolated Claude launch
+([Isolation](#isolation-claude-runs-in-the-repos-devcontainer)) mounts your
+`~/.claude` into the devcontainer and nothing else: no pixi prefix, and your
+home at a different path inside (`/home/vscode`) than out. A link into
 `~/.pixi/envs/wf/share/wf/skills` is a fine link on the host and a dangling one
-in there — and a dangling skill does not report itself, it comes back as
-`Unknown command: /wf-tdd` seconds after a launch. A relative link into a copy
-that rides the same mount resolves on both sides.
+in there. A relative link into a copy that rides the same mount resolves on both
+sides. Codex launches on the host until `dl` can hand its `~/.codex` directory
+into the container too.
 
 The copy is then the thing that could go stale, so it is not left to trust:
-`wf skills install` rewrites it, **every launch brings it back in step** before
-exec'ing the agent, and `wf skills` reports a copy that is not this build's
-rather than running a release behind:
+`wf skills install` rewrites them, **every launch brings its selected agent's
+copy back in step** before exec'ing, and `wf skills` reports a copy that is not
+this build's rather than running a release behind:
 
 ```
+Claude
 bundle  /home/you/.pixi/envs/wf/share/wf/skills (installed beside the binary)
 links   /home/you/.claude/skills
-copy    /home/you/.claude/wf-skills (what the links point at, so a devcontainer can read them too)
+copy    /home/you/.claude/wf-skills (what the links point at)
 
   wf              ok
   wf-auto         ok
   wf-one          outdated — the copy is not this build's
   wf-tdd          stale — links to /home/you/projects/wayfinder/skills
   wf-review       not a link — another tool owns this one
+
+Codex
+bundle  /home/you/.pixi/envs/wf/share/wf/skills (installed beside the binary)
+links   /home/you/.codex/skills
+copy    /home/you/.codex/wf-skills (what the links point at)
 ```
 
 `wf` never deletes a real directory it did not create — if chezmoi or a
@@ -96,9 +109,9 @@ your checkout's prompts rather than quietly replacing them with its own.
 
 The skills stay ordinary installed skills rather than text `wf` injects at exec
 time, because `wf` is not their only caller: `LIFECYCLE.md` has the manager
-agent spawn `/wf-tdd` and `/wf-review` in *fresh subagents* mid-session, you type
-`/wf-auto` yourself on efforts that never go through the picker, and
-model invocation needs a file on disk with frontmatter.
+agent spawn `wf-tdd` and `wf-review` in *fresh subagents* mid-session, you type
+the appropriate agent's `wf-auto` invocation yourself on efforts that never go
+through the picker, and model invocation needs a file on disk with frontmatter.
 
 ## Checks
 
@@ -303,21 +316,20 @@ ask again.
 
 ## Launching
 
-Picking a ticket runs an agent on it — `claude --dangerously-skip-permissions
-"<skill> …"`, with that project's checkout as its cwd — and that is the end of
-`wf`. It restores the terminal and **replaces its own process** with the agent:
-no picker underneath, no parent waiting, nothing to detach from. The agent holds
-the terminal, the exit code and the signals directly, because by then it *is*
-the process you started. A checkout that declares a devcontainer runs that same
-agent inside it — see
-[Isolation](#isolation-the-agent-runs-in-the-repos-devcontainer).
+Picking a ticket runs the agent chosen in the launch picker, with that project's
+checkout as its cwd — and that is the end of `wf`. It restores the terminal and
+**replaces its own process** with the agent: no picker underneath, no parent
+waiting, nothing to detach from. The agent holds the terminal, the exit code and
+the signals directly, because by then it *is* the process you started. A checkout
+that declares a devcontainer runs a Claude launch inside it — see
+[Isolation](#isolation-claude-runs-in-the-repos-devcontainer).
 
 **Launching is two steps.** `enter` on the cursor's node does not launch: it
 opens the **launch picker** over the list, showing what is about to happen and
-the one thing still undecided — who resolves the node:
+the two things still undecided — which agent runs it, and who resolves the node:
 
 ```
-┌ launch blooop/wayfinder · #65 Author the /wf-tdd skill ─────────────────┐
+┌ launch Claude · blooop/wayfinder · #65 Author the wf-tdd skill ───────┐
 │                                                                         │
 │  ▶ interactive   /wf-tdd   you are in the loop; it grills you           │
 │    auto          /wf-auto  the agent decides alone and drives it to done│
@@ -325,15 +337,16 @@ the one thing still undecided — who resolves the node:
 │                                                                         │
 │    steer  █                                                             │
 │                                                                         │
-│  enter launch · ↑/↓ pick · type to fill · esc cancel                    │
+│  enter launch · ←/→ agent · ↑/↓ pick · type to fill · esc cancel       │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-`↑`/`↓` (or `tab`) move between the rows and `enter` runs the one you are on,
-so the common case is `enter enter`. Every row is on screen with the skill it
-routes *this* node to, because that difference is the choice being made: the
-picker is where you see that `auto` means `/wf-auto` and will not stop to ask
-you anything.
+`←`/`→` switch Claude and Codex; the selected agent is named in the title and
+the route column changes between Claude's `/wf` and Codex's `$wf` syntax.
+`↑`/`↓` (or `tab`) move between the rows and `enter` runs that combination, so
+the common case is still `enter enter`. Every row is on screen with the skill
+it routes *this* node to, because that difference is the choice being made: the
+picker is where you see that `auto` means `wf-auto` and will not stop to ask.
 
 Anything you type goes into the field below the rows — on a launch row that is a
 **steering prompt** on whichever mode is selected, never a mode itself. That is
@@ -399,29 +412,35 @@ and the widened screen stays free of one row per project.
 
 **Which skill runs is a fact about what you picked and who decides:**
 
-| picked | stage | mode | launches |
+| picked | stage | mode | skill |
 | --- | --- | --- | --- |
-| a cluster header | — | interactive | `claude "/wf <map>"` |
-| `wayfinder:build` | ready · building · needs attention | interactive | `claude "/wf-tdd <n>"` |
-| `wayfinder:build` | in review | interactive | `claude "/wf-review <n>"` |
-| research · prototype · grilling · task | any unfinished stage | interactive | `claude "/wf <map> <n>"` |
-| anything | any unfinished stage | auto | `claude "/wf-auto <map> [<n>]"` |
-| anything | any unfinished stage | plain | `claude` — no skill; anything typed is the whole prompt |
-| a cluster header, or a map-less repo | — | new task | `claude "/wf-one <task>"` |
-| a cluster header, or a map-less repo | — | new map | `claude "/wf [<seed>]"` |
-| a cluster header, or a map-less repo | — | new map, auto | `claude "/wf-auto [<seed>]"` |
+| a cluster header | — | interactive | `<sigil>wf <map>` |
+| `wayfinder:build` | ready · building · needs attention | interactive | `<sigil>wf-tdd <n>` |
+| `wayfinder:build` | in review | interactive | `<sigil>wf-review <n>` |
+| research · prototype · grilling · task | any unfinished stage | interactive | `<sigil>wf <map> <n>` |
+| anything | any unfinished stage | auto | `<sigil>wf-auto <map> [<n>]` |
+| anything | any unfinished stage | plain | the selected agent, with no skill; anything typed is the whole prompt |
+| a cluster header, or a map-less repo | — | new task | `<sigil>wf-one <task>` |
+| a cluster header, or a map-less repo | — | new map | `<sigil>wf [<seed>]` |
+| a cluster header, or a map-less repo | — | new map, auto | `<sigil>wf-auto [<seed>]` |
 | a ticket | done | — | nothing — not launchable |
 
 A creation has no issue number until the skill files one, so it has no per-node
 branch either: it runs on the repo's **default workspace**, and the launched
 skill makes its own branches from there.
 
+Claude receives that skill prefixed with `/` through
+`claude --dangerously-skip-permissions`; Codex receives it prefixed with `$`
+through `codex --dangerously-bypass-approvals-and-sandbox`. Both receive one
+prompt argument, so the route, numbers, and steering text cannot be split apart
+by the shell.
+
 The auto mode collapses the ticket rows on purpose: the launched session is a
-*manager*, and what it manages is the node's whole remaining lifecycle — `/wf-tdd`,
-the gate, then a fresh-context `/wf-review` — so it is the manager skill that runs,
-not the one skill that stage would have called. Steering text rides whichever
-route you got, as ` steer: <text>` on the end of the prompt; the mode itself
-never does, because it has already chosen the skill.
+*manager*, and what it manages is the node's whole remaining lifecycle —
+`wf-tdd`, the gate, then a fresh-context `wf-review` — so it is the manager
+skill that runs, not the one skill that stage would have called. Steering text
+rides whichever route you got, as ` steer: <text>` on the end of the prompt;
+the mode itself never does, because it has already chosen the skill.
 
 **The plain mode collapses them for the opposite reason: it runs no skill at
 all.** Everything else about the launch is unchanged — same checkout, same
@@ -442,7 +461,7 @@ an empty one.
 | `→` | reveal: open a `▸ done`/`▸ blocked` group, else step forward one stop — which *is* descending, since a subtree's first row follows its parent |
 | `←` | close: shut an open group, else back out to the parent, else one stop back — which, from a cluster's first row, is that cluster's header |
 | `enter` | open the launch picker on the cursor's ticket, or on its map when the cursor is on a cluster header; a second `enter` runs the agent here and exits — on a group line it folds instead, since there is no agent to run |
-| `↑`/`↓` or `tab`, *type*, then `enter`* | in the launch picker: pick the row, fill the field beside it (a steering prompt, a task, or a map seed), launch — `esc` backs out with the query and cursor intact |
+| `←`/`→`, `↑`/`↓` or `tab`, *type*, then `enter`* | in the launch picker: pick Claude/Codex, pick the row, fill its field (a steering prompt, a task, or a map seed), launch — `esc` backs out with the query and cursor intact |
 | `ctrl-f` | focus the cursor row's project — only its clusters stay on screen |
 | `ctrl-g` | widen back to every project |
 | `ctrl-r` | refetch every map in place, keeping your query, scope and cursor |
@@ -461,21 +480,27 @@ checkouts (the `~/k1/kinisi_ros`, `~/k2/kinisi_ros` pattern) ever sees it: the
 agent has to run in exactly one tree and `wf` cannot guess which. One checkout
 launches straight away.
 
-`--dangerously-skip-permissions` is passed because the agent is started from a
-picker rather than from a shell you are already watching, and stopping on a
-permission prompt at that moment would just be a stall you did not ask for.
+Each agent receives its own explicit permission-bypass flag because it is
+started from a picker rather than from a shell you are already watching, and
+stopping on a permission prompt at that moment would just be a stall you did
+not ask for.
 
 Going back means running `wf` again, which is cheap — a warm start is ~0.6 s.
 
-### Isolation: the agent runs in the repo's devcontainer
+### Isolation: Claude runs in the repo's devcontainer
 
 A checkout that carries a **`.devcontainer/devcontainer.json`** (or a top-level
-`.devcontainer.json`) launches its agent *inside* that container, by way of
+`.devcontainer.json`) launches a **Claude** session *inside* that container, by way of
 [`dl`](https://github.com/blooop/devlaunch):
 
 ```
 dl owner/repo@wayfinder/repo-80 -- 'claude' '--dangerously-skip-permissions' '/wf 67 80'
 ```
+
+Codex deliberately stays on the host even for such a checkout. `dl` mounts
+`~/.claude` but not `~/.codex`, so an isolated Codex session would lose both its
+login and its `$wf` skills after `wf` had already handed over the terminal. The
+host is the only launch `wf` can make honestly until `dl` gains a Codex handover.
 
 `wf` owns which ticket, which checkout, which skill and which prompt. `dl` owns
 the container — building it, reusing it, forwarding your `gh` login into it,
@@ -534,8 +559,8 @@ over its index. (Isolated launches used to run in the picked tree itself, which
 meant every launch of a repo shared one tree and one container — serial by
 construction.)
 
-Two things have to be true, and otherwise the agent runs on the host exactly as
-it always has:
+Two things have to be true for a Claude launch to be isolated, and otherwise it
+runs on the host exactly as it always has:
 
 1. the checkout declares one of those two configs, and
 2. `dl` is on PATH.
@@ -616,11 +641,11 @@ unpushed work. `-f` reaps those too, and the plan says what it is discarding:
 waives the unsaved-work guard only — a running container is still kept, because
 that is a session in progress rather than bytes on disk. `-y` skips the prompt.
 
-Your host `~/.claude` is bind-mounted in, which is how the agent arrives already
-logged in — and is the reason `wf skills install` keeps the prompts *inside* that
-directory and links to them relatively. `~/.pixi` is not mounted and your home is
-at a different path in there, so a link into the package prefix dangles and the
-launch answers `Unknown command: /wf-tdd`. See
+Your host `~/.claude` is bind-mounted in, which is how the Claude agent arrives
+already logged in — and is the reason `wf skills install` keeps the prompts
+*inside* that directory and links to them relatively. `~/.pixi` is not mounted
+and your home is at a different path in there, so a link into the package prefix
+dangles and the launch answers `Unknown command: /wf-tdd`. See
 [the skills](#the-skills-ship-with-the-binary).
 
 **This container is not a security boundary, and is not trying to be.** It is

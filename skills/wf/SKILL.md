@@ -4,6 +4,12 @@ description: Plan a huge chunk of work — more than one agent session can hold 
 disable-model-invocation: true
 ---
 
+## Cross-agent invocation
+
+This bundle runs in both Claude Code and Codex. Mention a wayfinder skill with
+`/` in Claude Code and `$` in Codex; skill names below are written without a
+sigil.
+
 A loose idea has arrived — too big for one agent session, and wrapped in fog: the way from here to the **destination** isn't visible yet. Wayfinding is about finding that way, not charging at the destination. This skill charts the way as a **shared map** on the repo's issue tracker, then works its **decision tickets** — questions whose resolution is a decision, not slices of a build to execute — one at a time until the route is clear.
 
 The destination varies per effort, and naming it is the first act of charting — it shapes every ticket. It might be a spec to hand off and iterate on, a decision to lock before planning starts, or a change made in place like a data-structure migration. The map is domain-agnostic — engineering work, course content, whatever fits the shape.
@@ -86,7 +92,7 @@ Every ticket is either **HITL** — human in the loop, worked *with* a human who
 - **Prototype** (HITL): Raise the fidelity of the discussion by making a cheap, rough, concrete artifact to react to — an outline, a rough take, a stub, or UI/logic code via the /prototype skill. Links the prototype as an asset. Use when "how should it look" or "how should it behave" is the key question.
 - **Grilling** (HITL): Conversation via the /grill-me and /constructive-modeling skills, one question at a time; pull in /ubiquitous-language when the decision hinges on naming or contested terms. The default case.
 - **Task** (HITL or AFK): Manual work that must happen before a *decision* can be made — nothing to decide, prototype, or research, but the discussion is blocked until it's done. Signing up for a service so its API can be judged, provisioning access, moving data so its shape can be seen. This is the one type that *does* rather than decides — and it earns its place by unblocking a decision, not by delivering the destination. The agent drives it alone where it can (AFK); otherwise it hands the human a precise checklist (HITL). Resolved when the work is done; the answer records what was done and any resulting facts (credentials location, new URLs, row counts) later tickets depend on.
-- **Build** (AFK): An execution slice — code to write, sized to one fresh agent session, on a map whose Notes carry the execution override. Worked via the `/wf-tdd` skill and reviewed via `/wf-review`; its lifecycle position (**ready → building → in review → needs attention → done**) is *derived from its linked PRs*, never declared — see [LIFECYCLE.md](LIFECYCLE.md) for the stage lattice, gates, and the manager protocol. Review is a **stage** of a build ticket, not a ticket type.
+- **Build** (AFK): An execution slice — code to write, sized to one fresh agent session, on a map whose Notes carry the execution override. Worked via the `wf-tdd` skill and reviewed via `wf-review`; its lifecycle position (**ready → building → in review → needs attention → done**) is *derived from its linked PRs*, never declared — see [LIFECYCLE.md](LIFECYCLE.md) for the stage lattice, gates, and the manager protocol. Review is a **stage** of a build ticket, not a ticket type.
 
 ## Fog of war
 
@@ -123,10 +129,11 @@ Resolution comments are unchanged — the answer still lands once, at close. And
 
 Two modes. **Never resolve more than one ticket per session** — with one exception: research tickets.
 
-The invocation grammar (what `wf`'s launch line produces):
+The invocation grammar (what `wf`'s launch line produces; `<sigil>` is `/` for
+Claude and `$` for Codex):
 
-- `/wf <map> [<ticket>]` — everything below as written
-- `/wf <map> <ticket> steer: <steering>` — with a steering prompt
+- `<sigil>wf <map> [<ticket>]` — everything below as written
+- `<sigil>wf <map> <ticket> steer: <steering>` — with a steering prompt
 
 ### Chart the map
 
