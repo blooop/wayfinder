@@ -293,8 +293,8 @@ impl Plan {
 /// `door` is the map-less repo whose empty-state header closes the body, if
 /// this screen is showing one (#114). It is planned *here*, with everything
 /// else, rather than appended by the caller: on-screen order is this module's
-/// single answer, and a row the caller pushes afterwards is a row
-/// [`attach_rollups`] and every other walk below never sees.
+/// single answer, and a row the caller pushes afterwards is a row the rollup
+/// pass — and every other walk below — never sees.
 pub fn plan(
     clusters: &[(&MapId, &Map)],
     screen: Screen<'_>,
