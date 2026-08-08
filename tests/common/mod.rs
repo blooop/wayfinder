@@ -8,26 +8,54 @@
 //! finished map must render nothing rather than the wrong issue), so the
 //! failure was the fixture's fault, not the code's.
 
+// Each including binary uses a different part of this module, and dead-code
+// analysis runs per binary — so anything used by only one of them would warn
+// under CI's `-D warnings` in the other. The alternative is splitting the
+// module by consumer, which is more files than the problem is worth.
+#![allow(dead_code)]
+
 use std::path::Path;
 
+use tokio::sync::OnceCell;
 use wf::model::MapId;
 
 pub const THIS_REPO: &str = "blooop/wayfinder";
 
+/// Looked up once per test binary. The lookup is a ~2.5 s `gh api
+/// search/issues`, and four tests in `live_streaming_startup` want the same
+/// answer: without this they issue four concurrent searches at t=0, which is
+/// enough contention to push the warm-start timing assertion in that file past
+/// its budget about half the time. One search per binary, and the tests are
+/// measuring what they claim to measure again.
+static LIVE_MAP: OnceCell<MapId> = OnceCell::const_new();
+
 /// This repo's lowest-numbered open map, looked up live.
 ///
-/// Lowest-numbered rather than arbitrary so a run is reproducible against a
-/// tracker that is not moving, and looked up rather than named so the fixture
-/// survives any individual map being finished. The only precondition left is
-/// that the project has *a* map at all, which is the weakest one a test of the
-/// map machinery can have.
+/// Lowest-numbered rather than arbitrary because a newly charted map is always
+/// the highest-numbered one: picking the lowest means the fixture only moves
+/// when a *mature* map is finished, and the next one along has years of
+/// tickets on it too.
+///
+/// What this asks of the tracker, stated rather than implied — the callers
+/// assert against whatever comes back, so these are real preconditions:
+/// `blooop/wayfinder` has **more than one** open map (`live_discovery`,
+/// `live_streaming_startup`), and the lowest-numbered one has at least seven
+/// tickets, at least one closed, at least one blocking edge, and no ticket
+/// missing its `wayfinder:*` label. Every open map satisfies that today, and a
+/// map is charted long before it is worked, so a freshly charted one cannot
+/// become the fixture while any older map is still open.
 pub async fn a_live_map() -> MapId {
-    let maps = wf::fetch::find_maps(&[THIS_REPO.to_string()])
+    LIVE_MAP
+        .get_or_init(|| async {
+            let maps = wf::fetch::find_maps(&[THIS_REPO.to_string()])
+                .await
+                .unwrap_or_else(|e| panic!("{}", search_failed(&format!("{e:#}"))));
+            maps.into_iter()
+                .min_by_key(|id| id.number)
+                .unwrap_or_else(|| panic!("{}", nothing_found()))
+        })
         .await
-        .unwrap_or_else(|e| panic!("{}", search_failed(&format!("{e:#}"))));
-    maps.into_iter()
-        .min_by_key(|id| id.number)
-        .expect("blooop/wayfinder must have at least one open wayfinder:map issue")
+        .clone()
 }
 
 /// The panic message for a failed map search — with the reason it fails for
@@ -45,15 +73,46 @@ pub async fn a_live_map() -> MapId {
 /// absent while everything works is not a problem worth a warning: on the host
 /// `gh` reads its own keyring, and `GH_TOKEN` being unset there is the normal
 /// case rather than a broken one.
-fn search_failed(err: &str) -> String {
-    let has_token = ["GH_TOKEN", "GITHUB_TOKEN"]
-        .iter()
-        .any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()));
-    let in_container = Path::new("/.dockerenv").exists();
-    match advice(has_token, in_container) {
+pub fn search_failed(err: &str) -> String {
+    match advice(has_token(), in_container()) {
         Some(advice) => format!("the map search failed: {err}\n\n{advice}"),
         None => format!("the map search failed: {err}"),
     }
+}
+
+/// The panic message for a search that *succeeded* and found nothing.
+///
+/// Separate from [`search_failed`] because the cause is different and so is
+/// the fix: `find_maps` returns an empty set rather than an error when the
+/// token is valid but cannot see this repo — a fine-grained PAT without access
+/// to it, or a `GITHUB_TOKEN` scoped to another repository. Blaming the
+/// tracker for having no maps would send somebody looking in exactly the wrong
+/// place.
+fn nothing_found() -> String {
+    let mut msg = format!("the map search found no open `wayfinder:map` issue on {THIS_REPO}");
+    if has_token() {
+        msg.push_str(
+            ". A token is set, so if the tracker does have open maps this is most likely \
+             a token that cannot see this repository — a fine-grained PAT without access \
+             to it, or a GITHUB_TOKEN scoped elsewhere.",
+        );
+    }
+    msg
+}
+
+fn has_token() -> bool {
+    ["GH_TOKEN", "GITHUB_TOKEN"]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()))
+}
+
+/// Whether this is running inside a container, by the marker its runtime
+/// leaves. Docker writes `/.dockerenv`; podman and anything else built on
+/// libcontainer write `/run/.containerenv`. Checking only the first would give
+/// a podman workspace the *host* advice, which is the one piece of advice that
+/// is actively wrong there — a container has no keyring for `gh` to read.
+fn in_container() -> bool {
+    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
 }
 
 /// What to tell somebody about a failed search, given the two facts that

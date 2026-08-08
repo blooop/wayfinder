@@ -81,6 +81,18 @@ jobs:
       - name: Unit tests
         run: cargo test --locked --lib --bins --examples
 
+      # The one part of `tests/` that needs neither network nor `gh`: the
+      # fixture's own diagnostic, which decides what a failing live test tells
+      # you about a missing GH_TOKEN. It is split from the environment it reads
+      # precisely so it can be asserted — and an assertion no workflow runs is
+      # not an assertion. Named by filter, so the live tests around it stay
+      # compiled-not-run as below. Quoted because a plain YAML scalar may not
+      # end in a colon, and `common::` does — unquoted, this file stops parsing
+      # and the whole workflow silently never runs, which is the #84 failure
+      # mode rather than a loud one.
+      - name: The live fixture's diagnostic
+        run: "cargo test --locked --test live_fetch -- common::"
+
       # Compiled but not run: a test that no longer builds is rot, and this is
       # what catches it at the commit that caused it rather than the next time
       # somebody runs them by hand.

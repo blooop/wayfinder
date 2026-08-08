@@ -335,8 +335,7 @@ that never starts rather than an error. Measured here on devpod 0.26.1:
 `devpod ssh --command` (what `dl` ≤ 0.0.12 uses) gives `not a tty`, `TERM=dumb`
 even from a real terminal, while 0.0.13's `ssh -t` transport gives `/dev/pts/0`,
 `TERM=xterm-256color`. The `GH_TOKEN` forwarding below survives that change of
-transport — devpod's ssh server honours OpenSSH's `SendEnv`, which is also
-measured rather than assumed.
+transport; `.devcontainer/devcontainer.json` records why.
 
 **A missing `dl` degrades rather than refuses.** Plenty of repos carry a
 `devcontainer.json` for their editor users, and refusing to launch on a machine

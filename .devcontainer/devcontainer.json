@@ -63,8 +63,15 @@
   // for the interactive path `wf` actually uses. The last two are per-session,
   // so a postCreateCommand cannot see the token at all on the path that matters,
   // and a false alarm on every create would be worse than the silence it
-  // replaced. (That the token survives the ssh transport is measured, not
-  // assumed: devpod's ssh server honours SendEnv, with no AcceptEnv gate.)
+  // replaced.
+  //
+  // That the token survives the ssh transport was worth checking rather than
+  // assuming, because `SendEnv` is only a *request* — a stock sshd drops any
+  // variable not named in its `AcceptEnv`, and devlaunch's tests assert that
+  // the flag is built, never that the variable arrives. Probed on 2026-08-08
+  // against a running devpod workspace with fake values, over plain
+  // `ssh -o SendEnv=...` (the transport dl 0.0.13 uses): they arrive. devpod's
+  // ssh server is its own Go implementation and does not gate on AcceptEnv.
   //
   // `~/.ssh` is deliberately absent — devpod forwards git credentials and can
   // forward an ssh agent, which lends the *use* of a key without handing over
