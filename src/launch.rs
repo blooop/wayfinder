@@ -124,8 +124,8 @@ impl Mode {
         }
     }
 
-    /// Every mode, in picker order, starting at the default. Walks
-    /// [`Mode::after`] until it comes back round — or, if a future cycle is
+    /// Every mode, in picker order, starting at the default. Walks the private
+    /// `after` cycle until it comes back round — or, if a future cycle is
     /// malformed and never does, until it repeats itself, so this cannot spin.
     pub fn all() -> Vec<Mode> {
         let mut modes = vec![Mode::default()];
