@@ -70,22 +70,29 @@ pub enum Overlay {
     },
 }
 
-/// The mode the launch picker moves to on `key`, wrapping both ways.
+/// The mode after `mode` in the launch picker, wrapping.
 ///
 /// Derived from [`Mode::all`] rather than written as a toggle: with two modes a
 /// toggle is the same thing, but it stops being the same thing the moment a
 /// third mode exists, and this is the code that would silently keep working
 /// while skipping it.
-fn stepped(mode: Mode, key: KeyCode) -> Mode {
+fn next_mode(mode: Mode) -> Mode {
+    stepped(mode, 1)
+}
+
+/// The mode before it. Backwards is a forward step of `len - 1`, so there is no
+/// signed arithmetic and no underflow to reason about at index 0.
+fn previous_mode(mode: Mode) -> Mode {
+    let modes = Mode::all();
+    stepped(mode, modes.len() - 1)
+}
+
+/// Step `delta` places along [`Mode::all`], wrapping. Takes a distance rather
+/// than a key, so which key means which direction stays in the key handler
+/// where the rest of the bindings are.
+fn stepped(mode: Mode, delta: usize) -> Mode {
     let modes = Mode::all();
     let at = modes.iter().position(|m| *m == mode).unwrap_or(0);
-    // Backwards is a forward step of len-1: no signed arithmetic, and no
-    // underflow to reason about at index 0.
-    let delta = if key == KeyCode::Up {
-        modes.len() - 1
-    } else {
-        1
-    };
     modes[(at + delta) % modes.len()]
 }
 
@@ -699,22 +706,25 @@ impl App {
         &mut self,
         key: KeyEvent,
         staged: Staged,
-        mode: Mode,
+        mut mode: Mode,
         mut steer: String,
     ) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let mut mode = mode;
         match key.code {
             // Back to the list; the overlay is already None.
             KeyCode::Esc => return Outcome::Continue,
             KeyCode::Char('c') if ctrl => return Outcome::Quit,
+            // Returns *before* the overlay is put back, because resolving may
+            // have opened the which-checkout modal over this one — falling
+            // through would overwrite it with the picker the launch just left.
             KeyCode::Enter => {
                 return self.resolve_launch(&staged, &LaunchMode::picked(mode, &steer))
             }
-            // Two modes today, so both arrows and tab are the same step — and
-            // they stay right when a third mode arrives, which a plain toggle
-            // would not.
-            KeyCode::Up | KeyCode::Down | KeyCode::Tab => mode = stepped(mode, key.code),
+            // With two modes every step is the same step; `tab` joins the
+            // arrows because it is what the rest of the screen uses to move
+            // between two of something.
+            KeyCode::Up => mode = previous_mode(mode),
+            KeyCode::Down | KeyCode::Tab => mode = next_mode(mode),
             KeyCode::Backspace => {
                 steer.pop();
             }
@@ -1850,6 +1860,43 @@ mod tests {
             notice.contains("no registered checkout"),
             "notice: {notice}"
         );
+    }
+
+    #[test]
+    fn the_picker_walks_the_modes_both_ways_and_wraps() {
+        // Up and down are inverses and neither can fall off an end: with two
+        // modes every step lands on the other one, and the mode under the
+        // cursor is the mode `enter` will launch, so a step that went nowhere
+        // (or panicked at index 0) would launch the wrong skill.
+        let mut app = launchable_app();
+        go_to(&mut app, "#6");
+        app.handle_key(key(KeyCode::Enter));
+        let mode = |app: &App| match &app.overlay {
+            Overlay::PickLaunch { mode, .. } => *mode,
+            other => panic!("expected the launch picker, got {other:?}"),
+        };
+        assert_eq!(mode(&app), Mode::Interactive);
+        // Up from the first row wraps to the last rather than sticking.
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(mode(&app), Mode::Auto);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(mode(&app), Mode::Interactive, "and wraps back round");
+        // Tab steps the same way down does — it is not the view toggle in here.
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(mode(&app), Mode::Auto);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(mode(&app), Mode::Interactive);
+        // Steering text is untouched by moving the mode: the two axes are
+        // edited independently, in one overlay.
+        type_str(&mut app, "keep me");
+        app.handle_key(key(KeyCode::Down));
+        match &app.overlay {
+            Overlay::PickLaunch { mode, steer, .. } => {
+                assert_eq!(*mode, Mode::Auto);
+                assert_eq!(steer, "keep me");
+            }
+            other => panic!("expected the launch picker, got {other:?}"),
+        }
     }
 
     #[test]

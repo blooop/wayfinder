@@ -561,6 +561,23 @@ fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, mode: Mode, steer:
     );
 }
 
+/// Whichever modal is up, over the screen the rest of [`draw`] already drew.
+/// Exhaustive on the overlay, so a third modal cannot be added without being
+/// given something to draw.
+fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
+    match &app.overlay {
+        Overlay::None => {}
+        Overlay::PickLaunch {
+            staged,
+            mode,
+            steer,
+        } => draw_launch_picker(frame, staged, *mode, steer),
+        Overlay::PickCheckout { launches, cursor } => {
+            draw_checkout_picker(frame, launches, *cursor);
+        }
+    }
+}
+
 /// The which-checkout modal: one row per registered checkout of the repo.
 ///
 /// The one prompt `wf` still has, and the reason it survived the Build 7
@@ -568,24 +585,10 @@ fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, mode: Mode, steer:
 /// exactly one, and `wf` cannot guess which. The path *is* the row — it is what
 /// distinguishes the candidates, and with no session to name there is nothing
 /// shorter to show alongside it.
-fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
-    let launches;
-    let cursor;
-    match &app.overlay {
-        Overlay::None => return,
-        Overlay::PickLaunch {
-            staged,
-            mode,
-            steer,
-        } => return draw_launch_picker(frame, staged, *mode, steer),
-        Overlay::PickCheckout {
-            launches: l,
-            cursor: c,
-        } => (launches, cursor) = (l, c),
-    }
+fn draw_checkout_picker(frame: &mut Frame<'_>, launches: &[Launch], cursor: usize) {
     let mut lines = vec![Line::default()];
     for (i, launch) in launches.iter().enumerate() {
-        let marker = if i == *cursor { '▶' } else { ' ' };
+        let marker = if i == cursor { '▶' } else { ' ' };
         // Two trees of one repo can differ in what the agent will run in —
         // one carrying a devcontainer and one not — so the choice has to say
         // so here, where it is being made, not only in the notice after (#80).
