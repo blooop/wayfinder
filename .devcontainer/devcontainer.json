@@ -51,10 +51,16 @@
   //
   // The cost of dropping it, said plainly: brought up by something *other* than
   // `dl` — plain `devpod up`, or the devcontainer CLI from an editor — this
-  // container has no `gh` login, and tests/live_fetch.rs will fail. `dl` is this
+  // container has no `gh` login, and the live tests will fail. `dl` is this
   // repo's front door (blooop/wayfinder#36) and `wf` itself now launches through
   // it (blooop/wayfinder#80), so that is the supported path; export `GH_TOKEN`
-  // yourself for the others.
+  // yourself for the others. The failure at least explains itself now:
+  // tests/common/mod.rs names a missing GH_TOKEN as the cause when it is one,
+  // rather than surfacing `gh`'s error alone (raised by the review of #94).
+  // Deliberately not a create-time check: `dl` delivers the token as devpod
+  // *workspace env*, so whether it is visible to a postCreateCommand depends on
+  // ordering nobody here has verified, and a false alarm on every create would
+  // be worse than the silence it replaced.
   //
   // `~/.ssh` is deliberately absent — devpod forwards git credentials and can
   // forward an ssh agent, which lends the *use* of a key without handing over
