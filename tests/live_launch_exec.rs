@@ -88,6 +88,14 @@ impl Scratch {
         self.0.join("cache")
     }
 
+    /// A Claude Code config directory of this test's own. Not a nicety: the
+    /// launch path refreshes the installed skill copies on its way to the exec,
+    /// and a test that let it find the real `~/.claude` would be rewriting the
+    /// user's prompts as a side effect of running.
+    fn claude(&self) -> PathBuf {
+        self.0.join("claude")
+    }
+
     fn report(&self) -> PathBuf {
         self.0.join("report.txt")
     }
@@ -251,6 +259,18 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     scratch.write_shims();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
 
+    // Claim 4's setup: this repo's skills, installed into a config directory of
+    // the test's own, with one copied prompt then vandalised. What the launch
+    // does about that is checked after the exec.
+    let target = wf::skills::Target::beside(&scratch.claude().join("skills")).expect("a target");
+    let bundle = wf::skills::Bundle {
+        path: repo.join("skills"),
+        found_by: wf::skills::FoundBy::Checkout,
+    };
+    wf::skills::install(&bundle, &target).expect("install the skills");
+    let copied_prompt = target.mirror().join("wf-tdd/SKILL.md");
+    std::fs::write(&copied_prompt, "a prompt from an older release\n").expect("vandalise the copy");
+
     let (master, slave) = openpty_sized(40, 120);
     let path = format!(
         "{}:{}",
@@ -265,6 +285,7 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
             // Keep the user's real projects cache out of it: this run
             // registers a checkout and writes a map seed.
             .env("XDG_CACHE_HOME", scratch.cache())
+            .env("CLAUDE_CONFIG_DIR", scratch.claude())
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave.try_clone().expect("dup slave")))
             .stdout(Stdio::from(slave.try_clone().expect("dup slave")))
@@ -426,5 +447,25 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
         contains(handover, b"\x1b[?25h"),
         "wf never made the cursor visible again before handing over — \
          the agent inherits an invisible cursor"
+    );
+
+    // Claim 4: the agent can actually *run* the skill it was just handed. The
+    // prompt is a slash command, so a link the agent cannot resolve is not an
+    // error anywhere near here — it is `Unknown command: /wf-tdd` inside the
+    // session (#107). Two halves, both only observable on a real launch: the
+    // link is relative, so it still resolves after `dl` mounts `~/.claude` into
+    // the container at another path; and the copy behind it was brought back in
+    // step with this build's `skills/` on the way past, which is what stops a
+    // copy from being a thing that goes stale.
+    assert_eq!(
+        std::fs::read_link(target.links().join("wf-tdd")).ok(),
+        Some(PathBuf::from("../wf-skills/wf-tdd")),
+        "the installed link must name no home directory, or the container's \
+         copy of it dangles"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&copied_prompt).ok(),
+        std::fs::read_to_string(repo.join("skills/wf-tdd/SKILL.md")).ok(),
+        "the launch must refresh the prompt it is about to exec"
     );
 }

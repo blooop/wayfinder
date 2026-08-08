@@ -69,8 +69,10 @@ wf skills          report which prompt each route would actually run
 wf skills install  link this build's skills into ~/.claude/skills
 
 The skills wf execs ship in this package, so they update with it. `install`
-links rather than copies, which is what keeps them in step afterwards. Set
-WF_SKILLS_DIR to link a checkout instead, while you are editing them.";
+links ~/.claude/skills at a copy of them kept beside it, which is the only
+place a launch inside a devcontainer can read them from; every launch brings
+that copy back in step. Set WF_SKILLS_DIR to install a checkout's skills
+instead, while you are editing them.";
 
 /// Parse argv (without the program name). `wf` takes at most one argument, and
 /// anything it does not recognise is rejected rather than ignored, so a typo
@@ -119,7 +121,7 @@ fn run_skills(install: bool) -> Result<()> {
     use std::fmt::Write;
 
     let bundle = skills::Bundle::resolve()?;
-    let target = skills::claude_skills_dir()?;
+    let target = skills::Target::resolve()?;
     if !install {
         emit(&skills::report(&bundle, &target));
         return Ok(());
@@ -142,6 +144,9 @@ fn run_skills(install: bool) -> Result<()> {
     for (name, outcome) in &done {
         let line = match outcome {
             skills::Outcome::AlreadyCurrent => "already current".to_string(),
+            skills::Outcome::Refreshed => {
+                "refreshed — the prompt behind the link is now this build's".to_string()
+            }
             skills::Outcome::Linked { was: None } => "linked".to_string(),
             skills::Outcome::Linked { was: Some(old) } => {
                 format!("relinked (was {})", old.display())
@@ -149,7 +154,7 @@ fn run_skills(install: bool) -> Result<()> {
             skills::Outcome::Blocked => format!(
                 "BLOCKED — {} is a real directory, not a link. Remove it \
                  (chezmoi may own it) and run this again",
-                target.join(name).display()
+                target.links().join(name).display()
             ),
             skills::Outcome::NotInBundle => {
                 "NOT IN BUNDLE — this build shipped without it".to_string()
@@ -278,8 +283,36 @@ async fn main() -> Result<()> {
     ratatui::restore();
     match ending? {
         Ending::Quit => Ok(()),
-        // Only ever returns an error: on success this process *is* the agent.
-        Ending::Handover(launch) => Err(launch.exec()),
+        Ending::Handover(launch) => {
+            // The prompts the agent is about to run. `wf skills install` links
+            // `~/.claude/skills` at a *copy* of the bundle, because that is the
+            // only place a devcontainer can read them from, and a copy is a
+            // thing that can fall behind a `pixi global update wf`. This is
+            // where it cannot: the process that refreshes it is the same one
+            // that then execs the prompt, so no launch ever gets ahead by even
+            // one release.
+            refresh_skills();
+            // Only ever returns an error: on success this process *is* the agent.
+            Err(launch.exec())
+        }
+    }
+}
+
+/// Bring the installed skill copies back in step with the bundle they were
+/// installed from.
+///
+/// Best-effort, and deliberately silent when there is nothing to do: a machine
+/// with no home directory to resolve, and one that never ran
+/// `wf skills install`, are not worth a word on the way into an agent. A copy
+/// that could not be *written* is different — the agent is about to run a
+/// prompt that is not the one that was installed — so that one is said out
+/// loud.
+fn refresh_skills() {
+    let Ok(target) = skills::Target::resolve() else {
+        return;
+    };
+    if let Err(err) = skills::refresh(&target) {
+        eprintln!("wf: could not refresh the installed skills: {err:#}");
     }
 }
 
