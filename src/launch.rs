@@ -8,7 +8,10 @@
 //! ([`Aim`]) and who decides ([`Mode`]), and any steering text rides the
 //! prompt as a suffix (#61/#62/#96). Unattended work is still not supervised
 //! here — an `auto` launch is the same exec of `/wf-auto`, watched from
-//! another terminal or not at all.
+//! another terminal or not at all. One mode invokes no skill at all
+//! ([`Mode::Plain`], #112): the same exec, in the same workspace, with the
+//! prompt left to the human — so `wf` remains the thing that resolves a node
+//! to a place to work even when nothing is going to be run in it.
 //!
 //! A checkout that declares a devcontainer runs that same agent *inside* a
 //! container, by way of `dl` ([`Isolation`], #80): `wf` owns which ticket,
@@ -81,10 +84,11 @@ impl Route {
 /// Who resolves the launched node — the axis #96 added to routing, orthogonal
 /// to what the cursor was standing on.
 ///
-/// Not a flag on the skill: the two modes are *different skills* (`/wf`
-/// and `/wf-auto`), so the mode is an input to [`route`] rather than
-/// something the prompt carries. That is why nothing about "auto" survives
-/// into the exec'd prompt's steering suffix — by then it has already been spent.
+/// Not a flag on the skill: the modes are *different skills* (`/wf` and
+/// `/wf-auto`) — or, in [`Mode::Plain`]'s case, no skill at all — so the mode
+/// is an input to [`route`] rather than something the prompt carries. That is
+/// why nothing about "auto" survives into the exec'd prompt's steering suffix:
+/// by then it has already been spent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
     /// The default: the human is in the loop, and the session grills them.
@@ -963,7 +967,10 @@ mod tests {
     fn every_mode_is_in_the_picker_and_the_default_leads_it() {
         // The picker lists `Mode::all`, so a mode missing from it would be a
         // mode nothing on screen can reach.
-        assert_eq!(Mode::all(), vec![Mode::Interactive, Mode::Auto, Mode::Plain]);
+        assert_eq!(
+            Mode::all(),
+            vec![Mode::Interactive, Mode::Auto, Mode::Plain]
+        );
         assert_eq!(
             Mode::all().first(),
             Some(&Mode::default()),

@@ -315,15 +315,16 @@ opens the **launch picker** over the list, showing what is about to happen and
 the one thing still undecided — who resolves the node:
 
 ```
-┌ launch #65 Author the /wf-tdd skill ────────────────────────────┐
-│                                                                 │
-│  ▶ interactive /wf-tdd   you are in the loop; it grills you     │
-│    auto        /wf-auto  the agent decides alone and drives it  │
-│                                                                 │
-│    steer  █                                                     │
-│                                                                 │
-│  enter launch · ↑/↓ mode · type to steer · esc cancel           │
-└─────────────────────────────────────────────────────────────────┘
+┌ launch #65 Author the /wf-tdd skill ──────────────────────────────────┐
+│                                                                       │
+│  ▶ interactive /wf-tdd   you are in the loop; it grills you           │
+│    auto        /wf-auto  the agent decides alone and drives it to done│
+│    plain       claude    no skill; a bare session on the node's branch│
+│                                                                       │
+│    steer  █                                                           │
+│                                                                       │
+│  enter launch · ↑/↓ mode · type to steer · esc cancel                 │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 `↑`/`↓` (or `tab`) move between the modes and `enter` runs the one you are on,
@@ -361,6 +362,7 @@ headers are one `↑` away.
 | `wayfinder:build` | in review | interactive | `claude "/wf-review <n>"` |
 | research · prototype · grilling · task | any unfinished stage | interactive | `claude "/wf <map> <n>"` |
 | anything | any unfinished stage | auto | `claude "/wf-auto <map> [<n>]"` |
+| anything | any unfinished stage | plain | `claude` — no skill, no arguments |
 | a ticket | done | — | nothing — not launchable |
 
 The auto mode collapses the ticket rows on purpose: the launched session is a
@@ -369,6 +371,17 @@ the gate, then a fresh-context `/wf-review` — so it is the manager skill that 
 not the one skill that stage would have called. Steering text rides whichever
 route you got, as ` steer: <text>` on the end of the prompt; the mode itself
 never does, because it has already chosen the skill.
+
+**The plain mode collapses them for the opposite reason: it runs no skill at
+all.** Everything else about the launch is unchanged — same checkout, same
+per-node branch, same clone and container — so it is the way to get `wf`'s
+workspace without a skill's opinion about what to do in it: reading the code a
+ticket is about, a quick fix too small to be a node's lifecycle, or picking up
+after an agent that stopped somewhere awkward. There being no skill in front of
+it is also why steering text is handled differently here: a ` steer: <text>`
+suffix would be addressed to nobody, so whatever you type is simply the
+session's opening prompt, and typing nothing passes no prompt at all rather than
+an empty one.
 
 | key | what it does |
 | --- | --- |

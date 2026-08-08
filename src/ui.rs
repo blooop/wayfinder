@@ -1491,13 +1491,17 @@ mod tests {
             screen.contains("launch #6 Re-entry breadcrumbs"),
             "{screen}"
         );
-        // Both modes are on screen with the skill each one would run, because
+        // Every mode is on screen with the skill each one would run, because
         // that difference *is* the choice being offered — and the cursor sits
         // on the interactive default.
         assert!(screen.contains("▶ interactive"), "{screen}");
         assert!(screen.contains("/wf "), "{screen}");
         assert!(screen.contains("auto"), "{screen}");
         assert!(screen.contains("/wf-auto"), "{screen}");
+        // The skill-free mode (#112) reads as what it execs — a bare `claude`,
+        // no slash command — and says what picking it costs you.
+        assert!(screen.contains("plain"), "{screen}");
+        assert!(screen.contains("no skill"), "{screen}");
         assert!(screen.contains("steer"), "{screen}");
         assert!(screen.contains("esc cancel"), "{screen}");
 
@@ -1507,6 +1511,11 @@ mod tests {
         let screen = render(&app);
         assert!(screen.contains("▶ auto"), "{screen}");
         assert!(!screen.contains("▶ interactive"), "{screen}");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("▶ plain"), "{screen}");
+        assert!(!screen.contains("▶ auto"), "{screen}");
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
 
         // Typing steers rather than picking: the text lands in the field, and
         // the mode stays where the cursor put it.
