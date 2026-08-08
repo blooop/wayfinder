@@ -403,7 +403,11 @@ it always has:
 1. the checkout declares one of those two configs, and
 2. `dl` is on PATH.
 
-**Use `dl` 0.0.13 or newer.** `wf` pins no version and never will — the launch
+**Use `dl` 0.0.20 or newer.** Launching several tickets at once means several
+`dl` processes preparing the same repo's cache at the same moment; 0.0.20 is
+where those runs serialize over a per-repo lock instead of racing (the loser
+of the old race could delete the winner's half-written clone). The older floor
+still matters too: `wf` pins no version and never will — the launch
 is one `exec` of a program found on PATH — but older `dl` on devpod 0.26 hands
 the agent **no terminal**, and an agent with no terminal decides it was invoked
 non-interactively: it prints one answer and exits, so the symptom is a session
