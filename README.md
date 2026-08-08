@@ -157,7 +157,9 @@ open map that the last search found. Deleting it is safe — projects re-accrete
 as you open them, and the maps are re-found on the next start.
 
 Only repos with an open `wayfinder:map`-labelled issue show tickets; other
-checkouts stay cached but hidden.
+checkouts stay cached but hidden — except the one you are *focused* on, which
+renders a slim `no map` header so its first map has somewhere to be started from
+(see [Launching](#launching)).
 
 **Every open map renders as its own cluster** — a `▌ repo · map title` header
 carrying the map's **stage** counts, in the same glyph vocabulary the rows
@@ -315,31 +317,31 @@ opens the **launch picker** over the list, showing what is about to happen and
 the one thing still undecided — who resolves the node:
 
 ```
-┌ launch #65 Author the /wf-tdd skill ──────────────────────────────────┐
-│                                                                       │
-│  ▶ interactive /wf-tdd   you are in the loop; it grills you           │
-│    auto        /wf-auto  the agent decides alone and drives it to done│
-│    plain       claude    no skill; a bare session on the node's branch│
-│                                                                       │
-│    steer  █                                                           │
-│                                                                       │
-│  enter launch · ↑/↓ mode · type to steer · esc cancel                 │
-└───────────────────────────────────────────────────────────────────────┘
+┌ launch blooop/wayfinder · #65 Author the /wf-tdd skill ─────────────────┐
+│                                                                         │
+│  ▶ interactive   /wf-tdd   you are in the loop; it grills you           │
+│    auto          /wf-auto  the agent decides alone and drives it to done│
+│    plain         claude    no skill; a bare session on the node's branch│
+│                                                                         │
+│    steer  █                                                             │
+│                                                                         │
+│  enter launch · ↑/↓ pick · type to fill · esc cancel                    │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-`↑`/`↓` (or `tab`) move between the modes and `enter` runs the one you are on,
-so the common case is `enter enter`. Every mode is on screen with the skill it
+`↑`/`↓` (or `tab`) move between the rows and `enter` runs the one you are on,
+so the common case is `enter enter`. Every row is on screen with the skill it
 routes *this* node to, because that difference is the choice being made: the
 picker is where you see that `auto` means `/wf-auto` and will not stop to ask
 you anything.
 
-Anything you type goes into the **steer** field — a steering prompt on whichever
-mode is selected, never a mode itself. That is the difference from the launch
-*line* this replaced: the modes were words you had to already know (`defer`, then
-`auto`), typing one was indistinguishable from a typo until the agent ran, and
-`automate the release` had to be special-cased into not meaning unattended. No
-string moves the cursor now, so a launch goes unattended only because you
-selected it.
+Anything you type goes into the field below the rows — on a launch row that is a
+**steering prompt** on whichever mode is selected, never a mode itself. That is
+the difference from the launch *line* this replaced: the modes were words you had
+to already know (`defer`, then `auto`), typing one was indistinguishable from a
+typo until the agent ran, and `automate the release` had to be special-cased into
+not meaning unattended. No string moves the cursor now, so a launch goes
+unattended only because you selected it.
 
 `esc` backs out to the list with your query and cursor exactly as they were.
 `enter` on a **done** or **blocked** node opens nothing — it says why on the
@@ -353,6 +355,48 @@ default cursor position still skips headers and lands on the first row, so
 opening `wf` and pressing `enter` picks a ticket exactly as it always did;
 headers are one `↑` away.
 
+**Starting something new is more rows in the same picker.** Creation is an act on
+a *repo*, so it lives where the stop is repo-level — the cluster header — and is
+reached by the same `enter` as everything else. No new keys:
+
+```
+┌ launch blooop/wayfinder · #59 Map: the dev-process tree ────────────────┐
+│                                                                         │
+│  ▶ interactive   /wf       you are in the loop; it grills you           │
+│    auto          /wf-auto  the agent decides alone and drives it to done│
+│    plain         claude    no skill; a bare session on the node's branch│
+│    new task      /wf-one   one tracked ticket, built and reviewed       │
+│    new map       /wf       chart a new map in this repo, with you       │
+│    new map, auto /wf-auto  chart a new map in this repo, alone          │
+│                                                                         │
+│    task   █                                                             │
+│                                                                         │
+│  enter launch · ↑/↓ pick · type to fill · esc cancel                    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+The repo comes free from wherever the cursor was standing, which is why the title
+names it. **Ticket pickers are unchanged** — they list the three modes and
+nothing else, so `enter` on a ticket never offers to start something instead.
+
+The text field keeps one keyboard behaviour and takes its meaning from the row,
+which is what the name beside it says: `steer` on a launch row, `task` on **new
+task** — where the text *is* the ticket, so `enter` with nothing typed refuses on
+the count line — and `seed` on the two **new map** rows, where it is an optional
+loose idea the charting session will grill you about anyway.
+
+Adding a ticket to an existing map needs no row of its own: `enter` on its
+header, type `add a ticket for X`, launch — that is `/wf <map> steer: …`, and the
+charting session files it.
+
+**A repo with no map has a door too.** Run `wf` inside a registered checkout
+whose repo has no open `wayfinder:map` and the screen used to be empty; now it
+renders that repo as one slim header, and `enter` on it opens the creation rows
+alone — nothing to launch, so no launch rows. That is where a repo's *first* map
+gets charted. It appears only on the focused empty state and only once the load
+has landed, so a still-fetching repo never flashes a creation row under `enter`,
+and the widened screen stays free of one row per project.
+
 **Which skill runs is a fact about what you picked and who decides:**
 
 | picked | stage | mode | launches |
@@ -363,7 +407,14 @@ headers are one `↑` away.
 | research · prototype · grilling · task | any unfinished stage | interactive | `claude "/wf <map> <n>"` |
 | anything | any unfinished stage | auto | `claude "/wf-auto <map> [<n>]"` |
 | anything | any unfinished stage | plain | `claude` — no skill; anything typed is the whole prompt |
+| a cluster header, or a map-less repo | — | new task | `claude "/wf-one <task>"` |
+| a cluster header, or a map-less repo | — | new map | `claude "/wf [<seed>]"` |
+| a cluster header, or a map-less repo | — | new map, auto | `claude "/wf-auto [<seed>]"` |
 | a ticket | done | — | nothing — not launchable |
+
+A creation has no issue number until the skill files one, so it has no per-node
+branch either: it runs on the repo's **default workspace**, and the launched
+skill makes its own branches from there.
 
 The auto mode collapses the ticket rows on purpose: the launched session is a
 *manager*, and what it manages is the node's whole remaining lifecycle — `/wf-tdd`,
@@ -391,7 +442,7 @@ an empty one.
 | `→` | reveal: open a `▸ done`/`▸ blocked` group, else step forward one stop — which *is* descending, since a subtree's first row follows its parent |
 | `←` | close: shut an open group, else back out to the parent, else one stop back — which, from a cluster's first row, is that cluster's header |
 | `enter` | open the launch picker on the cursor's ticket, or on its map when the cursor is on a cluster header; a second `enter` runs the agent here and exits — on a group line it folds instead, since there is no agent to run |
-| `↑`/`↓` or `tab`, *type*, then `enter`* | in the launch picker: pick the mode, type a steering prompt, launch — `esc` backs out with the query and cursor intact |
+| `↑`/`↓` or `tab`, *type*, then `enter`* | in the launch picker: pick the row, fill the field beside it (a steering prompt, a task, or a map seed), launch — `esc` backs out with the query and cursor intact |
 | `ctrl-f` | focus the cursor row's project — only its clusters stay on screen |
 | `ctrl-g` | widen back to every project |
 | `ctrl-r` | refetch every map in place, keeping your query, scope and cursor |

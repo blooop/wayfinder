@@ -74,6 +74,7 @@ async fn main() {
         wf::view::Stop::Map(id) => format!("map #{}", id.number),
         wf::view::Stop::Ticket(row) => format!("#{}", app.ticket(row).number),
         wf::view::Stop::Group(g) => format!("{:?}", g.kind),
+        wf::view::Stop::Project(repo) => format!("project {repo}"),
     };
     println!(
         "cursor: {} of {} → {} at depth {}",

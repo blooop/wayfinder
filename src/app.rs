@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::launch::{self, Launch, LaunchMode, Mode, Staged, Targets};
+use crate::launch::{self, Candidate, Launch, LaunchMode, Route, Staged, Targets};
 use crate::model::{stage, Activity, Map, MapId, MapSet, Status, Ticket};
 use crate::projects::Checkout;
 use crate::refresh::Startup;
@@ -45,12 +45,12 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
     None,
-    /// The launch picker — `enter` on a launchable node staged this launch, and
-    /// the overlay now collects the two things a launch needs beyond the node:
-    /// which [`Mode`] resolves it, picked from a list, and the steering text.
-    /// It resolves the route from the staged node and the picked mode, so it
-    /// *shows* which skill `enter` will run and re-reads as the mode moves — and
-    /// a picker for an unlaunchable node is unrepresentable, because
+    /// The launch picker — `enter` on a stop staged this launch, and the
+    /// overlay now collects the two things it still needs: which [`Candidate`]
+    /// runs, picked from a list, and the text that fills that row's field.
+    /// Every candidate carries its own resolved route, so the picker *shows*
+    /// which skill `enter` will run and re-reads as the pick moves — and a
+    /// picker for an unlaunchable node is unrepresentable, because
     /// [`launch::Launchable`] refused it before anything was staged.
     ///
     /// The staged launch is index-free ([`Staged`]) for the same reason the
@@ -59,7 +59,10 @@ pub enum Overlay {
     /// held across that would name a different ticket, or none at all.
     PickLaunch {
         staged: Staged,
-        mode: Mode,
+        /// The picked row — one of [`Staged::candidates`], which is the only
+        /// list the arrows walk, so a candidate foreign to the staged stop
+        /// (creation on a ticket) is never held here (#114).
+        candidate: Candidate,
         steer: String,
     },
     /// Candidates are complete launches, so the pick cannot produce an
@@ -70,29 +73,36 @@ pub enum Overlay {
     },
 }
 
-/// The mode after `mode` in the launch picker, wrapping.
+/// The row after `candidate` in the launch picker, wrapping.
 ///
-/// Derived from [`Mode::all`] rather than written as a toggle. With two modes a
-/// toggle was the same thing; #112's third mode is exactly the change that
-/// would have left a toggle silently working and skipping the new one.
-fn next_mode(mode: Mode) -> Mode {
-    stepped(mode, 1)
+/// Walked over [`Staged::candidates`] rather than [`Mode::all`] since #114:
+/// the list is the staged stop's own, so a header's creation rows are reached
+/// by the same arrows that walk the modes, and a ticket's picker cannot step
+/// onto a row it does not draw.
+fn next_candidate(staged: &Staged, candidate: Candidate) -> Candidate {
+    stepped(staged, candidate, 1)
 }
 
-/// The mode before it. Backwards is a forward step of `len - 1`, so there is no
+/// The row before it. Backwards is a forward step of `len - 1`, so there is no
 /// signed arithmetic and no underflow to reason about at index 0.
-fn previous_mode(mode: Mode) -> Mode {
-    let modes = Mode::all();
-    stepped(mode, modes.len() - 1)
+fn previous_candidate(staged: &Staged, candidate: Candidate) -> Candidate {
+    let len = staged.candidates().len();
+    stepped(staged, candidate, len - 1)
 }
 
-/// Step `delta` places along [`Mode::all`], wrapping. Takes a distance rather
-/// than a key, so which key means which direction stays in the key handler
-/// where the rest of the bindings are.
-fn stepped(mode: Mode, delta: usize) -> Mode {
-    let modes = Mode::all();
-    let at = modes.iter().position(|m| *m == mode).unwrap_or(0);
-    modes[(at + delta) % modes.len()]
+/// Step `delta` places along the staged stop's candidates, wrapping. Takes a
+/// distance rather than a key, so which key means which direction stays in the
+/// key handler where the rest of the bindings are.
+///
+/// # Panics
+///
+/// Never: [`Staged::candidates`] is never empty — every stop offers rows, its
+/// launch rows or the map-less door's creation rows — so the modulo below is
+/// never by zero.
+fn stepped(staged: &Staged, candidate: Candidate, delta: usize) -> Candidate {
+    let candidates = staged.candidates();
+    let at = candidates.iter().position(|c| *c == candidate).unwrap_or(0);
+    candidates[(at + delta) % candidates.len()]
 }
 
 /// One on-screen row: which map's cluster it is in, and the ticket's position
@@ -130,6 +140,9 @@ pub enum StopKey {
     Map(MapId),
     Ticket(RowKey),
     Group(GroupId),
+    /// The empty-state door, by repo slug — already index-free, like the
+    /// map and group keys.
+    Project(String),
 }
 
 /// Where the cursor is, and — the part that matters — **whether anyone put it
@@ -324,7 +337,46 @@ impl App {
     /// what the draw walks and what the cursor navigates, so the two can never
     /// disagree about order.
     pub fn plan(&self) -> Plan {
-        view::plan(&self.scoped_clusters(), self.screen(), &self.expanded)
+        view::plan(
+            &self.scoped_clusters(),
+            self.screen(),
+            &self.expanded,
+            self.mapless_door().as_deref(),
+        )
+    }
+
+    /// The repo whose empty-state door this screen is showing, if it is
+    /// showing one (#114).
+    ///
+    /// Deliberately only the **focused** empty state: a registered repo with
+    /// no open map, with the scope on it and nothing rendered. That is the
+    /// case `wf` opened inside a fresh checkout lands in, and it is where the
+    /// repo's *first* map has otherwise had no way in — the picker's rows all
+    /// hang off stops, and a repo with no map renders no stop.
+    ///
+    /// A row per map-less project on the *widened* screen is the version this
+    /// is not: permanent furniture on a screen that is otherwise all signal,
+    /// one extra row every frame for an occasional act. Reaching those repos
+    /// is the project surface's job, not the tree's.
+    fn mapless_door(&self) -> Option<String> {
+        // Not until the load has landed. A focused repo whose maps are still
+        // in flight looks identical to one that has none, and drawing the door
+        // then would put a creation row under `enter` for the second or two
+        // before the clusters arrive — turning an ordinary launch into a new
+        // map. Same reason [`crate::ui::heading`] will not say "no projects"
+        // while the search is out.
+        if !self.startup.is_loaded() {
+            return None;
+        }
+        let Scope::Project(repo) = &self.scope else {
+            return None;
+        };
+        // Registered, and nothing of it on screen: a repo whose clusters are
+        // merely filtered out by a query still *has* maps, and its door would
+        // be a second answer to a question the query is already answering.
+        let registered = self.checkouts.iter().any(|c| &c.repo == repo);
+        let has_clusters = self.clusters.keys().any(|id| &id.repo == repo);
+        (registered && !has_clusters).then(|| repo.clone())
     }
 
     /// Every cursor stop with its depth, in on-screen order (#57). The cursor
@@ -360,6 +412,7 @@ impl App {
             Stop::Map(id) => StopKey::Map(id.clone()),
             Stop::Ticket(row) => StopKey::Ticket(self.row_key(row)),
             Stop::Group(id) => StopKey::Group(id.clone()),
+            Stop::Project(repo) => StopKey::Project(repo.clone()),
         }
     }
 
@@ -398,7 +451,7 @@ impl App {
     pub fn cursor_row(&self) -> Option<Row> {
         match self.cursor_stop() {
             Some(Stop::Ticket(row)) => Some(row),
-            Some(Stop::Map(_) | Stop::Group(_)) | None => None,
+            Some(Stop::Map(_) | Stop::Group(_) | Stop::Project(_)) | None => None,
         }
     }
 
@@ -411,13 +464,14 @@ impl App {
     }
 
     /// Which map the cursor is in, whichever kind of stop it is on — what
-    /// `ctrl-f` focuses. Every stop belongs to a cluster, so this is total
-    /// wherever the cursor can be at all.
+    /// `ctrl-f` focuses. `None` on the empty-state door: it names a repo that
+    /// has no map, which is the one stop that belongs to no cluster.
     pub fn cursor_map(&self) -> Option<MapId> {
         match self.cursor_stop()? {
             Stop::Map(id) => Some(id),
             Stop::Ticket(row) => Some(row.map),
             Stop::Group(id) => Some(id.map),
+            Stop::Project(_) => None,
         }
     }
 
@@ -614,9 +668,21 @@ impl App {
             }
             Some(Stop::Map(id)) => {
                 let title = self.clusters[&id].title.clone();
+                let staged = Staged::map(&id, &title);
                 self.overlay = Overlay::PickLaunch {
-                    staged: Staged::map(&id, &title),
-                    mode: Mode::default(),
+                    candidate: staged.default_candidate(),
+                    staged,
+                    steer: String::new(),
+                };
+                Outcome::Continue
+            }
+            // The empty-state door (#114): nothing to launch here, so the
+            // picker opens straight onto the creation rows.
+            Some(Stop::Project(repo)) => {
+                let staged = Staged::project(&repo);
+                self.overlay = Overlay::PickLaunch {
+                    candidate: staged.default_candidate(),
+                    staged,
                     steer: String::new(),
                 };
                 Outcome::Continue
@@ -649,8 +715,8 @@ impl App {
             }
             Some(staged) => {
                 self.overlay = Overlay::PickLaunch {
+                    candidate: staged.default_candidate(),
                     staged,
-                    mode: Mode::default(),
                     steer: String::new(),
                 };
                 Outcome::Continue
@@ -665,14 +731,32 @@ impl App {
     /// — a row without a map is unrepresentable, so the old "repo has no map"
     /// failure is gone with it.
     ///
-    /// Everything this needs came with the [`Staged`] launch, so a refetch
-    /// between the two enters cannot redirect it at another ticket.
-    fn resolve_launch(&mut self, staged: &Staged, mode: &LaunchMode) -> Outcome {
-        match launch::plan(&self.checkouts, staged, mode) {
+    /// Everything this needs came with the [`Staged`] launch and the picked
+    /// [`Candidate`] — including `route`, carried from the row that was drawn
+    /// rather than derived a second time — so a refetch between the two enters
+    /// cannot redirect it at another ticket or another skill.
+    fn resolve_launch(&mut self, staged: &Staged, route: Route, mode: &LaunchMode) -> Outcome {
+        let targets = launch::plan(&self.checkouts, staged, route, mode);
+        self.act_on(targets, &staged.repo, &staged.key())
+    }
+
+    /// The creation half: the same resolution against the same cache, for a
+    /// launch that has no node to name (#114). The creation arrives already
+    /// complete — [`launch::CreationKind::with_text`] refused the empty task
+    /// before this was called — so the only thing left to answer is *where*.
+    fn resolve_creation(&mut self, repo: &str, creation: &launch::Creation) -> Outcome {
+        let targets = launch::plan_create(&self.checkouts, repo, creation);
+        self.act_on(targets, repo, "+new")
+    }
+
+    /// What a resolved [`Targets`] does to the screen: launch, prompt for the
+    /// tree, or say there is none. Shared by both resolutions so a creation
+    /// cannot drift into reporting its checkouts differently from a node.
+    fn act_on(&mut self, targets: Targets, repo: &str, key: &str) -> Outcome {
+        match targets {
             Targets::Unregistered => {
                 self.notice = Some(format!(
-                    "no registered checkout of {} on this machine — run wf inside one",
-                    staged.repo
+                    "no registered checkout of {repo} on this machine — run wf inside one"
                 ));
                 Outcome::Continue
             }
@@ -681,7 +765,7 @@ impl App {
                 Outcome::Launch(launch)
             }
             Targets::Many(launches) => {
-                self.notice = Some(format!("{}{}: which checkout?", staged.repo, staged.key()));
+                self.notice = Some(format!("{repo}{key}: which checkout?"));
                 self.overlay = Overlay::PickCheckout {
                     launches,
                     cursor: 0,
@@ -705,7 +789,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         staged: Staged,
-        mut mode: Mode,
+        mut candidate: Candidate,
         mut steer: String,
     ) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -716,15 +800,29 @@ impl App {
             // Returns *before* the overlay is put back, because resolving may
             // have opened the which-checkout modal over this one — falling
             // through would overwrite it with the picker the launch just left.
-            KeyCode::Enter => {
-                return self.resolve_launch(&staged, &LaunchMode::picked(mode, &steer))
-            }
+            // The one exception is the refusal below, which puts this very
+            // picker back so the missing task can be typed into it.
+            KeyCode::Enter => match candidate {
+                Candidate::Launch { mode, route } => {
+                    return self.resolve_launch(&staged, route, &LaunchMode::picked(mode, &steer))
+                }
+                Candidate::Create(kind) => match kind.with_text(&steer) {
+                    Some(creation) => return self.resolve_creation(&staged.repo, &creation),
+                    // The one per-row refusal (#114): `/wf-one` with no task is
+                    // meaningless, so it is refused where a done or blocked node
+                    // is — on the count line, with the picker still up.
+                    None => {
+                        self.notice = Some(format!("type the {} first", kind.field()));
+                    }
+                },
+            },
             // The two directions are genuinely different steps now that there
-            // is a third mode (#112); `tab` joins the arrows because it is what
-            // the rest of the screen uses to move through a list, and it steps
-            // the way `down` does rather than toggling.
-            KeyCode::Up => mode = previous_mode(mode),
-            KeyCode::Down | KeyCode::Tab => mode = next_mode(mode),
+            // is a third mode (#112) and the creation rows (#114); `tab` joins
+            // the arrows because it is what the rest of the screen uses to move
+            // through a list, and it steps the way `down` does rather than
+            // toggling.
+            KeyCode::Up => candidate = previous_candidate(&staged, candidate),
+            KeyCode::Down | KeyCode::Tab => candidate = next_candidate(&staged, candidate),
             KeyCode::Backspace => {
                 steer.pop();
             }
@@ -735,7 +833,7 @@ impl App {
         }
         self.overlay = Overlay::PickLaunch {
             staged,
-            mode,
+            candidate,
             steer,
         };
         Outcome::Continue
@@ -802,10 +900,10 @@ impl App {
             }
             Overlay::PickLaunch {
                 staged,
-                mode,
+                candidate,
                 steer,
             } => {
-                return self.handle_pick_launch_key(key, staged, mode, steer);
+                return self.handle_pick_launch_key(key, staged, candidate, steer);
             }
             Overlay::None => {}
         }
@@ -906,7 +1004,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::launch::{Mode, Route};
+    use crate::launch::{CreationKind, Mode, Route};
     use crate::model::{classify, Checks, PrLink, PrStatus, Review, TicketType};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1255,6 +1353,7 @@ mod tests {
             Some(Stop::Map(id)) => format!("map #{}", id.number),
             Some(Stop::Ticket(row)) => format!("#{}", app.ticket(&row).number),
             Some(Stop::Group(g)) => format!("{:?}", g.kind),
+            Some(Stop::Project(repo)) => format!("project {repo}"),
             None => "nothing".to_string(),
         }
     }
@@ -1716,17 +1815,24 @@ mod tests {
         match &app.overlay {
             Overlay::PickLaunch {
                 staged,
-                mode,
+                candidate,
                 steer,
             } => {
                 assert_eq!(
                     staged.route(Mode::Interactive),
-                    Route::Wayfinder,
+                    Some(Route::Wayfinder),
                     "a task is a decision node"
                 );
                 assert_eq!(staged.key(), "#6");
                 assert_eq!(staged.title, "Re-entry breadcrumbs", "the picker names it");
-                assert_eq!(*mode, Mode::Interactive, "the picker opens on the default");
+                assert_eq!(
+                    *candidate,
+                    Candidate::Launch {
+                        mode: Mode::Interactive,
+                        route: Route::Wayfinder
+                    },
+                    "the picker opens on the default"
+                );
                 assert_eq!(steer, "", "with nothing steering it");
             }
             other => panic!("expected the launch picker, got {other:?}"),
@@ -1872,9 +1978,14 @@ mod tests {
         let mut app = launchable_app();
         go_to(&mut app, "#6");
         app.handle_key(key(KeyCode::Enter));
+        // A ticket's picker lists only the launch rows, so the walk is over
+        // the modes and the candidate's mode is what `enter` will launch.
         let mode = |app: &App| match &app.overlay {
-            Overlay::PickLaunch { mode, .. } => *mode,
-            other => panic!("expected the launch picker, got {other:?}"),
+            Overlay::PickLaunch {
+                candidate: Candidate::Launch { mode, .. },
+                ..
+            } => *mode,
+            other => panic!("expected a launch row, got {other:?}"),
         };
         assert_eq!(mode(&app), Mode::Interactive);
         // Up from the first row wraps to the last rather than sticking, and
@@ -1896,11 +2007,9 @@ mod tests {
         // edited independently, in one overlay.
         type_str(&mut app, "keep me");
         app.handle_key(key(KeyCode::Down));
+        assert_eq!(mode(&app), Mode::Auto);
         match &app.overlay {
-            Overlay::PickLaunch { mode, steer, .. } => {
-                assert_eq!(*mode, Mode::Auto);
-                assert_eq!(steer, "keep me");
-            }
+            Overlay::PickLaunch { steer, .. } => assert_eq!(steer, "keep me"),
             other => panic!("expected the launch picker, got {other:?}"),
         }
     }
@@ -2058,8 +2167,8 @@ mod tests {
             Overlay::PickLaunch { staged, .. } => {
                 assert_eq!(staged.key(), "#1");
                 assert_eq!(staged.title, "Map: wf", "the picker names the map");
-                assert_eq!(staged.route(Mode::Interactive), Route::Wayfinder);
-                assert_eq!(staged.route(Mode::Auto), Route::WayfinderAuto);
+                assert_eq!(staged.route(Mode::Interactive), Some(Route::Wayfinder));
+                assert_eq!(staged.route(Mode::Auto), Some(Route::WayfinderAuto));
             }
             other => panic!("expected the launch picker, got {other:?}"),
         }
@@ -2079,6 +2188,220 @@ mod tests {
             other => panic!("expected a launch, got {other:?}"),
         };
         assert_eq!(launch.agent_argv().last().unwrap(), "/wf-auto 1");
+    }
+
+    /// An app focused on a registered repo that has no open map — what `wf`
+    /// opened inside a fresh checkout is looking at.
+    fn mapless_app() -> App {
+        let mut app = App::new(BTreeMap::new()).with_checkouts(vec![Checkout {
+            path: std::path::PathBuf::from("/data/proj/newthing"),
+            repo: "blooop/newthing".to_string(),
+        }]);
+        app.scope = Scope::Project("blooop/newthing".to_string());
+        app
+    }
+
+    #[test]
+    fn a_focused_repo_with_no_map_renders_one_slim_header_to_start_from() {
+        // #114's empty-state door: this screen used to render nothing at all,
+        // which is where the first map of a repo had no way in. The header is
+        // a stop, so the cursor can name it and `enter` can act on it.
+        let app = mapless_app();
+        assert_eq!(
+            app.stops()
+                .iter()
+                .map(|at| at.stop.clone())
+                .collect::<Vec<_>>(),
+            vec![Stop::Project("blooop/newthing".to_string())]
+        );
+        assert_eq!(
+            app.cursor_stop(),
+            Some(Stop::Project("blooop/newthing".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_mapless_repo_offers_creation_and_nothing_to_launch() {
+        // There is no node here, so there is nothing to launch: the picker is
+        // the three creation rows alone. A launch row would name a skill with
+        // no argument to give it.
+        let mut app = mapless_app();
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        match &app.overlay {
+            Overlay::PickLaunch {
+                staged, candidate, ..
+            } => {
+                assert_eq!(
+                    staged.candidates(),
+                    vec![
+                        Candidate::Create(CreationKind::Task),
+                        Candidate::Create(CreationKind::Map),
+                        Candidate::Create(CreationKind::MapAuto),
+                    ]
+                );
+                assert_eq!(*candidate, Candidate::Create(CreationKind::Task));
+            }
+            other => panic!("expected the launch picker, got {other:?}"),
+        }
+        // And it charts: the first map of this repo, from the door that had
+        // nothing behind it before.
+        app.handle_key(key(KeyCode::Down)); // onto `new map`
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wf");
+        assert_eq!(launch.cwd(), std::path::Path::new("/data/proj/newthing"));
+    }
+
+    #[test]
+    fn the_door_waits_for_the_load_rather_than_flashing_up_mid_fetch() {
+        // A focused repo whose maps have not arrived *yet* looks exactly like
+        // one that has none — the same ambiguity `Startup` exists to remove
+        // for the "no projects" heading. Rendering the door on that screen
+        // would put a creation row under `enter` for the second or two before
+        // the clusters land, so an ordinary launch would start a new map.
+        let mut app = mapless_app();
+        app.startup = Startup::default();
+        assert!(app.stops().is_empty(), "no door while the search is out");
+        let found: MapSet = [MapId::new("blooop/newthing", 3)].into_iter().collect();
+        app.startup.searched(&found);
+        assert!(app.stops().is_empty(), "nor while its map is still coming");
+        // Only once the load has actually landed and left nothing behind.
+        app.startup = Startup::loaded();
+        assert_eq!(app.stops().len(), 1);
+    }
+
+    #[test]
+    fn map_less_repos_stay_off_the_widened_screen() {
+        // The door is the *focused* empty state, not a row per project on the
+        // main screen: permanent furniture for an occasional act is what #114
+        // ruled out. Widening drops it.
+        let mut app = mapless_app();
+        app.scope = Scope::All;
+        assert!(app.stops().is_empty());
+    }
+
+    #[test]
+    fn a_header_picker_reaches_the_creation_rows_and_a_ticket_picker_has_none() {
+        // #114: creation is a repo-level act, so the rows exist exactly where
+        // the stop is repo-level. On a header the walk reaches them after the
+        // launch modes; on a ticket the same walk wraps among the three modes.
+        let mut app = launchable_app();
+        go_to(&mut app, "map #1");
+        app.handle_key(key(KeyCode::Enter));
+        let picked = |app: &App| match &app.overlay {
+            Overlay::PickLaunch { candidate, .. } => *candidate,
+            other => panic!("expected the launch picker, got {other:?}"),
+        };
+        assert_eq!(
+            picked(&app),
+            Candidate::Launch {
+                mode: Mode::Interactive,
+                route: Route::Wayfinder
+            },
+            "opens on the default launch row"
+        );
+        // Down past the three modes lands on the creation rows, in order.
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(picked(&app), Candidate::Create(CreationKind::Task));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(picked(&app), Candidate::Create(CreationKind::Map));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(picked(&app), Candidate::Create(CreationKind::MapAuto));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            picked(&app),
+            Candidate::Launch {
+                mode: Mode::Interactive,
+                route: Route::Wayfinder
+            },
+            "and wraps back to the top"
+        );
+        // Up from the top wraps onto the last creation row.
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(picked(&app), Candidate::Create(CreationKind::MapAuto));
+
+        // A ticket stop walks only the modes: three downs is a full lap.
+        let mut app = launchable_app();
+        go_to(&mut app, "#6");
+        app.handle_key(key(KeyCode::Enter));
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(
+            picked(&app),
+            Candidate::Launch {
+                mode: Mode::Interactive,
+                route: Route::Wayfinder
+            },
+            "no creation rows on a ticket"
+        );
+    }
+
+    #[test]
+    fn a_new_task_launches_wf_one_and_refuses_an_empty_task() {
+        let mut app = launchable_app();
+        go_to(&mut app, "map #1");
+        app.handle_key(key(KeyCode::Enter));
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Down)); // onto `new task`
+        }
+        // Enter with nothing typed refuses on the count line — the overlay
+        // stays up, as a done or blocked node already refuses.
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert!(
+            matches!(app.overlay, Overlay::PickLaunch { .. }),
+            "the picker stays up to take the task"
+        );
+        assert!(
+            app.notice.as_deref().unwrap().contains("task"),
+            "{:?}",
+            app.notice
+        );
+        // With the task typed, enter execs /wf-one with it verbatim.
+        type_str(&mut app, "wire the exporter");
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(
+            launch.agent_argv().last().unwrap(),
+            "/wf-one wire the exporter"
+        );
+    }
+
+    #[test]
+    fn a_new_map_launches_the_charting_skill_with_the_text_as_its_seed() {
+        // The seed is optional: bare `/wf` charts from nothing.
+        let mut app = launchable_app();
+        go_to(&mut app, "map #1");
+        app.handle_key(key(KeyCode::Enter));
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Down)); // onto `new map`
+        }
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wf");
+
+        // And seeded, alone: the auto charting row takes the idea verbatim.
+        let mut app = launchable_app();
+        go_to(&mut app, "map #1");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Up)); // wrap straight onto `new map, auto`
+        type_str(&mut app, "a caching layer");
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(
+            launch.agent_argv().last().unwrap(),
+            "/wf-auto a caching layer"
+        );
     }
 
     #[test]
@@ -2145,7 +2468,7 @@ mod tests {
         ready.handle_key(key(KeyCode::Enter));
         match &ready.overlay {
             Overlay::PickLaunch { staged, .. } => {
-                assert_eq!(staged.route(Mode::Interactive), Route::Tdd);
+                assert_eq!(staged.route(Mode::Interactive), Some(Route::Tdd));
             }
             other => panic!("expected the launch picker, got {other:?}"),
         }
@@ -2166,7 +2489,7 @@ mod tests {
         in_review.handle_key(key(KeyCode::Enter));
         match &in_review.overlay {
             Overlay::PickLaunch { staged, .. } => {
-                assert_eq!(staged.route(Mode::Interactive), Route::Review);
+                assert_eq!(staged.route(Mode::Interactive), Some(Route::Review));
             }
             other => panic!("expected the launch picker, got {other:?}"),
         }
