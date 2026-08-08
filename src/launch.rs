@@ -1354,6 +1354,28 @@ mod tests {
     }
 
     #[test]
+    fn an_isolated_plain_session_gets_the_nodes_workspace_like_any_other_launch() {
+        // The point of the mode: the branch, the clone and the container are
+        // exactly what a skill launch would have got — `wf` still did all of
+        // that — and the only difference is that nothing is invoked inside it.
+        assert_eq!(
+            isolated(Route::Plain, plain("")).agent_argv(),
+            vec![
+                "dl".to_string(),
+                "blooop/wayfinder@wayfinder/wayfinder-80".to_string(),
+                "--".to_string(),
+                "'claude' '--dangerously-skip-permissions'".to_string(),
+            ]
+        );
+        // The typed prompt is one quoted argument here too, so a sentence
+        // arrives as a sentence rather than as several arguments.
+        assert_eq!(
+            isolated(Route::Plain, plain("check what the logs say")).agent_argv()[3],
+            "'claude' '--dangerously-skip-permissions' 'check what the logs say'"
+        );
+    }
+
+    #[test]
     fn parallel_nodes_get_distinct_workspaces_and_a_relaunch_gets_its_own_back() {
         // The reason the seam is a branch and not the checkout path: two
         // tickets launched at once must not share a tree or a container, and
