@@ -15,7 +15,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Overlay, Scope};
 use crate::filter;
-use crate::launch::Launch;
+use crate::launch::{Launch, LaunchMode};
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
 use crate::view::{Branch, Fold, GroupKind, Item, Plan};
 
@@ -50,9 +50,12 @@ fn glyph_style(glyph: RowGlyph) -> Style {
 /// half of what a ticket is matched against and the rows below do not draw it:
 /// typing a project name would otherwise sift the whole screen down to one
 /// cluster while underlining nothing anywhere.
-fn cluster_header(id: &MapId, map: &Map, lit: &[usize]) -> Line<'static> {
+fn cluster_header(id: &MapId, map: &Map, lit: &[usize], under_cursor: bool) -> Line<'static> {
     let cyan = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let mut spans = vec![Span::styled("▌ ", cyan)];
+    // The cursor rides *before* the `▌`, not after it: the bar is the cluster's
+    // left edge and every row below hangs off it, so a marker inside it would
+    // read as belonging to the first row rather than to the header (#96).
+    let mut spans = vec![cursor_span(under_cursor), Span::styled("▌ ", cyan)];
     spans.extend(lit_spans(id.short_repo(), lit, cyan));
     spans.push(Span::styled(format!(" · {}", map.title), cyan));
     for (glyph, count) in map.tally() {
@@ -369,7 +372,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
             Item::Header(id) => {
                 let map = &app.clusters[id];
                 let lit = query.as_mut().map(|q| q.in_repo(map)).unwrap_or_default();
-                lines.push(cluster_header(id, map, &lit));
+                lines.push(cluster_header(id, map, &lit, under_cursor));
             }
             Item::Ticket {
                 row,
@@ -589,16 +592,22 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(body, body_area);
 
     // The count line's slot is shared: while a launch is staged (#62) the
-    // launch line lives there instead — the resolved route, the ticket it
+    // launch line lives there instead — the resolved route, the node it
     // launches, and the mode text as it is typed.
+    //
+    // The route is resolved *per frame* from the text, not read off the staged
+    // launch, because since #96 the mode picks the skill: typing `auto` has to
+    // flip the echoed command from `/wayfinder` to `/wayfinder-auto` as you
+    // type it. Showing a stale route would be showing the wrong skill.
     if let Overlay::LaunchLine { staged, text } = &app.overlay {
+        let route = staged.route(LaunchMode::parse(text).mode());
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
-                    format!("  → {}", staged.route.label()),
+                    format!("  → {}", route.label()),
                     Style::new().fg(Color::Cyan),
                 ),
-                Span::raw(format!(" · #{} {}  {text}", staged.ticket, staged.title)),
+                Span::raw(format!(" · {} {}  {text}", staged.key(), staged.title)),
                 Span::styled("█", Style::new().add_modifier(Modifier::DIM)),
             ])),
             count_area,
@@ -1265,7 +1274,7 @@ mod tests {
         let body = lit_body(&app);
         assert!(
             body.iter()
-                .any(|l| l.starts_with("▌ «wayf»inder · Map: wf")),
+                .any(|l| l.starts_with("  ▌ «wayf»inder · Map: wf")),
             "{body:?}"
         );
         assert!(
@@ -1321,8 +1330,8 @@ mod tests {
         );
         assert_eq!(
             app.cursor_pos(),
-            0,
-            "typing snaps the cursor to the best hit"
+            1,
+            "typing snaps the cursor to the best hit, past its cluster header"
         );
     }
 
@@ -1403,10 +1412,16 @@ mod tests {
             "the count line is replaced: {screen}"
         );
 
-        // The typed mode shows on the line as it accumulates.
-        type_str(&mut app, "defer something");
+        // The typed mode shows on the line as it accumulates — and re-routes
+        // it live, because since #96 the mode word picks the skill and a line
+        // still echoing `/wayfinder` would be naming the wrong one.
+        type_str(&mut app, "auto something");
         let screen = render(&app);
-        assert!(screen.contains("defer something"), "{screen}");
+        assert!(screen.contains("auto something"), "{screen}");
+        assert!(
+            screen.contains("→ /wayfinder-auto · #6 Re-entry breadcrumbs"),
+            "{screen}"
+        );
 
         // Esc gives the count line back.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -1556,12 +1571,14 @@ mod tests {
         assert_eq!(app.cursor_ticket().unwrap().number, 50);
         let screen = render(&app);
         assert!(screen.contains("▶ ○ #50 Build: clusters"), "{screen}");
-        // And with the cursor back at the top, the top is what shows.
+        // And with the cursor back at the top — the first cluster's header,
+        // since #96 — the top is what shows.
         for _ in 0..40 {
             app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         }
         let screen = render(&app);
-        assert!(screen.contains("▶ ○ #1 Open 1"), "{screen}");
+        assert!(screen.contains("▶ ▌ wayfinder · Map: wf"), "{screen}");
+        assert!(screen.contains("○ #1 Open 1"), "{screen}");
     }
 
     #[test]

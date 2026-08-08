@@ -46,11 +46,12 @@ pub enum Outcome {
 pub enum Overlay {
     None,
     /// The launch line — enter on a launchable node staged this launch, and
-    /// the line now collects its mode: empty is interactive, `defer [text]`
-    /// defers, anything else steers ([`LaunchMode::parse`]). The route is
-    /// already resolved from (type, stage), so the line can *show* where enter
-    /// goes — and a line for an unlaunchable node is unrepresentable, because
-    /// no `Route` exists to put in it.
+    /// the line now collects its mode: empty is interactive, `auto [text]`
+    /// hands it to the manager, anything else steers ([`LaunchMode::parse`]).
+    /// The line resolves the route from the staged node and the mode typed so
+    /// far, so it *shows* where enter goes and changes as `auto` is typed — and
+    /// a line for an unlaunchable node is unrepresentable, because
+    /// [`launch::Launchable`] refused it before anything was staged.
     ///
     /// The staged launch is index-free ([`Staged`]) for the same reason the
     /// picker's candidates are complete `Launch`es: a background map arrival
@@ -100,6 +101,7 @@ pub struct RowKey {
 /// [`GroupId`] already names a map and a kind rather than any index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopKey {
+    Map(MapId),
     Ticket(RowKey),
     Group(GroupId),
 }
@@ -325,10 +327,11 @@ impl App {
         }
     }
 
-    /// A stop's durable identity: a ticket by (map, number), a group by its
-    /// own id — which already names no indices.
+    /// A stop's durable identity: a ticket by (map, number), a map or a group
+    /// by its own id — both of which already name no indices.
     fn stop_key(&self, stop: &Stop) -> StopKey {
         match stop {
+            Stop::Map(id) => StopKey::Map(id.clone()),
             Stop::Ticket(row) => StopKey::Ticket(self.row_key(row)),
             Stop::Group(id) => StopKey::Group(id.clone()),
         }
@@ -337,9 +340,22 @@ impl App {
     /// Cursor position clamped into the stop list. An untouched cursor is not a
     /// remembered position but a *rule* — the top of the list — so it is
     /// answered from the stops on screen now rather than from anything stored.
+    ///
+    /// "The top" skips cluster headers, and only those. #88 settled that the
+    /// default is the first stop **literally**, not the first *takeable* one —
+    /// a blocked or claimed row still gets the cursor. A header is not a row
+    /// competing for that place, though: it is the container the rows sit in,
+    /// and defaulting onto one would make `enter` on a freshly filtered screen
+    /// launch the whole map rather than the row that was filtered to. So the
+    /// #96 stops are reachable by `↑` from the row below them, and never by
+    /// arriving.
     pub fn cursor_pos(&self) -> usize {
         match self.cursor {
-            Cursor::Untouched => 0,
+            Cursor::Untouched => self
+                .stops()
+                .iter()
+                .position(|at| !matches!(at.stop, Stop::Map(_)))
+                .unwrap_or(0),
             Cursor::Chosen(pos) => pos.min(self.stops().len().saturating_sub(1)),
         }
     }
@@ -351,12 +367,12 @@ impl App {
             .map(|at| at.stop.clone())
     }
 
-    /// The row under the cursor — `None` when the cursor is on a group line,
-    /// which is exactly why the two are different types.
+    /// The row under the cursor — `None` when the cursor is on a header or a
+    /// group line, which is exactly why they are different types.
     pub fn cursor_row(&self) -> Option<Row> {
         match self.cursor_stop() {
             Some(Stop::Ticket(row)) => Some(row),
-            Some(Stop::Group(_)) | None => None,
+            Some(Stop::Map(_) | Stop::Group(_)) | None => None,
         }
     }
 
@@ -373,6 +389,7 @@ impl App {
     /// wherever the cursor can be at all.
     pub fn cursor_map(&self) -> Option<MapId> {
         match self.cursor_stop()? {
+            Stop::Map(id) => Some(id),
             Stop::Ticket(row) => Some(row.map),
             Stop::Group(id) => Some(id.map),
         }
@@ -547,27 +564,48 @@ impl App {
         }
     }
 
-    /// The first enter (#62): stage a launch of the cursor's ticket by opening
-    /// the launch line — or refuse, with a count-line notice, the two things
-    /// that cannot launch. Blocked is refused on *status* (its stage is
-    /// unactionable, whatever it is); done is refused by [`launch::route`]
-    /// returning no route — stage, not ticket state, so a merged PR on a
-    /// still-open ticket refuses too.
+    /// The first enter (#62): stage a launch of whatever the cursor is on by
+    /// opening the launch line — a ticket, or since #96 the cluster header,
+    /// which stages the **map** as one node.
+    ///
+    /// Two things still refuse, with a count-line notice, and both are
+    /// ticket-only. Blocked is refused on *status* (its stage is unactionable,
+    /// whatever it is); done is refused by [`launch::Launchable::parse`]
+    /// finding no launchable stage — stage, not ticket state, so a merged PR
+    /// on a still-open ticket refuses too. Neither can arise on a map: a map
+    /// has no blockers and no stage, and a finished one is not drawn.
     fn request_launch(&mut self) -> Outcome {
-        // On a group line there is no agent to run, and exactly one thing the
-        // key could plausibly mean — so `enter` opens or shuts it rather than
-        // reporting that nothing is selected when something plainly is.
-        if let Some(Stop::Group(id)) = self.cursor_stop() {
-            if !self.expanded.remove(&id) {
-                self.expanded.insert(id);
+        match self.cursor_stop() {
+            // On a group line there is no agent to run, and exactly one thing
+            // the key could plausibly mean — so `enter` opens or shuts it
+            // rather than reporting that nothing is selected when something
+            // plainly is.
+            Some(Stop::Group(id)) => {
+                if !self.expanded.remove(&id) {
+                    self.expanded.insert(id);
+                }
+                Outcome::Continue
             }
-            return Outcome::Continue;
+            Some(Stop::Map(id)) => {
+                let title = self.clusters[&id].title.clone();
+                self.overlay = Overlay::LaunchLine {
+                    staged: Staged::map(&id, &title),
+                    text: String::new(),
+                };
+                Outcome::Continue
+            }
+            Some(Stop::Ticket(row)) => self.request_ticket_launch(&row),
+            None => {
+                self.notice = Some("nothing selected".to_string());
+                Outcome::Continue
+            }
         }
-        let Some(row) = self.cursor_row() else {
-            self.notice = Some("nothing selected".to_string());
-            return Outcome::Continue;
-        };
-        let ticket = self.ticket(&row);
+    }
+
+    /// The ticket half of [`App::request_launch`], split out so the two
+    /// refusals sit together and the stop match above stays readable.
+    fn request_ticket_launch(&mut self, row: &Row) -> Outcome {
+        let ticket = self.ticket(row);
         if let Status::Blocked { needs } = &ticket.status {
             let needs: Vec<String> = needs.iter().map(|n| format!("#{n}")).collect();
             self.notice = Some(format!(
@@ -577,14 +615,14 @@ impl App {
             ));
             return Outcome::Continue;
         }
-        match launch::route(ticket.ticket_type, stage(&ticket.prs, &ticket.status)) {
+        match Staged::ticket(ticket, row.map.number, stage(&ticket.prs, &ticket.status)) {
             None => {
                 self.notice = Some(format!("#{} is done — nothing to launch", ticket.number));
                 Outcome::Continue
             }
-            Some(route) => {
+            Some(staged) => {
                 self.overlay = Overlay::LaunchLine {
-                    staged: Staged::new(ticket, row.map.number, route),
+                    staged,
                     text: String::new(),
                 };
                 Outcome::Continue
@@ -615,10 +653,7 @@ impl App {
                 Outcome::Launch(launch)
             }
             Targets::Many(launches) => {
-                self.notice = Some(format!(
-                    "{}#{}: which checkout?",
-                    staged.repo, staged.ticket
-                ));
+                self.notice = Some(format!("{}{}: which checkout?", staged.repo, staged.key()));
                 self.overlay = Overlay::PickCheckout {
                     launches,
                     cursor: 0,
@@ -823,7 +858,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::launch::Route;
+    use crate::launch::{Mode, Route};
     use crate::model::{classify, Checks, PrLink, PrStatus, Review, TicketType};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -991,7 +1026,7 @@ mod tests {
             Some("2026-08-01T00:00:00Z"),
             true,
         )]));
-        assert_eq!(app.cursor_pos(), 0);
+        assert_eq!(app.cursor_pos(), 1, "past the header");
 
         let mut both = BTreeMap::new();
         both.extend([cluster(
@@ -1009,11 +1044,12 @@ mod tests {
         app.replace_clusters(both);
 
         // the fresher map now renders first
-        assert_eq!(app.cursor_pos(), 0);
+        assert_eq!(app.cursor_pos(), 1);
     }
 
     /// Two live maps, the second of them older, so a map fresher than both sorts
-    /// above the pair and pushes every existing row down by one.
+    /// above the pair and pushes every existing stop down by two — its header
+    /// and its row (#96).
     fn streaming_pair() -> BTreeMap<MapId, Map> {
         [
             cluster("blooop/slow", 1, Some("2026-08-01T00:00:00Z"), true),
@@ -1023,8 +1059,8 @@ mod tests {
         .collect()
     }
 
-    /// The pair with a fresher map added — it renders first, so both original
-    /// rows move down one.
+    /// The pair with a fresher map added — it renders first, so every original
+    /// stop moves down two.
     fn streaming_trio() -> BTreeMap<MapId, Map> {
         let mut all = streaming_pair();
         all.extend([cluster(
@@ -1042,13 +1078,15 @@ mod tests {
         // is pinned by identity, so an arriving map slides it down the screen
         // rather than stealing the selection.
         let mut app = App::new(streaming_pair());
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.cursor_pos(), 1);
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Down)); // past slow's header and row, onto older's
+        }
+        assert_eq!(app.cursor_pos(), 3);
         assert_eq!(app.cursor_map(), Some(MapId::new("blooop/older", 3)));
 
         app.replace_clusters(streaming_trio());
 
-        assert_eq!(app.cursor_pos(), 2, "the fresher map pushed the row down");
+        assert_eq!(app.cursor_pos(), 5, "the fresher map pushed the row down");
         assert_eq!(
             app.cursor_map(),
             Some(MapId::new("blooop/older", 3)),
@@ -1058,14 +1096,15 @@ mod tests {
 
     #[test]
     fn choosing_the_top_row_pins_it_rather_than_re_defaulting_to_the_top() {
-        // The case a sentinel cannot serve. This cursor is at position 0 exactly
-        // like a fresh one, and must behave like the *opposite* of a fresh one:
-        // the human put it there, so a map arriving above carries it down. Read
-        // `cursor == 0` as "untouched" and this test lands on blooop/fresh.
+        // The case a sentinel cannot serve. This cursor sits on exactly the stop
+        // a fresh one resolves to, and must behave like the *opposite* of a
+        // fresh one: the human put it there, so a map arriving above carries it
+        // down. Read the position as "untouched" and this test lands on
+        // blooop/fresh.
         let mut app = App::new(streaming_pair());
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Up)); // deliberately back on the top row
-        assert_eq!(app.cursor_pos(), 0);
+        assert_eq!(app.cursor_pos(), 1);
         assert_eq!(app.cursor_map(), Some(MapId::new("blooop/slow", 1)));
 
         app.replace_clusters(streaming_trio());
@@ -1073,9 +1112,9 @@ mod tests {
         assert_eq!(
             app.cursor_map(),
             Some(MapId::new("blooop/slow", 1)),
-            "their row, not whatever is on top now"
+            "their stop, not whatever is on top now"
         );
-        assert_eq!(app.cursor_pos(), 1);
+        assert_eq!(app.cursor_pos(), 3);
     }
 
     #[test]
@@ -1089,7 +1128,7 @@ mod tests {
 
         app.replace_clusters(streaming_trio());
 
-        assert_eq!(app.cursor_pos(), 0);
+        assert_eq!(app.cursor_pos(), 1);
         assert_eq!(app.cursor_map(), Some(MapId::new("blooop/fresh", 2)));
     }
 
@@ -1120,11 +1159,9 @@ mod tests {
         // down as a choice, the one state `Cursor` exists to forbid. The symptom is
         // #88's own: the next map to sort above drags the cursor off the top row.
         let mut app = App::new(map_with_a_done_group());
-        app.handle_key(key(KeyCode::Down));
-        assert!(
-            matches!(app.cursor_stop(), Some(Stop::Group(_))),
-            "the leverage lens shows blooop/slow's Done group"
-        );
+        while !matches!(app.cursor_stop(), Some(Stop::Group(_))) {
+            app.handle_key(key(KeyCode::Down));
+        }
 
         app.handle_key(key(KeyCode::Tab)); // the forest has no group line to keep
 
@@ -1137,7 +1174,7 @@ mod tests {
         )]);
         app.replace_clusters(fresher);
 
-        assert_eq!(app.cursor_pos(), 0);
+        assert_eq!(app.cursor_pos(), 1);
         assert_eq!(
             app.cursor_map(),
             Some(MapId::new("blooop/fresh", 2)),
@@ -1160,27 +1197,49 @@ mod tests {
         let visible = app.visible();
         assert_eq!(visible.len(), 1);
         assert_eq!(app.cursor_ticket().unwrap().number, 6);
-        assert_eq!(app.cursor_pos(), 0);
+        assert_eq!(app.cursor_pos(), 1);
     }
 
-    /// What the cursor is on, as a short label: a ticket by number, a group by
-    /// kind. Reads like the screen does.
+    /// What the cursor is on, as a short label: a ticket by number, a map by
+    /// `map #n`, a group by kind. Reads like the screen does.
     fn at(app: &App) -> String {
         match app.cursor_stop() {
+            Some(Stop::Map(id)) => format!("map #{}", id.number),
             Some(Stop::Ticket(row)) => format!("#{}", app.ticket(&row).number),
             Some(Stop::Group(g)) => format!("{:?}", g.kind),
             None => "nothing".to_string(),
         }
     }
 
+    /// Walk the cursor down to the stop [`at`] labels `label`.
+    ///
+    /// Tests that only need to *be somewhere* say where with this rather than
+    /// counting `Down` presses: a count is a claim about the whole stop list,
+    /// so every change to what counts as a stop — cluster headers becoming one
+    /// (#96), the group lines of #57 before them — silently invalidates every
+    /// such count at once. The tests that are genuinely *about* navigation
+    /// still press the keys.
+    fn go_to(app: &mut App, label: &str) {
+        for _ in 0..=app.stops().len() {
+            if at(app) == label {
+                return;
+            }
+            app.handle_key(key(KeyCode::Down));
+        }
+        panic!("no stop labelled {label} on this screen");
+    }
+
     #[test]
     fn down_walks_the_takeable_tickets_and_steps_over_their_context() {
         // Clusters order by (repo, number): dotfiles#4 before wayfinder#1.
-        // The depth-0 axis is dotfiles #103, then wayfinder's takeable #6 and
-        // #9, then its Done group — #7 hangs under #6 as context and is *not*
-        // on this axis, which is the whole point of #57.
+        // The depth-0 axis is each cluster's header (#96), then its rows:
+        // dotfiles #103, then wayfinder's takeable #6 and #9, then its Done
+        // group — #7 hangs under #6 as context and is *not* on this axis,
+        // which is the whole point of #57.
         let mut app = fixture_app();
-        assert_eq!(at(&app), "#103");
+        assert_eq!(at(&app), "#103", "the default skips the header above it");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(at(&app), "map #1");
         app.handle_key(key(KeyCode::Down));
         assert_eq!(at(&app), "#6");
         app.handle_key(ctrl('j'));
@@ -1198,7 +1257,7 @@ mod tests {
         }
         assert_eq!(
             at(&app),
-            "#103",
+            "map #4",
             "clamped at the first stop, across clusters"
         );
     }
@@ -1206,8 +1265,7 @@ mod tests {
     #[test]
     fn right_descends_into_the_subtree_and_left_comes_back() {
         let mut app = fixture_app();
-        app.handle_key(key(KeyCode::Down)); // wayfinder #6
-        assert_eq!(at(&app), "#6");
+        go_to(&mut app, "#6");
         app.handle_key(key(KeyCode::Right));
         assert_eq!(at(&app), "#7", "→ steps into what #6 unblocks");
         // #7 is an only child, so there is no sibling to walk to — and ↓ must
@@ -1223,9 +1281,10 @@ mod tests {
         app.handle_key(key(KeyCode::Left));
         assert_eq!(at(&app), "#6", "← returns to the parent");
         // At depth 0 there is no parent to climb to, so ← keeps its promise the
-        // only way left: one stop back.
+        // only way left: one stop back — which, from a cluster's first row, is
+        // that cluster's own header.
         app.handle_key(key(KeyCode::Left));
-        assert_eq!(at(&app), "#103");
+        assert_eq!(at(&app), "map #1");
     }
 
     #[test]
@@ -1247,6 +1306,7 @@ mod tests {
             },
         );
         let mut app = App::new(clusters);
+        go_to(&mut app, "#6");
         app.handle_key(key(KeyCode::Right));
         assert_eq!(at(&app), "#7");
         app.handle_key(key(KeyCode::Down));
@@ -1351,6 +1411,11 @@ mod tests {
         // its end rather than looping or stalling part-way. `→` is the one that
         // visits *every* stop, since it steps one at a time.
         let mut app = knotty_app();
+        // From the very first stop, not the default one — the default skips
+        // the cluster header (#96), and `→` only ever moves forward, so
+        // starting there would leave one stop unvisited for a reason that has
+        // nothing to do with the property being measured.
+        app.handle_key(key(KeyCode::Up));
         let mut seen = vec![app.cursor_pos()];
         for _ in 0..40 {
             app.handle_key(key(KeyCode::Right));
@@ -1422,6 +1487,7 @@ mod tests {
             },
         );
         let mut app = App::new(clusters);
+        go_to(&mut app, "#1069");
         app.handle_key(key(KeyCode::Right)); // into #1070
         assert_eq!(at(&app), "#1070");
 
@@ -1441,6 +1507,9 @@ mod tests {
 
         // Every stop is reachable by ↓ alone — the property that was broken.
         let total = app.stops().len();
+        for _ in 0..total {
+            app.handle_key(key(KeyCode::Up)); // back to the very first stop
+        }
         let mut seen = vec![at(&app)];
         for _ in 1..total {
             app.handle_key(key(KeyCode::Down));
@@ -1448,7 +1517,7 @@ mod tests {
         }
         assert_eq!(
             seen,
-            vec!["#1069", "#1070", "#1071", "#1072"],
+            vec!["map #1064", "#1069", "#1070", "#1071", "#1072"],
             "↓ walked the whole tree"
         );
     }
@@ -1511,7 +1580,7 @@ mod tests {
     #[test]
     fn tab_toggles_the_lens_and_the_cursor_stays_on_its_ticket() {
         let mut app = fixture_app();
-        app.handle_key(key(KeyCode::Down)); // wayfinder #6
+        go_to(&mut app, "#6");
         app.handle_key(key(KeyCode::Right)); // into its subtree: #7
         assert_eq!(at(&app), "#7");
         assert_eq!(app.screen(), Screen::Structured(Lens::Leverage));
@@ -1522,7 +1591,11 @@ mod tests {
         // its ticket, not its old position.
         assert_eq!(at(&app), "#7");
         assert_eq!(app.visible().len(), 5, "the forest is total");
-        assert_eq!(app.stops().len(), 5, "and holds nothing back to open");
+        assert_eq!(
+            app.stops().len(),
+            7,
+            "and holds nothing back to open — the two extra stops are the headers"
+        );
 
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.screen(), Screen::Structured(Lens::Leverage));
@@ -1589,13 +1662,17 @@ mod tests {
         // The two-step (#62): the first enter stages the launch — nothing
         // execs yet — and an empty line's enter is the interactive default.
         let mut app = launchable_app();
-        // Move to wayfinder#6, whose repo has one checkout.
-        app.handle_key(key(KeyCode::Down));
+        // wayfinder#6, whose repo has one checkout.
+        go_to(&mut app, "#6");
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         match &app.overlay {
             Overlay::LaunchLine { staged, text } => {
-                assert_eq!(staged.route, Route::Wayfinder, "a task is a decision node");
-                assert_eq!(staged.ticket, 6);
+                assert_eq!(
+                    staged.route(Mode::Interactive),
+                    Route::Wayfinder,
+                    "a task is a decision node"
+                );
+                assert_eq!(staged.key(), "#6");
                 assert_eq!(staged.title, "Re-entry breadcrumbs", "the line names it");
                 assert_eq!(text, "", "the line opens empty");
             }
@@ -1643,8 +1720,9 @@ mod tests {
             path: std::path::PathBuf::from("/data/proj/wayfinder"),
             repo: "blooop/wayfinder".to_string(),
         }]);
-        // Row 0 is map #1's copy, row 1 is map #47's.
-        app.handle_key(key(KeyCode::Down));
+        // Both clusters hold a #6; the second one is map #47's copy.
+        go_to(&mut app, "map #47");
+        go_to(&mut app, "#6");
         app.handle_key(key(KeyCode::Enter)); // stage it
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
@@ -1666,8 +1744,9 @@ mod tests {
     #[test]
     fn several_checkouts_open_the_picker_and_enter_launches_the_pick() {
         let mut app = launchable_app();
-        // Cursor starts on dotfiles#103 — two checkouts. The first enter
-        // stages the launch; the second resolves it to the picker.
+        // dotfiles#103 — a repo with two checkouts. The first enter stages the
+        // launch; the second resolves it to the picker.
+        go_to(&mut app, "#103");
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         match &app.overlay {
@@ -1695,6 +1774,7 @@ mod tests {
     #[test]
     fn the_picker_clamps_and_esc_cancels_it() {
         let mut app = launchable_app();
+        go_to(&mut app, "#103");
         app.handle_key(key(KeyCode::Enter)); // dotfiles#103: stage the launch
         app.handle_key(key(KeyCode::Enter)); // resolve — two checkouts: picker
         for _ in 0..5 {
@@ -1761,40 +1841,38 @@ mod tests {
     }
 
     #[test]
-    fn defer_text_on_the_launch_line_launches_deferred_with_steering() {
-        // The acceptance shape: enter → `defer something` → enter produces a
-        // command carrying `defer: something`.
+    fn auto_text_on_the_launch_line_launches_the_manager_with_steering() {
+        // The acceptance shape (#96): enter → `auto something` → enter
+        // produces the manager skill carrying `steer: something`.
         let mut app = launchable_app();
-        app.handle_key(key(KeyCode::Down)); // wayfinder#6, one checkout
+        go_to(&mut app, "#6"); // wayfinder#6, one checkout
         app.handle_key(key(KeyCode::Enter));
-        type_str(&mut app, "defer something");
+        type_str(&mut app, "auto something");
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
         assert_eq!(
             launch.agent_argv().last().unwrap(),
-            "/wayfinder 1 6 defer: something"
+            "/wayfinder-auto 1 6 steer: something"
         );
     }
 
     #[test]
     fn the_typed_mode_survives_the_checkout_picker() {
         // Two checkouts of dotfiles: the mode is settled on the line, the
-        // picker only answers *where* — the pick must not lose the defer.
+        // picker only answers *where* — the pick must not lose the `auto`.
         let mut app = launchable_app();
+        go_to(&mut app, "#103");
         app.handle_key(key(KeyCode::Enter)); // dotfiles#103: stage
-        type_str(&mut app, "defer");
+        type_str(&mut app, "auto");
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         assert!(matches!(app.overlay, Overlay::PickCheckout { .. }));
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(
-            launch.agent_argv().last().unwrap(),
-            "/wayfinder 4 103 defer"
-        );
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder-auto 4 103");
     }
 
     #[test]
@@ -1805,14 +1883,14 @@ mod tests {
         // — the ticket it was opened on, wherever that ticket now sits.
         let staged = || {
             let mut app = launchable_app();
-            app.handle_key(key(KeyCode::Down)); // wayfinder#6, at index 1
+            go_to(&mut app, "#6");
             app.handle_key(key(KeyCode::Enter));
-            type_str(&mut app, "defer");
+            type_str(&mut app, "auto");
             app
         };
         let wf = MapId::new("blooop/wayfinder", 1);
 
-        // Reordered: index 1 now names #9, not #6.
+        // Reordered: #6's old index now names #9.
         let mut app = staged();
         let mut reordered = app.clusters.clone();
         reordered.get_mut(&wf).expect("the map").tickets = vec![
@@ -1840,7 +1918,7 @@ mod tests {
         };
         assert_eq!(
             launch.agent_argv().last().unwrap(),
-            "/wayfinder 1 6 defer",
+            "/wayfinder-auto 1 6",
             "the staged ticket, not whatever landed at its old index"
         );
 
@@ -1858,21 +1936,57 @@ mod tests {
         );
         app.replace_clusters(shrunk);
         match &app.overlay {
-            Overlay::LaunchLine { staged, .. } => assert_eq!(staged.ticket, 6),
+            Overlay::LaunchLine { staged, .. } => assert_eq!(staged.key(), "#6"),
             other => panic!("expected the launch line, got {other:?}"),
         }
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder 1 6 defer");
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder-auto 1 6");
+    }
+
+    #[test]
+    fn enter_on_a_cluster_header_stages_the_whole_map() {
+        // #96's headline: the cursor can land on a map, and launching one runs
+        // the wayfinder skill on the map alone — no ticket argument, because
+        // there is no ticket. Interactive charts it with the human; `auto`
+        // hands the whole map to the manager.
+        let mut app = launchable_app();
+        go_to(&mut app, "map #1");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        match &app.overlay {
+            Overlay::LaunchLine { staged, .. } => {
+                assert_eq!(staged.key(), "#1");
+                assert_eq!(staged.title, "Map: wf", "the line names the map");
+                assert_eq!(staged.route(Mode::Interactive), Route::Wayfinder);
+                assert_eq!(staged.route(Mode::Auto), Route::WayfinderAuto);
+            }
+            other => panic!("expected the launch line, got {other:?}"),
+        }
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.key(), "wayfinder#1");
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder 1");
+
+        let mut app = launchable_app();
+        go_to(&mut app, "map #1");
+        app.handle_key(key(KeyCode::Enter));
+        type_str(&mut app, "auto");
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder-auto 1");
     }
 
     #[test]
     fn enter_on_a_done_or_blocked_node_is_a_notice_not_a_launch_line() {
         let mut app = launchable_app();
         // Blocked: #7 hangs under #6 as context.
-        app.handle_key(key(KeyCode::Down)); // #6
+        go_to(&mut app, "#6");
         app.handle_key(key(KeyCode::Right)); // into #7
         assert_eq!(at(&app), "#7");
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
@@ -1930,20 +2044,12 @@ mod tests {
 
         let mut ready = build_app(vec![]);
         ready.handle_key(key(KeyCode::Enter));
-        assert!(
-            matches!(
-                &ready.overlay,
-                Overlay::LaunchLine {
-                    staged: Staged {
-                        route: Route::Tdd,
-                        ..
-                    },
-                    ..
-                }
-            ),
-            "{:?}",
-            ready.overlay
-        );
+        match &ready.overlay {
+            Overlay::LaunchLine { staged, .. } => {
+                assert_eq!(staged.route(Mode::Interactive), Route::Tdd);
+            }
+            other => panic!("expected the launch line, got {other:?}"),
+        }
         let launch = match ready.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
@@ -1959,20 +2065,12 @@ mod tests {
             },
         }]);
         in_review.handle_key(key(KeyCode::Enter));
-        assert!(
-            matches!(
-                &in_review.overlay,
-                Overlay::LaunchLine {
-                    staged: Staged {
-                        route: Route::Review,
-                        ..
-                    },
-                    ..
-                }
-            ),
-            "{:?}",
-            in_review.overlay
-        );
+        match &in_review.overlay {
+            Overlay::LaunchLine { staged, .. } => {
+                assert_eq!(staged.route(Mode::Interactive), Route::Review);
+            }
+            other => panic!("expected the launch line, got {other:?}"),
+        }
         let launch = match in_review.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
@@ -2003,7 +2101,7 @@ mod tests {
     #[test]
     fn ctrl_f_focuses_cursor_rows_project_and_ctrl_g_widens() {
         let mut app = fixture_app();
-        app.handle_key(key(KeyCode::Down)); // cursor on wayfinder #6
+        go_to(&mut app, "#6");
         app.handle_key(ctrl('f'));
         assert_eq!(app.scope, Scope::Project("blooop/wayfinder".to_string()));
         assert_eq!(
@@ -2060,7 +2158,7 @@ mod tests {
     fn ctrl_r_requests_refresh_and_replace_clusters_keeps_anchor() {
         let mut app = fixture_app();
         assert_eq!(app.handle_key(ctrl('r')), Outcome::Refresh);
-        app.handle_key(key(KeyCode::Down)); // cursor on wayfinder#6
+        go_to(&mut app, "#6");
         let same = app.clusters.clone();
         app.replace_clusters(same);
         assert_eq!(app.cursor_ticket().unwrap().number, 6);
@@ -2069,7 +2167,7 @@ mod tests {
     #[test]
     fn replace_clusters_does_not_teleport_when_cursor_ticket_vanishes() {
         let mut app = fixture_app();
-        app.handle_key(key(KeyCode::Down)); // cursor on wayfinder#6, position 1
+        go_to(&mut app, "#6"); // position 3: two stops per cluster ahead of it
         let mut smaller = app.clusters.clone();
         smaller
             .get_mut(&MapId::new("blooop/wayfinder", 1))
@@ -2078,7 +2176,7 @@ mod tests {
             .retain(|t| t.number != 6);
         app.replace_clusters(smaller);
         // Identity gone: cursor stays at the same position, clamped.
-        assert_eq!(app.cursor_pos(), 1);
+        assert_eq!(app.cursor_pos(), 3);
         assert_eq!(app.cursor_ticket().unwrap().number, 9);
     }
 
@@ -2105,8 +2203,9 @@ mod tests {
             );
         }
         let mut app = App::new(clusters);
-        app.handle_key(key(KeyCode::Down)); // cursor on upstream/dotfiles#5
-        assert_eq!(app.cursor_ticket().unwrap().repo, "upstream/dotfiles");
+        while app.cursor_ticket().map(|t| t.repo.as_str()) != Some("upstream/dotfiles") {
+            app.handle_key(key(KeyCode::Down));
+        }
         app.handle_key(ctrl('f'));
         assert_eq!(app.scope, Scope::Project("upstream/dotfiles".to_string()));
         assert_eq!(

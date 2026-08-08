@@ -25,6 +25,10 @@ fn press(app: &mut App, name: &str) {
         "left" => KeyCode::Left,
         "right" => KeyCode::Right,
         "tab" => KeyCode::Tab,
+        // Named so the launch line (#62/#96) is reachable from `$KEYS` —
+        // without them `enter` would send a bare `e` into the query.
+        "enter" => KeyCode::Enter,
+        "esc" => KeyCode::Esc,
         other => KeyCode::Char(other.chars().next().expect("a key")),
     };
     app.handle_key(KeyEvent::new(code, mods));
@@ -67,6 +71,7 @@ async fn main() {
     let stops = app.stops();
     let pos = app.cursor_pos();
     let label = |at: &wf::view::StopAt| match &at.stop {
+        wf::view::Stop::Map(id) => format!("map #{}", id.number),
         wf::view::Stop::Ticket(row) => format!("#{}", app.ticket(row).number),
         wf::view::Stop::Group(g) => format!("{:?}", g.kind),
     };
