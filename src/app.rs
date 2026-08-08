@@ -224,6 +224,12 @@ pub struct App {
     /// toggle — it is a choice about a *map*, not about a frame.
     expanded: Expanded,
     cursor: Cursor,
+    /// Workspaces already prewarmed this session ([`launch::prewarm`]): the
+    /// first enter fires `dl <ws> up` in the background so the container is
+    /// building while the human types steer text, and this is what keeps
+    /// re-staging the same node from firing a second one. Session-scoped on
+    /// purpose — after `wf` execs away, the workspace's own state answers.
+    prewarmed: BTreeSet<String>,
 }
 
 impl App {
@@ -242,6 +248,7 @@ impl App {
             lens: Lens::Leverage,
             expanded: Expanded::new(),
             cursor: Cursor::Untouched,
+            prewarmed: BTreeSet::new(),
         }
     }
 
@@ -669,6 +676,7 @@ impl App {
             Some(Stop::Map(id)) => {
                 let title = self.clusters[&id].title.clone();
                 let staged = Staged::map(&id, &title);
+                self.prewarm(&staged);
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
                     staged,
@@ -714,6 +722,7 @@ impl App {
                 Outcome::Continue
             }
             Some(staged) => {
+                self.prewarm(&staged);
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
                     staged,
@@ -722,6 +731,45 @@ impl App {
                 Outcome::Continue
             }
         }
+    }
+
+    /// Start warming the staged node's container while the launch picker is
+    /// up: the human's mode-and-steer pause is exactly the window a cold
+    /// `devpod up` needs a head start on.
+    ///
+    /// Nothing happens unless [`launch::prewarm_enabled`] says so — staging
+    /// must stay a keystroke that creates nothing for anyone who has not asked
+    /// for this. Beyond that: host launches plan nothing, a node already
+    /// warmed this session is not warmed twice, and the spawn is
+    /// fire-and-forget — the launch itself neither depends on it nor waits for
+    /// it, beyond `dl`'s own per-workspace serialization.
+    fn prewarm(&mut self, staged: &Staged) {
+        if !self.claim_prewarm(staged, launch::prewarm_enabled()) {
+            return;
+        }
+        if let Some(argv) = launch::prewarm(&self.checkouts, staged) {
+            launch::spawn_detached(&argv);
+        }
+    }
+
+    /// Whether this staging is the one that gets to warm `staged`, recording
+    /// it if so. Split from the spawn deliberately: the gate and the
+    /// once-per-node rule are the parts with logic in them, and this way they
+    /// are testable without a container, a `dl` on `PATH`, or reaching into
+    /// the process environment.
+    ///
+    /// Nothing is recorded while the prewarm is off — `&&` short-circuits —
+    /// so a session that exports `WF_PREWARM` and re-stages a node still
+    /// warms it. A stop with no workspace to warm (the map-less door) is not
+    /// recorded either, because there is nothing to record it under. A node
+    /// whose launch turns out to be host-only *is* recorded: it plans nothing
+    /// now and would plan nothing later, and remembering that saves
+    /// re-walking the checkouts on every re-stage.
+    fn claim_prewarm(&mut self, staged: &Staged, enabled: bool) -> bool {
+        enabled
+            && staged
+                .node_workspace()
+                .is_some_and(|workspace| self.prewarmed.insert(workspace))
     }
 
     /// The second enter: resolve the staged launch against the projects cache
@@ -1851,6 +1899,76 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("wayfinder#6 in /data/proj/wayfinder"));
+    }
+
+    /// A staged launch of the fixture's #6, for the prewarm-claim tests.
+    fn staged_six(app: &App) -> Staged {
+        Staged::ticket(
+            app.clusters
+                .values()
+                .flat_map(|m| &m.tickets)
+                .find(|t| t.number == 6)
+                .expect("#6 is in the fixture"),
+            1,
+            crate::model::Stage::Ready,
+        )
+        .expect("ready is launchable")
+    }
+
+    #[test]
+    fn nothing_is_claimed_or_recorded_while_the_prewarm_is_off() {
+        // Off is the default, and it has to mean *nothing happens*: staging
+        // is a keystroke, and the human has not committed to a container, a
+        // clone or a branch yet. Recording under a disabled flag would also
+        // mean a session that turns it on mid-flight never warms the nodes it
+        // had already looked at.
+        let mut app = fixture_app();
+        let staged = staged_six(&app);
+        assert!(!app.claim_prewarm(&staged, false));
+        assert!(app.prewarmed.is_empty());
+        // ...and enabling afterwards still gets its turn.
+        assert!(app.claim_prewarm(&staged, true));
+    }
+
+    #[test]
+    fn a_node_is_claimed_once_however_often_it_is_staged() {
+        // Backing out of the launch picker and coming back is ordinary use;
+        // each visit must not add another `dl up` to the pile.
+        let mut app = fixture_app();
+        let staged = staged_six(&app);
+        assert!(app.claim_prewarm(&staged, true), "the first staging warms");
+        for _ in 0..3 {
+            assert!(
+                !app.claim_prewarm(&staged, true),
+                "a re-stage must not warm again"
+            );
+        }
+        assert_eq!(app.prewarmed.len(), 1);
+    }
+
+    #[test]
+    fn distinct_nodes_each_get_their_own_claim() {
+        // The dedup is per node, not a one-shot latch: staging two tickets in
+        // one session must warm both, since they are two workspaces.
+        let mut app = fixture_app();
+        let six = staged_six(&app);
+        let map = Staged::map(&MapId::new("blooop/wayfinder", 1), "a map");
+        assert_ne!(six.node_workspace(), map.node_workspace());
+        assert!(app.claim_prewarm(&six, true));
+        assert!(app.claim_prewarm(&map, true));
+        assert_eq!(app.prewarmed.len(), 2);
+    }
+
+    #[test]
+    fn staging_a_host_launch_spawns_nothing() {
+        // Even claimed, a launch with no container to start plans no command:
+        // the fixture's checkout paths do not exist, so no candidate can
+        // declare a devcontainer, which is exactly the host case.
+        let app = fixture_app().with_checkouts(vec![Checkout {
+            path: std::path::PathBuf::from("/data/proj/wayfinder"),
+            repo: "blooop/wayfinder".to_string(),
+        }]);
+        assert_eq!(launch::prewarm(&app.checkouts, &staged_six(&app)), None);
     }
 
     #[test]

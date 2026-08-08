@@ -704,6 +704,39 @@ impl Staged {
             StagedAt::Project => "+new".to_string(),
         }
     }
+
+    /// The `dl` workspace **launching this node** would run in, known at stage
+    /// time — what the prewarm warms, and `None` when there is no single
+    /// answer to warm.
+    ///
+    /// Known this early because a node's workspace depends only on the node:
+    /// not on which checkout the second enter picks, and not on the mode. The
+    /// two `None` cases are the ones where staging does not determine a
+    /// workspace:
+    ///
+    /// - **The map-less door** ([`StagedAt::Project`]) offers creation rows
+    ///   alone. There is no node, so there is nothing a launch would attach
+    ///   to.
+    /// - A **creation** picked on a map's picker resolves to the repo's bare
+    ///   default workspace rather than the node's (see the resolved launch's
+    ///   own `workspace`), so a map stop has two possible answers and staging
+    ///   cannot tell which the human will take. It is still warmed on the
+    ///   node's, because that is what the default row launches and what
+    ///   `enter enter` therefore does; arrowing down to a creation row
+    ///   instead leaves the warmed container unused, which is the same cost
+    ///   as backing out.
+    pub fn node_workspace(&self) -> Option<String> {
+        match &self.at {
+            StagedAt::Node { aim, map_issue } => Some(node_workspace_name(
+                &self.repo,
+                match aim {
+                    Aim::Map => *map_issue,
+                    Aim::Ticket { number, .. } => *number,
+                },
+            )),
+            StagedAt::Project => None,
+        }
+    }
 }
 
 /// Where the agent runs: on the host, as `wf` always has, or inside the
@@ -898,12 +931,7 @@ impl Launch {
     /// skill files its own issues and makes its own branches (#114).
     fn workspace(&self) -> String {
         match self.job.number() {
-            Some(number) => format!(
-                "{}@wayfinder/{}-{}",
-                self.repo,
-                short_repo(&self.repo),
-                number
-            ),
+            Some(number) => node_workspace_name(&self.repo, number),
             None => self.repo.clone(),
         }
     }
@@ -1105,6 +1133,147 @@ fn resolve_on_path(program: &str) -> Result<PathBuf, anyhow::Error> {
 /// only — never an identity key, because a fork and its upstream share it.
 fn short_repo(slug: &str) -> &str {
     slug.split('/').next_back().unwrap_or(slug)
+}
+
+/// The per-node `dl` workspace, `owner/repo@wayfinder/<repo>-<n>` — one
+/// definition, because two spellings of it would be two workspaces: the
+/// prewarm builds a container that [`Launch::workspace`] then has to find by
+/// the same name. A creation has no node and does not come through here; it
+/// gets the repo's bare default workspace.
+fn node_workspace_name(repo: &str, number: u64) -> String {
+    format!("{}@wayfinder/{}-{}", repo, short_repo(repo), number)
+}
+
+/// The environment variable that turns the prewarm on. See
+/// [`prewarm_enabled`] for why it is off by default.
+const PREWARM_VAR: &str = "WF_PREWARM";
+
+/// The spellings that turn the prewarm on. An **allowlist**, which is where
+/// this deliberately parts company with `dl`'s `DEVLAUNCH_NO_TOOLS` and its
+/// "anything that is not `0`/`false`/`no`" rule.
+///
+/// The two variables point opposite ways, and the safe reading of a value
+/// nobody anticipated goes with the direction. `DEVLAUNCH_NO_TOOLS` is an
+/// opt-*out*, so treating an unrecognised value as "set" disables a
+/// convenience — cheap, and cheap in the safe direction. `WF_PREWARM` is an
+/// opt-*in* to something that creates containers and clones, so the same rule
+/// would make `WF_PREWARM=off` start building containers. Unrecognised means
+/// off here, and only these say yes.
+const TRUTHY: [&str; 4] = ["1", "true", "yes", "on"];
+
+/// Whether staging a launch may start its container early. **Off unless
+/// `WF_PREWARM` is set to something that is not `0`/`false`/`no`.**
+///
+/// Opt-in, and deliberately so. The prewarm turns the *first* enter — a
+/// keystroke that until now only opened an overlay — into real local state:
+/// a work branch in `dl`'s cache, a full clone of the repo, and a running
+/// container. That is an excellent trade when you are working a map and a bad
+/// one when you are browsing it, because a launch you back out of leaves all
+/// three behind — and `wf reap` will not collect them while the ticket is
+/// open. Nobody should discover that by upgrading.
+///
+/// It does reach the network (a fetch, an image pull); what it never does is
+/// *publish*. `dl` creates the work branch locally and never pushes it, so an
+/// abandoned stage leaves nothing on GitHub.
+pub fn prewarm_enabled() -> bool {
+    enabled_from(std::env::var(PREWARM_VAR).ok().as_deref())
+}
+
+/// The reading half of [`prewarm_enabled`], split out so the rule can be
+/// tested without mutating the process environment under parallel tests.
+fn enabled_from(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(value) => TRUTHY.contains(&value.trim().to_ascii_lowercase().as_str()),
+    }
+}
+
+/// The `dl` invocation that makes a staged node's container ready before the
+/// second enter: `dl <workspace> up` — start or create, never attach.
+///
+/// `None` unless there is exactly one thing to warm. Two ways to get nothing:
+/// the stop names no launchable workspace ([`Staged::node_workspace`] — the
+/// map-less door), or no candidate checkout would launch isolated, which is a
+/// host launch with no container in it.
+///
+/// Any *one* isolated candidate is enough — the workspace name is the node's,
+/// whichever checkout gets picked. If the human then picks a host tree, the
+/// container is left standing, which is the same fate as a launch they cancel
+/// outright: [`crate::reap`] only collects workspaces whose tickets are
+/// closed, so an abandoned stage of an open ticket waits for a hand to remove
+/// it.
+///
+/// This plans the bet; [`prewarm_enabled`] decides whether it is placed. When
+/// it is, `devpod up` — image pull, container create, tool install, the
+/// seconds-to-minutes tail of every cold launch — runs while the human is
+/// still choosing a mode and typing steer text. `dl` serializes the launch
+/// that follows against it (a per-workspace lock), so the second enter
+/// attaches to the container the prewarm built instead of racing it.
+pub fn prewarm(checkouts: &[Checkout], staged: &Staged) -> Option<Vec<String>> {
+    let workspace = staged.node_workspace()?;
+    let isolated = candidate_checkouts(checkouts, &staged.repo)
+        .into_iter()
+        .any(|c| Isolation::detect(&c.path) == Isolation::Devlaunch);
+    isolated.then(|| vec![DEVLAUNCH.to_string(), workspace, "up".to_string()])
+}
+
+/// Run `argv` in the background, detached from this process and its terminal.
+///
+/// Three things have to be true, and a plain `Command::spawn` gives none of
+/// them:
+///
+/// - **It cannot touch the terminal.** The TUI owns the screen, so the child's
+///   stdio is the null device. That alone is not enough: a child can open
+///   `/dev/tty` directly, which `git` and `ssh` do when they want a passphrase,
+///   and `dl` shells out to both. Putting it in its own process group makes the
+///   kernel stop that read with `SIGTTIN` instead of letting it race `wf`'s own
+///   `event::read()` for keystrokes.
+/// - **`wf`'s signals are not its signals.** `ctrl-c` and a closed terminal go
+///   to the *foreground process group*. A prewarm in that group dies mid-clone,
+///   and `dl`'s cleanup of a half-written workspace runs in a Python `except`
+///   that a signal does not reach — so the next launch finds a workspace
+///   directory that exists and is not usable. Its own group is what keeps a
+///   quit from corrupting the cache.
+/// - **It must leave nothing behind.** `main` is explicit that nothing may
+///   outlive the `exec` as a zombie the agent then holds, and `exec` does not
+///   reparent children. So this double-forks: the direct child is a shell that
+///   backgrounds the real command and exits immediately, which reparents the
+///   command to init and lets the shell be waited for right here. The wait is
+///   a process spawn and exit — milliseconds — and it is what makes this
+///   leave no entry in anyone's process table.
+///
+/// Failure is silent by design: it costs the head start and nothing else,
+/// because the launch that follows runs the same `dl` path itself and reports
+/// whatever is actually wrong.
+pub fn spawn_detached(argv: &[String]) {
+    let Some((program, _rest)) = argv.split_first() else {
+        return;
+    };
+    // Resolved here for the same reason `exec` does it: an empty `$PATH` entry
+    // would otherwise let a cloned repo's own `./dl` be what gets run.
+    let Ok(resolved) = resolve_on_path(program) else {
+        return;
+    };
+    let mut command = std::iter::once(resolved.display().to_string())
+        .chain(argv[1..].iter().cloned())
+        .map(|arg| shell_quote(&arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    command.push_str(" >/dev/null 2>&1 &");
+
+    let spawned = Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn();
+    // The shell exits as soon as it has backgrounded the command, so this
+    // returns immediately — and reaps it, leaving no zombie for the agent.
+    if let Ok(mut shell) = spawned {
+        let _ = shell.wait();
+    }
 }
 
 /// The checkouts that could host a ticket's agent: every registered checkout of
@@ -2069,6 +2238,69 @@ mod tests {
             isolated(Route::Plain, plain("check what the logs say")).agent_argv()[3],
             "'claude' '--dangerously-skip-permissions' 'check what the logs say'"
         );
+    }
+
+    #[test]
+    fn the_prewarm_names_the_same_workspace_the_launch_will_look_for() {
+        // The whole point of warming at stage time: the container the prewarm
+        // builds must be the one the second enter's `dl` finds. One naming
+        // function serves both, and this pins that they cannot drift.
+        let node = ticket("blooop/wayfinder", 80);
+        let staged = Staged::ticket(&node, 67, Stage::Ready).expect("launchable");
+        assert_eq!(
+            staged.node_workspace().as_deref(),
+            Some(isolated_ticket(80, Route::Tdd, interactive("")).agent_argv()[1].as_str())
+        );
+        // A staged map warms the map's own node, same as launching it.
+        let map = Staged::map(&MapId::new("blooop/wayfinder", 67), "the tree");
+        assert_eq!(
+            map.node_workspace().as_deref(),
+            Some("blooop/wayfinder@wayfinder/wayfinder-67")
+        );
+    }
+
+    #[test]
+    fn the_map_less_door_names_no_workspace_to_warm() {
+        // It offers creation rows alone (#114): no node, so nothing a launch
+        // would attach to, so nothing to warm. A creation resolves to the
+        // repo's bare default workspace, which staging must not pre-build on
+        // the strength of a keystroke.
+        let door = Staged::project("blooop/wayfinder");
+        assert_eq!(door.node_workspace(), None);
+        assert_eq!(prewarm(&cache(), &door), None);
+    }
+
+    #[test]
+    fn the_prewarm_is_off_until_it_is_asked_for() {
+        // Staging must create nothing for anyone who has not opted in.
+        assert!(!enabled_from(None));
+        for off in ["", "0", "false", "no", "FALSE", " No "] {
+            assert!(!enabled_from(Some(off)), "{off:?} means off");
+        }
+        for on in ["1", "true", "yes", "on", "YES", " 1 "] {
+            assert!(enabled_from(Some(on)), "{on:?} means on");
+        }
+        // The allowlist earns its keep here: a value nobody anticipated must
+        // not start building containers. Under `dl`'s opposite rule — which
+        // is right for an opt-out — every one of these would enable it.
+        for unrecognised in ["off", "disabled", "none", "nope", "0.0", "never"] {
+            assert!(
+                !enabled_from(Some(unrecognised)),
+                "{unrecognised:?} must not turn the prewarm on"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_only_repo_plans_no_prewarm() {
+        // The cache's paths do not exist, so no candidate can detect a
+        // devcontainer: there is no container to warm, and no `dl` is spawned
+        // for a launch that will run on the host. An unregistered repo warms
+        // nothing either — there is nothing to launch into at all.
+        let node = ticket("blooop/wayfinder", 80);
+        let staged = Staged::ticket(&node, 67, Stage::Ready).expect("launchable");
+        assert_eq!(prewarm(&cache(), &staged), None);
+        assert_eq!(prewarm(&[], &staged), None);
     }
 
     #[test]
