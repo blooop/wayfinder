@@ -1,6 +1,6 @@
 //! The prompts `wf` execs, shipped in the same package as the binary.
 //!
-//! `wf` does not merely *mention* `/tdd` and `/wayfinder-auto` — it hardcodes
+//! `wf` does not merely *mention* `/wf-tdd` and `/wf-auto` — it hardcodes
 //! them in [`crate::launch::route`] and execs them. That makes the skill files
 //! part of `wf`'s interface, and an interface split across two repos on two
 //! release cadences is one that drifts: `wf` reached 0.6.0 still routing
@@ -27,13 +27,15 @@ use anyhow::{Context, Result};
 /// Named explicitly rather than read from the bundle directory: this list is
 /// what the routing table promises, so a skill that vanishes from the package
 /// should be a *reported* absence, not a silently shorter list.
-pub const BUNDLED: [&str; 5] = [
-    "wayfinder",
-    "wayfinder-auto",
-    "wayfinder-one",
-    "tdd",
-    "review",
-];
+///
+/// Every name is prefixed `wf`, because `~/.claude/skills` is one flat
+/// namespace shared with every other source of skills the user has. Unprefixed,
+/// `tdd` and `review` are names `wf` *squats on* rather than merely occupies —
+/// while it holds one, the user cannot have their own, and [`install`] would
+/// refuse to link over theirs if they made one (#104).
+///
+/// Renaming this list is what [`sweep`] exists to clean up after.
+pub const BUNDLED: [&str; 5] = ["wf", "wf-auto", "wf-one", "wf-tdd", "wf-review"];
 
 /// Overrides the bundle location. The escape hatch for a build that is not
 /// installed — `wf-next` copied onto `PATH`, or a test — and the way to point
@@ -279,6 +281,71 @@ pub fn install(bundle: &Bundle, into: &Path) -> Result<Vec<(String, Outcome)>> {
     Ok(done)
 }
 
+/// Whether `target` names a directory inside some `wf` bundle — this build's,
+/// or one belonging to a prefix that has since been replaced.
+///
+/// This is the whole safety argument for [`sweep`]. A link is removed only when
+/// it points *into a bundle*, which is a place nothing but `wf` ever links to,
+/// so a skill the user wrote, a plugin's, or a link some other tool left behind
+/// can never match however dead it looks.
+fn points_into_a_bundle(target: &Path, bundle: &Path) -> bool {
+    let Some(parent) = target.parent() else {
+        return false;
+    };
+    // The current bundle covers `$WF_SKILLS_DIR` pointing at a checkout, whose
+    // path ends in `skills` and not in `share/wf/skills`. The suffix covers
+    // every installed prefix, including the older ones this is here to clear.
+    parent == bundle || parent.ends_with("share/wf/skills")
+}
+
+/// Remove links `wf` wrote for skills it no longer ships.
+///
+/// A rename leaves residue that neither [`status`] nor [`install`] can see:
+/// they iterate [`BUNDLED`], so the moment `wayfinder` left that list, the link
+/// named `wayfinder` stopped being anything either function looks at — while
+/// staying on disk, pointing into a bundle where its target no longer exists.
+/// Claude Code would go on reading a dangling entry forever, and no amount of
+/// `wf skills install` would mention it.
+///
+/// Scoped by where the link *points* rather than by a list of former names: a
+/// hardcoded list would need editing at every rename and would still miss the
+/// links left by a `wf` older than the list.
+///
+/// # Errors
+///
+/// When `into` cannot be read, or a link cannot be removed. A missing `into` is
+/// not an error — there is nothing to sweep.
+pub fn sweep(bundle: &Bundle, into: &Path) -> Result<Vec<PathBuf>> {
+    let Ok(entries) = std::fs::read_dir(into) else {
+        return Ok(Vec::new());
+    };
+    let mut swept = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("cannot read {}", into.display()))?;
+        let link = entry.path();
+        let name = entry.file_name();
+        if BUNDLED.iter().any(|b| std::ffi::OsStr::new(b) == name) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&link) else {
+            continue;
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(target) = std::fs::read_link(&link) else {
+            continue;
+        };
+        if !points_into_a_bundle(&target, &bundle.path) {
+            continue;
+        }
+        std::fs::remove_file(&link)
+            .with_context(|| format!("cannot remove the stale link {}", link.display()))?;
+        swept.push(link);
+    }
+    Ok(swept)
+}
+
 /// The `wf skills` report: where the bundle is, where the links go, and the
 /// state of each — the answer to "which prompt is actually going to run".
 pub fn report(bundle: &Bundle, into: &Path) -> String {
@@ -361,6 +428,44 @@ mod tests {
     }
 
     #[test]
+    fn sweep_clears_links_a_rename_orphaned_and_nothing_else() {
+        let scratch = Scratch::new("sweep");
+        let bundle = scratch.bundle(&[]);
+        let target = scratch.target();
+        install(&bundle, &target).expect("install");
+
+        // What #104's rename left behind: a link named for a skill no longer in
+        // BUNDLED, pointing into a prefix whose bundle is already gone. Nothing
+        // that iterates BUNDLED can see it, and it dangles.
+        let dead = scratch.0.join("old-prefix/share/wf/skills/wayfinder");
+        std::os::unix::fs::symlink(&dead, target.join("wayfinder")).expect("orphan");
+        assert!(target.join("wayfinder").symlink_metadata().is_ok());
+
+        // Two things sweep must not touch, and the reason it can tell: neither
+        // target is inside a bundle.
+        let mine = target.join("grill-me");
+        std::fs::create_dir_all(&mine).expect("a skill of the user's own");
+        let elsewhere = scratch.0.join("somewhere-else");
+        std::fs::create_dir_all(&elsewhere).expect("another tool's tree");
+        std::os::unix::fs::symlink(&elsewhere, target.join("other-tool")).expect("other link");
+
+        let swept = sweep(&bundle, &target).expect("sweep");
+
+        assert_eq!(swept, vec![target.join("wayfinder")]);
+        assert!(target.join("wayfinder").symlink_metadata().is_err());
+        assert!(mine.is_dir(), "a real directory is never swept");
+        assert!(
+            target.join("other-tool").symlink_metadata().is_ok(),
+            "a link pointing outside any bundle is never swept"
+        );
+        // The skills this build does ship are untouched: they are in BUNDLED,
+        // so sweep skips them before it ever looks at where they point.
+        assert!(status(&bundle, &target)
+            .iter()
+            .all(|s| s.state == State::Current));
+    }
+
+    #[test]
     fn install_links_every_bundled_skill_and_is_idempotent() {
         let scratch = Scratch::new("fresh");
         let bundle = scratch.bundle(&[]);
@@ -393,19 +498,19 @@ mod tests {
         let scratch = Scratch::new("stale");
         let bundle = scratch.bundle(&[]);
         let target = scratch.target();
-        let old = scratch.0.join("old-prefix").join("wayfinder");
+        let old = scratch.0.join("old-prefix").join("wf");
         std::fs::create_dir_all(&old).expect("old bundle");
-        std::os::unix::fs::symlink(&old, target.join("wayfinder")).expect("old link");
+        std::os::unix::fs::symlink(&old, target.join("wf")).expect("old link");
 
         assert_eq!(
-            state_of(&bundle.path.join("wayfinder"), &target.join("wayfinder")),
+            state_of(&bundle.path.join("wf"), &target.join("wf")),
             State::Stale(old.clone())
         );
         let done = install(&bundle, &target).expect("install");
-        let wayfinder = done.iter().find(|(n, _)| n == "wayfinder").expect("entry");
-        assert_eq!(wayfinder.1, Outcome::Linked { was: Some(old) });
+        let wf_skill = done.iter().find(|(n, _)| n == "wf").expect("entry");
+        assert_eq!(wf_skill.1, Outcome::Linked { was: Some(old) });
         assert_eq!(
-            state_of(&bundle.path.join("wayfinder"), &target.join("wayfinder")),
+            state_of(&bundle.path.join("wf"), &target.join("wf")),
             State::Current
         );
     }
@@ -418,17 +523,17 @@ mod tests {
         let scratch = Scratch::new("unmanaged");
         let bundle = scratch.bundle(&[]);
         let target = scratch.target();
-        let real = target.join("tdd");
+        let real = target.join("wf-tdd");
         std::fs::create_dir_all(&real).expect("real dir");
         std::fs::write(real.join("SKILL.md"), "someone else's").expect("write");
 
         let done = install(&bundle, &target).expect("install");
-        let tdd = done.iter().find(|(n, _)| n == "tdd").expect("entry");
+        let tdd = done.iter().find(|(n, _)| n == "wf-tdd").expect("entry");
         assert_eq!(tdd.1, Outcome::Blocked);
         assert!(real.join("SKILL.md").is_file(), "the file must survive");
         assert!(
             done.iter()
-                .filter(|(n, _)| n != "tdd")
+                .filter(|(n, _)| n != "wf-tdd")
                 .all(|(_, o)| matches!(o, Outcome::Linked { .. })),
             "one blocked skill must not stop the others: {done:?}"
         );
@@ -439,17 +544,17 @@ mod tests {
         // A packaging fault. Linking anyway would produce a broken link that
         // reads as installed, which is worse than the absence it hides.
         let scratch = Scratch::new("incomplete");
-        let bundle = scratch.bundle(&["review"]);
+        let bundle = scratch.bundle(&["wf-review"]);
         let target = scratch.target();
 
         let done = install(&bundle, &target).expect("install");
-        let review = done.iter().find(|(n, _)| n == "review").expect("entry");
+        let review = done.iter().find(|(n, _)| n == "wf-review").expect("entry");
         assert_eq!(review.1, Outcome::NotInBundle);
-        assert!(!target.join("review").exists());
+        assert!(!target.join("wf-review").exists());
         assert_eq!(
             status(&bundle, &target)
                 .iter()
-                .find(|s| s.name == "review")
+                .find(|s| s.name == "wf-review")
                 .map(|s| s.state.clone()),
             Some(State::Missing)
         );

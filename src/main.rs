@@ -124,8 +124,21 @@ fn run_skills(install: bool) -> Result<()> {
         emit(&skills::report(&bundle, &target));
         return Ok(());
     }
+    // Before linking, not after: a swept name could be one this build ships
+    // under a new spelling, and clearing the old link first keeps the two
+    // steps from racing over the same directory entry.
+    let swept = skills::sweep(&bundle, &target)?;
     let done = skills::install(&bundle, &target)?;
     let mut out = String::new();
+    for link in &swept {
+        let _ = writeln!(
+            out,
+            "  {:<15} removed — a skill an older wf shipped and this one does not",
+            link.file_name()
+                .unwrap_or(link.as_os_str())
+                .to_string_lossy()
+        );
+    }
     for (name, outcome) in &done {
         let line = match outcome {
             skills::Outcome::AlreadyCurrent => "already current".to_string(),

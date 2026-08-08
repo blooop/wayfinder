@@ -1685,7 +1685,7 @@ mod tests {
         assert_eq!(launch.key(), "wayfinder#6");
         assert_eq!(launch.cwd(), std::path::Path::new("/data/proj/wayfinder"));
         // The map issue is the cluster's — not a per-repo lookup.
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder 1 6");
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wf 1 6");
         assert_eq!(app.overlay, Overlay::None, "one candidate must not prompt");
         assert!(app
             .notice
@@ -1697,7 +1697,7 @@ mod tests {
     #[test]
     fn the_same_ticket_on_two_maps_launches_with_the_cluster_it_was_picked_in() {
         // One repo, two open maps, both listing ticket #6: the row's cluster —
-        // not the repo — decides `/wayfinder`'s map argument.
+        // not the repo — decides `/wf`'s map argument.
         let mut clusters = BTreeMap::new();
         for map_number in [1u64, 47] {
             clusters.insert(
@@ -1728,7 +1728,7 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder 47 6");
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wf 47 6");
     }
 
     #[test]
@@ -1854,7 +1854,7 @@ mod tests {
         };
         assert_eq!(
             launch.agent_argv().last().unwrap(),
-            "/wayfinder-auto 1 6 steer: something"
+            "/wf-auto 1 6 steer: something"
         );
     }
 
@@ -1872,7 +1872,7 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder-auto 4 103");
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wf-auto 4 103");
     }
 
     #[test]
@@ -1918,7 +1918,7 @@ mod tests {
         };
         assert_eq!(
             launch.agent_argv().last().unwrap(),
-            "/wayfinder-auto 1 6",
+            "/wf-auto 1 6",
             "the staged ticket, not whatever landed at its old index"
         );
 
@@ -1943,7 +1943,7 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder-auto 1 6");
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wf-auto 1 6");
     }
 
     #[test]
@@ -1969,7 +1969,7 @@ mod tests {
             other => panic!("expected a launch, got {other:?}"),
         };
         assert_eq!(launch.key(), "wayfinder#1");
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder 1");
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wf 1");
 
         let mut app = launchable_app();
         go_to(&mut app, "map #1");
@@ -1979,7 +1979,7 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wayfinder-auto 1");
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wf-auto 1");
     }
 
     #[test]
@@ -2014,13 +2014,13 @@ mod tests {
 
     #[test]
     fn a_build_node_routes_by_its_stage() {
-        // One build ticket, staged by its PR: in review → /review; the same
-        // ticket with no PR evidence is ready → /tdd.
+        // One build ticket, staged by its PR: in review → /wf-review; the same
+        // ticket with no PR evidence is ready → /wf-tdd.
         let build_app = |prs: Vec<PrLink>| -> App {
             let mut t = ticket(
                 "blooop/wayfinder",
                 65,
-                "Author the /tdd skill",
+                "Author the /wf-tdd skill",
                 true,
                 false,
                 vec![],
@@ -2054,7 +2054,7 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/tdd 65");
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wf-tdd 65");
 
         let mut in_review = build_app(vec![PrLink {
             repo: "blooop/wayfinder".to_string(),
@@ -2075,7 +2075,7 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/review 65");
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wf-review 65");
 
         // A merged PR with nothing open means done — stage, not ticket state,
         // is what refuses the launch.

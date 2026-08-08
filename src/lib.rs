@@ -16,7 +16,7 @@
 //!   appears. Nothing polls afterwards — a warm start costs ~0.6 s, so
 //!   re-running `wf` is cheaper than keeping it fresh.
 //! * **Launch** replaces this process ([`launch::Launch::exec`]): `wf` gives
-//!   the terminal back and becomes `claude "/wayfinder <map> <n>"` in the
+//!   the terminal back and becomes `claude "/wf <map> <n>"` in the
 //!   chosen checkout. Unattended work is not a feature — it is another
 //!   terminal session you start and switch away from.
 

@@ -58,24 +58,29 @@ Two things to know about it:
 
 ## The skills are part of this repo
 
-`skills/` holds the five prompts `wf` execs — `wayfinder`, `wayfinder-auto`,
-`wayfinder-one`, `tdd`, `review`. They are not documentation *about* `wf`; they
-are what it runs, named literally in `launch::route`, and the package installs
-them beside the binary so the two cannot drift (`src/skills.rs` says why at
-length).
+`skills/` holds the five prompts `wf` execs — `wf`, `wf-auto`, `wf-one`,
+`wf-tdd`, `wf-review`. They are not documentation *about* `wf`; they are what it
+runs, named literally in `launch::route`, and the package installs them beside
+the binary so the two cannot drift (`src/skills.rs` says why at length).
 
-Two consequences for anyone editing here:
+Three consequences for anyone editing here:
 
 - **Editing a skill is editing `wf`'s behaviour.** A change to
-  `skills/wayfinder/SKILL.md` ships in the next release exactly as a change to
+  `skills/wf/SKILL.md` ships in the next release exactly as a change to
   `src/` does, and belongs in the same PR as whatever routing change motivated
-  it. `skills/wayfinder-one/SKILL.md` and `wayfinder-auto` link
-  `../wayfinder/GITHUB_TRACKER.md` and `../wayfinder/LIFECYCLE.md` by relative
+  it. `skills/wf-one/SKILL.md` and `wf-auto` link
+  `../wf/GITHUB_TRACKER.md` and `../wf/LIFECYCLE.md` by relative
   path, so the five move as a set and the layout under `skills/` is load-bearing.
 - **Adding a `Route` means adding a skill.** `skills::BUNDLED` lists what ships
   and a unit test asserts every `Route::label()` is in it, so a route pointing
   at a prompt the package does not carry fails the build rather than an agent
   launch.
+- **Renaming one leaves residue on every machine that had the old name.**
+  `status` and `install` both iterate `BUNDLED`, so a link named for a skill
+  that left the list is invisible to them while staying on disk, dangling.
+  `skills::sweep` is what clears it, and a rename is not finished until the new
+  names are in `BUNDLED` — that list is the only thing sweep can tell "ours, and
+  no longer shipped" from "someone else's" by.
 
 To work on a skill against a released `wf`, link the checkout instead of the
 package — `WF_SKILLS_DIR=$PWD/skills wf skills install` — and the edit is live

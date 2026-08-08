@@ -112,13 +112,13 @@ tests:
         # Named individually rather than as a glob: the routing table promises
         # these four skills exist, so a package that quietly shipped three
         # must fail here rather than at the moment an agent is launched.
-        - share/wf/skills/wayfinder/SKILL.md
-        - share/wf/skills/wayfinder-auto/SKILL.md
-        - share/wf/skills/wayfinder-one/SKILL.md
-        - share/wf/skills/tdd/SKILL.md
-        - share/wf/skills/review/SKILL.md
-        - share/wf/skills/wayfinder/GITHUB_TRACKER.md
-        - share/wf/skills/wayfinder/LIFECYCLE.md
+        - share/wf/skills/wf/SKILL.md
+        - share/wf/skills/wf-auto/SKILL.md
+        - share/wf/skills/wf-one/SKILL.md
+        - share/wf/skills/wf-tdd/SKILL.md
+        - share/wf/skills/wf-review/SKILL.md
+        - share/wf/skills/wf/GITHUB_TRACKER.md
+        - share/wf/skills/wf/LIFECYCLE.md
 
 about:
   homepage: https://github.com/blooop/wayfinder
