@@ -53,10 +53,14 @@ pub enum Route {
     /// decisions settled against the skill's guiding principles, and the whole
     /// remaining lifecycle driven unattended (#96).
     WayfinderAuto,
+    /// `claude` — no skill at all (#112). The only route that invokes nothing:
+    /// the session opens in the node's workspace and the human drives it.
+    Plain,
 }
 
 impl Route {
-    /// How the route reads in the launch picker: the slash command it execs.
+    /// How the route reads in the launch picker: the slash command it execs,
+    /// or the bare agent when it execs no slash command at all.
     ///
     /// Every label is prefixed `wf`, because these names are claimed in a
     /// namespace `wf` does not own: `~/.claude/skills` is flat and shared with
@@ -69,6 +73,7 @@ impl Route {
             Route::Review => "/wf-review",
             Route::Wayfinder => "/wf",
             Route::WayfinderAuto => "/wf-auto",
+            Route::Plain => "claude",
         }
     }
 }
@@ -90,6 +95,11 @@ pub enum Mode {
     /// which routed to `/wf`'s own deferred mode before that skill existed
     /// (#63 → #96).
     Auto,
+    /// Nobody: no skill is invoked and no lifecycle is driven. The session
+    /// opens on the node's workspace and the human types the first thing it
+    /// hears (#112) — the answer to wanting `wf`'s branch, clone and container
+    /// without wanting a skill's opinion about what to do in them.
+    Plain,
 }
 
 impl Mode {
@@ -98,6 +108,7 @@ impl Mode {
         match self {
             Mode::Interactive => "interactive",
             Mode::Auto => "auto",
+            Mode::Plain => "plain",
         }
     }
 
@@ -108,6 +119,7 @@ impl Mode {
         match self {
             Mode::Interactive => "you are in the loop; it grills you",
             Mode::Auto => "the agent decides alone and drives it to done",
+            Mode::Plain => "no skill; a bare session on the node's branch",
         }
     }
 
@@ -120,7 +132,8 @@ impl Mode {
     fn after(self) -> Mode {
         match self {
             Mode::Interactive => Mode::Auto,
-            Mode::Auto => Mode::Interactive,
+            Mode::Auto => Mode::Plain,
+            Mode::Plain => Mode::Interactive,
         }
     }
 
@@ -249,6 +262,10 @@ pub fn route(aim: &Aim, mode: Mode) -> Route {
     match (aim, mode) {
         (Aim::Map, Mode::Interactive) => Route::Wayfinder,
         (Aim::Map | Aim::Ticket { .. }, Mode::Auto) => Route::WayfinderAuto,
+        // `Plain` collapses the table for the opposite reason `Auto` does:
+        // `Auto` picks one skill for every node, `Plain` picks none, and
+        // neither the aim nor the stage can change that.
+        (Aim::Map | Aim::Ticket { .. }, Mode::Plain) => Route::Plain,
         (
             Aim::Ticket {
                 ticket_type, stage, ..
@@ -545,20 +562,33 @@ impl Launch {
     /// wayfinder skill, and a wayfinder skill on a map is the map's number
     /// alone. The ticket arm is where the two argument shapes live.
     fn claude_argv(&self) -> Vec<String> {
-        let prompt = match &self.aim {
-            Aim::Map => format!("{} {}", self.route.label(), self.map_issue),
-            Aim::Ticket { number, .. } => match self.route {
-                Route::Tdd | Route::Review => format!("{} {number}", self.route.label()),
-                Route::Wayfinder | Route::WayfinderAuto => {
-                    format!("{} {} {number}", self.route.label(), self.map_issue)
-                }
-            },
-        };
-        vec![
-            "claude".to_string(),
-            SKIP_PERMISSIONS.to_string(),
-            format!("{prompt}{}", self.mode.suffix()),
-        ]
+        let mut argv = vec!["claude".to_string(), SKIP_PERMISSIONS.to_string()];
+        argv.extend(self.prompt());
+        argv
+    }
+
+    /// The single positional argument `claude` is opened on — `None` when
+    /// there is nothing to say to it, which is a shorter argv rather than an
+    /// empty argument (`claude ""` is a prompt, and an empty one).
+    fn prompt(&self) -> Option<String> {
+        let skill = self.skill_invocation()?;
+        Some(format!("{skill}{}", self.mode.suffix()))
+    }
+
+    /// The slash command and its arguments, for the routes that invoke a
+    /// skill. `None` is [`Route::Plain`]: no skill, so nothing to invoke.
+    fn skill_invocation(&self) -> Option<String> {
+        let skill = self.route.label();
+        match (self.route, &self.aim) {
+            (Route::Plain, _) => None,
+            (_, Aim::Map) => Some(format!("{skill} {}", self.map_issue)),
+            (Route::Tdd | Route::Review, Aim::Ticket { number, .. }) => {
+                Some(format!("{skill} {number}"))
+            }
+            (Route::Wayfinder | Route::WayfinderAuto, Aim::Ticket { number, .. }) => {
+                Some(format!("{skill} {} {number}", self.map_issue))
+            }
+        }
     }
 
     /// What `wf` becomes: the agent, or `dl` carrying the agent into the
@@ -777,6 +807,25 @@ mod tests {
         LaunchMode::picked(Mode::Auto, steer)
     }
 
+    /// The same with the `plain` row selected — the launch that hands the
+    /// session no skill at all.
+    fn plain(steer: &str) -> LaunchMode {
+        LaunchMode::picked(Mode::Plain, steer)
+    }
+
+    /// The whole argv a node of this (type, stage) is launched with, under
+    /// `mode`. Whole rather than its last entry, because a plain session's
+    /// argv may have no prompt entry to take the last of.
+    fn ticket_argv(ticket_type: TicketType, stage: Stage, mode: &LaunchMode) -> Vec<String> {
+        let mut node = ticket("blooop/wayfinder", 16);
+        node.ticket_type = ticket_type;
+        let staged = Staged::ticket(&node, 1, stage).expect("a launchable stage");
+        match plan(&cache(), &staged, mode) {
+            Targets::One(l) => l.agent_argv(),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// An interactive `/wf` plan — the default launch, and the shape
     /// every checkout-resolution test wants (route and mode are orthogonal to
     /// which trees are candidates).
@@ -909,7 +958,7 @@ mod tests {
     fn every_mode_is_in_the_picker_and_the_default_leads_it() {
         // The picker lists `Mode::all`, so a mode missing from it would be a
         // mode nothing on screen can reach.
-        assert_eq!(Mode::all(), vec![Mode::Interactive, Mode::Auto]);
+        assert_eq!(Mode::all(), vec![Mode::Interactive, Mode::Auto, Mode::Plain]);
         assert_eq!(
             Mode::all().first(),
             Some(&Mode::default()),
@@ -1101,6 +1150,30 @@ mod tests {
         }
         assert_eq!(route(&Aim::Map, Mode::Auto), Route::WayfinderAuto);
         assert_eq!(route(&Aim::Map, Mode::Interactive), Route::Wayfinder);
+    }
+
+    #[test]
+    fn plain_launches_a_session_with_no_skill_in_it() {
+        // The third mode collapses the table the way `auto` does, and for the
+        // opposite reason: `auto` picks one skill for every node, `plain` picks
+        // none. Which node it was aimed at cannot change that, so every cell
+        // answers the same.
+        for ticket_type in DECISION_TYPES.into_iter().chain([TicketType::Build]) {
+            for stage in LAUNCHABLE {
+                assert_eq!(
+                    route(&aim(ticket_type, stage), Mode::Plain),
+                    Route::Plain,
+                    "{ticket_type:?} at {stage:?}"
+                );
+            }
+        }
+        assert_eq!(route(&Aim::Map, Mode::Plain), Route::Plain);
+        // And the exec is `claude` with nothing said to it: no slash command,
+        // and no prompt argument at all rather than an empty one.
+        assert_eq!(
+            ticket_argv(TicketType::Build, Stage::Ready, &plain("")),
+            vec!["claude".to_string(), SKIP_PERMISSIONS.to_string()]
+        );
     }
 
     #[test]

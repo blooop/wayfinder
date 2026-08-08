@@ -1864,10 +1864,11 @@ mod tests {
 
     #[test]
     fn the_picker_walks_the_modes_both_ways_and_wraps() {
-        // Up and down are inverses and neither can fall off an end: with two
-        // modes every step lands on the other one, and the mode under the
-        // cursor is the mode `enter` will launch, so a step that went nowhere
-        // (or panicked at index 0) would launch the wrong skill.
+        // Up and down are inverses and neither can fall off an end, and the
+        // mode under the cursor is the mode `enter` will launch — so a step
+        // that went nowhere (or panicked at index 0) would launch the wrong
+        // skill. With a third mode (#112) the two directions are no longer the
+        // same step, so each is walked the whole way round.
         let mut app = launchable_app();
         go_to(&mut app, "#6");
         app.handle_key(key(KeyCode::Enter));
@@ -1876,7 +1877,10 @@ mod tests {
             other => panic!("expected the launch picker, got {other:?}"),
         };
         assert_eq!(mode(&app), Mode::Interactive);
-        // Up from the first row wraps to the last rather than sticking.
+        // Up from the first row wraps to the last rather than sticking, and
+        // keeps climbing back to the top.
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(mode(&app), Mode::Plain);
         app.handle_key(key(KeyCode::Up));
         assert_eq!(mode(&app), Mode::Auto);
         app.handle_key(key(KeyCode::Up));
@@ -1884,6 +1888,8 @@ mod tests {
         // Tab steps the same way down does — it is not the view toggle in here.
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(mode(&app), Mode::Auto);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(mode(&app), Mode::Plain, "down reaches the third mode too");
         app.handle_key(key(KeyCode::Down));
         assert_eq!(mode(&app), Mode::Interactive);
         // Steering text is untouched by moving the mode: the two axes are
