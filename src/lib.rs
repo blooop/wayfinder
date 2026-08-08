@@ -26,6 +26,7 @@ pub mod filter;
 pub mod launch;
 pub mod model;
 pub mod projects;
+pub mod reap;
 pub mod refresh;
 pub mod skills;
 pub mod ui;
