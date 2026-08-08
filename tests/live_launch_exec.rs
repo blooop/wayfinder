@@ -351,9 +351,11 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
     assert_eq!(skip, "--dangerously-skip-permissions");
     // This repo keeps several maps open (#50), and which cluster — and which
     // ticket, at which stage — the cursor landed on is the live tracker's
-    // business. So only the prompt's shape is asserted: one of the three
-    // routes (#61), with its numeric arguments and no mode suffix (the line
-    // was empty — interactive).
+    // business. So only the prompt's shape is asserted: one of the interactive
+    // routes (#61), with its numeric arguments and no steering suffix (the
+    // line was empty). `/wayfinder-auto` cannot appear — that needs the word
+    // `auto` typed — and neither can a bare map launch, since the default
+    // cursor skips cluster headers (#96).
     let (skill, numbers) = prompt.split_once(' ').expect("a skill and arguments");
     let halves: Vec<&str> = match skill {
         "/wayfinder" => numbers.splitn(2, ' ').collect(),

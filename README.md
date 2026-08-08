@@ -225,7 +225,7 @@ the process you started. A checkout that declares a devcontainer runs that same
 agent inside it — see
 [Isolation](#isolation-the-agent-runs-in-the-repos-devcontainer).
 
-**Launching is two steps.** `enter` on the cursor's ticket does not launch: it
+**Launching is two steps.** `enter` on the cursor's node does not launch: it
 opens the **launch line** where the count line was, showing where `enter` will
 go — `→ /tdd · #65 Author the /tdd skill`. What you type lands on that line, not
 in the query, and *is* the mode:
@@ -233,35 +233,50 @@ in the query, and *is* the mode:
 | the line says | what launches |
 | --- | --- |
 | *(empty)* | interactive — the default |
-| `defer` | the subtree, resolved unattended |
-| `defer <text>` | deferred, with `<text>` as the steering prompt |
+| `auto` | the agent decides alone and drives the rest of the lifecycle unattended |
+| `auto <text>` | the same, with `<text>` as the steering prompt |
 | *anything else* | interactive, with what you typed as the steering prompt |
 
-`esc` backs out to the list with your query and cursor exactly as they were.
-`enter` on a **done** or **blocked** node opens nothing — it says why on the
-count line instead.
+The line re-resolves as you type, so `auto` visibly flips the skill it names
+before you commit to it. `esc` backs out to the list with your query and cursor
+exactly as they were. `enter` on a **done** or **blocked** node opens nothing —
+it says why on the count line instead.
 
-**Which skill is a fact about the ticket**, from its type and its stage:
+**The cursor lands on cluster headers too**, so a whole map is a thing you can
+launch: `enter` on one runs the wayfinder skill on the map itself rather than on
+any one ticket — interactively to chart it with you, or under `auto` to have the
+agent take the map from open questions to merged work on its own judgement. The
+default cursor position still skips headers and lands on the first row, so
+opening `wf` and pressing `enter` picks a ticket exactly as it always did;
+headers are one `↑` away.
 
-| type | stage | launches |
-| --- | --- | --- |
-| `wayfinder:build` | ready · building · needs attention | `claude "/tdd <n>"` |
-| `wayfinder:build` | in review | `claude "/review <n>"` |
-| research · prototype · grilling · task | any unfinished stage | `claude "/wayfinder <map> <n>"` |
-| any | done | nothing — not launchable |
+**Which skill runs is a fact about what you picked and who decides:**
 
-The mode rides whichever route you got, as ` defer`, ` defer: <text>` or
-` steer: <text>` on the end of the prompt.
+| picked | stage | mode | launches |
+| --- | --- | --- | --- |
+| a cluster header | — | interactive | `claude "/wayfinder <map>"` |
+| `wayfinder:build` | ready · building · needs attention | interactive | `claude "/tdd <n>"` |
+| `wayfinder:build` | in review | interactive | `claude "/review <n>"` |
+| research · prototype · grilling · task | any unfinished stage | interactive | `claude "/wayfinder <map> <n>"` |
+| anything | any unfinished stage | `auto` | `claude "/wayfinder-auto <map> [<n>]"` |
+| a ticket | done | — | nothing — not launchable |
+
+`auto` collapses the ticket rows on purpose: the launched session is a
+*manager*, and what it manages is the node's whole remaining lifecycle — `/tdd`,
+the gate, then a fresh-context `/review` — so it is the manager skill that runs,
+not the one skill that stage would have called. Steering text rides whichever
+route you got, as ` steer: <text>` on the end of the prompt; the mode itself
+never does, because it has already chosen the skill.
 
 | key | what it does |
 | --- | --- |
 | *type anything* | fuzzy-filter: the tree is pruned to the matches, best-first, with the rows that place them dimmed; clearing restores it |
 | `tab` | toggle the leverage view ⇄ the structure forest |
-| `↑`/`↓`, `ctrl-j`/`ctrl-k` | move between siblings at the cursor's depth — on the default screen, the tickets you can take (cluster headers are never a stop) |
+| `↑`/`↓`, `ctrl-j`/`ctrl-k` | move between siblings at the cursor's depth — on the default screen, the tickets you can take, plus each cluster's header above them |
 | `→` | reveal: open a `▸ done`/`▸ blocked` group, else step forward one stop — which *is* descending, since a subtree's first row follows its parent |
-| `←` | close: shut an open group, else back out to the parent, else one stop back |
-| `enter` | open the launch line on the cursor's ticket; a second `enter` runs the agent here and exits — on a group line it folds instead, since there is no agent to run |
-| *type, then `enter`* | on the launch line: the mode (`defer`, `defer <text>`, or steering text) — `esc` backs out with the query and cursor intact |
+| `←` | close: shut an open group, else back out to the parent, else one stop back — which, from a cluster's first row, is that cluster's header |
+| `enter` | open the launch line on the cursor's ticket, or on its map when the cursor is on a cluster header; a second `enter` runs the agent here and exits — on a group line it folds instead, since there is no agent to run |
+| *type, then `enter`* | on the launch line: the mode (`auto`, `auto <text>`, or steering text) — `esc` backs out with the query and cursor intact |
 | `ctrl-f` | focus the cursor row's project — only its clusters stay on screen |
 | `ctrl-g` | widen back to every project |
 | `ctrl-r` | refetch every map in place, keeping your query, scope and cursor |

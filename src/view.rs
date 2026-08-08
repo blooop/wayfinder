@@ -112,9 +112,12 @@ pub type Expanded = BTreeSet<GroupId>;
 
 /// What the cursor is on. Since #57 that is no longer always a ticket: a
 /// collapsed group is a stop too, because opening one is an action the cursor
-/// has to be able to name.
+/// has to be able to name — and since #96 so is a cluster header, because a
+/// map is a thing you can launch an agent at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stop {
+    /// A cluster header: the whole map, launched as one.
+    Map(MapId),
     Ticket(Row),
     Group(GroupId),
 }
@@ -126,8 +129,9 @@ pub struct StopAt {
     pub depth: usize,
 }
 
-/// One line of the body. [`Item::Ticket`] and [`Item::Group`] are cursor stops;
-/// headers, spacers and context rows are not — [`Item::stop_at`] is the rule.
+/// One line of the body. [`Item::Header`], [`Item::Ticket`] and [`Item::Group`]
+/// are cursor stops; spacers and context rows are not — [`Item::stop_at`] is
+/// the rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     /// A cluster header — the map this and the following lines belong to.
@@ -174,16 +178,23 @@ impl Item {
                 stop: Stop::Ticket(row.clone()),
                 depth: *depth,
             }),
+            // A header sits at depth 0 alongside the cluster's top-level rows
+            // rather than above them, because the depth axis is what `←`/`→`
+            // walk and a header is not something you descend *into* — `←` from
+            // a top-level row already steps back to it as the previous stop.
+            Item::Header(id) => Some(StopAt {
+                stop: Stop::Map(id.clone()),
+                depth: 0,
+            }),
             // Nothing to land on. A sifted group leads this arm because it is
             // the narrower pattern: it is a heading the query wrote, not a fold
             // anyone can toggle — clearing the query is what puts the group
-            // back — so it is no more a stop than a header is.
+            // back — so there is no action for the cursor to name on it.
             Item::Group {
                 fold: Fold::Sifted { .. },
                 ..
             }
             | Item::Context { .. }
-            | Item::Header(_)
             | Item::Blank => None,
             Item::Group { id, .. } => Some(StopAt {
                 stop: Stop::Group(id.clone()),
@@ -987,13 +998,21 @@ mod tests {
             .collect()
     }
 
-    /// Every cursor stop as (what it is, depth) — tickets by number, groups by
-    /// kind. This is the navigation surface, so it is what the tests assert on.
+    /// Every cursor stop as (what it is, depth) — tickets by number, maps by
+    /// `map #n`, groups by kind. This is the navigation surface, so it is what
+    /// the tests assert on.
+    /// The cluster header's stop, which every plan below opens with since #96.
+    /// Named once so the assertions stay about the rows under it.
+    fn header() -> (String, usize) {
+        ("map #47".to_string(), 0)
+    }
+
     fn nav(plan: &Plan, m: &Map) -> Vec<(String, usize)> {
         plan.stops()
             .into_iter()
             .map(|at| {
                 let label = match at.stop {
+                    Stop::Map(id) => format!("map #{}", id.number),
                     Stop::Ticket(row) => format!("#{}", m.tickets[row.index].number),
                     Stop::Group(g) => format!("{:?}", g.kind),
                 };
@@ -1049,6 +1068,7 @@ mod tests {
         assert_eq!(
             nav(&plan, &m),
             vec![
+                header(),
                 ("#6".to_string(), 0),
                 ("#7".to_string(), 1),
                 ("#8".to_string(), 1),
@@ -1079,7 +1099,7 @@ mod tests {
             .filter(|(_, depth)| *depth == 0)
             .map(|(label, _)| label)
             .collect();
-        assert_eq!(top, vec!["#6", "#9", "Done"]);
+        assert_eq!(top, vec!["map #47", "#6", "#9", "Done"]);
     }
 
     #[test]
@@ -1105,7 +1125,7 @@ mod tests {
         );
         assert_eq!(
             nav(&collapsed, &m),
-            vec![("#6".to_string(), 0), ("Done".to_string(), 0)]
+            vec![header(), ("#6".to_string(), 0), ("Done".to_string(), 0)]
         );
         assert!(collapsed.items.iter().any(|i| matches!(
             i,
@@ -1122,6 +1142,7 @@ mod tests {
         assert_eq!(
             nav(&expanded, &m),
             vec![
+                header(),
                 ("#6".to_string(), 0),
                 ("Done".to_string(), 0),
                 ("#2".to_string(), 1),
@@ -1135,6 +1156,39 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn every_cluster_opens_with_its_header_as_a_stop() {
+        // #96: a map is a thing you can launch an agent at, so the cursor has
+        // to be able to name it. One stop per cluster, at the front of it and
+        // at depth 0 — context rows and spacers stay unreachable.
+        let m = map(vec![ticket(6, true, false, vec![])]);
+        let other = MapId::new("blooop/dotfiles", 4);
+        let binding = id();
+        let plan = plan(
+            &[(&binding, &m), (&other, &m)],
+            Screen::Structured(Lens::Leverage),
+            &nothing(),
+        );
+        let headers: Vec<MapId> = plan
+            .stops()
+            .into_iter()
+            .filter_map(|at| match at.stop {
+                Stop::Map(id) => Some(id),
+                Stop::Ticket(_) | Stop::Group(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec![binding, other],
+            "one per cluster, in render order"
+        );
+        assert_eq!(
+            plan.stops().first().map(|at| at.depth),
+            Some(0),
+            "a header sits alongside its top-level rows, not above them"
+        );
     }
 
     #[test]
@@ -1420,7 +1474,11 @@ mod tests {
         );
         assert_eq!(
             nav(&plan, &m),
-            vec![("#6".to_string(), 0), ("BlockedDeeper".to_string(), 0)]
+            vec![
+                header(),
+                ("#6".to_string(), 0),
+                ("BlockedDeeper".to_string(), 0)
+            ]
         );
     }
 
@@ -1464,6 +1522,7 @@ mod tests {
         assert_eq!(
             nav(&plan, &m),
             vec![
+                header(),
                 ("#6".to_string(), 0),
                 ("#9".to_string(), 1),
                 ("#9".to_string(), 0),
@@ -1490,6 +1549,7 @@ mod tests {
         assert_eq!(
             nav(&plan, &m),
             vec![
+                header(),
                 ("#6".to_string(), 0),
                 ("#7".to_string(), 1),
                 ("#8".to_string(), 2),
@@ -1529,6 +1589,7 @@ mod tests {
         assert_eq!(
             nav(&plan, &m),
             vec![
+                header(),
                 ("#2".to_string(), 0),
                 ("#6".to_string(), 0),
                 ("#14".to_string(), 1),
@@ -1648,7 +1709,7 @@ mod tests {
         assert_eq!(shape(&plan, &m), vec!["▌ wayfinder", "#6 dim", "└─#14"]);
         // The context row is drawn but not landed on: `↑`/`↓` walk the hits,
         // all of them depth 0, exactly as they did over the flat list.
-        assert_eq!(nav(&plan, &m), vec![("#14".to_string(), 0)]);
+        assert_eq!(nav(&plan, &m), vec![header(), ("#14".to_string(), 0)]);
         assert_eq!(plan.rows().len(), 1, "context rows are not matches");
     }
 
@@ -1768,7 +1829,7 @@ mod tests {
         let plan = plan(&[(&binding, &m)], sifted("alpha"), &nothing());
         assert_eq!(shape(&plan, &m), vec!["▌ wayfinder", "Done 1/2", "└─#2"]);
         // The group is a heading here, not a fold: only the match is a stop.
-        assert_eq!(nav(&plan, &m), vec![("#2".to_string(), 0)]);
+        assert_eq!(nav(&plan, &m), vec![header(), ("#2".to_string(), 0)]);
     }
 
     #[test]
