@@ -31,6 +31,7 @@ use wf::launch::Launch;
 use wf::model::{Map, MapId};
 use wf::projects::{self, ProjectsCache};
 use wf::refresh::{LoadEvent, Loaders, MapFetch, Startup};
+use wf::skills;
 
 /// How long the loop waits on a keypress before redrawing — the cadence at
 /// which streamed load events reach the screen.
@@ -43,6 +44,10 @@ const TICK: std::time::Duration = std::time::Duration::from_millis(250);
 #[derive(Debug, PartialEq, Eq)]
 enum Invocation {
     Tui,
+    /// Report where the bundled skills are and whether they are linked.
+    SkillsReport,
+    /// Link the bundled skills into Claude Code's personal skills directory.
+    SkillsInstall,
     /// Print to stdout, exit 0.
     Print(String),
     /// Print to stderr, exit 2.
@@ -53,11 +58,19 @@ const USAGE: &str = "\
 wf — the multi-project wayfinder ticket selector
 
 usage: wf [--version | --help]
+       wf skills [install]
 
 With no arguments: opens the picker over every mapped project, focused on the
 checkout you are standing in. enter runs an agent on the picked ticket, in that
 checkout, replacing wf — so wf is gone by the time the agent draws. ctrl-f and
-ctrl-g narrow and widen the scope, ctrl-r refetches, esc quits.";
+ctrl-g narrow and widen the scope, ctrl-r refetches, esc quits.
+
+wf skills          report which prompt each route would actually run
+wf skills install  link this build's skills into ~/.claude/skills
+
+The skills wf execs ship in this package, so they update with it. `install`
+links rather than copies, which is what keeps them in step afterwards. Set
+WF_SKILLS_DIR to link a checkout instead, while you are editing them.";
 
 /// Parse argv (without the program name). `wf` takes at most one argument, and
 /// anything it does not recognise is rejected rather than ignored, so a typo
@@ -66,9 +79,13 @@ ctrl-g narrow and widen the scope, ctrl-r refetches, esc quits.";
 /// Matched on the argument *slice* rather than on a pair of `next()` calls: a
 /// `(first, second)` tuple can hold `(None, Some(_))` — no first argument but a
 /// second one — which argv cannot produce, and absorbing it with a wildcard
-/// would also let a future third position slip through unhandled. The three
+/// would also let a future third position slip through unhandled. The four
 /// slice patterns below are exhaustive over every possible argv with no
 /// wildcard, so the compiler is what keeps this total.
+///
+/// `skills` is the one argument that takes a second word, so it is matched
+/// before the too-many-arguments arm rather than inside it — a two-word argv
+/// is only ever an error for the *other* first words.
 fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Invocation {
     let args: Vec<String> = args.into_iter().collect();
     match args.as_slice() {
@@ -76,12 +93,80 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Invocation {
         [flag] => match flag.as_str() {
             "--version" | "-V" => Invocation::Print(format!("wf {}", env!("CARGO_PKG_VERSION"))),
             "--help" | "-h" => Invocation::Print(USAGE.to_string()),
+            "skills" => Invocation::SkillsReport,
             other => Invocation::Reject(format!("wf: unknown argument {other:?}\n{USAGE}")),
+        },
+        [first, second] if first == "skills" => match second.as_str() {
+            "install" => Invocation::SkillsInstall,
+            other => Invocation::Reject(format!(
+                "wf: unknown skills subcommand {other:?} (expected `install`)\n{USAGE}"
+            )),
         },
         [_, second, ..] => Invocation::Reject(format!(
             "wf: too many arguments (unexpected {second:?})\n{USAGE}"
         )),
     }
+}
+
+/// `wf skills` and `wf skills install`. Both resolve the bundle and the target
+/// the same way, so a report and an install can never disagree about which
+/// files they are talking about.
+///
+/// Exit codes matter here: this is the command a setup script runs, so a
+/// blocked or missing skill exits non-zero rather than reporting itself in
+/// prose and calling that success.
+fn run_skills(install: bool) -> Result<()> {
+    use std::fmt::Write;
+
+    let bundle = skills::Bundle::resolve()?;
+    let target = skills::claude_skills_dir()?;
+    if !install {
+        emit(&skills::report(&bundle, &target));
+        return Ok(());
+    }
+    let done = skills::install(&bundle, &target)?;
+    let mut out = String::new();
+    for (name, outcome) in &done {
+        let line = match outcome {
+            skills::Outcome::AlreadyCurrent => "already current".to_string(),
+            skills::Outcome::Linked { was: None } => "linked".to_string(),
+            skills::Outcome::Linked { was: Some(old) } => {
+                format!("relinked (was {})", old.display())
+            }
+            skills::Outcome::Blocked => format!(
+                "BLOCKED — {} is a real directory, not a link. Remove it \
+                 (chezmoi may own it) and run this again",
+                target.join(name).display()
+            ),
+            skills::Outcome::NotInBundle => {
+                "NOT IN BUNDLE — this build shipped without it".to_string()
+            }
+        };
+        let _ = writeln!(out, "  {name:<15} {line}");
+    }
+    out.push('\n');
+    out.push_str(&skills::report(&bundle, &target));
+    emit(&out);
+    if done
+        .iter()
+        .any(|(_, o)| matches!(o, skills::Outcome::Blocked | skills::Outcome::NotInBundle))
+    {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Write a whole report to stdout, tolerating a reader that has gone away.
+///
+/// `println!` panics on a closed pipe: Rust ignores `SIGPIPE`, so the write
+/// returns `EPIPE` and the macro unwraps it. `wf skills | head` is an ordinary
+/// thing to type and a panic is an absurd answer to it — the reader stopped
+/// listening, which is not this program's problem to report. One write of one
+/// string rather than a line at a time, so there is a single place for that to
+/// be true.
+fn emit(text: &str) {
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(text.as_bytes());
 }
 
 #[tokio::main]
@@ -94,6 +179,17 @@ async fn main() -> Result<()> {
         Invocation::Reject(text) => {
             eprintln!("{text}");
             std::process::exit(2);
+        }
+        // Both skills paths answer on a stream and exit, like `--version`:
+        // no terminal, no `gh`, so they stay usable in a package test and in
+        // whatever script installs the tool.
+        Invocation::SkillsReport => {
+            run_skills(false)?;
+            return Ok(());
+        }
+        Invocation::SkillsInstall => {
+            run_skills(true)?;
+            return Ok(());
         }
         Invocation::Tui => {}
     }
@@ -403,5 +499,43 @@ mod tests {
             Invocation::Reject(message) => assert!(message.contains("too many")),
             other => panic!("expected a rejection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn skills_reports_and_skills_install_links() {
+        assert_eq!(parse_args(argv(&["skills"])), Invocation::SkillsReport);
+        assert_eq!(
+            parse_args(argv(&["skills", "install"])),
+            Invocation::SkillsInstall
+        );
+    }
+
+    #[test]
+    fn an_unknown_skills_subcommand_is_rejected_by_name() {
+        // `skills` is the one word that takes a second, so its own typos have
+        // to be caught here rather than falling into the too-many-arguments
+        // arm, which would name the wrong problem.
+        match parse_args(argv(&["skills", "instal"])) {
+            Invocation::Reject(message) => {
+                assert!(message.contains("instal"), "{message}");
+                assert!(message.contains("install"), "{message}");
+                assert!(!message.contains("too many"), "{message}");
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        // And a third word is still too many, even after `skills install`.
+        match parse_args(argv(&["skills", "install", "now"])) {
+            Invocation::Reject(message) => assert!(message.contains("too many"), "{message}"),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_usage_names_both_skills_forms() {
+        // The help is the only place the subcommand is discoverable, and a
+        // flag that exists but is undocumented may as well not.
+        assert!(USAGE.contains("wf skills"), "{USAGE}");
+        assert!(USAGE.contains("wf skills install"), "{USAGE}");
+        assert!(USAGE.contains(skills::BUNDLE_ENV), "{USAGE}");
     }
 }

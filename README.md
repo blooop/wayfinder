@@ -19,8 +19,60 @@ nothing else — there is no multiplexer to install. Add
 your repos' devcontainers ([Isolation](#isolation-the-agent-runs-in-the-repos-devcontainer));
 without it every launch runs on the host, which is what `wf` has always done.
 
-`wf --version` and `wf --help` are the only arguments; everything else is keys
-in the TUI.
+Then link the skills it launches into `~/.claude/skills`:
+
+```
+wf skills install
+```
+
+`wf --version`, `wf --help` and `wf skills [install]` are the only arguments;
+everything else is keys in the TUI.
+
+## The skills ship with the binary
+
+`wf` does not merely *mention* `/tdd` and `/wayfinder-auto` — it hardcodes them
+in its routing table and execs them, which makes those prompt files part of
+`wf`'s interface. So they live in this repo under `skills/`, the package
+installs them at `<prefix>/share/wf/skills`, and one `pixi global update wf`
+moves the binary and the prompts together. An interface split across two repos
+on two release cadences drifts silently, which is exactly what happened before
+this: `wf` reached 0.6.0 still routing `defer` at a `/wayfinder` section that
+`/wayfinder-auto` had superseded weeks earlier, and nothing anywhere could
+notice.
+
+Five skills ship: `wayfinder`, `wayfinder-auto`, `wayfinder-one`, `tdd` and
+`review` — the four `wf` can exec, plus the single-ticket sibling that shares
+their `GITHUB_TRACKER.md` and `LIFECYCLE.md`. A unit test asserts every route's
+label is one of them, so a route can never name a skill the package does not
+ship.
+
+`wf skills install` **symlinks** rather than copies, which is the whole point:
+updating the package updates the prompts, with no second command to remember
+and no copy to go stale in between. `wf skills` reports which prompt each route
+would actually run:
+
+```
+bundle  /home/you/.pixi/envs/wf/share/wf/skills (installed beside the binary)
+target  /home/you/.claude/skills
+
+  wayfinder       ok
+  wayfinder-auto  ok
+  wayfinder-one   ok
+  tdd             stale — links to /home/you/projects/wayfinder/skills
+  review          not a link — another tool owns this one
+```
+
+`wf` never deletes a real directory it did not create — if chezmoi or a
+hand-edit owns one, it says so and leaves it, and the other four still install.
+Set `WF_SKILLS_DIR` to link a checkout instead of the package, which is what
+you want while you are editing the prompts: the link points at your working
+tree, so an edit is live in the next session with nothing to reinstall.
+
+The skills stay ordinary installed skills rather than text `wf` injects at exec
+time, because `wf` is not their only caller: `LIFECYCLE.md` has the manager
+agent spawn `/tdd` and `/review` in *fresh subagents* mid-session, you type
+`/wayfinder-auto` yourself on efforts that never go through the picker, and
+model invocation needs a file on disk with frontmatter.
 
 ## Checks
 
