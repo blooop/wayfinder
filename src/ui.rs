@@ -78,10 +78,7 @@ fn mapless_header(repo: &str, under_cursor: bool) -> Line<'static> {
         cursor_span(under_cursor),
         Span::styled("▌ ", dim),
         // The name half, as every cluster header shows it.
-        Span::styled(
-            repo.split('/').next_back().unwrap_or(repo).to_string(),
-            dim,
-        ),
+        Span::styled(repo.split('/').next_back().unwrap_or(repo).to_string(), dim),
         Span::styled(" · no map — enter to start one", dim),
     ])
 }

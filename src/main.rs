@@ -534,18 +534,18 @@ async fn run(
                     loaders.reconcile(&found, &tx);
                     app.startup.searched(&found);
                     if let Some(slug) = focus.take() {
-                        if found.iter().any(|id| id.repo == slug) {
-                            app.scope = Scope::Project(slug);
-                        } else {
-                            // The seed may have focused this repo a moment ago on
-                            // a map that is gone; the search is the authority, so
-                            // the focus goes back.
-                            if app.scope == Scope::Project(slug.clone()) {
-                                app.scope = Scope::All;
-                            }
-                            app.notice = Some(format!(
-                                "{slug} has no wayfinder:map — showing all projects"
-                            ));
+                        // Focused either way now (#114). A repo with no open
+                        // map used to send the focus back to every project,
+                        // which left the repo you were standing in with
+                        // nothing on screen and no way to chart its first map.
+                        // Focused, it renders the empty-state door instead —
+                        // so the answer to "this repo has no map" is somewhere
+                        // to start one rather than somebody else's tickets.
+                        let mapless = !found.iter().any(|id| id.repo == slug);
+                        app.scope = Scope::Project(slug.clone());
+                        if mapless {
+                            app.notice =
+                                Some(format!("{slug} has no wayfinder:map — enter starts one"));
                         }
                     }
                     // Maps the search dropped must stop being rendered as well as

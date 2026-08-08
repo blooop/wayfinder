@@ -1144,7 +1144,7 @@ pub fn plan(checkouts: &[Checkout], staged: &Staged, mode: &LaunchMode) -> Targe
 /// zero or one candidate checkout never prompts. The creation arrives already
 /// complete ([`CreationKind::with_text`] refused the empty task), so this
 /// function only answers *where* the skill runs.
-pub fn plan_create(checkouts: &[Checkout], repo: &str, creation: Creation) -> Targets {
+pub fn plan_create(checkouts: &[Checkout], repo: &str, creation: &Creation) -> Targets {
     resolve(checkouts, repo, |_| Job::Create(creation.clone()))
 }
 
@@ -1497,7 +1497,7 @@ mod tests {
     /// The one-checkout creation launch, reduced to its argv.
     fn creation_argv(kind: CreationKind, text: &str) -> Vec<String> {
         let creation = kind.with_text(text).expect("a buildable creation");
-        match plan_create(&cache(), "blooop/wayfinder", creation) {
+        match plan_create(&cache(), "blooop/wayfinder", &creation) {
             Targets::One(l) => l.agent_argv(),
             other => panic!("{other:?}"),
         }
@@ -1571,7 +1571,7 @@ mod tests {
         // The launch notice is the last thing wf says: for a creation there is
         // no `#n` to name, so it names the act.
         let creation = CreationKind::Map.with_text("").expect("seedless map");
-        match plan_create(&cache(), "blooop/wayfinder", creation) {
+        match plan_create(&cache(), "blooop/wayfinder", &creation) {
             Targets::One(l) => {
                 assert_eq!(l.describe(), "new map in /data/proj/wayfinder");
             }
@@ -1588,10 +1588,10 @@ mod tests {
         // Same cache, same rules: none registered refuses, several prompt.
         let creation = || CreationKind::Map.with_text("").expect("seedless map");
         assert_eq!(
-            plan_create(&cache(), "blooop/dotfiles", creation()),
+            plan_create(&cache(), "blooop/dotfiles", &creation()),
             Targets::Unregistered
         );
-        match plan_create(&cache(), "kinisi/kinisi_ros", creation()) {
+        match plan_create(&cache(), "kinisi/kinisi_ros", &creation()) {
             Targets::Many(launches) => assert_eq!(launches.len(), 2),
             other => panic!("{other:?}"),
         }

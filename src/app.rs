@@ -740,7 +740,7 @@ impl App {
     /// launch that has no node to name (#114). The creation arrives already
     /// complete — [`launch::CreationKind::with_text`] refused the empty task
     /// before this was called — so the only thing left to answer is *where*.
-    fn resolve_creation(&mut self, repo: &str, creation: launch::Creation) -> Outcome {
+    fn resolve_creation(&mut self, repo: &str, creation: &launch::Creation) -> Outcome {
         let targets = launch::plan_create(&self.checkouts, repo, creation);
         self.act_on(targets, repo, "+new")
     }
@@ -803,13 +803,12 @@ impl App {
                     return self.resolve_launch(&staged, &LaunchMode::picked(mode, &steer))
                 }
                 Candidate::Create(kind) => match kind.with_text(&steer) {
-                    Some(creation) => return self.resolve_creation(&staged.repo, creation),
+                    Some(creation) => return self.resolve_creation(&staged.repo, &creation),
                     // The one per-row refusal (#114): `/wf-one` with no task is
                     // meaningless, so it is refused where a done or blocked node
                     // is — on the count line, with the picker still up.
                     None => {
-                        self.notice =
-                            Some(format!("type the {} first", kind.field()));
+                        self.notice = Some(format!("type the {} first", kind.field()));
                     }
                 },
             },
@@ -2205,10 +2204,16 @@ mod tests {
         // a stop, so the cursor can name it and `enter` can act on it.
         let app = mapless_app();
         assert_eq!(
-            app.stops().iter().map(|at| at.stop.clone()).collect::<Vec<_>>(),
+            app.stops()
+                .iter()
+                .map(|at| at.stop.clone())
+                .collect::<Vec<_>>(),
             vec![Stop::Project("blooop/newthing".to_string())]
         );
-        assert_eq!(app.cursor_stop(), Some(Stop::Project("blooop/newthing".to_string())));
+        assert_eq!(
+            app.cursor_stop(),
+            Some(Stop::Project("blooop/newthing".to_string()))
+        );
     }
 
     #[test]
@@ -2219,7 +2224,9 @@ mod tests {
         let mut app = mapless_app();
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         match &app.overlay {
-            Overlay::PickLaunch { staged, candidate, .. } => {
+            Overlay::PickLaunch {
+                staged, candidate, ..
+            } => {
                 assert_eq!(
                     staged.candidates(),
                     vec![
@@ -2387,7 +2394,10 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wf-auto a caching layer");
+        assert_eq!(
+            launch.agent_argv().last().unwrap(),
+            "/wf-auto a caching layer"
+        );
     }
 
     #[test]
