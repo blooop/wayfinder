@@ -10,22 +10,25 @@
 //!
 //! It pins down four claims, in the order they can fail:
 //!
-//! 0. **The container carries the agent.** This repo has a
-//!    `.devcontainer/devcontainer.json`, so its launches are isolated (#80):
-//!    `wf` execs `dl`, not `claude`. Both are shimmed, and the `dl` shim is
-//!    what makes the run deterministic — without it a machine with a real `dl`
-//!    installed and a machine without one would take different paths through
-//!    the same test. The shim records what `dl` was handed and then runs the
-//!    quoted command through a real `bash`, which is the only place the
-//!    quoting can be checked at all: `dl` joins everything after `--` and hands
-//!    it to a shell, so an unquoted prompt would arrive at `claude` as three
-//!    arguments and every assertion in claim 1 would fail.
+//! 0. **The container carries the agent, in a workspace of the ticket's
+//!    own.** This repo has a `.devcontainer/devcontainer.json`, so its
+//!    launches are isolated (#80): `wf` execs `dl`, not `claude`, and hands it
+//!    `owner/repo@wayfinder/<repo>-<n>` (#106) — the per-node workspace whose
+//!    branch number must be the very ticket the prompt names. Both binaries
+//!    are shimmed, and the `dl` shim is what makes the run deterministic —
+//!    without it a machine with a real `dl` installed and a machine without
+//!    one would take different paths through the same test. The shim records
+//!    what `dl` was handed and then runs the quoted command through a real
+//!    `bash`, which is the only place the quoting can be checked at all: `dl`
+//!    joins everything after `--` and hands it to a shell, so an unquoted
+//!    prompt would arrive at `claude` as three arguments and every assertion
+//!    in claim 1 would fail.
 //! 1. **`enter` execs the agent.** Two enters since the two-step launch (#62):
 //!    the first stages the launch line, the second launches it interactive.
 //!    `claude` is shimmed to a script that records its argv and cwd, so the
 //!    assertion is on what `wf` actually handed the agent —
-//!    `--dangerously-skip-permissions "<skill> …"`, in the checkout — rather
-//!    than on what it planned to.
+//!    `--dangerously-skip-permissions "<skill> …"` — rather than on what it
+//!    planned to.
 //! 2. **`wf` is gone.** The shim is the *same process* as the `wf` that was
 //!    spawned: an `exec` replaces the image, so the pid the test is waiting on
 //!    exits with the shim's status. Spawn-and-wait would leave a `wf` parent
@@ -114,7 +117,8 @@ impl Scratch {
             "#!/usr/bin/env bash\n{}printf '{RAN}\\n'\n",
             record(&self.report())
         );
-        // `dl <path> -- <command>`: $1 is the checkout, $3 the shell command.
+        // `dl <owner/repo@branch> -- <command>`: $1 is the workspace spec,
+        // $3 the shell command.
         let dl = format!(
             "#!/usr/bin/env bash\n{}exec bash -c \"exec $3\"\n",
             record(&self.dl_report())
@@ -242,7 +246,7 @@ fn flags(stty: &str) -> Vec<&str> {
 // launch. Splitting it to satisfy a line count would mean three real starts.
 #[allow(clippy::too_many_lines)]
 #[test]
-fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
+fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     let scratch = Scratch::new();
     scratch.write_shims();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -310,15 +314,22 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
     let dl_report = std::fs::read_to_string(scratch.dl_report()).expect("the dl shim's report");
 
     // Claim 0: `wf` handed the whole agent command to `dl`, as one shell
-    // command after `--`, with the checkout — a **path**, never
-    // `owner/repo@branch` — as the workspace. The prompt is the argument that
-    // has to survive a shell, so it is the one that has to be quoted.
+    // command after `--`, with a **per-node workspace** —
+    // `owner/repo@wayfinder/<repo>-<n>`, never the checkout path — as the
+    // workspace (#106): the branch is what buys N tickets N containers, and
+    // what keeps every agent out of the human's tree. The prompt is the
+    // argument that has to survive a shell, so it is the one that has to be
+    // quoted.
     let dl_argv = field(&dl_report, "argv=");
     let (workspace, rest) = dl_argv.split_once(' ').expect("a workspace and a command");
-    assert_eq!(
-        Path::new(workspace).canonicalize().ok(),
-        repo.canonicalize().ok(),
-        "dl must be pointed at the checkout wf resolved, not at a repo spec"
+    let workspace_ticket = workspace
+        .strip_prefix("blooop/wayfinder@wayfinder/wayfinder-")
+        .unwrap_or_else(|| {
+            panic!("dl must be pointed at this repo's per-node workspace, got {workspace:?}")
+        });
+    assert!(
+        !workspace_ticket.is_empty() && workspace_ticket.chars().all(|c| c.is_ascii_digit()),
+        "the workspace branch ends in the node's number, got {workspace:?}"
     );
     let command = rest
         .strip_prefix("-- ")
@@ -339,13 +350,16 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
         "the agent must be the same process as wf, not a child of it"
     );
 
-    // Claim 1: what the agent was actually handed.
+    // Claim 1: what the agent was actually handed. The cwd is the picked
+    // checkout because that is where `wf` chdir'd before the exec — in a real
+    // launch `dl` re-homes the agent into the workspace clone; the shim runs
+    // it where it stands, so what is observable here is the chdir.
     let cwd = field(&report, "cwd=");
     let argv = field(&report, "argv=");
     assert_eq!(
         Path::new(cwd).canonicalize().ok(),
         repo.canonicalize().ok(),
-        "the agent must run in the checkout, not in wf's cwd"
+        "wf must exec from the picked checkout, not from its own cwd"
     );
     let (skip, prompt) = argv.split_once(' ').expect("two arguments");
     assert_eq!(skip, "--dangerously-skip-permissions");
@@ -371,6 +385,15 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
     if skill == "/wf" {
         assert_eq!(halves.len(), 2, "prompt was {prompt:?}");
     }
+    // The two halves of the launch agree: the workspace `dl` was pointed at is
+    // named by the same node the prompt hands the skill — the last numeric
+    // argument (the ticket, or the map when the map is the whole subject).
+    assert_eq!(
+        halves.last().copied(),
+        Some(workspace_ticket),
+        "the workspace branch and the prompt must name the same node: \
+         {workspace:?} vs {prompt:?}"
+    );
 
     // Claim 3a: the tty itself came back. `wf` runs raw the whole time it is
     // up, so an agent that finds a raw tty here is one that would have found a
