@@ -493,6 +493,40 @@ already has. The branch is the same `wayfinder/<repo>-<n>` that `/wf-tdd` does
 ticket `n`'s work on, so a build agent wakes up already on its work branch and a
 review launch opens on the branch the PR was pushed from.
 
+**Optional: warm the container at the first enter.** With `WF_PREWARM=1` set,
+staging an isolated node fires a background `dl <workspace> up`, so the image
+pull, the clone and the tool install run while you are still picking a mode and
+typing steer text. By the second enter the container is ready or nearly so —
+`dl` serializes the launch against the warm-up (a per-workspace lock), so the
+agent attaches to the container the prewarm built instead of racing it. On a
+cold node that is most of the wait gone.
+
+It is **off by default**, and the reason is worth reading before you turn it
+on. It makes the first enter — until now a keystroke that only opened an
+overlay — do real work: it fetches the repo, creates a work branch in `dl`'s
+cache, clones it, and builds and starts a container. That is a good trade
+while you are working a map and a bad one while you are browsing it.
+
+Two things to be clear about, because the cleanup is not automatic:
+
+- **An abandoned stage leaves its workspace behind.** Back out of the launch
+  picker, pick a host checkout at the which-checkout prompt, or pick a
+  *creation* row on a map (a creation runs in the repo's bare workspace, not
+  the node's), and the branch, the clone and the container stay. `wf reap`
+  will *not* collect them while the ticket is open — it only removes
+  workspaces whose tickets are **closed** — so until then they are yours to
+  remove with `dl <workspace> rm`.
+
+  Only a **node** is ever warmed. The map-less door offers creation rows
+  alone, so staging it warms nothing: there is no node for a launch to attach
+  to, and a keystroke should not pre-build a repo's default workspace on the
+  chance you file something.
+- **It does reach the network, but it never publishes.** Fetching the repo and
+  pulling the image are the point of doing it early. What it does not do is
+  write anything to GitHub: `dl` creates the work branch locally and never
+  pushes it, so an abandoned stage leaves no branch, no PR and no comment
+  behind.
+
 The tree you picked in the checkout picker is **not** the agent's working tree:
 its jobs are declaring the devcontainer and hosting non-isolated launches. No
 agent mutates your checkout, checks out its branches, or fights a second agent
@@ -505,6 +539,11 @@ it always has:
 
 1. the checkout declares one of those two configs, and
 2. `dl` is on PATH.
+
+**`WF_PREWARM=1` needs `dl` 0.0.24 or newer.** `dl <workspace> up` — start
+without attaching — and the per-workspace launch lock are what the warm-up is
+made of; on an older `dl` the background spawn fails silently and the launch
+simply pays the cold start at the second enter, as it always did.
 
 **Use `dl` 0.0.20 or newer.** Launching several tickets at once means several
 `dl` processes preparing the same repo's cache at the same moment; 0.0.20 is
