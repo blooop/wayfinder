@@ -45,12 +45,12 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
     None,
-    /// The launch picker — `enter` on a launchable node staged this launch, and
-    /// the overlay now collects the two things a launch needs beyond the node:
-    /// which [`Mode`] resolves it, picked from a list, and the steering text.
-    /// It resolves the route from the staged node and the picked mode, so it
-    /// *shows* which skill `enter` will run and re-reads as the mode moves — and
-    /// a picker for an unlaunchable node is unrepresentable, because
+    /// The launch picker — `enter` on a stop staged this launch, and the
+    /// overlay now collects the two things it still needs: which [`Candidate`]
+    /// runs, picked from a list, and the text that fills that row's field.
+    /// Every candidate carries its own resolved route, so the picker *shows*
+    /// which skill `enter` will run and re-reads as the pick moves — and a
+    /// picker for an unlaunchable node is unrepresentable, because
     /// [`launch::Launchable`] refused it before anything was staged.
     ///
     /// The staged launch is index-free ([`Staged`]) for the same reason the
