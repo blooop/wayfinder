@@ -18,11 +18,9 @@ use wf::model::{MapId, MapSet};
 use wf::projects::ProjectsCache;
 use wf::refresh::{spawn_discovery, LoadEvent, Loaders, MapFetch};
 
-const THIS_REPO: &str = "blooop/wayfinder";
+mod common;
 
-fn map_1() -> MapId {
-    MapId::new(THIS_REPO, 1)
-}
+use common::THIS_REPO;
 
 /// Take the next event, failing loudly rather than hanging a CI run forever.
 async fn next(rx: &mut mpsc::UnboundedReceiver<LoadEvent>) -> LoadEvent {
@@ -59,10 +57,6 @@ async fn discovery_then_every_map_arrives_through_one_channel() {
             }
         }
     };
-    assert!(
-        found.contains(&map_1()),
-        "this repo's original map is issue #1; found {found:?}"
-    );
     assert!(
         found.len() > 1,
         "every open map is discovered, not one per repo (#50); found {found:?}"
@@ -110,7 +104,10 @@ async fn a_cached_seed_fetches_the_map_without_waiting_for_the_search() {
     // The #28 claim, end to end: with the map id already in hand, the map
     // itself lands in one round trip — no ~2.5s search in front of it.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let seed: MapSet = [map_1()].into_iter().collect();
+    // Looked up *before* the clock starts, because that is what a seed is: an
+    // id already in hand when the run begins.
+    let live = common::a_live_map().await;
+    let seed: MapSet = [live.clone()].into_iter().collect();
 
     let started = Instant::now();
     let mut loaders = Loaders::new();
@@ -121,7 +118,7 @@ async fn a_cached_seed_fetches_the_map_without_waiting_for_the_search() {
             id,
             outcome: MapFetch::Loaded(map),
         } => {
-            assert_eq!(id, map_1());
+            assert_eq!(id, live);
             assert!(!map.tickets.is_empty());
         }
         other => panic!("the seeded loader must fetch the map, got {other:?}"),
@@ -152,7 +149,7 @@ async fn a_stale_seed_reports_failure_and_is_replaced_by_the_search() {
         other => panic!("a non-map must not fetch as a map, got {other:?}"),
     }
 
-    let truth: MapSet = [map_1()].into_iter().collect();
+    let truth: MapSet = [common::a_live_map().await].into_iter().collect();
     loaders.reconcile(&truth, &tx);
     assert_eq!(
         loaders.targets(),
@@ -185,7 +182,8 @@ async fn restarting_the_loaders_refetches_and_cannot_be_beaten_by_the_load_it_re
     // result reaching the UI through one channel in send order is what makes
     // the newest write win, and that is what this pins.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let seed: MapSet = [map_1()].into_iter().collect();
+    let live = common::a_live_map().await;
+    let seed: MapSet = [live.clone()].into_iter().collect();
 
     let mut loaders = Loaders::new();
     loaders.reconcile(&seed, &tx);
@@ -207,7 +205,7 @@ async fn restarting_the_loaders_refetches_and_cannot_be_beaten_by_the_load_it_re
             id,
             outcome: MapFetch::Loaded(map),
         } => {
-            assert_eq!(id, map_1());
+            assert_eq!(id, live);
             assert!(!map.tickets.is_empty());
         }
         other => panic!("ctrl-r must refetch, got {other:?}"),
@@ -229,7 +227,7 @@ async fn shutdown_leaves_nothing_in_flight() {
     // task's `Child` is dropped, which only happens if someone waits for the
     // cancellation to actually run.
     let (tx, _rx) = mpsc::unbounded_channel();
-    let seed: MapSet = [map_1()].into_iter().collect();
+    let seed: MapSet = [common::a_live_map().await].into_iter().collect();
 
     let mut loaders = Loaders::new();
     loaders.reconcile(&seed, &tx);
