@@ -571,8 +571,13 @@ impl Launch {
     /// there is nothing to say to it, which is a shorter argv rather than an
     /// empty argument (`claude ""` is a prompt, and an empty one).
     fn prompt(&self) -> Option<String> {
-        let skill = self.skill_invocation()?;
-        Some(format!("{skill}{}", self.mode.suffix()))
+        match self.skill_invocation() {
+            Some(skill) => Some(format!("{skill}{}", self.mode.suffix())),
+            // No skill in front of it for a ` steer: …` suffix to steer, so
+            // the typed text is not steering anything — it is the whole of
+            // what the session is opened on.
+            None => self.mode.steer.clone(),
+        }
     }
 
     /// The slash command and its arguments, for the routes that invoke a
@@ -981,6 +986,15 @@ mod tests {
         }
     }
 
+    /// The whole argv of a launch aimed at the whole map.
+    fn map_argv(mode: &LaunchMode) -> Vec<String> {
+        let staged = Staged::map(&MapId::new("blooop/wayfinder", 59), "the dev-process tree");
+        match plan(&cache(), &staged, mode) {
+            Targets::One(l) => l.agent_argv(),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// The same, for a launch aimed at the whole map.
     fn map_prompt(mode: &LaunchMode) -> String {
         let staged = Staged::map(&MapId::new("blooop/wayfinder", 59), "the dev-process tree");
@@ -1172,6 +1186,35 @@ mod tests {
         // and no prompt argument at all rather than an empty one.
         assert_eq!(
             ticket_argv(TicketType::Build, Stage::Ready, &plain("")),
+            vec!["claude".to_string(), SKIP_PERMISSIONS.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_plain_session_opens_on_what_was_typed_and_nothing_else() {
+        // Steering rides as ` steer: …` because there is a skill in front of
+        // it to steer. With no skill the same suffix would be addressed to
+        // nobody, so the text is simply the session's first message — and the
+        // map number, which is an argument to a skill and not to `claude`,
+        // does not appear either.
+        assert_eq!(
+            ticket_argv(TicketType::Build, Stage::Ready, &plain("rebase onto main")),
+            vec![
+                "claude".to_string(),
+                SKIP_PERMISSIONS.to_string(),
+                "rebase onto main".to_string()
+            ]
+        );
+        assert_eq!(
+            map_argv(&plain("what is actually left in here?")),
+            vec![
+                "claude".to_string(),
+                SKIP_PERMISSIONS.to_string(),
+                "what is actually left in here?".to_string()
+            ]
+        );
+        assert_eq!(
+            map_argv(&plain("")),
             vec!["claude".to_string(), SKIP_PERMISSIONS.to_string()]
         );
     }
