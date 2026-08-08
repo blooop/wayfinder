@@ -58,6 +58,18 @@ build:
           # dep than the one that was tested.
           - cargo build --release --locked --bin wf
           - install -Dm755 target/release/wf "$PREFIX/bin/wf"
+          # The prompts `wf` execs travel in the same package as the binary
+          # that execs them. `wf` hardcodes `/tdd`, `/review`, `/wayfinder` and
+          # `/wayfinder-auto` in its routing table, so the skill files are part
+          # of its interface — and an interface split across two repos on two
+          # release cadences drifts silently, which is exactly what happened
+          # before this (blooop/wayfinder#96).
+          #
+          # `share/wf/skills` relative to `$PREFIX`, which is what
+          # `wf skills` reconstructs from its own `current_exe()` — so the
+          # binary can find its own prompts without being told where they are.
+          - mkdir -p "$PREFIX/share/wf"
+          - cp -R skills "$PREFIX/share/wf/skills"
         else:
           - echo "wf has no Windows build script yet" >&2 && exit 1
 
@@ -82,14 +94,31 @@ tests:
   - script:
       - if: unix
         then:
-          # The only thing testable without a tty or `gh` auth: `wf --version`
+          # The only things testable without a tty or `gh` auth: `wf --version`
           # answers on stdout and exits without touching either. That is exactly
           # why the flag exists.
           - wf --version
           - wf --help
+          # `wf skills` resolves the bundle from the installed binary's own
+          # path, so running it here proves the package really carries the
+          # prompts *and* that the binary can find them — the two halves that
+          # could each be right while the pair is broken. It reads only; the
+          # `install` half writes to $HOME and is not a package concern.
+          - wf skills
   - package_contents:
       bin:
         - wf
+      files:
+        # Named individually rather than as a glob: the routing table promises
+        # these four skills exist, so a package that quietly shipped three
+        # must fail here rather than at the moment an agent is launched.
+        - share/wf/skills/wayfinder/SKILL.md
+        - share/wf/skills/wayfinder-auto/SKILL.md
+        - share/wf/skills/wayfinder-one/SKILL.md
+        - share/wf/skills/tdd/SKILL.md
+        - share/wf/skills/review/SKILL.md
+        - share/wf/skills/wayfinder/GITHUB_TRACKER.md
+        - share/wf/skills/wayfinder/LIFECYCLE.md
 
 about:
   homepage: https://github.com/blooop/wayfinder

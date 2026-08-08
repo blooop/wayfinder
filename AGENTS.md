@@ -44,6 +44,43 @@ Two things to know about it:
   KEYS="down right" cargo run --example preview_screen -- blooop/wayfinder 47
   ```
 
+- **It cannot find its own skills.** `wf skills` resolves the bundle from the
+  binary's own path — `<prefix>/share/wf/skills` for an installed package, or
+  `<repo>/skills` for anything under `target/` — and a `wf-next` copied to
+  `~/.local/bin` matches neither. Point it at the checkout explicitly:
+
+  ```
+  WF_SKILLS_DIR=$PWD/skills wf-next skills
+  ```
+
+  `target/release/wf` needs no such help: it is inside the repo, so it finds
+  `skills/` on its own.
+
+## The skills are part of this repo
+
+`skills/` holds the five prompts `wf` execs — `wayfinder`, `wayfinder-auto`,
+`wayfinder-one`, `tdd`, `review`. They are not documentation *about* `wf`; they
+are what it runs, named literally in `launch::route`, and the package installs
+them beside the binary so the two cannot drift (`src/skills.rs` says why at
+length).
+
+Two consequences for anyone editing here:
+
+- **Editing a skill is editing `wf`'s behaviour.** A change to
+  `skills/wayfinder/SKILL.md` ships in the next release exactly as a change to
+  `src/` does, and belongs in the same PR as whatever routing change motivated
+  it. `skills/wayfinder-one/SKILL.md` and `wayfinder-auto` link
+  `../wayfinder/GITHUB_TRACKER.md` and `../wayfinder/LIFECYCLE.md` by relative
+  path, so the five move as a set and the layout under `skills/` is load-bearing.
+- **Adding a `Route` means adding a skill.** `skills::BUNDLED` lists what ships
+  and a unit test asserts every `Route::label()` is in it, so a route pointing
+  at a prompt the package does not carry fails the build rather than an agent
+  launch.
+
+To work on a skill against a released `wf`, link the checkout instead of the
+package — `WF_SKILLS_DIR=$PWD/skills wf skills install` — and the edit is live
+in the next session.
+
 ## Checks
 
 CI runs four things, in the order they are cheap to fix, with **both**
