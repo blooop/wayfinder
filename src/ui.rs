@@ -506,7 +506,8 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// options are rows now: each one names its mode, the skill that mode routes the
 /// staged node to, and who ends up deciding. Which is also why the route is
 /// drawn per option rather than once for the cursor's — the difference between
-/// `/wf` and `/wf-auto` *is* the choice being made, so both are on screen.
+/// `/wf`, `/wf-auto` and no skill at all (#112) *is* the choice being made, so
+/// every one of them is on screen.
 fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, mode: Mode, steer: &str) {
     let mut lines = vec![Line::default()];
     for option in Mode::all() {
@@ -1491,13 +1492,20 @@ mod tests {
             screen.contains("launch #6 Re-entry breadcrumbs"),
             "{screen}"
         );
-        // Both modes are on screen with the skill each one would run, because
+        // Every mode is on screen with the skill each one would run, because
         // that difference *is* the choice being offered — and the cursor sits
         // on the interactive default.
         assert!(screen.contains("▶ interactive"), "{screen}");
         assert!(screen.contains("/wf "), "{screen}");
         assert!(screen.contains("auto"), "{screen}");
         assert!(screen.contains("/wf-auto"), "{screen}");
+        // The skill-free mode (#112) reads as what it execs — a bare `claude`,
+        // no slash command — and says what picking it costs you. The route
+        // column is asserted too: it is the half of the row that says what will
+        // actually run, and it is drawn from a label nothing else reads.
+        assert!(screen.contains("plain"), "{screen}");
+        assert!(screen.contains("claude"), "{screen}");
+        assert!(screen.contains("no skill"), "{screen}");
         assert!(screen.contains("steer"), "{screen}");
         assert!(screen.contains("esc cancel"), "{screen}");
 
@@ -1507,6 +1515,11 @@ mod tests {
         let screen = render(&app);
         assert!(screen.contains("▶ auto"), "{screen}");
         assert!(!screen.contains("▶ interactive"), "{screen}");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("▶ plain"), "{screen}");
+        assert!(!screen.contains("▶ auto"), "{screen}");
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
 
         // Typing steers rather than picking: the text lands in the field, and
         // the mode stays where the cursor put it.

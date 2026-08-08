@@ -71,10 +71,13 @@ Three consequences for anyone editing here:
   it. `skills/wf-one/SKILL.md` and `wf-auto` link
   `../wf/GITHUB_TRACKER.md` and `../wf/LIFECYCLE.md` by relative
   path, so the five move as a set and the layout under `skills/` is load-bearing.
-- **Adding a `Route` means adding a skill.** `skills::BUNDLED` lists what ships
-  and a unit test asserts every `Route::label()` is in it, so a route pointing
+- **Adding a `Route` means saying which skill it invokes — or that it invokes
+  none.** `skills::BUNDLED` lists what ships and `Route::bundled_skill()` is the
+  exhaustive answer to which of them a route names; a unit test sweeps
+  `Route::all()` and asserts every `Some` is in the bundle, so a route pointing
   at a prompt the package does not carry fails the build rather than an agent
-  launch.
+  launch. `Route::Plain` (#112) is the one `None`: it execs the agent with no
+  slash command, so there is no prompt for the package to be missing.
 - **Renaming one leaves residue on every machine that had the old name.**
   `status` and `install` both iterate `BUNDLED`, so a link named for a skill
   that left the list is invisible to them while staying on disk, dangling.
