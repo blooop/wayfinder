@@ -211,6 +211,124 @@ impl Mode {
     }
 }
 
+/// Something new to start in a repo — the creation half of the picker (#114).
+/// Which kind, not yet what: the typed text that completes it (the task, or a
+/// map seed) arrives at the second enter, as [`Creation`].
+///
+/// Three hand-listed kinds rather than a creation × [`Mode`] product, because
+/// the product is dishonest: charting a map with no skill (`plain`) is
+/// meaningless, and a task's lifecycle is `/wf-one`'s own. These are exactly
+/// the combinations that mean something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationKind {
+    /// One tracked ticket via `/wf-one`: filed, built, reviewed.
+    Task,
+    /// Chart a new map via `/wf`, with the human in the loop.
+    Map,
+    /// Chart a new map via `/wf-auto`, alone.
+    MapAuto,
+}
+
+impl CreationKind {
+    /// Every kind, in picker order. Written out rather than derived from an
+    /// `after` cycle: three variants with one call site is below the size
+    /// where the cycle device earns its ceremony.
+    pub fn all() -> Vec<CreationKind> {
+        vec![CreationKind::Task, CreationKind::Map, CreationKind::MapAuto]
+    }
+
+    /// How the row reads in the picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            CreationKind::Task => "new task",
+            CreationKind::Map => "new map",
+            CreationKind::MapAuto => "new map, auto",
+        }
+    }
+
+    /// What picking it means — same register as [`Mode::blurb`].
+    pub fn blurb(self) -> &'static str {
+        match self {
+            CreationKind::Task => "one tracked ticket, built and reviewed",
+            CreationKind::Map => "chart a new map in this repo, with you",
+            CreationKind::MapAuto => "chart a new map in this repo, alone",
+        }
+    }
+
+    /// The skill this creation execs. Its own answer rather than [`route`]'s:
+    /// creation has no aim and no stage, so the (aim, mode) table has nothing
+    /// to say about it.
+    pub fn route(self) -> Route {
+        match self {
+            CreationKind::Task => Route::One,
+            CreationKind::Map => Route::Wayfinder,
+            CreationKind::MapAuto => Route::WayfinderAuto,
+        }
+    }
+
+    /// What the text field means on this row — the name drawn beside it.
+    pub fn field(self) -> &'static str {
+        match self {
+            CreationKind::Task => "task",
+            CreationKind::Map | CreationKind::MapAuto => "seed",
+        }
+    }
+}
+
+/// One row of the launch picker: a **complete candidate**, carrying its own
+/// aim and mode and therefore its own resolved route (#114). The picker's
+/// list stopped being a bare [`Mode`] walk when it started answering two
+/// questions — what am I aiming at, and who resolves it — and complete rows
+/// are what keep every one of them naming the skill it execs.
+///
+/// The launch arm carries its route *resolved* rather than re-deriving it at
+/// each use — the [`Targets::Many`] move: the pick cannot produce a launch
+/// inconsistent with the row that was drawn. [`Staged::candidates`] is the
+/// one constructor, so a launch row whose route disagrees with its mode, or a
+/// creation row on a stop that is not repo-level, is never built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Candidate {
+    /// Launch the staged node, `mode` deciding who resolves it.
+    Launch { mode: Mode, route: Route },
+    /// Start something new in the staged node's repo.
+    Create(CreationKind),
+}
+
+impl Candidate {
+    /// How the row reads in the picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            Candidate::Launch { mode, .. } => mode.label(),
+            Candidate::Create(kind) => kind.label(),
+        }
+    }
+
+    /// What picking it means.
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Candidate::Launch { mode, .. } => mode.blurb(),
+            Candidate::Create(kind) => kind.blurb(),
+        }
+    }
+
+    /// The skill this row execs — already resolved, whichever arm.
+    pub fn route(self) -> Route {
+        match self {
+            Candidate::Launch { route, .. } => route,
+            Candidate::Create(kind) => kind.route(),
+        }
+    }
+
+    /// What the text field means while this row is picked: launch rows steer
+    /// the agent; creation rows take the task or the seed.
+    pub fn field(self) -> &'static str {
+        match self {
+            Candidate::Launch { .. } => "steer",
+            Candidate::Create(kind) => kind.field(),
+        }
+    }
+}
+
 /// What the launch picker settled on: who decides, and what steers them.
 ///
 /// Two independent axes, so genuinely a product and not a four-armed sum: the
@@ -428,6 +546,25 @@ impl Staged {
     /// echoes as the mode word is typed, and what [`plan`] resolves with.
     pub fn route(&self, mode: Mode) -> Route {
         route(&self.aim, mode)
+    }
+
+    /// The picker's rows for this stop, in on-screen order — the one
+    /// constructor of [`Candidate`], which is what makes an inconsistent row
+    /// unbuildable (#114). Every stop launches; only the repo-level stop — the
+    /// cluster header, [`Aim::Map`] — adds the creation rows, because creation
+    /// is a repo-level act and a ticket picker carrying it would merge
+    /// concerns the stop grammar keeps apart.
+    pub fn candidates(&self) -> Vec<Candidate> {
+        let launches = Mode::all().into_iter().map(|mode| Candidate::Launch {
+            mode,
+            route: self.route(mode),
+        });
+        match self.aim {
+            Aim::Ticket { .. } => launches.collect(),
+            Aim::Map => launches
+                .chain(CreationKind::all().into_iter().map(Candidate::Create))
+                .collect(),
+        }
     }
 
     /// How the staged node reads: `#<n>`, the ticket's number or the map's.
@@ -1006,6 +1143,116 @@ mod tests {
                 "{typed:?} steers an interactive launch"
             );
         }
+    }
+
+    #[test]
+    fn a_ticket_picker_lists_exactly_the_three_launch_modes() {
+        // #114: creation is a repo-level act, and a ticket is not a repo-level
+        // stop — its picker stays the pure mode list, concerns unmerged.
+        let staged =
+            Staged::ticket(&ticket("blooop/wayfinder", 16), 1, Stage::Ready).expect("launchable");
+        assert_eq!(
+            staged.candidates(),
+            vec![
+                Candidate::Launch {
+                    mode: Mode::Interactive,
+                    route: Route::Wayfinder
+                },
+                Candidate::Launch {
+                    mode: Mode::Auto,
+                    route: Route::WayfinderAuto
+                },
+                Candidate::Launch {
+                    mode: Mode::Plain,
+                    route: Route::Plain
+                },
+            ]
+        );
+    }
+    #[test]
+    fn a_header_picker_adds_the_creation_rows_after_the_launch_rows() {
+        // The repo-level stop is where creation lives: the same three launch
+        // rows, then the three ways to start something new in this repo. Each
+        // candidate is complete — it carries its own resolved route, the
+        // `Targets::Many` move — so a row and its launch cannot disagree.
+        let staged = Staged::map(&MapId::new("blooop/wayfinder", 59), "the dev-process tree");
+        let candidates = staged.candidates();
+        assert_eq!(
+            candidates,
+            vec![
+                Candidate::Launch {
+                    mode: Mode::Interactive,
+                    route: Route::Wayfinder
+                },
+                Candidate::Launch {
+                    mode: Mode::Auto,
+                    route: Route::WayfinderAuto
+                },
+                Candidate::Launch {
+                    mode: Mode::Plain,
+                    route: Route::Plain
+                },
+                Candidate::Create(CreationKind::Task),
+                Candidate::Create(CreationKind::Map),
+                Candidate::Create(CreationKind::MapAuto),
+            ]
+        );
+        // Every row names the skill it execs — including the creation rows,
+        // whose routes are theirs rather than the staged node's.
+        let routes: Vec<Route> = candidates.iter().map(|c| c.route()).collect();
+        assert_eq!(
+            routes[3..],
+            [Route::One, Route::Wayfinder, Route::WayfinderAuto]
+        );
+    }
+
+    #[test]
+    fn a_build_tickets_launch_rows_resolve_its_own_stage_routes() {
+        // Complete candidates mean the per-row route is the (aim, mode) answer
+        // for *this* node: a build ticket's interactive row reads /wf-tdd, not
+        // a generic default.
+        let mut node = ticket("blooop/wayfinder", 16);
+        node.ticket_type = TicketType::Build;
+        let staged = Staged::ticket(&node, 1, Stage::Ready).expect("launchable");
+        assert_eq!(
+            staged.candidates()[0],
+            Candidate::Launch {
+                mode: Mode::Interactive,
+                route: Route::Tdd
+            }
+        );
+    }
+
+    #[test]
+    fn creation_rows_read_as_what_they_start() {
+        assert_eq!(Candidate::Create(CreationKind::Task).label(), "new task");
+        assert_eq!(Candidate::Create(CreationKind::Map).label(), "new map");
+        assert_eq!(
+            Candidate::Create(CreationKind::MapAuto).label(),
+            "new map, auto"
+        );
+        // Launch rows keep reading as their mode.
+        assert_eq!(
+            Candidate::Launch {
+                mode: Mode::Interactive,
+                route: Route::Wayfinder
+            }
+            .label(),
+            "interactive"
+        );
+        // The text field names what typing into it means, per row: steering an
+        // agent, the task itself, or a seed for the charting session.
+        assert_eq!(
+            Candidate::Launch {
+                mode: Mode::Auto,
+                route: Route::WayfinderAuto
+            }
+            .field(),
+            "steer"
+        );
+        assert_eq!(Candidate::Create(CreationKind::Task).field(), "task");
+        assert_eq!(Candidate::Create(CreationKind::Map).field(), "seed");
+        assert_eq!(Candidate::Create(CreationKind::MapAuto).field(), "seed");
     }
 
     #[test]
