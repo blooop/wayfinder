@@ -139,6 +139,9 @@ pub enum StopKey {
     Map(MapId),
     Ticket(RowKey),
     Group(GroupId),
+    /// The empty-state door, by repo slug — already index-free, like the
+    /// map and group keys.
+    Project(String),
 }
 
 /// Where the cursor is, and — the part that matters — **whether anyone put it
@@ -333,7 +336,45 @@ impl App {
     /// what the draw walks and what the cursor navigates, so the two can never
     /// disagree about order.
     pub fn plan(&self) -> Plan {
-        view::plan(&self.scoped_clusters(), self.screen(), &self.expanded)
+        let mut plan = view::plan(&self.scoped_clusters(), self.screen(), &self.expanded);
+        if let Some(repo) = self.mapless_door() {
+            plan.items.push(view::Item::MaplessHeader(repo));
+        }
+        plan
+    }
+
+    /// The repo whose empty-state door this screen is showing, if it is
+    /// showing one (#114).
+    ///
+    /// Deliberately only the **focused** empty state: a registered repo with
+    /// no open map, with the scope on it and nothing rendered. That is the
+    /// case `wf` opened inside a fresh checkout lands in, and it is where the
+    /// repo's *first* map has otherwise had no way in — the picker's rows all
+    /// hang off stops, and a repo with no map renders no stop.
+    ///
+    /// A row per map-less project on the *widened* screen is the version this
+    /// is not: permanent furniture on a screen that is otherwise all signal,
+    /// one extra row every frame for an occasional act. Reaching those repos
+    /// is the project surface's job, not the tree's.
+    fn mapless_door(&self) -> Option<String> {
+        // Not until the load has landed. A focused repo whose maps are still
+        // in flight looks identical to one that has none, and drawing the door
+        // then would put a creation row under `enter` for the second or two
+        // before the clusters arrive — turning an ordinary launch into a new
+        // map. Same reason [`crate::ui::heading`] will not say "no projects"
+        // while the search is out.
+        if !self.startup.is_loaded() {
+            return None;
+        }
+        let Scope::Project(repo) = &self.scope else {
+            return None;
+        };
+        // Registered, and nothing of it on screen: a repo whose clusters are
+        // merely filtered out by a query still *has* maps, and its door would
+        // be a second answer to a question the query is already answering.
+        let registered = self.checkouts.iter().any(|c| &c.repo == repo);
+        let has_clusters = self.clusters.keys().any(|id| &id.repo == repo);
+        (registered && !has_clusters).then(|| repo.clone())
     }
 
     /// Every cursor stop with its depth, in on-screen order (#57). The cursor
@@ -369,6 +410,7 @@ impl App {
             Stop::Map(id) => StopKey::Map(id.clone()),
             Stop::Ticket(row) => StopKey::Ticket(self.row_key(row)),
             Stop::Group(id) => StopKey::Group(id.clone()),
+            Stop::Project(repo) => StopKey::Project(repo.clone()),
         }
     }
 
@@ -407,7 +449,7 @@ impl App {
     pub fn cursor_row(&self) -> Option<Row> {
         match self.cursor_stop() {
             Some(Stop::Ticket(row)) => Some(row),
-            Some(Stop::Map(_) | Stop::Group(_)) | None => None,
+            Some(Stop::Map(_) | Stop::Group(_) | Stop::Project(_)) | None => None,
         }
     }
 
@@ -420,13 +462,14 @@ impl App {
     }
 
     /// Which map the cursor is in, whichever kind of stop it is on — what
-    /// `ctrl-f` focuses. Every stop belongs to a cluster, so this is total
-    /// wherever the cursor can be at all.
+    /// `ctrl-f` focuses. `None` on the empty-state door: it names a repo that
+    /// has no map, which is the one stop that belongs to no cluster.
     pub fn cursor_map(&self) -> Option<MapId> {
         match self.cursor_stop()? {
             Stop::Map(id) => Some(id),
             Stop::Ticket(row) => Some(row.map),
             Stop::Group(id) => Some(id.map),
+            Stop::Project(_) => None,
         }
     }
 
@@ -624,6 +667,17 @@ impl App {
             Some(Stop::Map(id)) => {
                 let title = self.clusters[&id].title.clone();
                 let staged = Staged::map(&id, &title);
+                self.overlay = Overlay::PickLaunch {
+                    candidate: staged.default_candidate(),
+                    staged,
+                    steer: String::new(),
+                };
+                Outcome::Continue
+            }
+            // The empty-state door (#114): nothing to launch here, so the
+            // picker opens straight onto the creation rows.
+            Some(Stop::Project(repo)) => {
+                let staged = Staged::project(&repo);
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
                     staged,
@@ -1296,6 +1350,7 @@ mod tests {
             Some(Stop::Map(id)) => format!("map #{}", id.number),
             Some(Stop::Ticket(row)) => format!("#{}", app.ticket(&row).number),
             Some(Stop::Group(g)) => format!("{:?}", g.kind),
+            Some(Stop::Project(repo)) => format!("project {repo}"),
             None => "nothing".to_string(),
         }
     }
@@ -1762,7 +1817,7 @@ mod tests {
             } => {
                 assert_eq!(
                     staged.route(Mode::Interactive),
-                    Route::Wayfinder,
+                    Some(Route::Wayfinder),
                     "a task is a decision node"
                 );
                 assert_eq!(staged.key(), "#6");
@@ -2109,8 +2164,8 @@ mod tests {
             Overlay::PickLaunch { staged, .. } => {
                 assert_eq!(staged.key(), "#1");
                 assert_eq!(staged.title, "Map: wf", "the picker names the map");
-                assert_eq!(staged.route(Mode::Interactive), Route::Wayfinder);
-                assert_eq!(staged.route(Mode::Auto), Route::WayfinderAuto);
+                assert_eq!(staged.route(Mode::Interactive), Some(Route::Wayfinder));
+                assert_eq!(staged.route(Mode::Auto), Some(Route::WayfinderAuto));
             }
             other => panic!("expected the launch picker, got {other:?}"),
         }
@@ -2130,6 +2185,90 @@ mod tests {
             other => panic!("expected a launch, got {other:?}"),
         };
         assert_eq!(launch.agent_argv().last().unwrap(), "/wf-auto 1");
+    }
+
+    /// An app focused on a registered repo that has no open map — what `wf`
+    /// opened inside a fresh checkout is looking at.
+    fn mapless_app() -> App {
+        let mut app = App::new(BTreeMap::new()).with_checkouts(vec![Checkout {
+            path: std::path::PathBuf::from("/data/proj/newthing"),
+            repo: "blooop/newthing".to_string(),
+        }]);
+        app.scope = Scope::Project("blooop/newthing".to_string());
+        app
+    }
+
+    #[test]
+    fn a_focused_repo_with_no_map_renders_one_slim_header_to_start_from() {
+        // #114's empty-state door: this screen used to render nothing at all,
+        // which is where the first map of a repo had no way in. The header is
+        // a stop, so the cursor can name it and `enter` can act on it.
+        let app = mapless_app();
+        assert_eq!(
+            app.stops().iter().map(|at| at.stop.clone()).collect::<Vec<_>>(),
+            vec![Stop::Project("blooop/newthing".to_string())]
+        );
+        assert_eq!(app.cursor_stop(), Some(Stop::Project("blooop/newthing".to_string())));
+    }
+
+    #[test]
+    fn a_mapless_repo_offers_creation_and_nothing_to_launch() {
+        // There is no node here, so there is nothing to launch: the picker is
+        // the three creation rows alone. A launch row would name a skill with
+        // no argument to give it.
+        let mut app = mapless_app();
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        match &app.overlay {
+            Overlay::PickLaunch { staged, candidate, .. } => {
+                assert_eq!(
+                    staged.candidates(),
+                    vec![
+                        Candidate::Create(CreationKind::Task),
+                        Candidate::Create(CreationKind::Map),
+                        Candidate::Create(CreationKind::MapAuto),
+                    ]
+                );
+                assert_eq!(*candidate, Candidate::Create(CreationKind::Task));
+            }
+            other => panic!("expected the launch picker, got {other:?}"),
+        }
+        // And it charts: the first map of this repo, from the door that had
+        // nothing behind it before.
+        app.handle_key(key(KeyCode::Down)); // onto `new map`
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.agent_argv().last().unwrap(), "/wf");
+        assert_eq!(launch.cwd(), std::path::Path::new("/data/proj/newthing"));
+    }
+
+    #[test]
+    fn the_door_waits_for_the_load_rather_than_flashing_up_mid_fetch() {
+        // A focused repo whose maps have not arrived *yet* looks exactly like
+        // one that has none — the same ambiguity `Startup` exists to remove
+        // for the "no projects" heading. Rendering the door on that screen
+        // would put a creation row under `enter` for the second or two before
+        // the clusters land, so an ordinary launch would start a new map.
+        let mut app = mapless_app();
+        app.startup = Startup::default();
+        assert!(app.stops().is_empty(), "no door while the search is out");
+        let found: MapSet = [MapId::new("blooop/newthing", 3)].into_iter().collect();
+        app.startup.searched(&found);
+        assert!(app.stops().is_empty(), "nor while its map is still coming");
+        // Only once the load has actually landed and left nothing behind.
+        app.startup = Startup::loaded();
+        assert_eq!(app.stops().len(), 1);
+    }
+
+    #[test]
+    fn map_less_repos_stay_off_the_widened_screen() {
+        // The door is the *focused* empty state, not a row per project on the
+        // main screen: permanent furniture for an occasional act is what #114
+        // ruled out. Widening drops it.
+        let mut app = mapless_app();
+        app.scope = Scope::All;
+        assert!(app.stops().is_empty());
     }
 
     #[test]
@@ -2315,7 +2454,7 @@ mod tests {
         ready.handle_key(key(KeyCode::Enter));
         match &ready.overlay {
             Overlay::PickLaunch { staged, .. } => {
-                assert_eq!(staged.route(Mode::Interactive), Route::Tdd);
+                assert_eq!(staged.route(Mode::Interactive), Some(Route::Tdd));
             }
             other => panic!("expected the launch picker, got {other:?}"),
         }
@@ -2336,7 +2475,7 @@ mod tests {
         in_review.handle_key(key(KeyCode::Enter));
         match &in_review.overlay {
             Overlay::PickLaunch { staged, .. } => {
-                assert_eq!(staged.route(Mode::Interactive), Route::Review);
+                assert_eq!(staged.route(Mode::Interactive), Some(Route::Review));
             }
             other => panic!("expected the launch picker, got {other:?}"),
         }

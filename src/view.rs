@@ -120,6 +120,10 @@ pub enum Stop {
     Map(MapId),
     Ticket(Row),
     Group(GroupId),
+    /// A focused repo with no open map, by full slug (#114). Nothing to
+    /// launch — this is the door its *first* map is charted from, and the one
+    /// stop that names a repo rather than something in a map.
+    Project(String),
 }
 
 /// A stop plus the depth it sits at — everything navigation needs.
@@ -136,6 +140,9 @@ pub struct StopAt {
 pub enum Item {
     /// A cluster header — the map this and the following lines belong to.
     Header(MapId),
+    /// The slim header of a focused repo with no open map (#114): no stage
+    /// counts, because there are no stages — just somewhere to stand.
+    MaplessHeader(String),
     /// A ticket row.
     Ticket {
         row: Row,
@@ -184,6 +191,10 @@ impl Item {
             // a top-level row already steps back to it as the previous stop.
             Item::Header(id) => Some(StopAt {
                 stop: Stop::Map(id.clone()),
+                depth: 0,
+            }),
+            Item::MaplessHeader(repo) => Some(StopAt {
+                stop: Stop::Project(repo.clone()),
                 depth: 0,
             }),
             // Nothing to land on. A sifted group leads this arm because it is
@@ -548,7 +559,11 @@ fn attach_rollups(items: &mut [Item], clusters: &[(&MapId, &Map)]) {
             }
             // `Item::Context` cannot appear here: rollups are attached only to
             // the unsifted screens, and only a sift produces context rows.
-            Item::Header(_) | Item::Group { .. } | Item::Context { .. } | Item::Blank => {
+            Item::Header(_)
+            | Item::MaplessHeader(_)
+            | Item::Group { .. }
+            | Item::Context { .. }
+            | Item::Blank => {
                 branches.extend(open.take());
             }
         }
@@ -1015,6 +1030,7 @@ mod tests {
                     Stop::Map(id) => format!("map #{}", id.number),
                     Stop::Ticket(row) => format!("#{}", m.tickets[row.index].number),
                     Stop::Group(g) => format!("{:?}", g.kind),
+                    Stop::Project(repo) => format!("project {repo}"),
                 };
                 (label, at.depth)
             })
@@ -1176,7 +1192,7 @@ mod tests {
             .into_iter()
             .filter_map(|at| match at.stop {
                 Stop::Map(id) => Some(id),
-                Stop::Ticket(_) | Stop::Group(_) => None,
+                Stop::Ticket(_) | Stop::Group(_) | Stop::Project(_) => None,
             })
             .collect();
         assert_eq!(
@@ -1674,6 +1690,7 @@ mod tests {
             .iter()
             .map(|item| match item {
                 Item::Header(id) => format!("▌ {}", id.short_repo()),
+                Item::MaplessHeader(repo) => format!("▌ {repo} no map"),
                 Item::Ticket { row, prefix, .. } => format!("{prefix}#{}", number(row)),
                 Item::Context { row, prefix } => format!("{prefix}#{} dim", number(row)),
                 Item::Group {

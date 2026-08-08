@@ -479,7 +479,7 @@ impl Launchable {
 /// from a node's PRs and a map has none. So the two are arms of one sum rather
 /// than a ticket struct with optional fields, and every consumer that needs a
 /// ticket number has to say which case it is answering.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Aim {
     /// The cluster header: the map itself, charted or driven as a whole.
     Map,
@@ -556,18 +556,37 @@ pub fn route(aim: &Aim, mode: Mode) -> Route {
 /// [`Launch`]es rather than a choice to re-resolve later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Staged {
-    /// The node's repo, full slug (`owner/name`) — what the checkout cache
-    /// is matched on (#15).
+    /// The repo, full slug (`owner/name`) — what the checkout cache is
+    /// matched on (#15), and the repo any creation lands in.
     pub repo: String,
-    /// What the launch picker names: the map, or one ticket in it.
-    pub aim: Aim,
+    /// What was stood on: a node fetched from the tracker, or a registered
+    /// repo with no map at all.
+    pub at: StagedAt,
     /// Its title as it read when the picker opened — the picker is showing the
     /// human what they picked, not re-reporting a row that may have moved.
     pub title: String,
-    /// The map issue of the cluster the row was picked in (#50) — which map a
-    /// ticket listed twice was launched from, and the launch target itself
-    /// when the cursor was on the cluster header.
-    pub map_issue: u64,
+}
+
+/// What the picker was opened on (#114). A map-less repo is not a node with a
+/// missing issue number — it has no aim, no map and nothing to launch, because
+/// nothing has been filed in it yet — so the two are arms of one sum rather
+/// than a node struct with optional fields. Which rows the picker offers falls
+/// out of this: a node launches (and a map also creates), a bare repo only
+/// creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedAt {
+    /// A node the tracker knows about.
+    Node {
+        /// What the launch picker names: the map, or one ticket in it.
+        aim: Aim,
+        /// The map issue of the cluster the row was picked in (#50) — which
+        /// map a ticket listed twice was launched from, and the launch target
+        /// itself when the cursor was on the cluster header.
+        map_issue: u64,
+    },
+    /// A registered checkout whose repo has no open map: the empty-state door
+    /// this repo's *first* map is charted from.
+    Project,
 }
 
 impl Staged {
@@ -577,13 +596,15 @@ impl Staged {
     pub fn ticket(ticket: &Ticket, map_issue: u64, stage: Stage) -> Option<Staged> {
         Some(Staged {
             repo: ticket.repo.clone(),
-            aim: Aim::Ticket {
-                number: ticket.number,
-                ticket_type: ticket.ticket_type,
-                stage: Launchable::parse(stage)?,
+            at: StagedAt::Node {
+                aim: Aim::Ticket {
+                    number: ticket.number,
+                    ticket_type: ticket.ticket_type,
+                    stage: Launchable::parse(stage)?,
+                },
+                map_issue,
             },
             title: ticket.title.clone(),
-            map_issue,
         })
     }
 
@@ -593,16 +614,31 @@ impl Staged {
     pub fn map(id: &MapId, title: &str) -> Staged {
         Staged {
             repo: id.repo.clone(),
-            aim: Aim::Map,
+            at: StagedAt::Node {
+                aim: Aim::Map,
+                map_issue: id.number,
+            },
             title: title.to_string(),
-            map_issue: id.number,
         }
     }
 
-    /// Which skill this launch would run in `mode` — what the launch picker
-    /// echoes as the mode word is typed, and what [`plan`] resolves with.
-    pub fn route(&self, mode: Mode) -> Route {
-        route(&self.aim, mode)
+    /// Stage the empty-state door: a registered repo with no open map (#114).
+    /// There is no node, so the picker offers creation alone.
+    pub fn project(repo: &str) -> Staged {
+        Staged {
+            repo: repo.to_string(),
+            at: StagedAt::Project,
+            title: "no map".to_string(),
+        }
+    }
+
+    /// Which skill launching this node in `mode` would run — `None` for the
+    /// map-less door, which has no node to launch and therefore no route.
+    pub fn route(&self, mode: Mode) -> Option<Route> {
+        match &self.at {
+            StagedAt::Node { aim, .. } => Some(route(aim, mode)),
+            StagedAt::Project => None,
+        }
     }
 
     /// The picker's rows for this stop, in on-screen order — the one
@@ -626,23 +662,45 @@ impl Staged {
     }
 
     pub fn candidates(&self) -> Vec<Candidate> {
-        let launches = Mode::all().into_iter().map(|mode| Candidate::Launch {
-            mode,
-            route: self.route(mode),
-        });
-        match self.aim {
-            Aim::Ticket { .. } => launches.collect(),
-            Aim::Map => launches
-                .chain(CreationKind::all().into_iter().map(Candidate::Create))
-                .collect(),
+        let launches = |aim: Aim| {
+            Mode::all()
+                .into_iter()
+                .map(move |mode| Candidate::Launch {
+                    mode,
+                    route: route(&aim, mode),
+                })
+                .collect::<Vec<_>>()
+        };
+        let creations = || CreationKind::all().into_iter().map(Candidate::Create);
+        match self.at {
+            StagedAt::Node {
+                aim: aim @ Aim::Ticket { .. },
+                ..
+            } => launches(aim),
+            StagedAt::Node {
+                aim: aim @ Aim::Map,
+                ..
+            } => launches(aim).into_iter().chain(creations()).collect(),
+            // Nothing has been filed in this repo yet, so there is nothing to
+            // launch — only the three ways to start something.
+            StagedAt::Project => creations().collect(),
         }
     }
 
-    /// How the staged node reads: `#<n>`, the ticket's number or the map's.
+    /// How the staged stop reads: `#<n>` for a node — the ticket's number or
+    /// the map's — and `+new` for the map-less door, which has no number to
+    /// name until a skill files one.
     pub fn key(&self) -> String {
-        match &self.aim {
-            Aim::Map => format!("#{}", self.map_issue),
-            Aim::Ticket { number, .. } => format!("#{number}"),
+        match &self.at {
+            StagedAt::Node {
+                aim: Aim::Map,
+                map_issue,
+            } => format!("#{map_issue}"),
+            StagedAt::Node {
+                aim: Aim::Ticket { number, .. },
+                ..
+            } => format!("#{number}"),
+            StagedAt::Project => "+new".to_string(),
         }
     }
 }
@@ -1067,10 +1125,16 @@ pub enum Targets {
 /// never prompts. The aim and mode arrive already settled — this function
 /// answers *where* the agent can run, and resolves the route the mode picked.
 pub fn plan(checkouts: &[Checkout], staged: &Staged, mode: &LaunchMode) -> Targets {
-    let route = staged.route(mode.mode());
+    let StagedAt::Node { aim, map_issue } = staged.at else {
+        // Unreachable from the picker: [`Staged::candidates`] offers no launch
+        // row on the map-less door, so nothing there can ask for a node
+        // launch. Refusing rather than inventing a node keeps this total.
+        return Targets::Unregistered;
+    };
+    let route = route(&aim, mode.mode());
     resolve(checkouts, &staged.repo, |_| Job::Node {
-        aim: staged.aim.clone(),
-        map_issue: staged.map_issue,
+        aim,
+        map_issue,
         route,
         mode: mode.clone(),
     })

@@ -68,6 +68,24 @@ fn cluster_header(id: &MapId, map: &Map, lit: &[usize], under_cursor: bool) -> L
     Line::from(spans)
 }
 
+/// The slim header of a focused repo with no open map (#114): the same left
+/// edge every cluster has, so it reads as somewhere to stand rather than as an
+/// error — but dim and countless, because there are no stages to count and
+/// nothing here to launch. `enter` on it opens the creation rows.
+fn mapless_header(repo: &str, under_cursor: bool) -> Line<'static> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    Line::from(vec![
+        cursor_span(under_cursor),
+        Span::styled("▌ ", dim),
+        // The name half, as every cluster header shows it.
+        Span::styled(
+            repo.split('/').next_back().unwrap_or(repo).to_string(),
+            dim,
+        ),
+        Span::styled(" · no map — enter to start one", dim),
+    ])
+}
+
 /// A rollup's trailing spans: a dim word for what the counts are *of*, then
 /// the glyph+count pairs in display order, each in the colour its glyph means.
 ///
@@ -396,6 +414,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                     under_cursor,
                 ));
             }
+            Item::MaplessHeader(repo) => lines.push(mapless_header(repo, under_cursor)),
             Item::Context { row, prefix } => lines.push(context_line(app.ticket(row), prefix)),
             Item::Group { id, held, fold } => {
                 lines.push(group_line(id.kind, *held, fold, under_cursor));
