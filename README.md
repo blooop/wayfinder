@@ -25,8 +25,9 @@ Then link the skills it launches into `~/.claude/skills`:
 wf skills install
 ```
 
-`wf --version`, `wf --help` and `wf skills [install]` are the only arguments;
-everything else is keys in the TUI.
+`wf --version`, `wf --help`, `wf skills [install]` and
+[`wf reap [-y] [-f]`](#wf-reap--clearing-away-finished-tickets) are the only
+arguments; everything else is keys in the TUI.
 
 ## The skills ship with the binary
 
@@ -430,12 +431,49 @@ choosing among variants would be `wf` picking a container shape, and it has no
 basis to pick. Host access, GPU passthrough and the rest are the repo's
 declarations to make — `wf` injects no `runArgs`.
 
-Container lifecycle is entirely `dl`'s: `wf` never stops, removes or rebuilds
-one, and could not — it `exec`s and is gone, so there is no `wf` left to observe
-an agent exiting. `dl <ws> stop`, `dl <ws> rm` and `dl --ls` are the tools, and
-they are yours to run. With a workspace per ticket they accumulate faster than
-they used to: a merged ticket's workspace has no further use, and reaping it is
-manual — `dl --ls` shows what exists, `dl <ws> rm` removes one.
+Container lifecycle is `dl`'s: `wf` never stops or rebuilds one, and could not
+during a session — it `exec`s and is gone, so there is no `wf` left to observe
+an agent exiting. `dl <ws> stop`, `dl <ws> rm` and `dl --ls` are yours to run.
+
+### `wf reap` — clearing away finished tickets
+
+A workspace per ticket means workspaces accumulate as fast as tickets are
+worked. `wf reap` removes the ones whose tickets are **closed**:
+
+```
+$ wf reap
+  keep  devlaunch-wayfinder-devlaunch-131-a  (devlaunch#131 is still open)
+  keep  wayfinder-wayfinder-wayfinder-42-b   (still running — stop it first)
+  reap  devlaunch-wayfinder-devlaunch-127-c  (devlaunch#127 is closed)
+
+delete 1 workspace(s)? [y/N]
+```
+
+This is the same division of labour the launch draws: **`dl` owns the
+containers, `wf` owns the tickets.** `dl` deliberately does not decide what is
+finished — that is a fact about a ticket, and inferring it from the branch
+cannot tell a squash-merged branch from an abandoned one — so it publishes what
+it knows (`dl --ls --json`) and refuses to destroy work that exists nowhere
+else, while `wf`, which minted those branch names from its own ticket numbers,
+decides. Needs `dl` **0.0.21 or newer** for the JSON listing.
+
+Kept, always: workspaces `dl` did not create (they are not `wf`'s, whatever
+their branch looks like), branches that are not `wayfinder/<repo>-<n>` for that
+repo, tickets still open, and anything **running** — a ticket closing is no
+evidence that the session in the container ended.
+
+Kept by default but waivable: a workspace whose clone holds uncommitted or
+unpushed work. `-f` reaps those too, and the plan says what it is discarding:
+
+```
+  reap  devlaunch-…-127-c  (devlaunch#127 is closed, discarding 1 uncommitted change(s) (pixi.lock))
+```
+
+`-f` exists for a case that is not hypothetical: a devcontainer whose
+`postCreateCommand` installs packages leaves a tracked lockfile modified in
+*every* workspace it builds, so without it those are unreapable forever. It
+waives the unsaved-work guard only — a running container is still kept, because
+that is a session in progress rather than bytes on disk. `-y` skips the prompt.
 
 **This container is not a security boundary, and is not trying to be.** It is
 for reproducible dependencies. Your host `~/.claude` is bind-mounted into it

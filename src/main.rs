@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::DefaultTerminal;
 use tokio::signal::unix::{signal, SignalKind};
@@ -30,6 +30,7 @@ use wf::app::{App, Outcome, Scope};
 use wf::launch::Launch;
 use wf::model::{Map, MapId};
 use wf::projects::{self, ProjectsCache};
+use wf::reap;
 use wf::refresh::{LoadEvent, Loaders, MapFetch, Startup};
 use wf::skills;
 
@@ -48,6 +49,14 @@ enum Invocation {
     SkillsReport,
     /// Link the bundled skills into Claude Code's personal skills directory.
     SkillsInstall,
+    /// Remove the workspaces whose tickets are closed. `yes` skips the prompt;
+    /// `insist` also reaps workspaces holding work that is not pushed anywhere,
+    /// which is what a devcontainer that dirties its own checkout on every
+    /// build leaves behind.
+    Reap {
+        yes: bool,
+        insist: bool,
+    },
     /// Print to stdout, exit 0.
     Print(String),
     /// Print to stderr, exit 2.
@@ -59,6 +68,7 @@ wf — the multi-project wayfinder ticket selector
 
 usage: wf [--version | --help]
        wf skills [install]
+       wf reap [-y] [-f]
 
 With no arguments: opens the picker over every mapped project, focused on the
 checkout you are standing in. enter runs an agent on the picked ticket, in that
@@ -67,6 +77,10 @@ ctrl-g narrow and widen the scope, ctrl-r refetches, esc quits.
 
 wf skills          report which prompt each route would actually run
 wf skills install  link this build's skills into ~/.claude/skills
+wf reap            remove the workspaces whose tickets are closed (-y to skip
+                   the prompt). Keeps anything running or holding work that is
+                   not pushed anywhere; -f reaps the unpushed ones too, naming
+                   what it discards. Needs dl 0.0.21 or newer.
 
 The skills wf execs ship in this package, so they update with it. `install`
 links rather than copies, which is what keeps them in step afterwards. Set
@@ -94,6 +108,10 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Invocation {
             "--version" | "-V" => Invocation::Print(format!("wf {}", env!("CARGO_PKG_VERSION"))),
             "--help" | "-h" => Invocation::Print(USAGE.to_string()),
             "skills" => Invocation::SkillsReport,
+            "reap" => Invocation::Reap {
+                yes: false,
+                insist: false,
+            },
             other => Invocation::Reject(format!("wf: unknown argument {other:?}\n{USAGE}")),
         },
         [first, second] if first == "skills" => match second.as_str() {
@@ -102,10 +120,36 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Invocation {
                 "wf: unknown skills subcommand {other:?} (expected `install`)\n{USAGE}"
             )),
         },
+        [first, rest @ ..] if first == "reap" => parse_reap(rest),
         [_, second, ..] => Invocation::Reject(format!(
             "wf: too many arguments (unexpected {second:?})\n{USAGE}"
         )),
     }
+}
+
+/// Parse `wf reap`'s flags, which unlike every other `wf` argument may be
+/// combined and given in any order.
+///
+/// Rejecting an unknown flag rather than ignoring it matters more here than
+/// anywhere else in this parser: the two flags waive a confirmation and a
+/// safety guard, so a typo that were quietly dropped would leave someone
+/// believing they had asked for something they had not — and a mistyped `-y`
+/// that silently opened a prompt is a much better outcome than a mistyped `-f`
+/// that silently did nothing.
+fn parse_reap(flags: &[String]) -> Invocation {
+    let (mut yes, mut insist) = (false, false);
+    for flag in flags {
+        match flag.as_str() {
+            "-y" | "--yes" => yes = true,
+            "-f" | "--force" => insist = true,
+            other => {
+                return Invocation::Reject(format!(
+                    "wf: unknown reap argument {other:?} (expected `-y` or `-f`)\n{USAGE}"
+                ))
+            }
+        }
+    }
+    Invocation::Reap { yes, insist }
 }
 
 /// `wf skills` and `wf skills install`. Both resolve the bundle and the target
@@ -169,6 +213,81 @@ fn run_skills(install: bool) -> Result<()> {
     Ok(())
 }
 
+/// `wf reap`: remove the workspaces whose tickets are closed.
+///
+/// The division of labour is the one the launch already draws — `dl` owns the
+/// containers, `wf` owns the tickets — so this asks `dl` what exists, asks the
+/// tracker which of those nodes are closed, prints the plan, and hands the
+/// finished ones back to `dl`. No terminal is taken: this is a stream command
+/// like `wf skills`, not a second TUI.
+///
+/// The plan is printed **before** the prompt and includes what is being kept,
+/// because a workspace someone expected to go and that stayed is the thing they
+/// most need told about, and a reason they disagree with ("still running" when
+/// they thought they had stopped it) is only actionable while no is an answer.
+async fn run_reap(yes: bool, insist: bool) -> Result<()> {
+    use std::collections::BTreeSet;
+    use std::fmt::Write;
+    use std::io::Write as _;
+
+    let workspaces = reap::workspaces().await?;
+    let nodes: BTreeSet<reap::Node> = workspaces.iter().filter_map(reap::node_of).collect();
+    if nodes.is_empty() {
+        emit("no wayfinder workspaces on this machine — nothing to reap\n");
+        return Ok(());
+    }
+    let finished = reap::finished_nodes(&nodes).await?;
+    let verdicts = reap::plan(&workspaces, &finished, insist);
+
+    let (doomed, kept): (Vec<_>, Vec<_>) = verdicts
+        .iter()
+        .partition(|v| matches!(v, reap::Verdict::Reap { .. }));
+    let mut out = String::new();
+    for verdict in &kept {
+        let _ = writeln!(out, "  keep  {}  ({})", verdict.id(), verdict.reason());
+    }
+    for verdict in &doomed {
+        let _ = writeln!(out, "  reap  {}  ({})", verdict.id(), verdict.reason());
+    }
+    emit(&out);
+    if doomed.is_empty() {
+        emit("nothing to reap\n");
+        return Ok(());
+    }
+
+    if !yes {
+        emit(&format!("\ndelete {} workspace(s)? [y/N] ", doomed.len()));
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .context("cannot read the answer")?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            emit("aborted\n");
+            return Ok(());
+        }
+    }
+
+    // One at a time, reporting each: `dl <ws> rm` tears down a container, and a
+    // failure part-way through leaves a set the next run has to be able to make
+    // sense of. Failures are collected rather than propagated at the first one,
+    // so a single wedged workspace does not strand the rest.
+    let mut failed = Vec::new();
+    for verdict in &doomed {
+        match reap::remove(verdict.id(), insist).await {
+            Ok(()) => emit(&format!("removed {}\n", verdict.id())),
+            Err(e) => {
+                emit(&format!("could not remove {}: {e}\n", verdict.id()));
+                failed.push(verdict.id().to_string());
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!("{} workspace(s) could not be removed", failed.len());
+    }
+    Ok(())
+}
+
 /// Write a whole report to stdout, tolerating a reader that has gone away.
 ///
 /// `println!` panics on a closed pipe: Rust ignores `SIGPIPE`, so the write
@@ -202,6 +321,10 @@ async fn main() -> Result<()> {
         }
         Invocation::SkillsInstall => {
             run_skills(true)?;
+            return Ok(());
+        }
+        Invocation::Reap { yes, insist } => {
+            run_reap(yes, insist).await?;
             return Ok(());
         }
         Invocation::Tui => {}
@@ -496,6 +619,58 @@ mod tests {
             parse_args(argv(&["--help"])),
             Invocation::Print(USAGE.to_string())
         );
+    }
+
+    #[test]
+    fn reap_takes_its_two_flags_in_any_order_or_neither() {
+        assert_eq!(
+            parse_args(argv(&["reap"])),
+            Invocation::Reap {
+                yes: false,
+                insist: false
+            }
+        );
+        assert_eq!(
+            parse_args(argv(&["reap", "-y"])),
+            Invocation::Reap {
+                yes: true,
+                insist: false
+            }
+        );
+        assert_eq!(
+            parse_args(argv(&["reap", "-f"])),
+            Invocation::Reap {
+                yes: false,
+                insist: true
+            }
+        );
+        // Both, either way round, long or short: these waive a prompt and a
+        // safety guard, so the shapes someone will actually type all have to
+        // mean what they look like.
+        for both in [
+            vec!["reap", "-y", "-f"],
+            vec!["reap", "-f", "-y"],
+            vec!["reap", "--yes", "--force"],
+        ] {
+            assert_eq!(
+                parse_args(argv(&both)),
+                Invocation::Reap {
+                    yes: true,
+                    insist: true
+                },
+                "{both:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mistyped_reap_flag_is_rejected_rather_than_dropped() {
+        // Silently dropping it would leave someone believing they had waived a
+        // guard they had not — or, worse, that they had not waived one they had.
+        match parse_args(argv(&["reap", "--forse"])) {
+            Invocation::Reject(message) => assert!(message.contains("--forse")),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
     }
 
     #[test]
