@@ -1170,21 +1170,29 @@ mod tests {
     #[test]
     fn every_route_wf_can_exec_is_in_the_bundle() {
         // The invariant the whole module exists for: `route` cannot name a
-        // skill the package does not ship. Asserted against the label, which
-        // is the string that actually reaches the agent's prompt.
+        // skill the package does not ship. Swept over `Route::all`, not a list
+        // written out here — a hand-written list is a second place to remember,
+        // and a route added without being added to it is exactly the case this
+        // is meant to catch.
         use crate::launch::Route;
-        for route in [
-            Route::Tdd,
-            Route::Review,
-            Route::Wayfinder,
-            Route::WayfinderAuto,
-        ] {
-            let skill = route.label().trim_start_matches('/');
+        for route in Route::all() {
+            // `None` is the one route that invokes no skill (#112): there is no
+            // prompt for the package to be missing.
+            let Some(skill) = route.bundled_skill() else {
+                continue;
+            };
             assert!(
                 BUNDLED.contains(&skill),
                 "{} is routable but not bundled",
                 route.label()
             );
         }
+        // …and the sweep is only worth anything if it covers everything: a
+        // route missing from the cycle would be silently skipped above.
+        assert_eq!(
+            Route::all().len(),
+            5,
+            "every route must be in the cycle `Route::all` walks"
+        );
     }
 }

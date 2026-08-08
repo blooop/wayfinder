@@ -72,10 +72,9 @@ pub enum Overlay {
 
 /// The mode after `mode` in the launch picker, wrapping.
 ///
-/// Derived from [`Mode::all`] rather than written as a toggle: with two modes a
-/// toggle is the same thing, but it stops being the same thing the moment a
-/// third mode exists, and this is the code that would silently keep working
-/// while skipping it.
+/// Derived from [`Mode::all`] rather than written as a toggle. With two modes a
+/// toggle was the same thing; #112's third mode is exactly the change that
+/// would have left a toggle silently working and skipping the new one.
 fn next_mode(mode: Mode) -> Mode {
     stepped(mode, 1)
 }
@@ -720,9 +719,10 @@ impl App {
             KeyCode::Enter => {
                 return self.resolve_launch(&staged, &LaunchMode::picked(mode, &steer))
             }
-            // With two modes every step is the same step; `tab` joins the
-            // arrows because it is what the rest of the screen uses to move
-            // between two of something.
+            // The two directions are genuinely different steps now that there
+            // is a third mode (#112); `tab` joins the arrows because it is what
+            // the rest of the screen uses to move through a list, and it steps
+            // the way `down` does rather than toggling.
             KeyCode::Up => mode = previous_mode(mode),
             KeyCode::Down | KeyCode::Tab => mode = next_mode(mode),
             KeyCode::Backspace => {

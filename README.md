@@ -362,7 +362,7 @@ headers are one `↑` away.
 | `wayfinder:build` | in review | interactive | `claude "/wf-review <n>"` |
 | research · prototype · grilling · task | any unfinished stage | interactive | `claude "/wf <map> <n>"` |
 | anything | any unfinished stage | auto | `claude "/wf-auto <map> [<n>]"` |
-| anything | any unfinished stage | plain | `claude` — no skill, no arguments |
+| anything | any unfinished stage | plain | `claude` — no skill; anything typed is the whole prompt |
 | a ticket | done | — | nothing — not launchable |
 
 The auto mode collapses the ticket rows on purpose: the launched session is a
