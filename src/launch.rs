@@ -56,6 +56,10 @@ pub enum Route {
     /// decisions settled against the skill's guiding principles, and the whole
     /// remaining lifecycle driven unattended (#96).
     WayfinderAuto,
+    /// `/wf-one <task>` — one tracked ticket, filed and driven by the skill:
+    /// its own single-ticket map, `/wf-tdd` build, `/wf-review` review (#114).
+    /// The only route reached by a creation candidate rather than a mode.
+    One,
     /// `claude` — no skill at all (#112). The only route that invokes nothing:
     /// the session opens in the node's workspace and the human drives it.
     Plain,
@@ -77,6 +81,7 @@ impl Route {
             Route::Review => "/wf-review",
             Route::Wayfinder => "/wf",
             Route::WayfinderAuto => "/wf-auto",
+            Route::One => "/wf-one",
             Route::Plain => "claude",
         }
     }
@@ -92,7 +97,7 @@ impl Route {
     /// discovered at an agent launch.
     pub fn bundled_skill(self) -> Option<&'static str> {
         match self {
-            Route::Tdd | Route::Review | Route::Wayfinder | Route::WayfinderAuto => {
+            Route::Tdd | Route::Review | Route::Wayfinder | Route::WayfinderAuto | Route::One => {
                 Some(self.label().trim_start_matches('/'))
             }
             Route::Plain => None,
@@ -108,7 +113,8 @@ impl Route {
             Route::Tdd => Route::Review,
             Route::Review => Route::Wayfinder,
             Route::Wayfinder => Route::WayfinderAuto,
-            Route::WayfinderAuto => Route::Plain,
+            Route::WayfinderAuto => Route::One,
+            Route::One => Route::Plain,
             Route::Plain => Route::Tdd,
         }
     }
@@ -637,6 +643,11 @@ impl Launch {
         let skill = self.route.label();
         match (self.route, &self.aim) {
             (Route::Plain, _) => None,
+            // Unreachable from a node: [`route`] never answers `One` — it is
+            // the creation candidates' route (#114), and a creation launch
+            // builds its prompt from the typed task, not from an aim. If a
+            // node ever did carry it, the bare skill grills for its task.
+            (Route::One, _) => Some(skill.to_string()),
             (_, Aim::Map) => Some(format!("{skill} {}", self.map_issue)),
             (Route::Tdd | Route::Review, Aim::Ticket { number, .. }) => {
                 Some(format!("{skill} {number}"))
@@ -995,6 +1006,16 @@ mod tests {
                 "{typed:?} steers an interactive launch"
             );
         }
+    }
+
+    #[test]
+    fn the_new_task_route_names_the_wf_one_skill() {
+        // #114: `wf` ships `/wf-one` but routed nothing to it — the one skill
+        // in the bundle with no arm in `route`. The creation candidates give
+        // it its arm, so it must exist as a route and name its bundled skill.
+        assert_eq!(Route::One.label(), "/wf-one");
+        assert_eq!(Route::One.bundled_skill(), Some("wf-one"));
+        assert!(Route::all().contains(&Route::One), "reachable in the cycle");
     }
 
     #[test]

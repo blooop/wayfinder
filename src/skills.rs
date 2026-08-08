@@ -1191,7 +1191,7 @@ mod tests {
         // route missing from the cycle would be silently skipped above.
         assert_eq!(
             Route::all().len(),
-            5,
+            6,
             "every route must be in the cycle `Route::all` walks"
         );
     }
