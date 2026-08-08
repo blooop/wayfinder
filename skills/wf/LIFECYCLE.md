@@ -1,6 +1,6 @@
 # The manager protocol — a node's lifecycle, one fresh subagent per stage
 
-How a launched session drives a node (or a deferred subtree of nodes) through its stages without anyone watching. This is referenced by the `wf` skill's deferred mode and honored by `/wf-tdd` and `/wf-review`; nothing launches "the manager" directly — **the launched session is the manager**. wf itself never is: it exec'd and exited.
+How a launched session drives a node (or a whole subtree of nodes) through its stages without anyone watching. This is referenced by `/wf-auto` and honored by `/wf-tdd` and `/wf-review`; nothing launches "the manager" directly — **the launched session is the manager**. wf itself never is: it exec'd and exited.
 
 ## The stage lattice (decided on blooop/wayfinder#61)
 

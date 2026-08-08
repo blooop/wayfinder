@@ -87,7 +87,7 @@ Per ticket:
 1. Load the map (low-res; zoom into closed tickets on demand). Claim the ticket. If it was already claimed, read its trail first — the last `### handoff`, then the breadcrumbs after it — and open with a breadcrumb noting resumption.
 2. Hand it to a fresh subagent with the ticket body, the map's Decisions-so-far, the principles, and the skill its type calls for. Build tickets run the [LIFECYCLE.md](../wf/LIFECYCLE.md) stages with gates between; everything else resolves in one subagent.
 3. Breadcrumb each decision-grade moment on the ticket — a sub-decision settling, a direction changing, a stage transition, a gate result.
-4. **Record**: a resolution comment opening `**agent-decided (<principle>):**` and carrying the reasoning that would have been the grilling; close the ticket; append its one-line gist to Decisions-so-far with an *(agent)* suffix.
+4. **Record**: a resolution comment opening `**agent-decided (<principle>):**` and carrying the reasoning that would have been the grilling; close the ticket; append its one-line gist to Decisions-so-far with an *(agent)* suffix. A human later re-opening an agent-decided ticket to re-decide it is normal, not a conflict.
 5. **Advance the map**: graduate whatever fog the answer made specifiable into fresh tickets — including slicing new `wayfinder:build` tickets — clear those fog patches, and retire tickets the answer invalidated.
 
 Then take the next unblocked ticket. The run ends when the frontier is empty, everything left is parked, or the budget runs out — and it ends with a summary: what closed, what parked, what is still open.

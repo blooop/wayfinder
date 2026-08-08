@@ -80,7 +80,7 @@ The answer isn't part of the body — it's recorded on resolution (see [Work thr
 
 ## Ticket Types
 
-Every ticket is either **HITL** — human in the loop, worked *with* a human who speaks for themselves — or **AFK**, driven by the agent alone. A HITL ticket only resolves through that live exchange; the agent never stands in for the human's side of it (a grilling agent that answers its own questions has broken this). The single exception is a **deferred launch** (see [Deferred mode](#deferred-mode)), where the human has explicitly handed judgement to the agent for a subtree.
+Every ticket is either **HITL** — human in the loop, worked *with* a human who speaks for themselves — or **AFK**, driven by the agent alone. A HITL ticket only resolves through that live exchange; the agent never stands in for the human's side of it (a grilling agent that answers its own questions has broken this). Handing judgement to the agent wholesale is `/wf-auto`'s job, never a variant of this skill.
 
 - **Research** (AFK): Reading documentation, third-party APIs, or local resources like knowledge bases to surface a fact a decision waits on. Resolved by a `/research` **subagent**. Use when knowledge outside the current working directory is required.
 - **Prototype** (HITL): Raise the fidelity of the discussion by making a cheap, rough, concrete artifact to react to — an outline, a rough take, a stub, or UI/logic code via the /prototype skill. Links the prototype as an asset. Use when "how should it look" or "how should it behave" is the key question.
@@ -121,14 +121,12 @@ Resolution comments are unchanged — the answer still lands once, at close. And
 
 ## Invocation
 
-Two modes, plus a deferred variant of the second. **Never resolve more than one ticket per session** — with two exceptions: research tickets, and a **deferred launch**, which may work its named ticket's whole subtree.
+Two modes. **Never resolve more than one ticket per session** — with one exception: research tickets.
 
 The invocation grammar (what `wf`'s launch line produces):
 
-- `/wf <map> [<ticket>]` — interactive (everything below as written)
-- `/wf <map> <ticket> defer` — deferred subtree (see [Deferred mode](#deferred-mode))
-- `/wf <map> <ticket> defer: <steering>` — deferred, with a steering prompt
-- `/wf <map> <ticket> steer: <steering>` — interactive, with a steering prompt
+- `/wf <map> [<ticket>]` — everything below as written
+- `/wf <map> <ticket> steer: <steering>` — with a steering prompt
 
 ### Chart the map
 
@@ -154,17 +152,3 @@ User invokes with a map (URL or number). A ticket is **optional** — without on
 If the session ends deliberately before the resolution lands, post the `### handoff` comment on the ticket before you go — where we are, the open thread, the first move on resume.
 
 The user may run unblocked tickets in parallel, so expect other sessions to be editing the tracker concurrently.
-
-### Deferred mode
-
-A **deferred launch** (`defer` in the invocation) hands judgement to the agent for the named ticket **plus everything in its rendered unblocks-subtree**, worked in dependency order. The human chose this at launch time, standing in front of the tree — that consent is what lifts the HITL rules below, and *only* for this run.
-
-**The standing default prompt** for every deferred run: decide with best judgment in the spirit of the map's Decisions-so-far; prefer the smallest decision that unblocks the subtree; record every resolution flagged `**agent-decided:**` with the reasoning that would have been the grilling. A steering prompt (`defer: <text>`) composes *after* this default — it narrows scope or states preferences; it cannot lift stop conditions.
-
-**Claiming is as-you-go**: the launch claims the root; each subtree ticket is claimed when the agent reaches it — a crash leaves only live claims stale, and concurrent sessions still see honest assignees.
-
-**HITL types under defer:** grilling → the agent answers its own questions from the map, repo, and research, flagged agent-decided (this is precisely what deferring judgement means — the self-answering ban is lifted *only* here); prototype → build the artifact and pick, recording the reaction as judgment; a task needing human hands → park it (stop condition c). Build tickets run their lifecycle under the manager protocol in [LIFECYCLE.md](LIFECYCLE.md) — fresh subagent per stage, gates between.
-
-**Stop conditions — park instead of deciding** when a resolution would: (a) redraw the Destination, (b) rule work out of scope, (c) need credentials, purchases, or human-only action, (d) contradict an existing Decisions-so-far entry. Parking = a `### handoff` comment on that ticket; the run continues with other unblocked subtree tickets and reports every park at the end.
-
-**Audit trail:** resolution comments open with `**agent-decided:**`; the map's Decisions-so-far line gets an *(agent)* suffix. A human later re-opening an agent-decided ticket to re-decide it is normal, not a conflict.

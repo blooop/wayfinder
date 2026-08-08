@@ -1072,4 +1072,24 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn the_full_glyph_vocabulary_sorts_into_display_order() {
+        // `RowGlyph`'s derived `Ord` *is* the display order — the cluster
+        // header, shut-group rollups, and branch-root rollups all render
+        // tallies in it — so reordering the `Stage` declaration silently
+        // reorders the screen while the tallies elsewhere in the suite stay
+        // green (#86). Sorting the whole vocabulary pins the sequence.
+        let mut glyphs = [
+            RowGlyph::Blocked,
+            RowGlyph::Stage(Stage::Done),
+            RowGlyph::Stage(Stage::NeedsAttention),
+            RowGlyph::Stage(Stage::InReview),
+            RowGlyph::Stage(Stage::Building),
+            RowGlyph::Stage(Stage::Ready),
+        ];
+        glyphs.sort();
+        let sequence: String = glyphs.iter().map(|g| g.char()).collect();
+        assert_eq!(sequence, "○◐◍!●⊘");
+    }
 }
