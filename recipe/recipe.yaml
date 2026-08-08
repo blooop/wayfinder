@@ -13,7 +13,7 @@ schema_version: 1
 
 context:
   # Must equal Cargo.toml's version — CI fails the build if they drift.
-  version: "0.8.0"
+  version: "0.9.0"
 
 package:
   name: wf
@@ -59,8 +59,8 @@ build:
           - cargo build --release --locked --bin wf
           - install -Dm755 target/release/wf "$PREFIX/bin/wf"
           # The prompts `wf` execs travel in the same package as the binary
-          # that execs them. `wf` hardcodes `/tdd`, `/review`, `/wayfinder` and
-          # `/wayfinder-auto` in its routing table, so the skill files are part
+          # that execs them. `wf` hardcodes `/wf-tdd`, `/wf-review`, `/wf` and
+          # `/wf-auto` in its routing table, so the skill files are part
           # of its interface — and an interface split across two repos on two
           # release cadences drifts silently, which is exactly what happened
           # before this (blooop/wayfinder#96).
