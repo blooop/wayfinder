@@ -371,7 +371,7 @@ A checkout that carries a **`.devcontainer/devcontainer.json`** (or a top-level
 [`dl`](https://github.com/blooop/devlaunch):
 
 ```
-dl <the checkout> -- 'claude' '--dangerously-skip-permissions' '/wf 67 80'
+dl owner/repo@wayfinder/repo-80 -- 'claude' '--dangerously-skip-permissions' '/wf 67 80'
 ```
 
 `wf` owns which ticket, which checkout, which skill and which prompt. `dl` owns
@@ -380,9 +380,22 @@ keeping an editor from opening over the terminal. `wf` builds no flags, reads no
 `devcontainer.json` and writes none: **the repo's own config is the entire
 opt-in**, and there is nothing to configure on the `wf` side.
 
-The checkout reaches `dl` as a **path**, never as `owner/repo@branch`. Given a
-repo spec `dl` would clone a second copy into its own cache and run the agent
-there — abandoning the tree you picked in the checkout picker.
+Each launched node gets a **workspace of its own**:
+`owner/repo@wayfinder/<repo>-<n>`, where `n` is the ticket's number (the map's,
+for a whole-map session). `dl` creates that branch off the default branch if it
+is new, clones it into its own cache, and runs the agent in a container per
+branch — so launching five tickets is five branches in five containers,
+colliding nowhere, and relaunching a ticket reattaches to the workspace it
+already has. The branch is the same `wayfinder/<repo>-<n>` that `/wf-tdd` does
+ticket `n`'s work on, so a build agent wakes up already on its work branch and a
+review launch opens on the branch the PR was pushed from.
+
+The tree you picked in the checkout picker is **not** the agent's working tree:
+its jobs are declaring the devcontainer and hosting non-isolated launches. No
+agent mutates your checkout, checks out its branches, or fights a second agent
+over its index. (Isolated launches used to run in the picked tree itself, which
+meant every launch of a repo shared one tree and one container — serial by
+construction.)
 
 Two things have to be true, and otherwise the agent runs on the host exactly as
 it always has:
@@ -390,7 +403,11 @@ it always has:
 1. the checkout declares one of those two configs, and
 2. `dl` is on PATH.
 
-**Use `dl` 0.0.13 or newer.** `wf` pins no version and never will — the launch
+**Use `dl` 0.0.20 or newer.** Launching several tickets at once means several
+`dl` processes preparing the same repo's cache at the same moment; 0.0.20 is
+where those runs serialize over a per-repo lock instead of racing (the loser
+of the old race could delete the winner's half-written clone). The older floor
+still matters too: `wf` pins no version and never will — the launch
 is one `exec` of a program found on PATH — but older `dl` on devpod 0.26 hands
 the agent **no terminal**, and an agent with no terminal decides it was invoked
 non-interactively: it prints one answer and exits, so the symptom is a session
@@ -415,8 +432,10 @@ declarations to make — `wf` injects no `runArgs`.
 
 Container lifecycle is entirely `dl`'s: `wf` never stops, removes or rebuilds
 one, and could not — it `exec`s and is gone, so there is no `wf` left to observe
-an agent exiting. `dl <ws> stop`, `dl <ws> reset` and `dl --prune-worktrees` are
-the tools, and they are yours to run. Containers accumulate until you do.
+an agent exiting. `dl <ws> stop`, `dl <ws> rm` and `dl --ls` are the tools, and
+they are yours to run. With a workspace per ticket they accumulate faster than
+they used to: a merged ticket's workspace has no further use, and reaping it is
+manual — `dl --ls` shows what exists, `dl <ws> rm` removes one.
 
 **This container is not a security boundary, and is not trying to be.** It is
 for reproducible dependencies. Your host `~/.claude` is bind-mounted into it

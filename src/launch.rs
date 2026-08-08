@@ -10,12 +10,19 @@
 //! here — an `auto` launch is the same exec of `/wf-auto`, watched from
 //! another terminal or not at all.
 //!
-//! A checkout that declares a devcontainer runs that same agent *inside* it,
-//! by way of `dl` ([`Isolation`], #80): `wf` owns which ticket, which checkout,
-//! which skill and which prompt, and `dl` owns the container, its lifecycle and
-//! its credentials. The seam is the checkout **path** — never `owner/repo@branch`,
-//! which would send `dl` off to clone a second tree and abandon the one the
-//! human picked.
+//! A checkout that declares a devcontainer runs that same agent *inside* a
+//! container, by way of `dl` ([`Isolation`], #80): `wf` owns which ticket,
+//! which checkout, which skill and which prompt, and `dl` owns the container,
+//! its lifecycle and its credentials. The seam is a **per-node workspace**,
+//! `owner/repo@wayfinder/<repo>-<n>` ([`Launch::agent_argv`]): every launched
+//! node gets its own branch, its own clone under `dl`'s cache and its own
+//! container, so any number of tickets run at once without colliding — and
+//! the tree the human picked in the checkout picker stays theirs, never
+//! mutated by an agent. (#80 originally handed `dl` the checkout path so the
+//! agent worked the picked tree; that seam made every launch of a repo share
+//! one tree and one container, which is exactly the collision this replaces.)
+//! The checkout keeps two jobs: declaring the devcontainer, and hosting
+//! host-mode launches.
 //!
 //! The one thing that can go wrong is ordering: the terminal must be restored
 //! *before* the image is replaced, because after that there is no `wf` left to
@@ -310,8 +317,9 @@ pub enum Isolation {
     /// No devcontainer in the checkout, or no `dl` on PATH: `claude` runs in
     /// the checkout directly.
     Host,
-    /// `dl <checkout> -- claude …`: the agent runs in the container the repo's
-    /// own `devcontainer.json` describes.
+    /// `dl owner/repo@wayfinder/<repo>-<n> -- claude …`: the agent runs in the
+    /// container the repo's own `devcontainer.json` describes, in a workspace
+    /// of its own — one branch, one clone, one container per node.
     Devlaunch,
 }
 
@@ -402,7 +410,10 @@ pub struct Launch {
     /// The map issue — `/wf`'s first argument, and its only one when
     /// the aim is the map itself.
     map_issue: u64,
-    /// The checkout the agent works in: the process's working directory.
+    /// The picked checkout: the process's working directory, and the agent's
+    /// working tree on the host. An isolated launch works in its own `dl`
+    /// workspace instead — the checkout's remaining job there is having
+    /// declared the devcontainer.
     cwd: PathBuf,
     /// The skill this launch execs, resolved from (type, stage).
     route: Route,
@@ -423,15 +434,39 @@ impl Launch {
         &self.cwd
     }
 
+    /// The issue number this launch is about: the ticket's, or the map's own
+    /// when the whole map is the subject.
+    fn number(&self) -> u64 {
+        match &self.aim {
+            Aim::Map => self.map_issue,
+            Aim::Ticket { number, .. } => *number,
+        }
+    }
+
     /// How this node reads on screen: `<short_repo>#<number>`, the same
     /// identity the picker's rows show — the ticket's number, or the map's
     /// when the whole map is what was picked.
     pub fn key(&self) -> String {
-        let number = match &self.aim {
-            Aim::Map => self.map_issue,
-            Aim::Ticket { number, .. } => *number,
-        };
-        format!("{}#{}", short_repo(&self.repo), number)
+        format!("{}#{}", short_repo(&self.repo), self.number())
+    }
+
+    /// The `dl` workspace an isolated launch runs in:
+    /// `owner/repo@wayfinder/<repo>-<n>` — one branch per node, so parallel
+    /// launches never share a tree or a container, and relaunching a node
+    /// reattaches to the workspace it already has.
+    ///
+    /// The branch name is not `wf`'s invention: `wayfinder/<repo>-<n>` is the
+    /// branch `/wf-tdd` is instructed to do ticket `n`'s work on. `dl` creates
+    /// it (locally, off the default branch) when it does not exist yet, so a
+    /// build agent wakes up already on its work branch, and a reviewer's
+    /// workspace opens on the branch the PR was pushed from.
+    fn workspace(&self) -> String {
+        format!(
+            "{}@wayfinder/{}-{}",
+            self.repo,
+            short_repo(&self.repo),
+            self.number()
+        )
     }
 
     /// Where this launch's agent runs.
@@ -440,14 +475,15 @@ impl Launch {
     }
 
     /// One-line description for the notice: what is being launched, where, and
-    /// — when it is not the host default — in what.
+    /// — when it is not the host default — in what. "Where" is where the agent
+    /// actually works: the checkout on the host, the per-node workspace in a
+    /// container.
     pub fn describe(&self) -> String {
-        format!(
-            "{} in {}{}",
-            self.key(),
-            self.cwd.display(),
-            self.isolation.suffix()
-        )
+        let place = match self.isolation {
+            Isolation::Host => self.cwd.display().to_string(),
+            Isolation::Devlaunch => self.workspace(),
+        };
+        format!("{} in {}{}", self.key(), place, self.isolation.suffix())
     }
 
     /// The agent itself. `claude` takes a single positional prompt, so the
@@ -479,20 +515,24 @@ impl Launch {
     /// What `wf` becomes: the agent, or `dl` carrying the agent into the
     /// container.
     ///
-    /// The isolated form hands `dl` the checkout **path** — the tree the human
-    /// picked — rather than `owner/repo@branch`, which `dl` would answer by
-    /// cloning a second copy under its own cache and running the agent in
-    /// *that*. The path is a plain argv entry to `dl` and needs no quoting; the
-    /// agent command that follows `--` does, because `dl` runs it through a
-    /// shell (every argument is single-quoted), and it is one entry rather than several
-    /// because "a shell command" is exactly what `dl` documents it to be.
+    /// The isolated form hands `dl` the per-node workspace
+    /// — `owner/repo@branch` — which `dl` answers by cloning that branch under
+    /// its own cache (creating it off the default branch if it is new) and
+    /// running the agent in a container of its own. That second tree is the
+    /// point: N launched nodes are N branches in N containers, colliding
+    /// nowhere, and the human's checkout is not one of them. The workspace
+    /// spec is a plain argv entry to `dl` and needs no quoting; the agent
+    /// command that follows `--` does, because `dl` runs it through a shell
+    /// (every argument is single-quoted), and it is one entry rather than
+    /// several because "a shell command" is exactly what `dl` documents it
+    /// to be.
     pub fn agent_argv(&self) -> Vec<String> {
         let agent = self.claude_argv();
         match self.isolation {
             Isolation::Host => agent,
             Isolation::Devlaunch => vec![
                 DEVLAUNCH.to_string(),
-                self.cwd.display().to_string(),
+                self.workspace(),
                 "--".to_string(),
                 agent
                     .iter()
@@ -1076,10 +1116,14 @@ mod tests {
     /// `plan` reads the real filesystem, so a test that wants the isolated
     /// shape builds it here rather than arranging a `dl` on PATH.
     fn isolated(route: Route, text: &str) -> Launch {
+        isolated_ticket(80, route, text)
+    }
+
+    fn isolated_ticket(number: u64, route: Route, text: &str) -> Launch {
         Launch {
             repo: "blooop/wayfinder".to_string(),
             aim: Aim::Ticket {
-                number: 80,
+                number,
                 ticket_type: TicketType::Task,
                 stage: Launchable::Ready,
             },
@@ -1092,17 +1136,18 @@ mod tests {
     }
 
     #[test]
-    fn an_isolated_launch_hands_dl_the_checkout_path_and_a_quoted_shell_command() {
-        // `dl` joins everything after `--` and runs it through a shell in the
-        // container, so the prompt has to arrive already quoted or it lands as
-        // three arguments. The path is a plain argv entry to `dl` itself and is
-        // not quoted — and it is a path, never `owner/repo@branch`, which would
-        // send `dl` off to clone a second tree.
+    fn an_isolated_launch_hands_dl_a_per_node_workspace_and_a_quoted_shell_command() {
+        // The workspace is `owner/repo@wayfinder/<repo>-<n>`: `dl` clones that
+        // branch into a tree and container of the node's own, so the human's
+        // checkout is never the agent's working tree. `dl` joins everything
+        // after `--` and runs it through a shell in the container, so the
+        // prompt has to arrive already quoted or it lands as three arguments;
+        // the workspace spec is a plain argv entry and is not quoted.
         assert_eq!(
             isolated(Route::Wayfinder, "").agent_argv(),
             vec![
                 "dl".to_string(),
-                "/data/proj/wayfinder".to_string(),
+                "blooop/wayfinder@wayfinder/wayfinder-80".to_string(),
                 "--".to_string(),
                 "'claude' '--dangerously-skip-permissions' '/wf 67 80'".to_string(),
             ]
@@ -1111,6 +1156,46 @@ mod tests {
         assert_eq!(
             isolated(Route::WayfinderAuto, "auto merge when green").agent_argv()[3],
             "'claude' '--dangerously-skip-permissions' '/wf-auto 67 80 steer: merge when green'"
+        );
+    }
+
+    #[test]
+    fn parallel_nodes_get_distinct_workspaces_and_a_relaunch_gets_its_own_back() {
+        // The reason the seam is a branch and not the checkout path: two
+        // tickets launched at once must not share a tree or a container, and
+        // the same ticket launched twice must land in the same workspace
+        // (that is `dl` reattaching, not a second clone).
+        let a = isolated_ticket(80, Route::Tdd, "").agent_argv()[1].clone();
+        let b = isolated_ticket(81, Route::Tdd, "").agent_argv()[1].clone();
+        let a_again = isolated_ticket(80, Route::Review, "").agent_argv()[1].clone();
+        assert_ne!(a, b);
+        assert_eq!(a, a_again);
+        // The branch is the one `/wf-tdd` is told to work on, so a build agent
+        // wakes up already on its work branch.
+        assert_eq!(a, "blooop/wayfinder@wayfinder/wayfinder-80");
+    }
+
+    #[test]
+    fn a_map_launch_gets_a_workspace_named_by_the_map_issue() {
+        // A whole-map session is a node like any other: its own branch, its
+        // own container, keyed by the map issue since there is no ticket.
+        let launch = Launch {
+            repo: "blooop/wayfinder".to_string(),
+            aim: Aim::Map,
+            map_issue: 67,
+            cwd: PathBuf::from("/data/proj/wayfinder"),
+            route: Route::WayfinderAuto,
+            mode: LaunchMode::parse("auto"),
+            isolation: Isolation::Devlaunch,
+        };
+        assert_eq!(
+            launch.agent_argv(),
+            vec![
+                "dl".to_string(),
+                "blooop/wayfinder@wayfinder/wayfinder-67".to_string(),
+                "--".to_string(),
+                "'claude' '--dangerously-skip-permissions' '/wf-auto 67'".to_string(),
+            ]
         );
     }
 
@@ -1130,9 +1215,11 @@ mod tests {
 
     #[test]
     fn the_notice_names_the_container_when_there_is_one_and_stays_quiet_otherwise() {
+        // An isolated launch works in its workspace, not in the checkout —
+        // so the workspace is what the notice names.
         assert_eq!(
             isolated(Route::Wayfinder, "").describe(),
-            "wayfinder#80 in /data/proj/wayfinder (devlaunch)"
+            "wayfinder#80 in blooop/wayfinder@wayfinder/wayfinder-80 (devlaunch)"
         );
         match plan_wf(&cache(), &ticket("blooop/wayfinder", 80), 67) {
             Targets::One(launch) => {

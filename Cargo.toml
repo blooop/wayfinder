@@ -1,6 +1,6 @@
 [package]
 name = "wf"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "Multi-project wayfinder ticket selector: a fuzzy-find picker over agentic planning maps that runs the agent on the ticket you pick"
 license = "MIT"
