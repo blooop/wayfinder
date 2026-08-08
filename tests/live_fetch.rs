@@ -2,9 +2,10 @@
 //! of blooop/wayfinder's live maps through `gh api graphql`. Needs network
 //! and an authenticated `gh`.
 //!
-//! The map is **looked up, not named** (see `common`), so every assertion
-//! below is about what any live map must satisfy rather than about a
-//! particular ticket on a particular map.
+//! The map is **looked up, not named** (see `common`), so no assertion below
+//! names a ticket. They do assume a *mature* map — seven tickets, some closed,
+//! some blocking edges — which is why the lookup takes the oldest open one
+//! rather than any open one.
 
 use wf::model::{Status, TicketType};
 
@@ -15,12 +16,15 @@ async fn fetches_the_live_wayfinder_map() {
     let map_id = common::a_live_map().await;
     let map = wf::fetch::fetch_map(&map_id)
         .await
-        .unwrap_or_else(|e| panic!("live fetch of {map_id:?}: {e}"));
+        .unwrap_or_else(|e| panic!("live fetch of {map_id:?}: {e:#}"));
 
+    // Not the `Map:` title convention: nothing enforces it — issue #67 carries
+    // `wayfinder:map` without it — and the fixture no longer knows which map it
+    // has. That an issue is a map at all is checked where it can be: `fetch_map`
+    // refuses anything that is not an open `wayfinder:map` (#28).
     assert!(
-        map.title.starts_with("Map:"),
-        "map issue title: {}",
-        map.title
+        !map.title.is_empty(),
+        "the map issue's title must come back"
     );
     assert!(
         map.tickets.len() >= 7,
@@ -60,27 +64,19 @@ async fn fetches_the_live_wayfinder_map() {
 
     // #19's addition: the `labels` selection is accepted by the real API and
     // every ticket's `wayfinder:*` type comes back parsed. A query GitHub
-    // silently dropped labels from would show up as Untyped — and a map worth
-    // charting mixes types, so a single-type answer is a parse collapsing
-    // rather than a real map.
-    let mut types: Vec<TicketType> = Vec::new();
-    for ticket in &map.tickets {
-        if !types.contains(&ticket.ticket_type) {
-            types.push(ticket.ticket_type);
-        }
-    }
+    // silently dropped labels from shows up here as Untyped. Which *specific*
+    // label maps to which type is fixture-tested in `model::tests`, so this
+    // does not also demand that the live map happen to mix types.
     assert!(
-        !types.contains(&TicketType::Untyped),
+        map.tickets
+            .iter()
+            .all(|t| t.ticket_type != TicketType::Untyped),
         "every ticket on a map is labelled: {:?}",
         map.tickets
             .iter()
             .filter(|t| t.ticket_type == TicketType::Untyped)
             .map(|t| t.number)
             .collect::<Vec<_>>()
-    );
-    assert!(
-        types.len() >= 2,
-        "a real map mixes ticket types; got only {types:?}"
     );
 
     // The old `#17 is blocked only by #13, so it is Blocked while #13 is open`

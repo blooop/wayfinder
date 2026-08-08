@@ -1,2 +1,9 @@
 /target
 /output
+
+# Agent worktrees. Each is a full checkout with a `target/` of its own — one
+# reached 794 MB here — and they are created inside the repo rather than beside
+# it, so without this a `git add -A` in the wrong moment stages a gigabyte of
+# build output. Only the worktree directory is ignored: `.claude/` also holds
+# settings and skills, which are worth committing.
+/.claude/worktrees/

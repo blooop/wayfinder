@@ -187,4 +187,4 @@ jobs:
       - name: Say why nothing was published
         if: env.PIXI_TOKEN == ''
         run: |
-          echo "::notice::PIXI_TOKEN is not set on this repository, so the package was attached to the release but not published to prefix.dev/blooop. Add the secret, or publish via blooop-feedstock — see blooop/wayfinder#12."
+          echo "::notice::PIXI_TOKEN is not set on this repository, so the package was attached to the release but not published to prefix.dev/blooop. Add a prefix.dev API key with upload rights to the blooop channel as the PIXI_TOKEN secret, or publish via blooop-feedstock instead."

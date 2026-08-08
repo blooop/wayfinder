@@ -31,6 +31,7 @@ to main, in the order they are cheap to fix:
 cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked
 cargo test --locked --lib --bins --examples
+cargo test --locked --test live_fetch -- common::
 cargo doc --no-deps --all-features --locked
 ```
 
@@ -45,8 +46,11 @@ arguable rather than accumulating.
 
 Everything under `tests/` is a `live_*` integration test — a real `gh`, real
 network, real assertions against this project's own tracker — so CI compiles
-them but does not run them, and a moving map never breaks a build. Run them
-yourself when the fetch or launch path changes:
+them but does not run them, and a moving map never breaks a build. The one
+exception is the fourth command above: `tests/common`'s diagnostic, which
+decides what a failing live test tells you about a missing `GH_TOKEN`, is pure
+and needs no network, and an assertion nothing runs is not an assertion. Run
+the rest yourself when the fetch or launch path changes:
 
 ```
 cargo test --test live_fetch --test live_discovery
@@ -326,6 +330,16 @@ it always has:
 
 1. the checkout declares one of those two configs, and
 2. `dl` is on PATH.
+
+**Use `dl` 0.0.13 or newer.** `wf` pins no version and never will — the launch
+is one `exec` of a program found on PATH — but older `dl` on devpod 0.26 hands
+the agent **no terminal**, and an agent with no terminal decides it was invoked
+non-interactively: it prints one answer and exits, so the symptom is a session
+that never starts rather than an error. Measured here on devpod 0.26.1:
+`devpod ssh --command` (what `dl` ≤ 0.0.12 uses) gives `not a tty`, `TERM=dumb`
+even from a real terminal, while 0.0.13's `ssh -t` transport gives `/dev/pts/0`,
+`TERM=xterm-256color`. The `GH_TOKEN` forwarding below survives that change of
+transport; `.devcontainer/devcontainer.json` records why.
 
 **A missing `dl` degrades rather than refuses.** Plenty of repos carry a
 `devcontainer.json` for their editor users, and refusing to launch on a machine

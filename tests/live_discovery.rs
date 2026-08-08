@@ -8,6 +8,8 @@ use std::path::Path;
 
 use wf::projects::{discover_checkout, ProjectsCache};
 
+mod common;
+
 #[tokio::test]
 async fn registering_this_checkout_finds_and_fetches_its_map() {
     // Discover: this checkout's toplevel and origin-derived slug.
@@ -38,7 +40,7 @@ async fn registering_this_checkout_finds_and_fetches_its_map() {
     // survive rather than only the lowest-numbered.
     let maps = wf::fetch::find_maps(&reloaded.repos())
         .await
-        .expect("map label search");
+        .unwrap_or_else(|e| panic!("{}", common::search_failed(&format!("{e:#}"))));
     //
     // Which maps those are is deliberately not asserted: pinning this to map
     // #1 outlived the map itself, and a test that fails when a map reaches its
@@ -57,7 +59,7 @@ async fn registering_this_checkout_finds_and_fetches_its_map() {
     // Render-ready: the discovered map fetches with real tickets.
     let map = wf::fetch::fetch_map(&map_id)
         .await
-        .expect("fetch the discovered map");
+        .unwrap_or_else(|e| panic!("fetch the discovered map {map_id:?}: {e:#}"));
     assert!(
         map.tickets.len() >= 7,
         "expected the real map's tickets, got {}",

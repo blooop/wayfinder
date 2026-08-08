@@ -132,10 +132,10 @@ async fn a_cached_seed_fetches_the_map_without_waiting_for_the_search() {
 
 #[tokio::test]
 async fn a_stale_seed_reports_failure_and_is_replaced_by_the_search() {
-    // A cached id that no longer names a map — here the map's own *first
-    // ticket*, an issue that exists and is a sub-issue rather than a map. The
-    // fetch must refuse it (a wrong map is worse than no map) and the search's
-    // answer must move the load onto the real id.
+    // A cached id that no longer names a map — here `#2`, a closed sub-issue
+    // that exists and is not a map, which is refused for either reason alone.
+    // The fetch must refuse it (a wrong map is worse than no map) and the
+    // search's answer must move the load onto the real id.
     let (tx, mut rx) = mpsc::unbounded_channel();
     let stale: MapSet = [MapId::new(THIS_REPO, 2)].into_iter().collect();
 
