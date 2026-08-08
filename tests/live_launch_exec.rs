@@ -24,7 +24,8 @@
 //!    prompt would arrive at `claude` as three arguments and every assertion
 //!    in claim 1 would fail.
 //! 1. **`enter` execs the agent.** Two enters since the two-step launch (#62):
-//!    the first stages the launch line, the second launches it interactive.
+//!    the first opens the launch picker, the second launches the mode it
+//!    opened on — interactive.
 //!    `claude` is shimmed to a script that records its argv and cwd, so the
 //!    assertion is on what `wf` actually handed the agent —
 //!    `--dangerously-skip-permissions "<skill> …"` — rather than on what it
@@ -294,12 +295,17 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     // Generous, because a cold cache pays for the map search before the fetch.
     wait_for(&seen, "▶", Duration::from_secs(60), "the map to load");
 
-    // First enter stages the launch: the line shows the resolved route where
-    // the count line was. The second enter, on an empty line, launches
-    // interactive — today's default.
+    // First enter stages the launch: the picker opens over the list, titled
+    // with the node and cursored on the interactive row. The second enter
+    // takes that row — today's default.
     keys.write_all(b"\r").expect("send enter");
     keys.flush().expect("flush enter");
-    wait_for(&seen, "→ /", Duration::from_secs(10), "the launch line");
+    wait_for(
+        &seen,
+        "▶ interactive",
+        Duration::from_secs(10),
+        "the launch picker",
+    );
     keys.write_all(b"\r").expect("send the second enter");
     keys.flush().expect("flush the second enter");
 

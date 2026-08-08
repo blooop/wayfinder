@@ -56,7 +56,7 @@ pub enum Route {
 }
 
 impl Route {
-    /// How the route reads on the launch line: the slash command it execs.
+    /// How the route reads in the launch picker: the slash command it execs.
     ///
     /// Every label is prefixed `wf`, because these names are claimed in a
     /// namespace `wf` does not own: `~/.claude/skills` is flat and shared with
@@ -80,49 +80,98 @@ impl Route {
 /// and `/wf-auto`), so the mode is an input to [`route`] rather than
 /// something the prompt carries. That is why nothing about "auto" survives
 /// into the exec'd prompt's steering suffix — by then it has already been spent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
     /// The default: the human is in the loop, and the session grills them.
+    #[default]
     Interactive,
-    /// The word `auto`: the agent decides alone, under `/wf-auto`'s
-    /// declared principles, and drives the node's remaining lifecycle
-    /// unattended. Replaced `defer`, which routed to `/wf`'s own
-    /// deferred mode before that skill existed (#63 → #96).
+    /// The agent decides alone, under `/wf-auto`'s declared principles, and
+    /// drives the node's remaining lifecycle unattended. Replaced `defer`,
+    /// which routed to `/wf`'s own deferred mode before that skill existed
+    /// (#63 → #96).
     Auto,
 }
 
-/// What the launch line's typed text meant — parsed once at the second enter
-/// (parse, don't validate: the exec never re-reads a string).
+impl Mode {
+    /// How the mode reads in the launch picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Interactive => "interactive",
+            Mode::Auto => "auto",
+        }
+    }
+
+    /// What picking it means, in the words the choice actually turns on: who
+    /// decides. The picker shows this because the skill name alone (`/wf` vs
+    /// `/wf-auto`) does not say that one of them will not stop to ask you.
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Mode::Interactive => "you are in the loop; it grills you",
+            Mode::Auto => "the agent decides alone and drives it to done",
+        }
+    }
+
+    /// The next mode in the picker's order, wrapping.
+    ///
+    /// Exhaustive, and the reason [`Mode::all`] is derived from it rather than
+    /// written out beside it: a new mode has to say where it sits in the cycle,
+    /// and the picker then lists it without anyone having to remember a second
+    /// place to add it.
+    fn after(self) -> Mode {
+        match self {
+            Mode::Interactive => Mode::Auto,
+            Mode::Auto => Mode::Interactive,
+        }
+    }
+
+    /// Every mode, in picker order, starting at the default. Walks
+    /// [`Mode::after`] until it comes back round — or, if a future cycle is
+    /// malformed and never does, until it repeats itself, so this cannot spin.
+    pub fn all() -> Vec<Mode> {
+        let mut modes = vec![Mode::default()];
+        while let Some(&last) = modes.last() {
+            let next = last.after();
+            if modes.contains(&next) {
+                break;
+            }
+            modes.push(next);
+        }
+        modes
+    }
+}
+
+/// What the launch picker settled on: who decides, and what steers them.
 ///
 /// Two independent axes, so genuinely a product and not a four-armed sum: the
-/// leading `auto` picks *who decides*, and whatever follows steers them. Every
-/// combination is meaningful, which is the test for a product being honest.
+/// picked [`Mode`] chooses *who decides*, and the steering text — typed in the
+/// same overlay — steers them. Every combination is meaningful, which is the
+/// test for a product being honest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchMode {
     mode: Mode,
-    /// The steering prompt, never empty — [`LaunchMode::parse`] trims, and an
+    /// The steering prompt, never empty — [`LaunchMode::picked`] trims, and an
     /// empty steer is spelt `None` rather than `Some("")`.
     steer: Option<String>,
 }
 
 impl LaunchMode {
-    /// Parse the launch line. Total: every string means exactly one launch.
-    /// `auto` is matched as a *word* — `automate the release` is steering text
-    /// that happens to start with the same letters, not a mode.
-    pub fn parse(text: &str) -> LaunchMode {
-        let text = text.trim();
-        let (mode, steer) = match text.strip_prefix("auto") {
-            Some("") => (Mode::Auto, ""),
-            Some(rest) if rest.starts_with(char::is_whitespace) => (Mode::Auto, rest.trim_start()),
-            _ => (Mode::Interactive, text),
-        };
+    /// The launch the picker composed: a mode selected from a list, and
+    /// whatever steering text was typed alongside it.
+    ///
+    /// The mode is *picked*, not parsed out of the text (#62's `defer`, then
+    /// #96's `auto`, were both words at the front of one line). Nothing you can
+    /// type changes who decides, so steering text starting `auto` is steering
+    /// text — and, the other way round, an unattended launch is a thing you
+    /// selected and saw selected rather than a word you had to know.
+    pub fn picked(mode: Mode, steer: &str) -> LaunchMode {
+        let steer = steer.trim();
         LaunchMode {
             mode,
             steer: (!steer.is_empty()).then(|| steer.to_string()),
         }
     }
 
-    /// Which skill this line resolves to, given what the cursor was on.
+    /// Which skill this launch resolves to, given what the cursor was on.
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -236,11 +285,11 @@ pub fn route(aim: &Aim, mode: Mode) -> Route {
 }
 
 /// A launch the first enter staged but the machine has not answered yet (#62):
-/// everything the launch line draws and the second enter needs, snapshotted
+/// everything the launch picker draws and the second enter needs, snapshotted
 /// **index-free**.
 ///
 /// Index-free is the whole point. `crate::app::Row` is positional — an index
-/// into a `Vec` that the next fetch replaces — and the line stays up while
+/// into a `Vec` that the next fetch replaces — and the picker stays up while
 /// background map arrivals swap the clusters underneath it (#27). A `Row` held
 /// here would draw, and then launch, whichever ticket had landed at that
 /// index; a shorter map would panic on the next frame. So the staged launch
@@ -251,9 +300,9 @@ pub struct Staged {
     /// The node's repo, full slug (`owner/name`) — what the checkout cache
     /// is matched on (#15).
     pub repo: String,
-    /// What the launch line names: the map, or one ticket in it.
+    /// What the launch picker names: the map, or one ticket in it.
     pub aim: Aim,
-    /// Its title as it read when the line opened — the line is showing the
+    /// Its title as it read when the picker opened — the picker is showing the
     /// human what they picked, not re-reporting a row that may have moved.
     pub title: String,
     /// The map issue of the cluster the row was picked in (#50) — which map a
@@ -291,7 +340,7 @@ impl Staged {
         }
     }
 
-    /// Which skill this launch would run in `mode` — what the launch line
+    /// Which skill this launch would run in `mode` — what the launch picker
     /// echoes as the mode word is typed, and what [`plan`] resolves with.
     pub fn route(&self, mode: Mode) -> Route {
         route(&self.aim, mode)
@@ -417,7 +466,7 @@ pub struct Launch {
     cwd: PathBuf,
     /// The skill this launch execs, resolved from (type, stage).
     route: Route,
-    /// What the launch line said. The mode half already picked `route`; what
+    /// What the launch picker settled on. The mode half already picked `route`; what
     /// is left to spend here is the steering text.
     mode: LaunchMode,
     /// Host or container, decided from the checkout at [`plan`] time (#80).
@@ -717,6 +766,17 @@ mod tests {
         }
     }
 
+    /// What the picker composes with the default mode row selected, steered by
+    /// whatever was typed into it.
+    fn interactive(steer: &str) -> LaunchMode {
+        LaunchMode::picked(Mode::Interactive, steer)
+    }
+
+    /// The same with the `auto` row selected.
+    fn auto(steer: &str) -> LaunchMode {
+        LaunchMode::picked(Mode::Auto, steer)
+    }
+
     /// An interactive `/wf` plan — the default launch, and the shape
     /// every checkout-resolution test wants (route and mode are orthogonal to
     /// which trees are candidates).
@@ -724,7 +784,7 @@ mod tests {
         plan(
             checkouts,
             &Staged::ticket(ticket, map_issue, Stage::Ready).expect("ready is launchable"),
-            &LaunchMode::parse(""),
+            &LaunchMode::picked(Mode::Interactive, ""),
         )
     }
 
@@ -811,57 +871,71 @@ mod tests {
     }
 
     #[test]
-    fn the_launch_line_text_parses_to_a_mode_and_a_steer() {
-        // The two axes of the typed line (#62/#96): a leading `auto` picks who
-        // decides, whatever follows steers them, and either may be absent.
-        let parse = |text: &str| {
-            let mode = LaunchMode::parse(text);
-            (mode.mode, mode.steer)
-        };
-        assert_eq!(parse(""), (Mode::Interactive, None));
-        assert_eq!(parse("   "), (Mode::Interactive, None));
-        assert_eq!(parse("auto"), (Mode::Auto, None));
-        assert_eq!(parse("auto "), (Mode::Auto, None));
+    fn a_picked_launch_keeps_who_decides_out_of_what_was_typed() {
+        // The two axes (#62/#96), now that the mode is a picked row and not a
+        // word at the front of one line: the selection decides who resolves the
+        // node, and the text only ever steers.
+        let picked = |mode: LaunchMode| (mode.mode, mode.steer);
+        assert_eq!(picked(interactive("")), (Mode::Interactive, None));
+        assert_eq!(picked(auto("")), (Mode::Auto, None));
+        // An all-whitespace field is an empty one, not a steer made of spaces.
+        assert_eq!(picked(interactive("   ")), (Mode::Interactive, None));
+        assert_eq!(picked(auto("  \t ")), (Mode::Auto, None));
         assert_eq!(
-            parse("auto skip the flaky suite"),
+            picked(auto("skip the flaky suite")),
             (Mode::Auto, Some("skip the flaky suite".to_string()))
         );
         assert_eq!(
-            parse("try the other approach"),
+            picked(interactive("try the other approach")),
             (
                 Mode::Interactive,
                 Some("try the other approach".to_string())
             )
         );
-        // `auto` is a word, not a prefix: no fuzzy matching.
-        assert_eq!(
-            parse("automate the release"),
-            (Mode::Interactive, Some("automate the release".to_string()))
-        );
-        // `defer` retired with #96: it is ordinary steering text now, not a
-        // mode word that quietly still means something.
-        assert_eq!(
-            parse("defer"),
-            (Mode::Interactive, Some("defer".to_string()))
-        );
+        // The mode words of #62 and #96 are both ordinary steering text now:
+        // no string can move the mode the human is looking at, so there is no
+        // longer such a thing as a launch that went unattended because of what
+        // it happened to start with.
+        for typed in ["auto", "auto merge when green", "automate it", "defer"] {
+            assert_eq!(
+                picked(interactive(typed)),
+                (Mode::Interactive, Some(typed.to_string())),
+                "{typed:?} steers an interactive launch"
+            );
+        }
     }
 
-    /// The prompt a node of this (type, stage) is launched with, for a launch
-    /// line reading `text`.
-    fn ticket_prompt(ticket_type: TicketType, stage: Stage, text: &str) -> String {
+    #[test]
+    fn every_mode_is_in_the_picker_and_the_default_leads_it() {
+        // The picker lists `Mode::all`, so a mode missing from it would be a
+        // mode nothing on screen can reach.
+        assert_eq!(Mode::all(), vec![Mode::Interactive, Mode::Auto]);
+        assert_eq!(
+            Mode::all().first(),
+            Some(&Mode::default()),
+            "enter opens on the default"
+        );
+        // Derived from the `after` cycle: every mode appears exactly once.
+        let mut seen = Mode::all();
+        seen.dedup();
+        assert_eq!(seen.len(), Mode::all().len());
+    }
+
+    /// The prompt a node of this (type, stage) is launched with, under `mode`.
+    fn ticket_prompt(ticket_type: TicketType, stage: Stage, mode: &LaunchMode) -> String {
         let mut node = ticket("blooop/wayfinder", 16);
         node.ticket_type = ticket_type;
         let staged = Staged::ticket(&node, 1, stage).expect("a launchable stage");
-        match plan(&cache(), &staged, &LaunchMode::parse(text)) {
+        match plan(&cache(), &staged, mode) {
             Targets::One(l) => l.agent_argv().last().expect("a prompt").clone(),
             other => panic!("{other:?}"),
         }
     }
 
     /// The same, for a launch aimed at the whole map.
-    fn map_prompt(text: &str) -> String {
+    fn map_prompt(mode: &LaunchMode) -> String {
         let staged = Staged::map(&MapId::new("blooop/wayfinder", 59), "the dev-process tree");
-        match plan(&cache(), &staged, &LaunchMode::parse(text)) {
+        match plan(&cache(), &staged, mode) {
             Targets::One(l) => l.agent_argv().last().expect("a prompt").clone(),
             other => panic!("{other:?}"),
         }
@@ -872,19 +946,19 @@ mod tests {
         // The route picks the skill; only the wayfinder skills take the map
         // argument. The mode is *not* in the suffix — it chose the skill.
         assert_eq!(
-            ticket_prompt(TicketType::Build, Stage::Ready, ""),
+            ticket_prompt(TicketType::Build, Stage::Ready, &interactive("")),
             "/wf-tdd 16"
         );
         assert_eq!(
-            ticket_prompt(TicketType::Build, Stage::InReview, ""),
+            ticket_prompt(TicketType::Build, Stage::InReview, &interactive("")),
             "/wf-review 16"
         );
         assert_eq!(
-            ticket_prompt(TicketType::Grilling, Stage::Ready, ""),
+            ticket_prompt(TicketType::Grilling, Stage::Ready, &interactive("")),
             "/wf 1 16"
         );
         assert_eq!(
-            ticket_prompt(TicketType::Grilling, Stage::Ready, "auto"),
+            ticket_prompt(TicketType::Grilling, Stage::Ready, &auto("")),
             "/wf-auto 1 16"
         );
         // Steering rides as a suffix, whatever the route.
@@ -892,12 +966,16 @@ mod tests {
             ticket_prompt(
                 TicketType::Grilling,
                 Stage::Ready,
-                "auto skip the flaky suite"
+                &auto("skip the flaky suite")
             ),
             "/wf-auto 1 16 steer: skip the flaky suite"
         );
         assert_eq!(
-            ticket_prompt(TicketType::Build, Stage::Ready, "try the other approach"),
+            ticket_prompt(
+                TicketType::Build,
+                Stage::Ready,
+                &interactive("try the other approach")
+            ),
             "/wf-tdd 16 steer: try the other approach"
         );
     }
@@ -906,16 +984,16 @@ mod tests {
     fn a_map_launch_is_the_skill_and_the_map_number_alone() {
         // No ticket argument exists to pass, so none is passed — the map aim
         // is the whole subject (#96).
-        assert_eq!(map_prompt(""), "/wf 59");
-        assert_eq!(map_prompt("auto"), "/wf-auto 59");
+        assert_eq!(map_prompt(&interactive("")), "/wf 59");
+        assert_eq!(map_prompt(&auto("")), "/wf-auto 59");
         assert_eq!(
-            map_prompt("auto merge when green"),
+            map_prompt(&auto("merge when green")),
             "/wf-auto 59 steer: merge when green"
         );
         // A map's key is its own issue number, not a ticket's.
         let staged = Staged::map(&MapId::new("blooop/wayfinder", 59), "the dev-process tree");
         assert_eq!(staged.key(), "#59");
-        match plan(&cache(), &staged, &LaunchMode::parse("")) {
+        match plan(&cache(), &staged, &interactive("")) {
             Targets::One(l) => assert_eq!(l.key(), "wayfinder#59"),
             other => panic!("{other:?}"),
         }
@@ -1115,11 +1193,11 @@ mod tests {
     /// The same launch, forced into a container — the fields are private and
     /// `plan` reads the real filesystem, so a test that wants the isolated
     /// shape builds it here rather than arranging a `dl` on PATH.
-    fn isolated(route: Route, text: &str) -> Launch {
-        isolated_ticket(80, route, text)
+    fn isolated(route: Route, mode: LaunchMode) -> Launch {
+        isolated_ticket(80, route, mode)
     }
 
-    fn isolated_ticket(number: u64, route: Route, text: &str) -> Launch {
+    fn isolated_ticket(number: u64, route: Route, mode: LaunchMode) -> Launch {
         Launch {
             repo: "blooop/wayfinder".to_string(),
             aim: Aim::Ticket {
@@ -1130,7 +1208,7 @@ mod tests {
             map_issue: 67,
             cwd: PathBuf::from("/data/proj/wayfinder"),
             route,
-            mode: LaunchMode::parse(text),
+            mode,
             isolation: Isolation::Devlaunch,
         }
     }
@@ -1144,7 +1222,7 @@ mod tests {
         // prompt has to arrive already quoted or it lands as three arguments;
         // the workspace spec is a plain argv entry and is not quoted.
         assert_eq!(
-            isolated(Route::Wayfinder, "").agent_argv(),
+            isolated(Route::Wayfinder, interactive("")).agent_argv(),
             vec![
                 "dl".to_string(),
                 "blooop/wayfinder@wayfinder/wayfinder-80".to_string(),
@@ -1154,7 +1232,7 @@ mod tests {
         );
         // The steering suffix rides inside the same quoted argument.
         assert_eq!(
-            isolated(Route::WayfinderAuto, "auto merge when green").agent_argv()[3],
+            isolated(Route::WayfinderAuto, auto("merge when green")).agent_argv()[3],
             "'claude' '--dangerously-skip-permissions' '/wf-auto 67 80 steer: merge when green'"
         );
     }
@@ -1165,9 +1243,9 @@ mod tests {
         // tickets launched at once must not share a tree or a container, and
         // the same ticket launched twice must land in the same workspace
         // (that is `dl` reattaching, not a second clone).
-        let a = isolated_ticket(80, Route::Tdd, "").agent_argv()[1].clone();
-        let b = isolated_ticket(81, Route::Tdd, "").agent_argv()[1].clone();
-        let a_again = isolated_ticket(80, Route::Review, "").agent_argv()[1].clone();
+        let a = isolated_ticket(80, Route::Tdd, interactive("")).agent_argv()[1].clone();
+        let b = isolated_ticket(81, Route::Tdd, interactive("")).agent_argv()[1].clone();
+        let a_again = isolated_ticket(80, Route::Review, interactive("")).agent_argv()[1].clone();
         assert_ne!(a, b);
         assert_eq!(a, a_again);
         // The branch is the one `/wf-tdd` is told to work on, so a build agent
@@ -1185,7 +1263,7 @@ mod tests {
             map_issue: 67,
             cwd: PathBuf::from("/data/proj/wayfinder"),
             route: Route::WayfinderAuto,
-            mode: LaunchMode::parse("auto"),
+            mode: auto(""),
             isolation: Isolation::Devlaunch,
         };
         assert_eq!(
@@ -1203,7 +1281,7 @@ mod tests {
     fn steering_text_cannot_break_out_of_the_shell_command() {
         // The one string a user types that reaches a shell. A single quote
         // closes, escapes, reopens — the argument stays one argument.
-        let launch = isolated(Route::Tdd, "don't touch the CI; rm -rf /");
+        let launch = isolated(Route::Tdd, interactive("don't touch the CI; rm -rf /"));
         assert_eq!(
             launch.agent_argv()[3],
             r"'claude' '--dangerously-skip-permissions' '/wf-tdd 80 steer: don'\''t touch the CI; rm -rf /'"
@@ -1218,7 +1296,7 @@ mod tests {
         // An isolated launch works in its workspace, not in the checkout —
         // so the workspace is what the notice names.
         assert_eq!(
-            isolated(Route::Wayfinder, "").describe(),
+            isolated(Route::Wayfinder, interactive("")).describe(),
             "wayfinder#80 in blooop/wayfinder@wayfinder/wayfinder-80 (devlaunch)"
         );
         match plan_wf(&cache(), &ticket("blooop/wayfinder", 80), 67) {

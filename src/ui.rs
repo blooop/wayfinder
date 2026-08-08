@@ -15,7 +15,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Overlay, Scope};
 use crate::filter;
-use crate::launch::{Launch, LaunchMode};
+use crate::launch::{Launch, Mode, Staged};
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
 use crate::view::{Branch, Fold, GroupKind, Item, Plan};
 
@@ -497,6 +497,70 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     area
 }
 
+/// The launch picker: what `enter` on a node opens, and everything that launch
+/// still needs decided.
+///
+/// A modal rather than #62's one-line prompt, because the line could only *echo*
+/// what you typed — the modes were words you had to already know (`defer`, then
+/// `auto`), and an unattended launch looked exactly like a typo until it ran. The
+/// options are rows now: each one names its mode, the skill that mode routes the
+/// staged node to, and who ends up deciding. Which is also why the route is
+/// drawn per option rather than once for the cursor's — the difference between
+/// `/wf` and `/wf-auto` *is* the choice being made, so both are on screen.
+fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, mode: Mode, steer: &str) {
+    let mut lines = vec![Line::default()];
+    for option in Mode::all() {
+        let picked = option == mode;
+        let marker = if picked { '▶' } else { ' ' };
+        // The cursor's row is the one that will run, so it is the one that reads
+        // as bold; the others stay dim enough to scan past.
+        let emphasis = if picked {
+            Style::new().add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().add_modifier(Modifier::DIM)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {marker} {:<12}", option.label()), emphasis),
+            Span::styled(
+                format!("{:<10}", staged.route(option).label()),
+                Style::new().fg(Color::Cyan),
+            ),
+            Span::styled(option.blurb(), Style::new().add_modifier(Modifier::DIM)),
+        ]));
+    }
+    lines.push(Line::default());
+    // The steer field is always shown, empty or not: it is the other half of
+    // what enter will do, and a field that appears only once you have typed
+    // into it cannot tell you that you may.
+    lines.push(Line::from(vec![
+        Span::styled("    steer  ", Style::new().add_modifier(Modifier::DIM)),
+        Span::raw(steer.to_string()),
+        Span::styled("█", Style::new().add_modifier(Modifier::DIM)),
+    ]));
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "  enter launch · ↑/↓ mode · type to steer · esc cancel",
+        Style::new().add_modifier(Modifier::DIM),
+    ));
+    let title = format!(" launch {} {} ", staged.key(), staged.title);
+    let width = lines
+        .iter()
+        .map(|l| l.width() as u16 + 4)
+        .chain(std::iter::once(title.chars().count() as u16 + 4))
+        .max()
+        .unwrap_or(40);
+    let area = centered(frame.area(), width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(title)
+                .border_style(Style::new().fg(Color::Cyan)),
+        ),
+        area,
+    );
+}
+
 /// The which-checkout modal: one row per registered checkout of the repo.
 ///
 /// The one prompt `wf` still has, and the reason it survived the Build 7
@@ -505,9 +569,20 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// distinguishes the candidates, and with no session to name there is nothing
 /// shorter to show alongside it.
 fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
-    let Overlay::PickCheckout { launches, cursor } = &app.overlay else {
-        return;
-    };
+    let launches;
+    let cursor;
+    match &app.overlay {
+        Overlay::None => return,
+        Overlay::PickLaunch {
+            staged,
+            mode,
+            steer,
+        } => return draw_launch_picker(frame, staged, *mode, steer),
+        Overlay::PickCheckout {
+            launches: l,
+            cursor: c,
+        } => (launches, cursor) = (l, c),
+    }
     let mut lines = vec![Line::default()];
     for (i, launch) in launches.iter().enumerate() {
         let marker = if i == *cursor { '▶' } else { ' ' };
@@ -603,51 +678,31 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     }
     frame.render_widget(body, body_area);
 
-    // The count line's slot is shared: while a launch is staged (#62) the
-    // launch line lives there instead — the resolved route, the node it
-    // launches, and the mode text as it is typed.
-    //
-    // The route is resolved *per frame* from the text, not read off the staged
-    // launch, because since #96 the mode picks the skill: typing `auto` has to
-    // flip the echoed command from `/wf` to `/wf-auto` as you
-    // type it. Showing a stale route would be showing the wrong skill.
-    if let Overlay::LaunchLine { staged, text } = &app.overlay {
-        let route = staged.route(LaunchMode::parse(text).mode());
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!("  → {}", route.label()),
-                    Style::new().fg(Color::Cyan),
-                ),
-                Span::raw(format!(" · {} {}  {text}", staged.key(), staged.title)),
-                Span::styled("█", Style::new().add_modifier(Modifier::DIM)),
-            ])),
-            count_area,
-        );
-    } else {
-        // The load hint, the failure note, and the idle count share one dim
-        // segment, and any of them can be live at once; empty ones drop out
-        // rather than leaving gaps.
-        let status = [app.startup.hint(), failure_note(app), idle_note(&plan)]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let mut count_spans = vec![
-            Span::raw(format!("  {}/{}", app.visible().len(), app.scoped().len())),
-            Span::styled(
-                format!("  {status}"),
-                Style::new().add_modifier(Modifier::DIM),
-            ),
-        ];
-        if let Some(notice) = &app.notice {
-            count_spans.push(Span::styled(
-                format!("   {notice}"),
-                Style::new().add_modifier(Modifier::DIM),
-            ));
-        }
-        frame.render_widget(Paragraph::new(Line::from(count_spans)), count_area);
+    // The load hint, the failure note, and the idle count share one dim
+    // segment, and any of them can be live at once; empty ones drop out
+    // rather than leaving gaps. The count line keeps its slot while a launch is
+    // staged — the staged launch is a modal now (#62's line became
+    // [`draw_launch_picker`]), and a modal does not need the row it covers to
+    // move out of its way.
+    let status = [app.startup.hint(), failure_note(app), idle_note(&plan)]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut count_spans = vec![
+        Span::raw(format!("  {}/{}", app.visible().len(), app.scoped().len())),
+        Span::styled(
+            format!("  {status}"),
+            Style::new().add_modifier(Modifier::DIM),
+        ),
+    ];
+    if let Some(notice) = &app.notice {
+        count_spans.push(Span::styled(
+            format!("   {notice}"),
+            Style::new().add_modifier(Modifier::DIM),
+        ));
     }
+    frame.render_widget(Paragraph::new(Line::from(count_spans)), count_area);
 
     frame.render_widget(
         Paragraph::new(KEY_HINTS).style(Style::new().add_modifier(Modifier::DIM)),
@@ -1422,40 +1477,50 @@ mod tests {
     }
 
     #[test]
-    fn the_launch_line_replaces_the_count_line_and_shows_the_route() {
+    fn enter_opens_the_launch_picker_over_the_screen_with_every_mode_on_it() {
         let mut app = fixture_app();
-        let screen = render(&app);
-        assert!(screen.contains("5/5"), "{screen}");
 
-        // Enter on #6 (a task at ready): the line opens where the count was,
-        // naming the resolved route and the ticket it launches.
+        // Enter on #6 (a task at ready): the picker floats over the list,
+        // titled with the node it launches.
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let screen = render(&app);
         assert!(
-            screen.contains("→ /wf · #6 Re-entry breadcrumbs"),
+            screen.contains("launch #6 Re-entry breadcrumbs"),
             "{screen}"
         );
-        assert!(
-            !screen.contains("5/5"),
-            "the count line is replaced: {screen}"
-        );
+        // Both modes are on screen with the skill each one would run, because
+        // that difference *is* the choice being offered — and the cursor sits
+        // on the interactive default.
+        assert!(screen.contains("▶ interactive"), "{screen}");
+        assert!(screen.contains("/wf "), "{screen}");
+        assert!(screen.contains("auto"), "{screen}");
+        assert!(screen.contains("/wf-auto"), "{screen}");
+        assert!(screen.contains("steer"), "{screen}");
+        assert!(screen.contains("esc cancel"), "{screen}");
 
-        // The typed mode shows on the line as it accumulates — and re-routes
-        // it live, because since #96 the mode word picks the skill and a line
-        // still echoing `/wf` would be naming the wrong one.
-        type_str(&mut app, "auto something");
+        // Down moves the pick; the marker moves with it and nothing about the
+        // route line is stale, since each row draws its own.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let screen = render(&app);
-        assert!(screen.contains("auto something"), "{screen}");
-        assert!(
-            screen.contains("→ /wf-auto · #6 Re-entry breadcrumbs"),
-            "{screen}"
-        );
+        assert!(screen.contains("▶ auto"), "{screen}");
+        assert!(!screen.contains("▶ interactive"), "{screen}");
 
-        // Esc gives the count line back.
+        // Typing steers rather than picking: the text lands in the field, and
+        // the mode stays where the cursor put it.
+        type_str(&mut app, "merge when green");
+        let screen = render(&app);
+        assert!(screen.contains("merge when green"), "{screen}");
+        assert!(screen.contains("▶ auto"), "{screen}");
+
+        // The count line was never taken away — the picker covers the rows, not
+        // the chrome that says how many there are.
+        assert!(screen.contains("5/5"), "{screen}");
+
+        // Esc closes it and gives the whole screen back.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let screen = render(&app);
+        assert!(!screen.contains("launch #6"), "{screen}");
         assert!(screen.contains("5/5"), "{screen}");
-        assert!(!screen.contains("→ /wf"), "{screen}");
     }
 
     #[test]
