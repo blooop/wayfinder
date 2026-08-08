@@ -82,9 +82,18 @@ Three consequences for anyone editing here:
   names are in `BUNDLED` — that list is the only thing sweep can tell "ours, and
   no longer shipped" from "someone else's" by.
 
-To work on a skill against a released `wf`, link the checkout instead of the
+- **They reach the agent as a copy, not as a link into this tree.**
+  `wf skills install` writes `~/.claude/wf-skills/<name>` and links
+  `~/.claude/skills/<name> -> ../wf-skills/<name>`, because an isolated launch
+  mounts `~/.claude` into the devcontainer and nothing else — a link into the
+  pixi prefix dangles in there, and the symptom is `Unknown command: /wf-tdd`
+  after the launch rather than an error anywhere near the install. The copy
+  records the bundle it came from and every launch re-copies from it, so it
+  cannot fall behind the tree you are editing.
+
+To work on a skill against a released `wf`, install the checkout instead of the
 package — `WF_SKILLS_DIR=$PWD/skills wf skills install` — and the edit is live
-in the next session.
+in the next session, however you launch.
 
 ## Checks
 

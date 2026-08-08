@@ -54,27 +54,45 @@ older `wf` left under its old names, and touches nothing else — it removes a
 link only when the link points into a `wf` bundle, so a skill of yours can never
 match however dead it looks.
 
-`wf skills install` **symlinks** rather than copies, which is the whole point:
-updating the package updates the prompts, with no second command to remember
-and no copy to go stale in between. `wf skills` reports which prompt each route
-would actually run:
+`wf skills install` **symlinks**, so a name under `~/.claude/skills` is `wf`'s
+only when `wf` put it there and a real directory can go on meaning *somebody
+else owns this*. What the link points at is the part worth knowing:
+`~/.claude/wf-skills`, a **copy** of the package's bundle kept beside the links,
+reached *relatively* — `wf-tdd -> ../wf-skills/wf-tdd`.
+
+That indirection exists for the containers. An isolated launch
+([Isolation](#isolation-the-agent-runs-in-the-repos-devcontainer)) mounts your
+`~/.claude` into the devcontainer and nothing else: no pixi prefix, and your home
+at a different path inside (`/home/vscode`) than out. A link into
+`~/.pixi/envs/wf/share/wf/skills` is a fine link on the host and a dangling one
+in there — and a dangling skill does not report itself, it comes back as
+`Unknown command: /wf-tdd` seconds after a launch. A relative link into a copy
+that rides the same mount resolves on both sides.
+
+The copy is then the thing that could go stale, so it is not left to trust:
+`wf skills install` rewrites it, **every launch brings it back in step** before
+exec'ing the agent, and `wf skills` reports a copy that is not this build's
+rather than running a release behind:
 
 ```
 bundle  /home/you/.pixi/envs/wf/share/wf/skills (installed beside the binary)
-target  /home/you/.claude/skills
+links   /home/you/.claude/skills
+copy    /home/you/.claude/wf-skills (what the links point at, so a devcontainer can read them too)
 
   wf              ok
   wf-auto         ok
-  wf-one          ok
+  wf-one          outdated — the copy is not this build's
   wf-tdd          stale — links to /home/you/projects/wayfinder/skills
   wf-review       not a link — another tool owns this one
 ```
 
 `wf` never deletes a real directory it did not create — if chezmoi or a
 hand-edit owns one, it says so and leaves it, and the other four still install.
-Set `WF_SKILLS_DIR` to link a checkout instead of the package, which is what
-you want while you are editing the prompts: the link points at your working
-tree, so an edit is live in the next session with nothing to reinstall.
+Set `WF_SKILLS_DIR` to install a checkout's prompts instead of the package's,
+which is what you want while you are editing them: the copy **remembers where it
+was made from**, so every launch re-copies from your working tree and an edit is
+live in the next session — and an ordinary launch by the released `wf` refreshes
+your checkout's prompts rather than quietly replacing them with its own.
 
 The skills stay ordinary installed skills rather than text `wf` injects at exec
 time, because `wf` is not their only caller: `LIFECYCLE.md` has the manager
@@ -475,9 +493,16 @@ unpushed work. `-f` reaps those too, and the plan says what it is discarding:
 waives the unsaved-work guard only — a running container is still kept, because
 that is a session in progress rather than bytes on disk. `-y` skips the prompt.
 
+Your host `~/.claude` is bind-mounted in, which is how the agent arrives already
+logged in — and is the reason `wf skills install` keeps the prompts *inside* that
+directory and links to them relatively. `~/.pixi` is not mounted and your home is
+at a different path in there, so a link into the package prefix dangles and the
+launch answers `Unknown command: /wf-tdd`. See
+[the skills](#the-skills-ship-with-the-binary).
+
 **This container is not a security boundary, and is not trying to be.** It is
-for reproducible dependencies. Your host `~/.claude` is bind-mounted into it
-read-write and your `gh` login is forwarded as `GH_TOKEN`, so everything running
+for reproducible dependencies. That `~/.claude` mount is read-write and your
+`gh` login is forwarded as `GH_TOKEN`, so everything running
 in a repo's devcontainer — including a `postCreateCommand` you did not write —
 gets both. That is a deliberate trade for zero-friction auth, taken with eyes
 open ([#73](https://github.com/blooop/wayfinder/issues/73)); the repos this
