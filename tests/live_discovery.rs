@@ -39,15 +39,20 @@ async fn registering_this_checkout_finds_and_fetches_its_map() {
     let maps = wf::fetch::find_maps(&reloaded.repos())
         .await
         .expect("map label search");
-    let map_id = wf::model::MapId::new(slug.clone(), 1);
-    assert!(
-        maps.contains(&map_id),
-        "blooop/wayfinder must have wayfinder:map issue #1; found {maps:?}"
-    );
+    //
+    // Which maps those are is deliberately not asserted: pinning this to map
+    // #1 outlived the map itself, and a test that fails when a map reaches its
+    // destination is testing the tracker's contents rather than the search.
     assert!(
         maps.iter().filter(|id| id.repo == slug).count() > 1,
         "every open map must be found, not one per repo; found {maps:?}"
     );
+    let map_id = maps
+        .iter()
+        .filter(|id| id.repo == slug)
+        .min_by_key(|id| id.number)
+        .expect("the search just found this repo's maps")
+        .clone();
 
     // Render-ready: the discovered map fetches with real tickets.
     let map = wf::fetch::fetch_map(&map_id)
