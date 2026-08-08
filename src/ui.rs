@@ -597,7 +597,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     //
     // The route is resolved *per frame* from the text, not read off the staged
     // launch, because since #96 the mode picks the skill: typing `auto` has to
-    // flip the echoed command from `/wayfinder` to `/wayfinder-auto` as you
+    // flip the echoed command from `/wf` to `/wf-auto` as you
     // type it. Showing a stale route would be showing the wrong skill.
     if let Overlay::LaunchLine { staged, text } = &app.overlay {
         let route = staged.route(LaunchMode::parse(text).mode());
@@ -1404,7 +1404,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let screen = render(&app);
         assert!(
-            screen.contains("→ /wayfinder · #6 Re-entry breadcrumbs"),
+            screen.contains("→ /wf · #6 Re-entry breadcrumbs"),
             "{screen}"
         );
         assert!(
@@ -1414,12 +1414,12 @@ mod tests {
 
         // The typed mode shows on the line as it accumulates — and re-routes
         // it live, because since #96 the mode word picks the skill and a line
-        // still echoing `/wayfinder` would be naming the wrong one.
+        // still echoing `/wf` would be naming the wrong one.
         type_str(&mut app, "auto something");
         let screen = render(&app);
         assert!(screen.contains("auto something"), "{screen}");
         assert!(
-            screen.contains("→ /wayfinder-auto · #6 Re-entry breadcrumbs"),
+            screen.contains("→ /wf-auto · #6 Re-entry breadcrumbs"),
             "{screen}"
         );
 
@@ -1427,7 +1427,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let screen = render(&app);
         assert!(screen.contains("5/5"), "{screen}");
-        assert!(!screen.contains("→ /wayfinder"), "{screen}");
+        assert!(!screen.contains("→ /wf"), "{screen}");
     }
 
     #[test]

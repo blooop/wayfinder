@@ -30,21 +30,28 @@ everything else is keys in the TUI.
 
 ## The skills ship with the binary
 
-`wf` does not merely *mention* `/tdd` and `/wayfinder-auto` — it hardcodes them
+`wf` does not merely *mention* `/wf-tdd` and `/wf-auto` — it hardcodes them
 in its routing table and execs them, which makes those prompt files part of
 `wf`'s interface. So they live in this repo under `skills/`, the package
 installs them at `<prefix>/share/wf/skills`, and one `pixi global update wf`
 moves the binary and the prompts together. An interface split across two repos
 on two release cadences drifts silently, which is exactly what happened before
-this: `wf` reached 0.6.0 still routing `defer` at a `/wayfinder` section that
-`/wayfinder-auto` had superseded weeks earlier, and nothing anywhere could
+this: `wf` reached 0.6.0 still routing `defer` at a `/wf` section that
+`/wf-auto` had superseded weeks earlier, and nothing anywhere could
 notice.
 
-Five skills ship: `wayfinder`, `wayfinder-auto`, `wayfinder-one`, `tdd` and
-`review` — the four `wf` can exec, plus the single-ticket sibling that shares
-their `GITHUB_TRACKER.md` and `LIFECYCLE.md`. A unit test asserts every route's
-label is one of them, so a route can never name a skill the package does not
-ship.
+Five skills ship: `wf`, `wf-auto`, `wf-one`, `wf-tdd` and `wf-review` — the four
+`wf` can exec, plus the single-ticket sibling that shares their
+`GITHUB_TRACKER.md` and `LIFECYCLE.md`. A unit test asserts every route's label
+is one of them, so a route can never name a skill the package does not ship.
+
+Every name carries the `wf` prefix because `~/.claude/skills` is one flat
+namespace shared with every other source of skills you have. Unprefixed, `tdd`
+and `review` are names `wf` would *squat on* rather than merely occupy: while it
+held one, you could not have your own. `wf skills install` clears the links an
+older `wf` left under its old names, and touches nothing else — it removes a
+link only when the link points into a `wf` bundle, so a skill of yours can never
+match however dead it looks.
 
 `wf skills install` **symlinks** rather than copies, which is the whole point:
 updating the package updates the prompts, with no second command to remember
@@ -55,11 +62,11 @@ would actually run:
 bundle  /home/you/.pixi/envs/wf/share/wf/skills (installed beside the binary)
 target  /home/you/.claude/skills
 
-  wayfinder       ok
-  wayfinder-auto  ok
-  wayfinder-one   ok
-  tdd             stale — links to /home/you/projects/wayfinder/skills
-  review          not a link — another tool owns this one
+  wf              ok
+  wf-auto         ok
+  wf-one          ok
+  wf-tdd          stale — links to /home/you/projects/wayfinder/skills
+  wf-review       not a link — another tool owns this one
 ```
 
 `wf` never deletes a real directory it did not create — if chezmoi or a
@@ -70,8 +77,8 @@ tree, so an edit is live in the next session with nothing to reinstall.
 
 The skills stay ordinary installed skills rather than text `wf` injects at exec
 time, because `wf` is not their only caller: `LIFECYCLE.md` has the manager
-agent spawn `/tdd` and `/review` in *fresh subagents* mid-session, you type
-`/wayfinder-auto` yourself on efforts that never go through the picker, and
+agent spawn `/wf-tdd` and `/wf-review` in *fresh subagents* mid-session, you type
+`/wf-auto` yourself on efforts that never go through the picker, and
 model invocation needs a file on disk with frontmatter.
 
 ## Checks
@@ -283,7 +290,7 @@ agent inside it — see
 
 **Launching is two steps.** `enter` on the cursor's node does not launch: it
 opens the **launch line** where the count line was, showing where `enter` will
-go — `→ /tdd · #65 Author the /tdd skill`. What you type lands on that line, not
+go — `→ /wf-tdd · #65 Author the /wf-tdd skill`. What you type lands on that line, not
 in the query, and *is* the mode:
 
 | the line says | what launches |
@@ -310,16 +317,16 @@ headers are one `↑` away.
 
 | picked | stage | mode | launches |
 | --- | --- | --- | --- |
-| a cluster header | — | interactive | `claude "/wayfinder <map>"` |
-| `wayfinder:build` | ready · building · needs attention | interactive | `claude "/tdd <n>"` |
-| `wayfinder:build` | in review | interactive | `claude "/review <n>"` |
-| research · prototype · grilling · task | any unfinished stage | interactive | `claude "/wayfinder <map> <n>"` |
-| anything | any unfinished stage | `auto` | `claude "/wayfinder-auto <map> [<n>]"` |
+| a cluster header | — | interactive | `claude "/wf <map>"` |
+| `wayfinder:build` | ready · building · needs attention | interactive | `claude "/wf-tdd <n>"` |
+| `wayfinder:build` | in review | interactive | `claude "/wf-review <n>"` |
+| research · prototype · grilling · task | any unfinished stage | interactive | `claude "/wf <map> <n>"` |
+| anything | any unfinished stage | `auto` | `claude "/wf-auto <map> [<n>]"` |
 | a ticket | done | — | nothing — not launchable |
 
 `auto` collapses the ticket rows on purpose: the launched session is a
-*manager*, and what it manages is the node's whole remaining lifecycle — `/tdd`,
-the gate, then a fresh-context `/review` — so it is the manager skill that runs,
+*manager*, and what it manages is the node's whole remaining lifecycle — `/wf-tdd`,
+the gate, then a fresh-context `/wf-review` — so it is the manager skill that runs,
 not the one skill that stage would have called. Steering text rides whichever
 route you got, as ` steer: <text>` on the end of the prompt; the mode itself
 never does, because it has already chosen the skill.
@@ -364,7 +371,7 @@ A checkout that carries a **`.devcontainer/devcontainer.json`** (or a top-level
 [`dl`](https://github.com/blooop/devlaunch):
 
 ```
-dl <the checkout> -- 'claude' '--dangerously-skip-permissions' '/wayfinder 67 80'
+dl <the checkout> -- 'claude' '--dangerously-skip-permissions' '/wf 67 80'
 ```
 
 `wf` owns which ticket, which checkout, which skill and which prompt. `dl` owns

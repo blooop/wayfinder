@@ -1,5 +1,5 @@
 ---
-name: wayfinder
+name: wf
 description: Plan a huge chunk of work — more than one agent session can hold — as a shared map of decision tickets on your issue tracker, and resolve them one at a time until the way to the destination is clear.
 disable-model-invocation: true
 ---
@@ -86,7 +86,7 @@ Every ticket is either **HITL** — human in the loop, worked *with* a human who
 - **Prototype** (HITL): Raise the fidelity of the discussion by making a cheap, rough, concrete artifact to react to — an outline, a rough take, a stub, or UI/logic code via the /prototype skill. Links the prototype as an asset. Use when "how should it look" or "how should it behave" is the key question.
 - **Grilling** (HITL): Conversation via the /grill-me and /constructive-modeling skills, one question at a time; pull in /ubiquitous-language when the decision hinges on naming or contested terms. The default case.
 - **Task** (HITL or AFK): Manual work that must happen before a *decision* can be made — nothing to decide, prototype, or research, but the discussion is blocked until it's done. Signing up for a service so its API can be judged, provisioning access, moving data so its shape can be seen. This is the one type that *does* rather than decides — and it earns its place by unblocking a decision, not by delivering the destination. The agent drives it alone where it can (AFK); otherwise it hands the human a precise checklist (HITL). Resolved when the work is done; the answer records what was done and any resulting facts (credentials location, new URLs, row counts) later tickets depend on.
-- **Build** (AFK): An execution slice — code to write, sized to one fresh agent session, on a map whose Notes carry the execution override. Worked via the `/tdd` skill and reviewed via `/review`; its lifecycle position (**ready → building → in review → needs attention → done**) is *derived from its linked PRs*, never declared — see [LIFECYCLE.md](LIFECYCLE.md) for the stage lattice, gates, and the manager protocol. Review is a **stage** of a build ticket, not a ticket type.
+- **Build** (AFK): An execution slice — code to write, sized to one fresh agent session, on a map whose Notes carry the execution override. Worked via the `/wf-tdd` skill and reviewed via `/wf-review`; its lifecycle position (**ready → building → in review → needs attention → done**) is *derived from its linked PRs*, never declared — see [LIFECYCLE.md](LIFECYCLE.md) for the stage lattice, gates, and the manager protocol. Review is a **stage** of a build ticket, not a ticket type.
 
 ## Fog of war
 
@@ -125,10 +125,10 @@ Two modes, plus a deferred variant of the second. **Never resolve more than one 
 
 The invocation grammar (what `wf`'s launch line produces):
 
-- `/wayfinder <map> [<ticket>]` — interactive (everything below as written)
-- `/wayfinder <map> <ticket> defer` — deferred subtree (see [Deferred mode](#deferred-mode))
-- `/wayfinder <map> <ticket> defer: <steering>` — deferred, with a steering prompt
-- `/wayfinder <map> <ticket> steer: <steering>` — interactive, with a steering prompt
+- `/wf <map> [<ticket>]` — interactive (everything below as written)
+- `/wf <map> <ticket> defer` — deferred subtree (see [Deferred mode](#deferred-mode))
+- `/wf <map> <ticket> defer: <steering>` — deferred, with a steering prompt
+- `/wf <map> <ticket> steer: <steering>` — interactive, with a steering prompt
 
 ### Chart the map
 

@@ -353,13 +353,13 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
     // ticket, at which stage — the cursor landed on is the live tracker's
     // business. So only the prompt's shape is asserted: one of the interactive
     // routes (#61), with its numeric arguments and no steering suffix (the
-    // line was empty). `/wayfinder-auto` cannot appear — that needs the word
+    // line was empty). `/wf-auto` cannot appear — that needs the word
     // `auto` typed — and neither can a bare map launch, since the default
     // cursor skips cluster headers (#96).
     let (skill, numbers) = prompt.split_once(' ').expect("a skill and arguments");
     let halves: Vec<&str> = match skill {
-        "/wayfinder" => numbers.splitn(2, ' ').collect(),
-        "/tdd" | "/review" => vec![numbers],
+        "/wf" => numbers.splitn(2, ' ').collect(),
+        "/wf-tdd" | "/wf-review" => vec![numbers],
         other => panic!("unroutable skill {other:?} in prompt {prompt:?}"),
     };
     for half in &halves {
@@ -368,7 +368,7 @@ fn enter_execs_the_agent_in_the_checkout_and_leaves_no_wf_behind() {
             "prompt was {prompt:?}"
         );
     }
-    if skill == "/wayfinder" {
+    if skill == "/wf" {
         assert_eq!(halves.len(), 2, "prompt was {prompt:?}");
     }
 

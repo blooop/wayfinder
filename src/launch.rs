@@ -7,7 +7,7 @@
 //! ([`Launch::exec`]) — which skill is [`route`]'s answer to what was picked
 //! ([`Aim`]) and who decides ([`Mode`]), and any steering text rides the
 //! prompt as a suffix (#61/#62/#96). Unattended work is still not supervised
-//! here — an `auto` launch is the same exec of `/wayfinder-auto`, watched from
+//! here — an `auto` launch is the same exec of `/wf-auto`, watched from
 //! another terminal or not at all.
 //!
 //! A checkout that declares a devcontainer runs that same agent *inside* it,
@@ -34,15 +34,15 @@ use crate::projects::Checkout;
 /// hardcoded in `wf` (#61/#96): not per-ticket config, not a Notes-parsed table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
-    /// `/tdd <n>` — build work: ready, resuming, or acting on red checks and
+    /// `/wf-tdd <n>` — build work: ready, resuming, or acting on red checks and
     /// requested changes (the reviewer's comments live on the PR).
     Tdd,
-    /// `/review <n>` — a build whose PR awaits its independent look.
+    /// `/wf-review <n>` — a build whose PR awaits its independent look.
     Review,
-    /// `/wayfinder <map> [<n>]` — a decision session with the human in it,
+    /// `/wf <map> [<n>]` — a decision session with the human in it,
     /// on one ticket or on the map itself.
     Wayfinder,
-    /// `/wayfinder-auto <map> [<n>]` — the same map with nobody in the loop:
+    /// `/wf-auto <map> [<n>]` — the same map with nobody in the loop:
     /// decisions settled against the skill's guiding principles, and the whole
     /// remaining lifecycle driven unattended (#96).
     WayfinderAuto,
@@ -50,12 +50,18 @@ pub enum Route {
 
 impl Route {
     /// How the route reads on the launch line: the slash command it execs.
+    ///
+    /// Every label is prefixed `wf`, because these names are claimed in a
+    /// namespace `wf` does not own: `~/.claude/skills` is flat and shared with
+    /// every other source of skills the user has. Unprefixed `tdd` and `review`
+    /// are names someone else will plausibly want — and while `wf` holds them,
+    /// nobody else can have them (#104).
     pub fn label(self) -> &'static str {
         match self {
-            Route::Tdd => "/tdd",
-            Route::Review => "/review",
-            Route::Wayfinder => "/wayfinder",
-            Route::WayfinderAuto => "/wayfinder-auto",
+            Route::Tdd => "/wf-tdd",
+            Route::Review => "/wf-review",
+            Route::Wayfinder => "/wf",
+            Route::WayfinderAuto => "/wf-auto",
         }
     }
 }
@@ -63,17 +69,17 @@ impl Route {
 /// Who resolves the launched node — the axis #96 added to routing, orthogonal
 /// to what the cursor was standing on.
 ///
-/// Not a flag on the skill: the two modes are *different skills* (`/wayfinder`
-/// and `/wayfinder-auto`), so the mode is an input to [`route`] rather than
+/// Not a flag on the skill: the two modes are *different skills* (`/wf`
+/// and `/wf-auto`), so the mode is an input to [`route`] rather than
 /// something the prompt carries. That is why nothing about "auto" survives
 /// into the exec'd prompt's steering suffix — by then it has already been spent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// The default: the human is in the loop, and the session grills them.
     Interactive,
-    /// The word `auto`: the agent decides alone, under `/wayfinder-auto`'s
+    /// The word `auto`: the agent decides alone, under `/wf-auto`'s
     /// declared principles, and drives the node's remaining lifecycle
-    /// unattended. Replaced `defer`, which routed to `/wayfinder`'s own
+    /// unattended. Replaced `defer`, which routed to `/wf`'s own
     /// deferred mode before that skill existed (#63 → #96).
     Auto,
 }
@@ -181,7 +187,7 @@ pub enum Aim {
 /// The mode axis collapses the ticket table wherever it is `Auto`, and that is
 /// the point rather than a shortcut: under `Auto` the launched session is a
 /// **manager**, and what it manages is the node's whole remaining lifecycle —
-/// `/tdd`, the gate, then fresh-context `/review` — so it is `/wayfinder-auto`
+/// `/wf-tdd`, the gate, then fresh-context `/wf-review` — so it is `/wf-auto`
 /// that gets launched at every stage, not the stage's own skill.
 pub fn route(aim: &Aim, mode: Mode) -> Route {
     match (aim, mode) {
@@ -207,7 +213,7 @@ pub fn route(aim: &Aim, mode: Mode) -> Route {
                 match ticket_type {
                     TicketType::Build => Route::Tdd,
                     // Decision types (untyped riding along, as it always
-                    // launched): /wayfinder at every unfinished stage —
+                    // launched): /wf at every unfinished stage —
                     // PR-dominant derivation can put a decision node past "in
                     // progress" (a prototype's PR counts), and the skill owns
                     // its node's PR state.
@@ -365,7 +371,7 @@ fn has_devcontainer(checkout: &Path) -> bool {
 /// joins everything after `--` with spaces and gives the single string to
 /// `devpod ssh --command`, which runs it through a shell inside the container.
 /// So [`Launch::agent_argv`]'s one-argv-entry-per-prompt invariant does not
-/// survive the trip on its own — unquoted, `/wayfinder 67 80` would arrive as
+/// survive the trip on its own — unquoted, `/wf 67 80` would arrive as
 /// three arguments.
 ///
 /// Single quotes, uniformly, because inside them a POSIX shell interprets
@@ -393,7 +399,7 @@ pub struct Launch {
     repo: String,
     /// What is being worked: the map, or one ticket in it.
     aim: Aim,
-    /// The map issue — `/wayfinder`'s first argument, and its only one when
+    /// The map issue — `/wf`'s first argument, and its only one when
     /// the aim is the map itself.
     map_issue: u64,
     /// The checkout the agent works in: the process's working directory.
@@ -447,7 +453,7 @@ impl Launch {
     /// The agent itself. `claude` takes a single positional prompt, so the
     /// slash command, its arguments and the steering suffix are one argv
     /// entry, not several. Only the wayfinder skills take the map argument —
-    /// `/tdd` and `/review` resolve the repo from the checkout they run in.
+    /// `/wf-tdd` and `/wf-review` resolve the repo from the checkout they run in.
     ///
     /// The map aim is matched first because it is the arm that needs no
     /// second thought: [`route`] hands a cluster header nothing but a
@@ -671,7 +677,7 @@ mod tests {
         }
     }
 
-    /// An interactive `/wayfinder` plan — the default launch, and the shape
+    /// An interactive `/wf` plan — the default launch, and the shape
     /// every checkout-resolution test wants (route and mode are orthogonal to
     /// which trees are candidates).
     fn plan_wf(checkouts: &[Checkout], ticket: &Ticket, map_issue: u64) -> Targets {
@@ -759,7 +765,7 @@ mod tests {
             vec![
                 "claude".to_string(),
                 SKIP_PERMISSIONS.to_string(),
-                "/wayfinder 1 16".to_string()
+                "/wf 1 16".to_string()
             ]
         );
     }
@@ -827,19 +833,19 @@ mod tests {
         // argument. The mode is *not* in the suffix — it chose the skill.
         assert_eq!(
             ticket_prompt(TicketType::Build, Stage::Ready, ""),
-            "/tdd 16"
+            "/wf-tdd 16"
         );
         assert_eq!(
             ticket_prompt(TicketType::Build, Stage::InReview, ""),
-            "/review 16"
+            "/wf-review 16"
         );
         assert_eq!(
             ticket_prompt(TicketType::Grilling, Stage::Ready, ""),
-            "/wayfinder 1 16"
+            "/wf 1 16"
         );
         assert_eq!(
             ticket_prompt(TicketType::Grilling, Stage::Ready, "auto"),
-            "/wayfinder-auto 1 16"
+            "/wf-auto 1 16"
         );
         // Steering rides as a suffix, whatever the route.
         assert_eq!(
@@ -848,11 +854,11 @@ mod tests {
                 Stage::Ready,
                 "auto skip the flaky suite"
             ),
-            "/wayfinder-auto 1 16 steer: skip the flaky suite"
+            "/wf-auto 1 16 steer: skip the flaky suite"
         );
         assert_eq!(
             ticket_prompt(TicketType::Build, Stage::Ready, "try the other approach"),
-            "/tdd 16 steer: try the other approach"
+            "/wf-tdd 16 steer: try the other approach"
         );
     }
 
@@ -860,11 +866,11 @@ mod tests {
     fn a_map_launch_is_the_skill_and_the_map_number_alone() {
         // No ticket argument exists to pass, so none is passed — the map aim
         // is the whole subject (#96).
-        assert_eq!(map_prompt(""), "/wayfinder 59");
-        assert_eq!(map_prompt("auto"), "/wayfinder-auto 59");
+        assert_eq!(map_prompt(""), "/wf 59");
+        assert_eq!(map_prompt("auto"), "/wf-auto 59");
         assert_eq!(
             map_prompt("auto merge when green"),
-            "/wayfinder-auto 59 steer: merge when green"
+            "/wf-auto 59 steer: merge when green"
         );
         // A map's key is its own issue number, not a ticket's.
         let staged = Staged::map(&MapId::new("blooop/wayfinder", 59), "the dev-process tree");
@@ -934,7 +940,7 @@ mod tests {
     #[test]
     fn build_nodes_route_to_tdd_except_in_review_which_routes_to_review() {
         // The #61 routing table's build rows: failing checks and requested
-        // changes are code work, so needs-attention goes back to /tdd.
+        // changes are code work, so needs-attention goes back to /wf-tdd.
         let build = |stage| route(&aim(TicketType::Build, stage), Mode::Interactive);
         assert_eq!(build(Launchable::Ready), Route::Tdd);
         assert_eq!(build(Launchable::Building), Route::Tdd);
@@ -947,7 +953,7 @@ mod tests {
         // The table lists decision types at ready/in-progress, but PR-dominant
         // derivation can put one at in-review or needs-attention (a
         // prototype's PR counts) — the skill owns its node's PR state, so the
-        // route stays /wayfinder at every stage short of done. Untyped rides
+        // route stays /wf at every stage short of done. Untyped rides
         // along: launching untyped tickets is today's behavior, kept.
         for ticket_type in DECISION_TYPES {
             for stage in LAUNCHABLE {
@@ -1098,13 +1104,13 @@ mod tests {
                 "dl".to_string(),
                 "/data/proj/wayfinder".to_string(),
                 "--".to_string(),
-                "'claude' '--dangerously-skip-permissions' '/wayfinder 67 80'".to_string(),
+                "'claude' '--dangerously-skip-permissions' '/wf 67 80'".to_string(),
             ]
         );
         // The steering suffix rides inside the same quoted argument.
         assert_eq!(
             isolated(Route::WayfinderAuto, "auto merge when green").agent_argv()[3],
-            "'claude' '--dangerously-skip-permissions' '/wayfinder-auto 67 80 steer: merge when green'"
+            "'claude' '--dangerously-skip-permissions' '/wf-auto 67 80 steer: merge when green'"
         );
     }
 
@@ -1115,7 +1121,7 @@ mod tests {
         let launch = isolated(Route::Tdd, "don't touch the CI; rm -rf /");
         assert_eq!(
             launch.agent_argv()[3],
-            r"'claude' '--dangerously-skip-permissions' '/tdd 80 steer: don'\''t touch the CI; rm -rf /'"
+            r"'claude' '--dangerously-skip-permissions' '/wf-tdd 80 steer: don'\''t touch the CI; rm -rf /'"
         );
         // Every metacharacter a shell would otherwise act on is inside quotes.
         assert_eq!(shell_quote("a b|c;d&e$f`g"), "'a b|c;d&e$f`g'");
