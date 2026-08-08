@@ -31,6 +31,7 @@ to main, in the order they are cheap to fix:
 cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked
 cargo test --locked --lib --bins --examples
+cargo test --locked --test live_fetch -- common::
 cargo doc --no-deps --all-features --locked
 ```
 
@@ -45,8 +46,11 @@ arguable rather than accumulating.
 
 Everything under `tests/` is a `live_*` integration test — a real `gh`, real
 network, real assertions against this project's own tracker — so CI compiles
-them but does not run them, and a moving map never breaks a build. Run them
-yourself when the fetch or launch path changes:
+them but does not run them, and a moving map never breaks a build. The one
+exception is the fourth command above: `tests/common`'s diagnostic, which
+decides what a failing live test tells you about a missing `GH_TOKEN`, is pure
+and needs no network, and an assertion nothing runs is not an assertion. Run
+the rest yourself when the fetch or launch path changes:
 
 ```
 cargo test --test live_fetch --test live_discovery
