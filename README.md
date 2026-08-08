@@ -317,16 +317,16 @@ opens the **launch picker** over the list, showing what is about to happen and
 the one thing still undecided — who resolves the node:
 
 ```
-┌ launch blooop/wayfinder · #65 Author the /wf-tdd skill ────────────────┐
-│                                                                        │
-│  ▶ interactive   /wf-tdd   you are in the loop; it grills you          │
+┌ launch blooop/wayfinder · #65 Author the /wf-tdd skill ─────────────────┐
+│                                                                         │
+│  ▶ interactive   /wf-tdd   you are in the loop; it grills you           │
 │    auto          /wf-auto  the agent decides alone and drives it to done│
 │    plain         claude    no skill; a bare session on the node's branch│
-│                                                                        │
-│    steer  █                                                            │
-│                                                                        │
-│  enter launch · ↑/↓ pick · type to fill · esc cancel                   │
-└────────────────────────────────────────────────────────────────────────┘
+│                                                                         │
+│    steer  █                                                             │
+│                                                                         │
+│  enter launch · ↑/↓ pick · type to fill · esc cancel                    │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 `↑`/`↓` (or `tab`) move between the rows and `enter` runs the one you are on,
@@ -360,19 +360,19 @@ a *repo*, so it lives where the stop is repo-level — the cluster header — an
 reached by the same `enter` as everything else. No new keys:
 
 ```
-┌ launch blooop/wayfinder · #59 Map: the dev-process tree ───────────────┐
-│                                                                        │
-│  ▶ interactive   /wf       you are in the loop; it grills you          │
+┌ launch blooop/wayfinder · #59 Map: the dev-process tree ────────────────┐
+│                                                                         │
+│  ▶ interactive   /wf       you are in the loop; it grills you           │
 │    auto          /wf-auto  the agent decides alone and drives it to done│
 │    plain         claude    no skill; a bare session on the node's branch│
-│    new task      /wf-one   one tracked ticket, built and reviewed      │
-│    new map       /wf       chart a new map in this repo, with you      │
-│    new map, auto /wf-auto  chart a new map in this repo, alone         │
-│                                                                        │
-│    task   █                                                            │
-│                                                                        │
-│  enter launch · ↑/↓ pick · type to fill · esc cancel                   │
-└────────────────────────────────────────────────────────────────────────┘
+│    new task      /wf-one   one tracked ticket, built and reviewed       │
+│    new map       /wf       chart a new map in this repo, with you       │
+│    new map, auto /wf-auto  chart a new map in this repo, alone          │
+│                                                                         │
+│    task   █                                                             │
+│                                                                         │
+│  enter launch · ↑/↓ pick · type to fill · esc cancel                    │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 The repo comes free from wherever the cursor was standing, which is why the title

@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::launch::{self, Candidate, Launch, LaunchMode, Staged, Targets};
+use crate::launch::{self, Candidate, Launch, LaunchMode, Route, Staged, Targets};
 use crate::model::{stage, Activity, Map, MapId, MapSet, Status, Ticket};
 use crate::projects::Checkout;
 use crate::refresh::Startup;
@@ -96,8 +96,9 @@ fn previous_candidate(staged: &Staged, candidate: Candidate) -> Candidate {
 ///
 /// # Panics
 ///
-/// Never: [`Staged::candidates`] always lists the three launch rows, so the
-/// modulo below is never by zero.
+/// Never: [`Staged::candidates`] is never empty — every stop offers rows, its
+/// launch rows or the map-less door's creation rows — so the modulo below is
+/// never by zero.
 fn stepped(staged: &Staged, candidate: Candidate, delta: usize) -> Candidate {
     let candidates = staged.candidates();
     let at = candidates.iter().position(|c| *c == candidate).unwrap_or(0);
@@ -336,11 +337,12 @@ impl App {
     /// what the draw walks and what the cursor navigates, so the two can never
     /// disagree about order.
     pub fn plan(&self) -> Plan {
-        let mut plan = view::plan(&self.scoped_clusters(), self.screen(), &self.expanded);
-        if let Some(repo) = self.mapless_door() {
-            plan.items.push(view::Item::MaplessHeader(repo));
-        }
-        plan
+        view::plan(
+            &self.scoped_clusters(),
+            self.screen(),
+            &self.expanded,
+            self.mapless_door().as_deref(),
+        )
     }
 
     /// The repo whose empty-state door this screen is showing, if it is
@@ -729,10 +731,12 @@ impl App {
     /// — a row without a map is unrepresentable, so the old "repo has no map"
     /// failure is gone with it.
     ///
-    /// Everything this needs came with the [`Staged`] launch, so a refetch
-    /// between the two enters cannot redirect it at another ticket.
-    fn resolve_launch(&mut self, staged: &Staged, mode: &LaunchMode) -> Outcome {
-        let targets = launch::plan(&self.checkouts, staged, mode);
+    /// Everything this needs came with the [`Staged`] launch and the picked
+    /// [`Candidate`] — including `route`, carried from the row that was drawn
+    /// rather than derived a second time — so a refetch between the two enters
+    /// cannot redirect it at another ticket or another skill.
+    fn resolve_launch(&mut self, staged: &Staged, route: Route, mode: &LaunchMode) -> Outcome {
+        let targets = launch::plan(&self.checkouts, staged, route, mode);
         self.act_on(targets, &staged.repo, &staged.key())
     }
 
@@ -799,8 +803,8 @@ impl App {
             // The one exception is the refusal below, which puts this very
             // picker back so the missing task can be typed into it.
             KeyCode::Enter => match candidate {
-                Candidate::Launch { mode, .. } => {
-                    return self.resolve_launch(&staged, &LaunchMode::picked(mode, &steer))
+                Candidate::Launch { mode, route } => {
+                    return self.resolve_launch(&staged, route, &LaunchMode::picked(mode, &steer))
                 }
                 Candidate::Create(kind) => match kind.with_text(&steer) {
                     Some(creation) => return self.resolve_creation(&staged.repo, &creation),

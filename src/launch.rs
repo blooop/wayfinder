@@ -641,26 +641,27 @@ impl Staged {
         }
     }
 
-    /// The picker's rows for this stop, in on-screen order — the one
-    /// constructor of [`Candidate`], which is what makes an inconsistent row
-    /// unbuildable (#114). Every stop launches; only the repo-level stop — the
-    /// cluster header, [`Aim::Map`] — adds the creation rows, because creation
-    /// is a repo-level act and a ticket picker carrying it would merge
-    /// concerns the stop grammar keeps apart.
-    /// The row the picker opens on: the default mode's launch row, whatever
-    /// else this stop offers. Creation is never the default — `enter` on a
-    /// node still means "launch this node" first.
+    /// The row the picker opens on: the first row this stop offers. On a node
+    /// that is the default mode's launch row — creation is never the default,
+    /// because `enter` on a node still means "launch this node" first. On the
+    /// map-less door there is no node to launch, so the first creation row
+    /// leads.
     ///
     /// # Panics
     ///
-    /// Never: [`Staged::candidates`] always leads with the launch rows.
+    /// Never: [`Staged::candidates`] is never empty. Every stop offers rows —
+    /// its launch rows, or, on the map-less door, its creation rows.
     pub fn default_candidate(&self) -> Candidate {
-        *self
-            .candidates()
-            .first()
-            .expect("every stop offers its launch rows")
+        *self.candidates().first().expect("every stop offers rows")
     }
 
+    /// The picker's rows for this stop, in on-screen order — the one
+    /// constructor of [`Candidate`], which is what makes an inconsistent row
+    /// unbuildable (#114). Every *node* launches; only the repo-level node —
+    /// the cluster header, [`Aim::Map`] — adds the creation rows, because
+    /// creation is a repo-level act and a ticket picker carrying it would
+    /// merge concerns the stop grammar keeps apart. The map-less door has no
+    /// node, so it offers the creation rows alone.
     pub fn candidates(&self) -> Vec<Candidate> {
         let launches = |aim: Aim| {
             Mode::all()
@@ -841,6 +842,25 @@ enum Job {
     Create(Creation),
 }
 
+impl Job {
+    /// The issue number this job hangs off: the ticket's, or the map's when the
+    /// whole map is what was picked. `None` for a creation, which has no number
+    /// until the launched skill files one.
+    ///
+    /// Held here rather than inlined at each use because the display key and
+    /// the `dl` branch name must never disagree about which number a launch is
+    /// — they are two renderings of the same fact.
+    fn number(&self) -> Option<u64> {
+        match self {
+            Job::Node { aim, map_issue, .. } => Some(match aim {
+                Aim::Map => *map_issue,
+                Aim::Ticket { number, .. } => *number,
+            }),
+            Job::Create(_) => None,
+        }
+    }
+}
+
 /// Agent sessions are started from a picker rather than from a shell someone is
 /// watching, so they do not stop for permission prompts.
 const SKIP_PERMISSIONS: &str = "--dangerously-skip-permissions";
@@ -856,15 +876,9 @@ impl Launch {
     /// picked — and `<short_repo>+new` for a creation, which has no number
     /// until the skill files one.
     pub fn key(&self) -> String {
-        match &self.job {
-            Job::Node { aim, map_issue, .. } => {
-                let number = match aim {
-                    Aim::Map => map_issue,
-                    Aim::Ticket { number, .. } => number,
-                };
-                format!("{}#{}", short_repo(&self.repo), number)
-            }
-            Job::Create(_) => format!("{}+new", short_repo(&self.repo)),
+        match self.job.number() {
+            Some(number) => format!("{}#{}", short_repo(&self.repo), number),
+            None => format!("{}+new", short_repo(&self.repo)),
         }
     }
 
@@ -883,20 +897,14 @@ impl Launch {
     /// gets the bare `owner/repo` — the default workspace — and the launched
     /// skill files its own issues and makes its own branches (#114).
     fn workspace(&self) -> String {
-        match &self.job {
-            Job::Node { aim, map_issue, .. } => {
-                let number = match aim {
-                    Aim::Map => map_issue,
-                    Aim::Ticket { number, .. } => number,
-                };
-                format!(
-                    "{}@wayfinder/{}-{}",
-                    self.repo,
-                    short_repo(&self.repo),
-                    number
-                )
-            }
-            Job::Create(_) => self.repo.clone(),
+        match self.job.number() {
+            Some(number) => format!(
+                "{}@wayfinder/{}-{}",
+                self.repo,
+                short_repo(&self.repo),
+                number
+            ),
+            None => self.repo.clone(),
         }
     }
 
@@ -1122,22 +1130,28 @@ pub enum Targets {
 }
 
 /// Resolve a launch request against the projects cache. Zero or one candidate
-/// never prompts. The aim and mode arrive already settled — this function
-/// answers *where* the agent can run, and resolves the route the mode picked.
-pub fn plan(checkouts: &[Checkout], staged: &Staged, mode: &LaunchMode) -> Targets {
+/// never prompts. The aim, mode **and route** all arrive already settled — the
+/// route comes from the [`Candidate`] the human actually saw drawn, not from a
+/// second derivation here, so what execs is what the row named (#114). This
+/// function answers only *where* the agent can run.
+pub fn plan(checkouts: &[Checkout], staged: &Staged, route: Route, mode: &LaunchMode) -> Targets {
     let StagedAt::Node { aim, map_issue } = staged.at else {
         // Unreachable from the picker: [`Staged::candidates`] offers no launch
         // row on the map-less door, so nothing there can ask for a node
-        // launch. Refusing rather than inventing a node keeps this total.
+        // launch. Refusing rather than inventing a node — there is no aim and
+        // no map issue to invent one from — keeps this total.
         return Targets::Unregistered;
     };
-    let route = route(&aim, mode.mode());
-    resolve(checkouts, &staged.repo, |_| Job::Node {
-        aim,
-        map_issue,
-        route,
-        mode: mode.clone(),
-    })
+    resolve(
+        checkouts,
+        &staged.repo,
+        &Job::Node {
+            aim,
+            map_issue,
+            route,
+            mode: mode.clone(),
+        },
+    )
 }
 
 /// Resolve a creation against the projects cache — the same rules as [`plan`]:
@@ -1145,7 +1159,7 @@ pub fn plan(checkouts: &[Checkout], staged: &Staged, mode: &LaunchMode) -> Targe
 /// complete ([`CreationKind::with_text`] refused the empty task), so this
 /// function only answers *where* the skill runs.
 pub fn plan_create(checkouts: &[Checkout], repo: &str, creation: &Creation) -> Targets {
-    resolve(checkouts, repo, |_| Job::Create(creation.clone()))
+    resolve(checkouts, repo, &Job::Create(creation.clone()))
 }
 
 /// The shared half of [`plan`] and [`plan_create`]: every registered checkout
@@ -1162,13 +1176,15 @@ pub fn plan_create(checkouts: &[Checkout], repo: &str, creation: &Creation) -> T
 ///
 /// Never: the `expect` in the one-candidate arm is guarded by the `match` on
 /// the length immediately above it.
-fn resolve(checkouts: &[Checkout], repo: &str, job: impl Fn(&Checkout) -> Job) -> Targets {
+fn resolve(checkouts: &[Checkout], repo: &str, job: &Job) -> Targets {
     let launches: Vec<Launch> = candidate_checkouts(checkouts, repo)
         .into_iter()
         .map(|c| Launch {
             repo: repo.to_string(),
             cwd: c.path.clone(),
-            job: job(c),
+            // The job is the same whichever checkout hosts it — what differs
+            // per candidate is only where it runs and in what.
+            job: job.clone(),
             isolation: Isolation::detect(&c.path),
         })
         .collect();
@@ -1224,11 +1240,20 @@ mod tests {
     /// every checkout-resolution test wants (route and mode are orthogonal to
     /// which trees are candidates).
     fn plan_wf(checkouts: &[Checkout], ticket: &Ticket, map_issue: u64) -> Targets {
-        plan(
+        let staged = Staged::ticket(ticket, map_issue, Stage::Ready).expect("ready is launchable");
+        plan_picked(
             checkouts,
-            &Staged::ticket(ticket, map_issue, Stage::Ready).expect("ready is launchable"),
+            &staged,
             &LaunchMode::picked(Mode::Interactive, ""),
         )
+    }
+
+    /// [`plan`] as the picker reaches it: the route comes from the row the
+    /// stop would have drawn for this mode, not from a second derivation the
+    /// test invents — so these stay tests of the real second enter.
+    fn plan_picked(checkouts: &[Checkout], staged: &Staged, mode: &LaunchMode) -> Targets {
+        let route = staged.route(mode.mode()).expect("a node stop launches");
+        plan(checkouts, staged, route, mode)
     }
 
     fn cache() -> Vec<Checkout> {
@@ -1633,7 +1658,7 @@ mod tests {
         let mut node = ticket("blooop/wayfinder", 16);
         node.ticket_type = ticket_type;
         let staged = Staged::ticket(&node, 1, stage).expect("a launchable stage");
-        match plan(&cache(), &staged, mode) {
+        match plan_picked(&cache(), &staged, mode) {
             Targets::One(l) => l.agent_argv(),
             other => panic!("{other:?}"),
         }
@@ -1651,7 +1676,7 @@ mod tests {
     /// The whole argv of a launch aimed at the whole map.
     fn map_argv(mode: &LaunchMode) -> Vec<String> {
         let staged = Staged::map(&MapId::new("blooop/wayfinder", 59), "the dev-process tree");
-        match plan(&cache(), &staged, mode) {
+        match plan_picked(&cache(), &staged, mode) {
             Targets::One(l) => l.agent_argv(),
             other => panic!("{other:?}"),
         }
@@ -1714,7 +1739,7 @@ mod tests {
         // A map's key is its own issue number, not a ticket's.
         let staged = Staged::map(&MapId::new("blooop/wayfinder", 59), "the dev-process tree");
         assert_eq!(staged.key(), "#59");
-        match plan(&cache(), &staged, &interactive("")) {
+        match plan_picked(&cache(), &staged, &interactive("")) {
             Targets::One(l) => assert_eq!(l.key(), "wayfinder#59"),
             other => panic!("{other:?}"),
         }

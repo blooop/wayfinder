@@ -289,7 +289,18 @@ impl Plan {
 }
 
 /// Plan the body for the clusters in scope, in their given (render) order.
-pub fn plan(clusters: &[(&MapId, &Map)], screen: Screen<'_>, expanded: &Expanded) -> Plan {
+///
+/// `door` is the map-less repo whose empty-state header closes the body, if
+/// this screen is showing one (#114). It is planned *here*, with everything
+/// else, rather than appended by the caller: on-screen order is this module's
+/// single answer, and a row the caller pushes afterwards is a row
+/// [`attach_rollups`] and every other walk below never sees.
+pub fn plan(
+    clusters: &[(&MapId, &Map)],
+    screen: Screen<'_>,
+    expanded: &Expanded,
+    door: Option<&str>,
+) -> Plan {
     let sieve = Sieve::new(clusters, screen);
     // Under a query the cluster order is the query's to decide: the project
     // holding the best hit leads, as it did when the hits were one flat list.
@@ -312,6 +323,9 @@ pub fn plan(clusters: &[(&MapId, &Map)], screen: Screen<'_>, expanded: &Expanded
     // there is nothing left for a rollup to summarise honestly.
     if !sieve.sifting() {
         attach_rollups(&mut plan.items, clusters);
+    }
+    if let Some(repo) = door {
+        plan.items.push(Item::MaplessHeader(repo.to_string()));
     }
     plan
 }
@@ -960,6 +974,13 @@ fn walk_forest(
 mod tests {
     use super::*;
     use crate::model::{classify, Checks, PrLink, PrStatus, Review, Stage, TicketType};
+
+    /// The body without an empty-state door — the case every test below but
+    /// the door's own is about. Shadows [`super::plan`] so those tests read as
+    /// what they are testing rather than trailing a `None` each.
+    fn plan(clusters: &[(&MapId, &Map)], screen: Screen<'_>, expanded: &Expanded) -> Plan {
+        super::plan(clusters, screen, expanded, None)
+    }
 
     fn ticket(number: u64, open: bool, assigned: bool, blocked_by: Vec<u64>) -> Ticket {
         let open_blockers = blocked_by.clone(); // callers pass open blockers in fixtures
