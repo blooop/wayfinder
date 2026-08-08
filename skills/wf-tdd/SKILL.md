@@ -3,13 +3,19 @@ name: wf-tdd
 description: Build one ticket's worth of behavior test-first — red before green, one slice at a time, at seams the ticket pre-agreed — ending at a pushed branch with an open PR. Use when working a build-stage ticket, or when wf routes a build node here.
 ---
 
-Build the behavior a **ticket** describes, test-first, and end at a **pushed branch with an open PR**. This skill is one stage of a node's lifecycle: it builds; it does not review (that is `/wf-review`, in a fresh context), and it does not decide what to build (that already happened — the ticket is the contract).
+## Cross-agent invocation
+
+This bundle runs in both Claude Code and Codex. Mention a wayfinder skill with
+`/` in Claude Code and `$` in Codex; skill names below are written without a
+sigil.
+
+Build the behavior a **ticket** describes, test-first, and end at a **pushed branch with an open PR**. This skill is one stage of a node's lifecycle: it builds; it does not review (that is `wf-review`, in a fresh context), and it does not decide what to build (that already happened — the ticket is the contract).
 
 Adapted from aihero.dev's `/tdd` + `/implement` (see `research/aihero-spine.md` in blooop/wayfinder). The loop discipline is theirs verbatim; every "ask the user" is rerouted to "read the ticket / post a comment and stop", because this skill must work with nobody in the room.
 
 ## Invocation
 
-`/wf-tdd <ticket>` — an issue number or URL. Resolve the repo explicitly from the working checkout's remote and pass `--repo` on every `gh` call.
+`wf-tdd <ticket>` — an issue number or URL. Resolve the repo explicitly from the working checkout's remote and pass `--repo` on every `gh` call.
 
 ## The contract is the ticket
 
@@ -47,6 +53,6 @@ Done means, in order:
 3. PR opened against the default branch, its body linking the ticket (`Closes #<n>` so the PR↔ticket edge exists for stage derivation).
 4. A final breadcrumb on the ticket: PR number, one-line summary of the slice.
 
-Then **stop**. Do not review your own work, do not merge, do not continue into the next stage — the manager (see the `wf` skill's LIFECYCLE.md) or the human launches `/wf-review` in a fresh context. If CI fails after push, fixing it is still this stage: fix, push, and only then stop.
+Then **stop**. Do not review your own work, do not merge, do not continue into the next stage — the manager (see the `wf` skill's LIFECYCLE.md) or the human launches `wf-review` in a fresh context. If CI fails after push, fixing it is still this stage: fix, push, and only then stop.
 
 If mid-stage you hit a question the ticket can't answer, degrade to: post the question as a comment, leave a handoff, exit. Never invent the answer and never wait in-session for one.

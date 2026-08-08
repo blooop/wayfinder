@@ -2,18 +2,16 @@
 //!
 //! `wf` is a selector (#26/#34). There is no multiplexer, no tab, no session
 //! and no supervision: the picked node resolves to a checkout, `wf` gives the
-//! terminal back, and its own process image is replaced by
-//! `claude --dangerously-skip-permissions "<skill> …"` in that checkout
-//! ([`Launch::exec`]) — which skill is [`route`]'s answer to what was picked
-//! ([`Aim`]) and who decides ([`Mode`]), and any steering text rides the
-//! prompt as a suffix (#61/#62/#96). Unattended work is still not supervised
-//! here — an `auto` launch is the same exec of `/wf-auto`, watched from
-//! another terminal or not at all. One mode invokes no skill at all
-//! ([`Mode::Plain`], #112): the same exec, in the same workspace, with the
-//! prompt left to the human — so `wf` remains the thing that resolves a node
-//! to a place to work even when nothing is going to be run in it.
+//! terminal back, and its own process image is replaced by the selected agent
+//! in that checkout ([`Launch::exec`]) — which skill is [`route`]'s answer to
+//! what was picked ([`Aim`]) and who decides ([`Mode`]), and any steering text
+//! rides the prompt as a suffix (#61/#62/#96). Unattended work is still not
+//! supervised here — an `auto` launch is the same exec of the `wf-auto` skill,
+//! watched from another terminal or not at all. One mode invokes no skill at
+//! all ([`Mode::Plain`], #112): the same exec, in the same workspace, with the
+//! prompt left to the human.
 //!
-//! A checkout that declares a devcontainer runs that same agent *inside* a
+//! A checkout that declares a devcontainer runs a **Claude** launch *inside* a
 //! container, by way of `dl` ([`Isolation`], #80): `wf` owns which ticket,
 //! which checkout, which skill and which prompt, and `dl` owns the container,
 //! its lifecycle and its credentials. The seam is a **per-node workspace**,
@@ -21,7 +19,8 @@
 //! node gets its own branch, its own clone under `dl`'s cache and its own
 //! container, so any number of tickets run at once without colliding — and
 //! the tree the human picked in the checkout picker stays theirs, never
-//! mutated by an agent. (#80 originally handed `dl` the checkout path so the
+//! mutated by an agent. Codex stays on the host until `dl` can carry its
+//! configuration too. (#80 originally handed `dl` the checkout path so the
 //! agent worked the picked tree; that seam made every launch of a repo share
 //! one tree and one container, which is exactly the collision this replaces.)
 //! The checkout keeps two jobs: declaring the devcontainer, and hosting
@@ -39,6 +38,76 @@ use std::process::Command;
 
 use crate::model::{MapId, Stage, Ticket, TicketType};
 use crate::projects::Checkout;
+
+/// Which interactive coding agent `wf` becomes after a launch.
+///
+/// The bundle is deliberately shared: both CLIs read Agent Skills directories,
+/// and a route is the same named workflow whichever one runs it. What differs
+/// is the mention syntax (`/wf` for Claude Code, `$wf` for Codex) and the
+/// command-line permission switch. Keeping that translation here means the
+/// picker cannot display one agent while the exec path silently starts the
+/// other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Agent {
+    /// Claude Code, which is the longstanding `wf` default.
+    #[default]
+    Claude,
+    /// Codex CLI, which names installed skills with `$` mentions.
+    Codex,
+}
+
+impl Agent {
+    /// The name shown in the launch picker's title.
+    pub fn label(self) -> &'static str {
+        match self {
+            Agent::Claude => "Claude",
+            Agent::Codex => "Codex",
+        }
+    }
+
+    /// The CLI program this choice starts.
+    fn program(self) -> &'static str {
+        match self {
+            Agent::Claude => "claude",
+            Agent::Codex => "codex",
+        }
+    }
+
+    /// The explicit skill sigil each CLI recognises in an initial prompt.
+    fn skill_sigil(self) -> char {
+        match self {
+            Agent::Claude => '/',
+            Agent::Codex => '$',
+        }
+    }
+
+    /// The permission bypass matching an interactive agent launched from this
+    /// picker. `wf` has always handed Claude its equivalent: the picker is the
+    /// deliberate opt-in point, and neither agent should stop after `wf` has
+    /// restored the terminal and replaced itself.
+    fn skip_permissions(self) -> &'static str {
+        match self {
+            Agent::Claude => "--dangerously-skip-permissions",
+            Agent::Codex => "--dangerously-bypass-approvals-and-sandbox",
+        }
+    }
+
+    /// The other agent. The picker has two choices, so each horizontal arrow
+    /// is both previous and next; naming the operation keeps that fact local.
+    #[must_use]
+    pub fn other(self) -> Agent {
+        match self {
+            Agent::Claude => Agent::Codex,
+            Agent::Codex => Agent::Claude,
+        }
+    }
+
+    /// Every launch agent, in picker order, beginning with the compatible
+    /// default. This also gives installation one list to follow.
+    pub const fn all() -> [Agent; 2] {
+        [Agent::Claude, Agent::Codex]
+    }
+}
 
 /// Which skill the launched agent runs — the (aim, mode) → skill table,
 /// hardcoded in `wf` (#61/#96): not per-ticket config, not a Notes-parsed table.
@@ -66,15 +135,30 @@ pub enum Route {
 }
 
 impl Route {
-    /// How the route reads in the launch picker: the slash command it execs,
-    /// or — for the one route that execs none — the agent's own name.
-    ///
-    /// Every *skill* label is prefixed `wf`, because those names are claimed in
-    /// a namespace `wf` does not own: `~/.claude/skills` is flat and shared with
-    /// every other source of skills the user has. Unprefixed `tdd` and `review`
-    /// are names someone else will plausibly want — and while `wf` holds them,
-    /// nobody else can have them (#104). [`Route::Plain`] is outside that
-    /// argument entirely: it claims no name, because it invokes nothing.
+    /// The bundled skill this route invokes, without the selected agent's
+    /// sigil. [`Route::Plain`] invokes no skill.
+    pub fn bundled_skill(self) -> Option<&'static str> {
+        match self {
+            Route::Tdd => Some("wf-tdd"),
+            Route::Review => Some("wf-review"),
+            Route::Wayfinder => Some("wf"),
+            Route::WayfinderAuto => Some("wf-auto"),
+            Route::One => Some("wf-one"),
+            Route::Plain => None,
+        }
+    }
+
+    /// How the route is invoked by `agent`, or the agent's own name when no
+    /// skill is run.
+    pub fn invocation(self, agent: Agent) -> String {
+        self.bundled_skill().map_or_else(
+            || agent.program().to_string(),
+            |skill| format!("{}{skill}", agent.skill_sigil()),
+        )
+    }
+
+    /// How Claude Code spells this route. Launch prompts use
+    /// [`Route::invocation`] so the selected agent controls the sigil.
     pub fn label(self) -> &'static str {
         match self {
             Route::Tdd => "/wf-tdd",
@@ -86,28 +170,7 @@ impl Route {
         }
     }
 
-    /// The bundled skill this route invokes, named as
-    /// [`crate::skills::BUNDLED`] spells it — `None` for the one route that
-    /// invokes no skill.
-    ///
-    /// The typed form of "adding a `Route` means adding a skill": a new route
-    /// has to say which bundled prompt it names, or that it names none, and
-    /// cannot quietly point at one the package does not ship. Exhaustive, so
-    /// the answer is given at the point the route is added rather than
-    /// discovered at an agent launch.
-    pub fn bundled_skill(self) -> Option<&'static str> {
-        match self {
-            Route::Tdd | Route::Review | Route::Wayfinder | Route::WayfinderAuto | Route::One => {
-                Some(self.label().trim_start_matches('/'))
-            }
-            Route::Plain => None,
-        }
-    }
-
-    /// The next route, wrapping — private, and existing only so [`Route::all`]
-    /// can be derived rather than written out. Same device as [`Mode::after`],
-    /// for the same reason: a list written beside the enum is a second place to
-    /// remember, and the bundle invariant is exactly what forgetting it breaks.
+    /// The next route, wrapping, so [`Route::all`] has one source of truth.
     fn after(self) -> Route {
         match self {
             Route::Tdd => Route::Review,
@@ -119,9 +182,7 @@ impl Route {
         }
     }
 
-    /// Every route there is. Walks the `after` cycle until it comes back round
-    /// — or, if a future cycle is malformed and never does, until it repeats
-    /// itself, so this cannot spin.
+    /// Every route in derived picker order.
     pub fn all() -> Vec<Route> {
         let mut routes = vec![Route::Tdd];
         while let Some(&last) = routes.last() {
@@ -319,15 +380,15 @@ impl Creation {
     /// [`LaunchMode::opening_prompt`] because nothing is being steered: the
     /// text is the skill's *argument* — the task, or the loose idea — not a
     /// ` steer: …` suffix on a session that already has a subject.
-    fn invocation(&self) -> String {
+    fn invocation(&self, agent: Agent) -> String {
         let seeded = |skill: &str, seed: &Option<String>| match seed {
             None => skill.to_string(),
             Some(seed) => format!("{skill} {seed}"),
         };
         match self {
-            Creation::Task { task } => format!("{} {task}", Route::One.label()),
-            Creation::Map { seed } => seeded(Route::Wayfinder.label(), seed),
-            Creation::MapAuto { seed } => seeded(Route::WayfinderAuto.label(), seed),
+            Creation::Task { task } => format!("{} {task}", Route::One.invocation(agent)),
+            Creation::Map { seed } => seeded(&Route::Wayfinder.invocation(agent), seed),
+            Creation::MapAuto { seed } => seeded(&Route::WayfinderAuto.invocation(agent), seed),
         }
     }
 }
@@ -394,6 +455,10 @@ impl Candidate {
 /// test for a product being honest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchMode {
+    /// Which CLI executes the route. The route and the agent are independent:
+    /// choosing Codex changes how the same bundled workflow is invoked, not
+    /// what work the cursor selected.
+    agent: Agent,
     mode: Mode,
     /// The steering prompt, never empty — [`LaunchMode::picked`] trims, and an
     /// empty steer is spelt `None` rather than `Some("")`.
@@ -409,12 +474,18 @@ impl LaunchMode {
     /// type changes who decides, so steering text starting `auto` is steering
     /// text — and, the other way round, an unattended launch is a thing you
     /// selected and saw selected rather than a word you had to know.
-    pub fn picked(mode: Mode, steer: &str) -> LaunchMode {
+    pub fn picked(agent: Agent, mode: Mode, steer: &str) -> LaunchMode {
         let steer = steer.trim();
         LaunchMode {
+            agent,
             mode,
             steer: (!steer.is_empty()).then(|| steer.to_string()),
         }
+    }
+
+    /// Which CLI will execute this launch.
+    pub fn agent(&self) -> Agent {
+        self.agent
     }
 
     /// Which skill this launch resolves to, given what the cursor was on.
@@ -739,16 +810,17 @@ impl Staged {
     }
 }
 
-/// Where the agent runs: on the host, as `wf` always has, or inside the
-/// checkout's own devcontainer by way of `dl` (#80).
+/// Where the selected agent runs: on the host, as `wf` always has, or — for a
+/// compatible Claude launch — inside the checkout's own devcontainer by way of
+/// `dl` (#80).
 ///
 /// Two states, not three: there is no "wanted isolation but could not get it".
 /// [`Isolation::detect`] is total — it answers with what will actually happen,
 /// so a launch cannot carry an intention the exec then fails to honour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Isolation {
-    /// No devcontainer in the checkout, or no `dl` on PATH: `claude` runs in
-    /// the checkout directly.
+    /// No compatible isolation path: the selected agent runs in the checkout
+    /// directly.
     Host,
     /// `dl owner/repo@wayfinder/<repo>-<n> -- claude …`: the agent runs in the
     /// container the repo's own `devcontainer.json` describes, in a workspace
@@ -777,8 +849,18 @@ impl Isolation {
     /// isolation here is for dependencies, not security (#73), so the host is
     /// a worse environment rather than an unsafe one. The launch notice names
     /// the mode ([`Launch::describe`]), so the degradation is visible.
-    pub fn detect(checkout: &Path) -> Isolation {
-        if has_devcontainer(checkout) && resolve_on_path(DEVLAUNCH).is_ok() {
+    ///
+    /// Codex is deliberately host-only for now. `dl` mounts the host's
+    /// `~/.claude` into a workspace — which carries Claude's authentication and
+    /// the relative skill copies — but does not mount `~/.codex`. Running Codex
+    /// through it would show a real picker choice and then fail to find either
+    /// its login or `$wf`; the host is the only path this binary can honestly
+    /// make work until `dl` grows a Codex handover.
+    pub fn detect(checkout: &Path, agent: Agent) -> Isolation {
+        if agent == Agent::Claude
+            && has_devcontainer(checkout)
+            && resolve_on_path(DEVLAUNCH).is_ok()
+        {
             Isolation::Devlaunch
         } else {
             Isolation::Host
@@ -872,7 +954,7 @@ enum Job {
         mode: LaunchMode,
     },
     /// Start something new in the repo — the skill files the issues.
-    Create(Creation),
+    Create { creation: Creation, agent: Agent },
 }
 
 impl Job {
@@ -889,15 +971,19 @@ impl Job {
                 Aim::Map => *map_issue,
                 Aim::Ticket { number, .. } => *number,
             }),
-            Job::Create(_) => None,
+            Job::Create { .. } => None,
+        }
+    }
+
+    /// The CLI that executes this job, held on both arms because creation has
+    /// no launch mode of its own.
+    fn agent(&self) -> Agent {
+        match self {
+            Job::Node { mode, .. } => mode.agent(),
+            Job::Create { agent, .. } => *agent,
         }
     }
 }
-
-/// Agent sessions are started from a picker rather than from a shell someone is
-/// watching, so they do not stop for permission prompts.
-const SKIP_PERMISSIONS: &str = "--dangerously-skip-permissions";
-
 impl Launch {
     /// The checkout the agent runs in.
     pub fn cwd(&self) -> &Path {
@@ -941,6 +1027,11 @@ impl Launch {
         self.isolation
     }
 
+    /// Which agent will run this resolved launch.
+    pub fn agent(&self) -> Agent {
+        self.job.agent()
+    }
+
     /// One-line description for the notice: what is being launched, where, and
     /// — when it is not the host default — in what. "Where" is where the agent
     /// actually works: the checkout on the host, the per-node workspace in a
@@ -953,36 +1044,30 @@ impl Launch {
         let what = match &self.job {
             Job::Node { .. } => self.key(),
             // A creation has no `#n` to name yet, so the notice names the act.
-            Job::Create(creation) => creation.kind().label().to_string(),
+            Job::Create { creation, .. } => creation.kind().label().to_string(),
         };
         format!("{what} in {place}{}", self.isolation.suffix())
     }
 
-    /// The agent itself. `claude` takes a single positional prompt, so the
-    /// slash command, its arguments and the steering suffix are one argv
-    /// entry, not several — and, when there is nothing to say to it at all, no
-    /// entry rather than an empty one (`claude ""` is a prompt, and an empty
-    /// one).
-    fn claude_argv(&self) -> Vec<String> {
-        let mut argv = vec!["claude".to_string(), SKIP_PERMISSIONS.to_string()];
+    /// The selected agent and its optional one-argument prompt. Both CLIs
+    /// receive a whole skill invocation as one argv entry; a plain launch with
+    /// no steering receives no prompt at all.
+    fn agent_argv_inner(&self) -> Vec<String> {
+        let agent = self.agent();
         let prompt = match &self.job {
             Job::Node { mode, .. } => mode.opening_prompt(self.skill_invocation()),
-            Job::Create(creation) => Some(creation.invocation()),
+            Job::Create { creation, .. } => Some(creation.invocation(agent)),
         };
+        let mut argv = vec![
+            agent.program().to_string(),
+            agent.skip_permissions().to_string(),
+        ];
         argv.extend(prompt);
         argv
     }
 
-    /// The slash command and its arguments, for the node routes that invoke a
-    /// skill. `None` is [`Route::Plain`]: no skill, so nothing to invoke.
-    /// A creation never reaches here — its prompt is [`Creation::invocation`].
-    ///
-    /// [`Route::Plain`] is absorbed first because it is the arm that needs no
-    /// second thought — it has no arguments to shape, whatever it was aimed at.
-    /// The map aim comes next for the same reason: a skill on a map is the
-    /// map's number alone. The ticket arm is where the two argument shapes
-    /// live — only the wayfinder skills take the map argument, since `/wf-tdd`
-    /// and `/wf-review` resolve the repo from the checkout they run in.
+    /// The selected agent's skill invocation and arguments for a node. Plain
+    /// mode has no skill, while creation prompts are built by [`Creation`].
     fn skill_invocation(&self) -> Option<String> {
         let Job::Node {
             aim,
@@ -993,14 +1078,10 @@ impl Launch {
         else {
             return None;
         };
-        let skill = route.label();
+        route.bundled_skill()?;
+        let skill = route.invocation(self.agent());
         match (route, aim) {
-            (Route::Plain, _) => None,
-            // Unreachable from a node: [`route`] never answers `One` — it is
-            // the creation candidates' route (#114), and a creation launch
-            // builds its prompt from the typed task, not from an aim. If a
-            // node ever did carry it, the bare skill grills for its task.
-            (Route::One, _) => Some(skill.to_string()),
+            (Route::One, _) => Some(skill),
             (_, Aim::Map) => Some(format!("{skill} {map_issue}")),
             (Route::Tdd | Route::Review, Aim::Ticket { number, .. }) => {
                 Some(format!("{skill} {number}"))
@@ -1008,6 +1089,7 @@ impl Launch {
             (Route::Wayfinder | Route::WayfinderAuto, Aim::Ticket { number, .. }) => {
                 Some(format!("{skill} {map_issue} {number}"))
             }
+            (Route::Plain, _) => None,
         }
     }
 
@@ -1026,7 +1108,7 @@ impl Launch {
     /// several because "a shell command" is exactly what `dl` documents it
     /// to be.
     pub fn agent_argv(&self) -> Vec<String> {
-        let agent = self.claude_argv();
+        let agent = self.agent_argv_inner();
         match self.isolation {
             Isolation::Host => agent,
             Isolation::Devlaunch => vec![
@@ -1042,8 +1124,9 @@ impl Launch {
         }
     }
 
-    /// Become the agent: replace `wf`'s process image with `claude` — or with
-    /// the `dl` that carries it into the container — in the checkout.
+    /// Become the selected agent: replace `wf`'s process image with it — or,
+    /// for an isolated Claude launch, with the `dl` that carries it into the
+    /// container — in the checkout.
     ///
     /// Returns **only** on failure — on success there is no `wf` left to return
     /// to, which is why the return type is a bare error rather than a `Result`
@@ -1213,7 +1296,7 @@ pub fn prewarm(checkouts: &[Checkout], staged: &Staged) -> Option<Vec<String>> {
     let workspace = staged.node_workspace()?;
     let isolated = candidate_checkouts(checkouts, &staged.repo)
         .into_iter()
-        .any(|c| Isolation::detect(&c.path) == Isolation::Devlaunch);
+        .any(|c| Isolation::detect(&c.path, Agent::default()) == Isolation::Devlaunch);
     isolated.then(|| vec![DEVLAUNCH.to_string(), workspace, "up".to_string()])
 }
 
@@ -1327,8 +1410,20 @@ pub fn plan(checkouts: &[Checkout], staged: &Staged, route: Route, mode: &Launch
 /// zero or one candidate checkout never prompts. The creation arrives already
 /// complete ([`CreationKind::with_text`] refused the empty task), so this
 /// function only answers *where* the skill runs.
-pub fn plan_create(checkouts: &[Checkout], repo: &str, creation: &Creation) -> Targets {
-    resolve(checkouts, repo, &Job::Create(creation.clone()))
+pub fn plan_create(
+    checkouts: &[Checkout],
+    repo: &str,
+    creation: &Creation,
+    agent: Agent,
+) -> Targets {
+    resolve(
+        checkouts,
+        repo,
+        &Job::Create {
+            creation: creation.clone(),
+            agent,
+        },
+    )
 }
 
 /// The shared half of [`plan`] and [`plan_create`]: every registered checkout
@@ -1354,7 +1449,7 @@ fn resolve(checkouts: &[Checkout], repo: &str, job: &Job) -> Targets {
             // The job is the same whichever checkout hosts it — what differs
             // per candidate is only where it runs and in what.
             job: job.clone(),
-            isolation: Isolation::detect(&c.path),
+            isolation: Isolation::detect(&c.path, job.agent()),
         })
         .collect();
     match launches.len() {
@@ -1391,18 +1486,18 @@ mod tests {
     /// What the picker composes with the default mode row selected, steered by
     /// whatever was typed into it.
     fn interactive(steer: &str) -> LaunchMode {
-        LaunchMode::picked(Mode::Interactive, steer)
+        LaunchMode::picked(Agent::Claude, Mode::Interactive, steer)
     }
 
     /// The same with the `auto` row selected.
     fn auto(steer: &str) -> LaunchMode {
-        LaunchMode::picked(Mode::Auto, steer)
+        LaunchMode::picked(Agent::Claude, Mode::Auto, steer)
     }
 
     /// The same with the `plain` row selected — the launch that hands the
     /// session no skill at all.
     fn plain(steer: &str) -> LaunchMode {
-        LaunchMode::picked(Mode::Plain, steer)
+        LaunchMode::picked(Agent::Claude, Mode::Plain, steer)
     }
 
     /// An interactive `/wf` plan — the default launch, and the shape
@@ -1413,7 +1508,7 @@ mod tests {
         plan_picked(
             checkouts,
             &staged,
-            &LaunchMode::picked(Mode::Interactive, ""),
+            &LaunchMode::picked(Agent::Claude, Mode::Interactive, ""),
         )
     }
 
@@ -1507,8 +1602,31 @@ mod tests {
             launch.agent_argv(),
             vec![
                 "claude".to_string(),
-                SKIP_PERMISSIONS.to_string(),
+                Agent::Claude.skip_permissions().to_string(),
                 "/wf 1 16".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_agent_runs_codex_with_a_skill_mention_and_one_prompt_argument() {
+        let staged = Staged::ticket(&ticket("blooop/wayfinder", 16), 1, Stage::Ready)
+            .expect("ready is launchable");
+        let launch = match plan(
+            &cache(),
+            &staged,
+            Route::Wayfinder,
+            &LaunchMode::picked(Agent::Codex, Mode::Interactive, "try it"),
+        ) {
+            Targets::One(launch) => launch,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            launch.agent_argv(),
+            vec![
+                "codex".to_string(),
+                Agent::Codex.skip_permissions().to_string(),
+                "$wf 1 16 steer: try it".to_string(),
             ]
         );
     }
@@ -1518,19 +1636,30 @@ mod tests {
         // The two axes (#62/#96), now that the mode is a picked row and not a
         // word at the front of one line: the selection decides who resolves the
         // node, and the text only ever steers.
-        let picked = |mode: LaunchMode| (mode.mode, mode.steer);
-        assert_eq!(picked(interactive("")), (Mode::Interactive, None));
-        assert_eq!(picked(auto("")), (Mode::Auto, None));
+        let picked = |mode: LaunchMode| (mode.agent, mode.mode, mode.steer);
+        assert_eq!(
+            picked(interactive("")),
+            (Agent::Claude, Mode::Interactive, None)
+        );
+        assert_eq!(picked(auto("")), (Agent::Claude, Mode::Auto, None));
         // An all-whitespace field is an empty one, not a steer made of spaces.
-        assert_eq!(picked(interactive("   ")), (Mode::Interactive, None));
-        assert_eq!(picked(auto("  \t ")), (Mode::Auto, None));
+        assert_eq!(
+            picked(interactive("   ")),
+            (Agent::Claude, Mode::Interactive, None)
+        );
+        assert_eq!(picked(auto("  \t ")), (Agent::Claude, Mode::Auto, None));
         assert_eq!(
             picked(auto("skip the flaky suite")),
-            (Mode::Auto, Some("skip the flaky suite".to_string()))
+            (
+                Agent::Claude,
+                Mode::Auto,
+                Some("skip the flaky suite".to_string())
+            )
         );
         assert_eq!(
             picked(interactive("try the other approach")),
             (
+                Agent::Claude,
                 Mode::Interactive,
                 Some("try the other approach".to_string())
             )
@@ -1542,7 +1671,7 @@ mod tests {
         for typed in ["auto", "auto merge when green", "automate it", "defer"] {
             assert_eq!(
                 picked(interactive(typed)),
-                (Mode::Interactive, Some(typed.to_string())),
+                (Agent::Claude, Mode::Interactive, Some(typed.to_string())),
                 "{typed:?} steers an interactive launch"
             );
         }
@@ -1691,7 +1820,7 @@ mod tests {
     /// The one-checkout creation launch, reduced to its argv.
     fn creation_argv(kind: CreationKind, text: &str) -> Vec<String> {
         let creation = kind.with_text(text).expect("a buildable creation");
-        match plan_create(&cache(), "blooop/wayfinder", &creation) {
+        match plan_create(&cache(), "blooop/wayfinder", &creation, Agent::Claude) {
             Targets::One(l) => l.agent_argv(),
             other => panic!("{other:?}"),
         }
@@ -1705,7 +1834,7 @@ mod tests {
             creation_argv(CreationKind::Task, "wire the exporter"),
             vec![
                 "claude".to_string(),
-                SKIP_PERMISSIONS.to_string(),
+                Agent::Claude.skip_permissions().to_string(),
                 "/wf-one wire the exporter".to_string()
             ]
         );
@@ -1765,7 +1894,7 @@ mod tests {
         // The launch notice is the last thing wf says: for a creation there is
         // no `#n` to name, so it names the act.
         let creation = CreationKind::Map.with_text("").expect("seedless map");
-        match plan_create(&cache(), "blooop/wayfinder", &creation) {
+        match plan_create(&cache(), "blooop/wayfinder", &creation, Agent::Claude) {
             Targets::One(l) => {
                 assert_eq!(l.describe(), "new map in /data/proj/wayfinder");
             }
@@ -1782,10 +1911,10 @@ mod tests {
         // Same cache, same rules: none registered refuses, several prompt.
         let creation = || CreationKind::Map.with_text("").expect("seedless map");
         assert_eq!(
-            plan_create(&cache(), "blooop/dotfiles", &creation()),
+            plan_create(&cache(), "blooop/dotfiles", &creation(), Agent::Claude),
             Targets::Unregistered
         );
-        match plan_create(&cache(), "kinisi/kinisi_ros", &creation()) {
+        match plan_create(&cache(), "kinisi/kinisi_ros", &creation(), Agent::Claude) {
             Targets::Many(launches) => assert_eq!(launches.len(), 2),
             other => panic!("{other:?}"),
         }
@@ -2038,7 +2167,10 @@ mod tests {
         // and no prompt argument at all rather than an empty one.
         assert_eq!(
             ticket_argv(TicketType::Build, Stage::Ready, &plain("")),
-            vec!["claude".to_string(), SKIP_PERMISSIONS.to_string()]
+            vec![
+                "claude".to_string(),
+                Agent::Claude.skip_permissions().to_string()
+            ]
         );
     }
 
@@ -2053,7 +2185,7 @@ mod tests {
             ticket_argv(TicketType::Build, Stage::Ready, &plain("rebase onto main")),
             vec![
                 "claude".to_string(),
-                SKIP_PERMISSIONS.to_string(),
+                Agent::Claude.skip_permissions().to_string(),
                 "rebase onto main".to_string()
             ]
         );
@@ -2061,13 +2193,16 @@ mod tests {
             map_argv(&plain("what is actually left in here?")),
             vec![
                 "claude".to_string(),
-                SKIP_PERMISSIONS.to_string(),
+                Agent::Claude.skip_permissions().to_string(),
                 "what is actually left in here?".to_string()
             ]
         );
         assert_eq!(
             map_argv(&plain("")),
-            vec!["claude".to_string(), SKIP_PERMISSIONS.to_string()]
+            vec![
+                "claude".to_string(),
+                Agent::Claude.skip_permissions().to_string()
+            ]
         );
     }
 
@@ -2139,13 +2274,26 @@ mod tests {
     }
 
     #[test]
+    fn codex_stays_on_the_host_even_when_the_checkout_declares_a_devcontainer() {
+        // `dl` presently hands a container Claude's config tree, not Codex's.
+        // A host launch can read the Codex skill copies that `wf skills install`
+        // made; an isolated one would only fail after replacing the picker.
+        let checkout = Scratch::new("codex-host");
+        checkout.touch(".devcontainer/devcontainer.json");
+        assert_eq!(
+            Isolation::detect(&checkout.0, Agent::Codex),
+            Isolation::Host
+        );
+    }
+
+    #[test]
     fn a_checkout_without_a_devcontainer_runs_on_the_host_whatever_is_on_path() {
         // The other half — a devcontainer but no `dl` — is the degradation
         // path, and it is what every other test in this module exercises by
         // running on a machine that may or may not have `dl`. This direction is
         // the one that must hold unconditionally.
         let bare = Scratch::new("host");
-        assert_eq!(Isolation::detect(&bare.0), Isolation::Host);
+        assert_eq!(Isolation::detect(&bare.0, Agent::Claude), Isolation::Host);
         assert_eq!(
             plan_wf(&cache(), &ticket("blooop/wayfinder", 16), 1),
             plan_wf(&cache(), &ticket("blooop/wayfinder", 16), 1)
@@ -2189,7 +2337,10 @@ mod tests {
         Launch {
             repo: "blooop/wayfinder".to_string(),
             cwd: PathBuf::from("/data/proj/wayfinder"),
-            job: Job::Create(creation),
+            job: Job::Create {
+                creation,
+                agent: Agent::Claude,
+            },
             isolation: Isolation::Devlaunch,
         }
     }

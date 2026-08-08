@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::launch::{self, Candidate, Launch, LaunchMode, Route, Staged, Targets};
+use crate::launch::{self, Agent, Candidate, Launch, LaunchMode, Route, Staged, Targets};
 use crate::model::{stage, Activity, Map, MapId, MapSet, Status, Ticket};
 use crate::projects::Checkout;
 use crate::refresh::Startup;
@@ -45,13 +45,11 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
     None,
-    /// The launch picker — `enter` on a stop staged this launch, and the
-    /// overlay now collects the two things it still needs: which [`Candidate`]
-    /// runs, picked from a list, and the text that fills that row's field.
-    /// Every candidate carries its own resolved route, so the picker *shows*
-    /// which skill `enter` will run and re-reads as the pick moves — and a
-    /// picker for an unlaunchable node is unrepresentable, because
-    /// [`launch::Launchable`] refused it before anything was staged.
+    /// The launch picker — `enter` on a launchable node staged this launch, and
+    /// the overlay collects its agent, a complete [`Candidate`], and any text
+    /// needed to fill that candidate. The candidate carries its resolved route,
+    /// so the picker shows exactly what `enter` will run. An unlaunchable node
+    /// never reaches this state: [`launch::Launchable`] refuses it first.
     ///
     /// The staged launch is index-free ([`Staged`]) for the same reason the
     /// picker's candidates are complete `Launch`es: a background map arrival
@@ -59,6 +57,7 @@ pub enum Overlay {
     /// held across that would name a different ticket, or none at all.
     PickLaunch {
         staged: Staged,
+        agent: Agent,
         /// The picked row — one of [`Staged::candidates`], which is the only
         /// list the arrows walk, so a candidate foreign to the staged stop
         /// (creation on a ticket) is never held here (#114).
@@ -103,6 +102,13 @@ fn stepped(staged: &Staged, candidate: Candidate, delta: usize) -> Candidate {
     let candidates = staged.candidates();
     let at = candidates.iter().position(|c| *c == candidate).unwrap_or(0);
     candidates[(at + delta) % candidates.len()]
+}
+
+/// Move horizontally between the two launch agents. The agent is the execution
+/// environment, unlike [`Mode`] which changes the workflow route, so the two
+/// axes deliberately have different keys in the same picker.
+fn next_agent(agent: Agent) -> Agent {
+    agent.other()
 }
 
 /// One on-screen row: which map's cluster it is in, and the ticket's position
@@ -680,6 +686,7 @@ impl App {
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
                     staged,
+                    agent: Agent::default(),
                     steer: String::new(),
                 };
                 Outcome::Continue
@@ -691,6 +698,7 @@ impl App {
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
                     staged,
+                    agent: Agent::default(),
                     steer: String::new(),
                 };
                 Outcome::Continue
@@ -726,6 +734,7 @@ impl App {
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
                     staged,
+                    agent: Agent::default(),
                     steer: String::new(),
                 };
                 Outcome::Continue
@@ -792,8 +801,13 @@ impl App {
     /// launch that has no node to name (#114). The creation arrives already
     /// complete — [`launch::CreationKind::with_text`] refused the empty task
     /// before this was called — so the only thing left to answer is *where*.
-    fn resolve_creation(&mut self, repo: &str, creation: &launch::Creation) -> Outcome {
-        let targets = launch::plan_create(&self.checkouts, repo, creation);
+    fn resolve_creation(
+        &mut self,
+        repo: &str,
+        creation: &launch::Creation,
+        agent: Agent,
+    ) -> Outcome {
+        let targets = launch::plan_create(&self.checkouts, repo, creation, agent);
         self.act_on(targets, repo, "+new")
     }
 
@@ -838,6 +852,7 @@ impl App {
         key: KeyEvent,
         staged: Staged,
         mut candidate: Candidate,
+        mut agent: Agent,
         mut steer: String,
     ) -> Outcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -852,10 +867,14 @@ impl App {
             // picker back so the missing task can be typed into it.
             KeyCode::Enter => match candidate {
                 Candidate::Launch { mode, route } => {
-                    return self.resolve_launch(&staged, route, &LaunchMode::picked(mode, &steer))
+                    return self.resolve_launch(
+                        &staged,
+                        route,
+                        &LaunchMode::picked(agent, mode, &steer),
+                    )
                 }
                 Candidate::Create(kind) => match kind.with_text(&steer) {
-                    Some(creation) => return self.resolve_creation(&staged.repo, &creation),
+                    Some(creation) => return self.resolve_creation(&staged.repo, &creation, agent),
                     // The one per-row refusal (#114): `/wf-one` with no task is
                     // meaningless, so it is refused where a done or blocked node
                     // is — on the count line, with the picker still up.
@@ -869,6 +888,7 @@ impl App {
             // the arrows because it is what the rest of the screen uses to move
             // through a list, and it steps the way `down` does rather than
             // toggling.
+            KeyCode::Left | KeyCode::Right => agent = next_agent(agent),
             KeyCode::Up => candidate = previous_candidate(&staged, candidate),
             KeyCode::Down | KeyCode::Tab => candidate = next_candidate(&staged, candidate),
             KeyCode::Backspace => {
@@ -882,6 +902,7 @@ impl App {
         self.overlay = Overlay::PickLaunch {
             staged,
             candidate,
+            agent,
             steer,
         };
         Outcome::Continue
@@ -949,9 +970,10 @@ impl App {
             Overlay::PickLaunch {
                 staged,
                 candidate,
+                agent,
                 steer,
             } => {
-                return self.handle_pick_launch_key(key, staged, candidate, steer);
+                return self.handle_pick_launch_key(key, staged, candidate, agent, steer);
             }
             Overlay::None => {}
         }
@@ -1864,6 +1886,7 @@ mod tests {
             Overlay::PickLaunch {
                 staged,
                 candidate,
+                agent,
                 steer,
             } => {
                 assert_eq!(
@@ -1881,6 +1904,7 @@ mod tests {
                     },
                     "the picker opens on the default"
                 );
+                assert_eq!(*agent, Agent::Claude, "the picker opens on Claude");
                 assert_eq!(steer, "", "with nothing steering it");
             }
             other => panic!("expected the launch picker, got {other:?}"),
@@ -2087,49 +2111,65 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_walks_the_modes_both_ways_and_wraps() {
-        // Up and down are inverses and neither can fall off an end, and the
-        // mode under the cursor is the mode `enter` will launch — so a step
-        // that went nowhere (or panicked at index 0) would launch the wrong
-        // skill. With a third mode (#112) the two directions are no longer the
-        // same step, so each is walked the whole way round.
+    fn the_picker_keeps_the_agent_and_candidate_axes_independent() {
         let mut app = launchable_app();
         go_to(&mut app, "#6");
         app.handle_key(key(KeyCode::Enter));
-        // A ticket's picker lists only the launch rows, so the walk is over
-        // the modes and the candidate's mode is what `enter` will launch.
-        let mode = |app: &App| match &app.overlay {
+        let choice = |app: &App| match &app.overlay {
             Overlay::PickLaunch {
-                candidate: Candidate::Launch { mode, .. },
-                ..
-            } => *mode,
-            other => panic!("expected a launch row, got {other:?}"),
+                agent, candidate, ..
+            } => (*agent, *candidate),
+            other => panic!("expected the launch picker, got {other:?}"),
         };
-        assert_eq!(mode(&app), Mode::Interactive);
-        // Up from the first row wraps to the last rather than sticking, and
-        // keeps climbing back to the top.
+        let launch = |mode| Candidate::Launch {
+            mode,
+            route: match mode {
+                Mode::Interactive => Route::Wayfinder,
+                Mode::Auto => Route::WayfinderAuto,
+                Mode::Plain => Route::Plain,
+            },
+        };
+        assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Interactive)));
         app.handle_key(key(KeyCode::Up));
-        assert_eq!(mode(&app), Mode::Plain);
+        assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Plain)));
         app.handle_key(key(KeyCode::Up));
-        assert_eq!(mode(&app), Mode::Auto);
+        assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Auto)));
         app.handle_key(key(KeyCode::Up));
-        assert_eq!(mode(&app), Mode::Interactive, "and wraps back round");
-        // Tab steps the same way down does — it is not the view toggle in here.
+        assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Interactive)));
         app.handle_key(key(KeyCode::Tab));
-        assert_eq!(mode(&app), Mode::Auto);
+        assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Auto)));
         app.handle_key(key(KeyCode::Down));
-        assert_eq!(mode(&app), Mode::Plain, "down reaches the third mode too");
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(mode(&app), Mode::Interactive);
-        // Steering text is untouched by moving the mode: the two axes are
-        // edited independently, in one overlay.
+        assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Plain)));
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(choice(&app), (Agent::Codex, launch(Mode::Plain)));
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Plain)));
         type_str(&mut app, "keep me");
         app.handle_key(key(KeyCode::Down));
-        assert_eq!(mode(&app), Mode::Auto);
+        assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Interactive)));
         match &app.overlay {
-            Overlay::PickLaunch { steer, .. } => assert_eq!(steer, "keep me"),
+            Overlay::PickLaunch {
+                agent,
+                candidate,
+                steer,
+                ..
+            } => {
+                assert_eq!(*agent, Agent::Claude);
+                assert_eq!(*candidate, launch(Mode::Interactive));
+                assert_eq!(steer, "keep me");
+            }
             other => panic!("expected the launch picker, got {other:?}"),
         }
+        app.handle_key(key(KeyCode::Right));
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.agent(), Agent::Codex);
+        assert_eq!(
+            launch.agent_argv().last().expect("one prompt"),
+            "$wf 1 6 steer: keep me"
+        );
     }
 
     #[test]
