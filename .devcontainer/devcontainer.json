@@ -57,10 +57,14 @@
   // yourself for the others. The failure at least explains itself now:
   // tests/common/mod.rs names a missing GH_TOKEN as the cause when it is one,
   // rather than surfacing `gh`'s error alone (raised by the review of #94).
-  // Deliberately not a create-time check: `dl` delivers the token as devpod
-  // *workspace env*, so whether it is visible to a postCreateCommand depends on
-  // ordering nobody here has verified, and a false alarm on every create would
-  // be worse than the silence it replaced.
+  // Deliberately not a create-time check. `dl` delivers the token by whichever
+  // transport carries the payload — devpod *workspace env* on `up`, `devpod ssh
+  // --send-env` when attaching, and since dl 0.0.13 `ssh -o SendEnv=GH_TOKEN`
+  // for the interactive path `wf` actually uses. The last two are per-session,
+  // so a postCreateCommand cannot see the token at all on the path that matters,
+  // and a false alarm on every create would be worse than the silence it
+  // replaced. (That the token survives the ssh transport is measured, not
+  // assumed: devpod's ssh server honours SendEnv, with no AcceptEnv gate.)
   //
   // `~/.ssh` is deliberately absent — devpod forwards git credentials and can
   // forward an ssh agent, which lends the *use* of a key without handing over

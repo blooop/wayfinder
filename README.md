@@ -327,6 +327,17 @@ it always has:
 1. the checkout declares one of those two configs, and
 2. `dl` is on PATH.
 
+**Use `dl` 0.0.13 or newer.** `wf` pins no version and never will — the launch
+is one `exec` of a program found on PATH — but older `dl` on devpod 0.26 hands
+the agent **no terminal**, and an agent with no terminal decides it was invoked
+non-interactively: it prints one answer and exits, so the symptom is a session
+that never starts rather than an error. Measured here on devpod 0.26.1:
+`devpod ssh --command` (what `dl` ≤ 0.0.12 uses) gives `not a tty`, `TERM=dumb`
+even from a real terminal, while 0.0.13's `ssh -t` transport gives `/dev/pts/0`,
+`TERM=xterm-256color`. The `GH_TOKEN` forwarding below survives that change of
+transport — devpod's ssh server honours OpenSSH's `SendEnv`, which is also
+measured rather than assumed.
+
 **A missing `dl` degrades rather than refuses.** Plenty of repos carry a
 `devcontainer.json` for their editor users, and refusing to launch on a machine
 that has never installed `dl` would be a regression for people who never asked
