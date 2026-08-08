@@ -273,6 +273,63 @@ impl CreationKind {
             CreationKind::Map | CreationKind::MapAuto => "seed",
         }
     }
+
+    /// Complete this kind with the typed text — parse, don't validate. `None`
+    /// is the one refusal: a task with nothing typed, because `/wf-one` with
+    /// no task is meaningless and the picker refuses it on the count line the
+    /// way a done or blocked node already refuses. A map's text is only a
+    /// seed, so absence is fine and is spelt `None` rather than `Some("")`.
+    pub fn with_text(self, text: &str) -> Option<Creation> {
+        let text = text.trim();
+        let seed = || (!text.is_empty()).then(|| text.to_string());
+        match self {
+            CreationKind::Task => (!text.is_empty()).then(|| Creation::Task {
+                task: text.to_string(),
+            }),
+            CreationKind::Map => Some(Creation::Map { seed: seed() }),
+            CreationKind::MapAuto => Some(Creation::MapAuto { seed: seed() }),
+        }
+    }
+}
+
+/// A creation, completed: the kind plus the text that makes it launchable
+/// (#114). Built only by [`CreationKind::with_text`], so a task without its
+/// text is unrepresentable — the refusal happened at the parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Creation {
+    /// `/wf-one <task>` — the task text, never empty.
+    Task { task: String },
+    /// `/wf [<seed>]` — charting with the human; the seed is the loose idea.
+    Map { seed: Option<String> },
+    /// `/wf-auto [<seed>]` — charting alone.
+    MapAuto { seed: Option<String> },
+}
+
+impl Creation {
+    /// The kind this creation completes — for the labels the notice reuses.
+    fn kind(&self) -> CreationKind {
+        match self {
+            Creation::Task { .. } => CreationKind::Task,
+            Creation::Map { .. } => CreationKind::Map,
+            Creation::MapAuto { .. } => CreationKind::MapAuto,
+        }
+    }
+
+    /// The whole prompt this creation execs. Built here rather than through
+    /// [`LaunchMode::opening_prompt`] because nothing is being steered: the
+    /// text is the skill's *argument* — the task, or the loose idea — not a
+    /// ` steer: …` suffix on a session that already has a subject.
+    fn invocation(&self) -> String {
+        let seeded = |skill: &str, seed: &Option<String>| match seed {
+            None => skill.to_string(),
+            Some(seed) => format!("{skill} {seed}"),
+        };
+        match self {
+            Creation::Task { task } => format!("{} {task}", Route::One.label()),
+            Creation::Map { seed } => seeded(Route::Wayfinder.label(), seed),
+            Creation::MapAuto { seed } => seeded(Route::WayfinderAuto.label(), seed),
+        }
+    }
 }
 
 /// One row of the launch picker: a **complete candidate**, carrying its own
@@ -672,26 +729,44 @@ fn shell_quote(arg: &str) -> String {
 /// `Route` for it exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
-    /// The node's repo, full slug (`owner/name`) — the identity half, kept
+    /// The repo, full slug (`owner/name`) — the identity half, kept
     /// whole because a fork and its upstream share a short name (#15).
     repo: String,
-    /// What is being worked: the map, or one ticket in it.
-    aim: Aim,
-    /// The map issue — `/wf`'s first argument, and its only one when
-    /// the aim is the map itself.
-    map_issue: u64,
     /// The picked checkout: the process's working directory, and the agent's
     /// working tree on the host. An isolated launch works in its own `dl`
     /// workspace instead — the checkout's remaining job there is having
     /// declared the devcontainer.
     cwd: PathBuf,
-    /// The skill this launch execs, resolved from (type, stage).
-    route: Route,
-    /// What the launch picker settled on. The mode half already picked `route`; what
-    /// is left to spend here is the steering text.
-    mode: LaunchMode,
-    /// Host or container, decided from the checkout at [`plan`] time (#80).
+    /// What the agent is asked to do there: work a node, or start something
+    /// new (#114).
+    job: Job,
+    /// Host or container, decided from the checkout at plan time (#80).
     isolation: Isolation,
+}
+
+/// What a launch asks of its agent — the sum that keeps a creation from being
+/// a node with missing fields (#114). A creation has no aim, no map issue and
+/// no stage, because the things it would name do not exist until the launched
+/// skill files them; giving it sentinel zeroes would put a lie in every
+/// consumer. The workspace rule falls out per arm: a node gets its per-ticket
+/// branch, a creation gets the repo's default workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Job {
+    /// Work a node fetched from the tracker.
+    Node {
+        /// The map, or one ticket in it.
+        aim: Aim,
+        /// The map issue — `/wf`'s first argument, and its only one when the
+        /// aim is the map itself.
+        map_issue: u64,
+        /// The skill this launch execs, resolved from (type, stage).
+        route: Route,
+        /// What the launch picker settled on. The mode half already picked
+        /// `route`; what is left to spend here is the steering text.
+        mode: LaunchMode,
+    },
+    /// Start something new in the repo — the skill files the issues.
+    Create(Creation),
 }
 
 /// Agent sessions are started from a picker rather than from a shell someone is
@@ -704,39 +779,53 @@ impl Launch {
         &self.cwd
     }
 
-    /// The issue number this launch is about: the ticket's, or the map's own
-    /// when the whole map is the subject.
-    fn number(&self) -> u64 {
-        match &self.aim {
-            Aim::Map => self.map_issue,
-            Aim::Ticket { number, .. } => *number,
+    /// How this launch reads on screen: `<short_repo>#<number>` for a node —
+    /// the ticket's number, or the map's when the whole map is what was
+    /// picked — and `<short_repo>+new` for a creation, which has no number
+    /// until the skill files one.
+    pub fn key(&self) -> String {
+        match &self.job {
+            Job::Node { aim, map_issue, .. } => {
+                let number = match aim {
+                    Aim::Map => map_issue,
+                    Aim::Ticket { number, .. } => number,
+                };
+                format!("{}#{}", short_repo(&self.repo), number)
+            }
+            Job::Create(_) => format!("{}+new", short_repo(&self.repo)),
         }
     }
 
-    /// How this node reads on screen: `<short_repo>#<number>`, the same
-    /// identity the picker's rows show — the ticket's number, or the map's
-    /// when the whole map is what was picked.
-    pub fn key(&self) -> String {
-        format!("{}#{}", short_repo(&self.repo), self.number())
-    }
-
-    /// The `dl` workspace an isolated launch runs in:
-    /// `owner/repo@wayfinder/<repo>-<n>` — one branch per node, so parallel
-    /// launches never share a tree or a container, and relaunching a node
-    /// reattaches to the workspace it already has.
+    /// The `dl` workspace an isolated launch runs in.
     ///
-    /// The branch name is not `wf`'s invention: `wayfinder/<repo>-<n>` is the
+    /// A node gets `owner/repo@wayfinder/<repo>-<n>` — one branch per node,
+    /// so parallel launches never share a tree or a container, and
+    /// relaunching a node reattaches to the workspace it already has. The
+    /// branch name is not `wf`'s invention: `wayfinder/<repo>-<n>` is the
     /// branch `/wf-tdd` is instructed to do ticket `n`'s work on. `dl` creates
     /// it (locally, off the default branch) when it does not exist yet, so a
     /// build agent wakes up already on its work branch, and a reviewer's
     /// workspace opens on the branch the PR was pushed from.
+    ///
+    /// A creation has no number, so no per-ticket branch exists to name: it
+    /// gets the bare `owner/repo` — the default workspace — and the launched
+    /// skill files its own issues and makes its own branches (#114).
     fn workspace(&self) -> String {
-        format!(
-            "{}@wayfinder/{}-{}",
-            self.repo,
-            short_repo(&self.repo),
-            self.number()
-        )
+        match &self.job {
+            Job::Node { aim, map_issue, .. } => {
+                let number = match aim {
+                    Aim::Map => map_issue,
+                    Aim::Ticket { number, .. } => number,
+                };
+                format!(
+                    "{}@wayfinder/{}-{}",
+                    self.repo,
+                    short_repo(&self.repo),
+                    number
+                )
+            }
+            Job::Create(_) => self.repo.clone(),
+        }
     }
 
     /// Where this launch's agent runs.
@@ -753,7 +842,12 @@ impl Launch {
             Isolation::Host => self.cwd.display().to_string(),
             Isolation::Devlaunch => self.workspace(),
         };
-        format!("{} in {}{}", self.key(), place, self.isolation.suffix())
+        let what = match &self.job {
+            Job::Node { .. } => self.key(),
+            // A creation has no `#n` to name yet, so the notice names the act.
+            Job::Create(creation) => creation.kind().label().to_string(),
+        };
+        format!("{what} in {place}{}", self.isolation.suffix())
     }
 
     /// The agent itself. `claude` takes a single positional prompt, so the
@@ -763,12 +857,17 @@ impl Launch {
     /// one).
     fn claude_argv(&self) -> Vec<String> {
         let mut argv = vec!["claude".to_string(), SKIP_PERMISSIONS.to_string()];
-        argv.extend(self.mode.opening_prompt(self.skill_invocation()));
+        let prompt = match &self.job {
+            Job::Node { mode, .. } => mode.opening_prompt(self.skill_invocation()),
+            Job::Create(creation) => Some(creation.invocation()),
+        };
+        argv.extend(prompt);
         argv
     }
 
-    /// The slash command and its arguments, for the routes that invoke a
+    /// The slash command and its arguments, for the node routes that invoke a
     /// skill. `None` is [`Route::Plain`]: no skill, so nothing to invoke.
+    /// A creation never reaches here — its prompt is [`Creation::invocation`].
     ///
     /// [`Route::Plain`] is absorbed first because it is the arm that needs no
     /// second thought — it has no arguments to shape, whatever it was aimed at.
@@ -777,20 +876,29 @@ impl Launch {
     /// live — only the wayfinder skills take the map argument, since `/wf-tdd`
     /// and `/wf-review` resolve the repo from the checkout they run in.
     fn skill_invocation(&self) -> Option<String> {
-        let skill = self.route.label();
-        match (self.route, &self.aim) {
+        let Job::Node {
+            aim,
+            map_issue,
+            route,
+            ..
+        } = &self.job
+        else {
+            return None;
+        };
+        let skill = route.label();
+        match (route, aim) {
             (Route::Plain, _) => None,
             // Unreachable from a node: [`route`] never answers `One` — it is
             // the creation candidates' route (#114), and a creation launch
             // builds its prompt from the typed task, not from an aim. If a
             // node ever did carry it, the bare skill grills for its task.
             (Route::One, _) => Some(skill.to_string()),
-            (_, Aim::Map) => Some(format!("{skill} {}", self.map_issue)),
+            (_, Aim::Map) => Some(format!("{skill} {map_issue}")),
             (Route::Tdd | Route::Review, Aim::Ticket { number, .. }) => {
                 Some(format!("{skill} {number}"))
             }
             (Route::Wayfinder | Route::WayfinderAuto, Aim::Ticket { number, .. }) => {
-                Some(format!("{skill} {} {number}", self.map_issue))
+                Some(format!("{skill} {map_issue} {number}"))
             }
         }
     }
@@ -944,28 +1052,45 @@ pub enum Targets {
 /// Resolve a launch request against the projects cache. Zero or one candidate
 /// never prompts. The aim and mode arrive already settled — this function
 /// answers *where* the agent can run, and resolves the route the mode picked.
+pub fn plan(checkouts: &[Checkout], staged: &Staged, mode: &LaunchMode) -> Targets {
+    let route = staged.route(mode.mode());
+    resolve(checkouts, &staged.repo, |_| Job::Node {
+        aim: staged.aim.clone(),
+        map_issue: staged.map_issue,
+        route,
+        mode: mode.clone(),
+    })
+}
+
+/// Resolve a creation against the projects cache — the same rules as [`plan`]:
+/// zero or one candidate checkout never prompts. The creation arrives already
+/// complete ([`CreationKind::with_text`] refused the empty task), so this
+/// function only answers *where* the skill runs.
+pub fn plan_create(checkouts: &[Checkout], repo: &str, creation: Creation) -> Targets {
+    resolve(checkouts, repo, |_| Job::Create(creation.clone()))
+}
+
+/// The shared half of [`plan`] and [`plan_create`]: every registered checkout
+/// of the repo becomes a complete [`Launch`] carrying the job, and the count
+/// decides whether anyone is prompted.
 ///
 /// Isolation is decided **here**, per candidate, rather than at the exec: a
 /// checkout that has a devcontainer and one that does not can both be
-/// candidates for the same ticket, the notice has to say which is which before
-/// the human picks, and by the exec there is nothing left to tell them with.
-/// It is the one filesystem read in this module's otherwise pure planning path.
+/// candidates, the notice has to say which is which before the human picks,
+/// and by the exec there is nothing left to tell them with. It is the one
+/// filesystem read in this module's otherwise pure planning path.
 ///
 /// # Panics
 ///
 /// Never: the `expect` in the one-candidate arm is guarded by the `match` on
 /// the length immediately above it.
-pub fn plan(checkouts: &[Checkout], staged: &Staged, mode: &LaunchMode) -> Targets {
-    let route = staged.route(mode.mode());
-    let launches: Vec<Launch> = candidate_checkouts(checkouts, &staged.repo)
+fn resolve(checkouts: &[Checkout], repo: &str, job: impl Fn(&Checkout) -> Job) -> Targets {
+    let launches: Vec<Launch> = candidate_checkouts(checkouts, repo)
         .into_iter()
         .map(|c| Launch {
-            repo: staged.repo.clone(),
-            aim: staged.aim.clone(),
-            map_issue: staged.map_issue,
+            repo: repo.to_string(),
             cwd: c.path.clone(),
-            route,
-            mode: mode.clone(),
+            job: job(c),
             isolation: Isolation::detect(&c.path),
         })
         .collect();
@@ -1061,8 +1186,14 @@ mod tests {
             Targets::One(launch) => {
                 assert_eq!(launch.cwd(), Path::new("/data/proj/wayfinder"));
                 assert_eq!(launch.key(), "wayfinder#16");
-                assert_eq!(launch.map_issue, 1);
-                assert!(matches!(launch.aim, Aim::Ticket { number: 16, .. }));
+                assert!(matches!(
+                    &launch.job,
+                    Job::Node {
+                        map_issue: 1,
+                        aim: Aim::Ticket { number: 16, .. },
+                        ..
+                    }
+                ));
             }
             other => panic!("expected One, got {other:?}"),
         }
@@ -1253,6 +1384,139 @@ mod tests {
         assert_eq!(Candidate::Create(CreationKind::Task).field(), "task");
         assert_eq!(Candidate::Create(CreationKind::Map).field(), "seed");
         assert_eq!(Candidate::Create(CreationKind::MapAuto).field(), "seed");
+    }
+
+    #[test]
+    fn a_task_needs_its_text_and_a_map_seed_is_optional() {
+        // Parse, don't validate (#114): an empty task is refused where the
+        // creation is built, so a `/wf-one` with nothing to do is
+        // unrepresentable — and all-whitespace is empty, as the steer field
+        // already treats it. A map's text is only a seed: the charting session
+        // grills for the idea anyway, so nothing typed is a fine seed.
+        assert_eq!(CreationKind::Task.with_text("   "), None);
+        assert_eq!(
+            CreationKind::Task.with_text(" wire the exporter "),
+            Some(Creation::Task {
+                task: "wire the exporter".to_string()
+            })
+        );
+        assert_eq!(
+            CreationKind::Map.with_text(""),
+            Some(Creation::Map { seed: None })
+        );
+        assert_eq!(
+            CreationKind::Map.with_text(" a caching layer "),
+            Some(Creation::Map {
+                seed: Some("a caching layer".to_string())
+            })
+        );
+        assert_eq!(
+            CreationKind::MapAuto.with_text(""),
+            Some(Creation::MapAuto { seed: None })
+        );
+    }
+
+    /// The one-checkout creation launch, reduced to its argv.
+    fn creation_argv(kind: CreationKind, text: &str) -> Vec<String> {
+        let creation = kind.with_text(text).expect("a buildable creation");
+        match plan_create(&cache(), "blooop/wayfinder", creation) {
+            Targets::One(l) => l.agent_argv(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_new_task_launch_execs_wf_one_with_the_task_verbatim() {
+        // The typed text *is* the ticket — no `steer:` prefix, no skill to
+        // steer: `/wf-one` receives the task as its argument.
+        assert_eq!(
+            creation_argv(CreationKind::Task, "wire the exporter"),
+            vec![
+                "claude".to_string(),
+                SKIP_PERMISSIONS.to_string(),
+                "/wf-one wire the exporter".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_map_launch_execs_the_charting_skill_with_an_optional_seed() {
+        // Bare `/wf` charts from nothing; typed text rides as the loose idea.
+        assert_eq!(
+            creation_argv(CreationKind::Map, "").last().expect("prompt"),
+            "/wf"
+        );
+        assert_eq!(
+            creation_argv(CreationKind::Map, "a caching layer")
+                .last()
+                .expect("prompt"),
+            "/wf a caching layer"
+        );
+        assert_eq!(
+            creation_argv(CreationKind::MapAuto, "")
+                .last()
+                .expect("prompt"),
+            "/wf-auto"
+        );
+        assert_eq!(
+            creation_argv(CreationKind::MapAuto, "a caching layer")
+                .last()
+                .expect("prompt"),
+            "/wf-auto a caching layer"
+        );
+    }
+
+    #[test]
+    fn an_isolated_creation_launch_runs_on_the_default_workspace() {
+        // A creation has no issue number, so no per-ticket branch exists to
+        // name: `dl` gets the bare `owner/repo` spec — the default workspace —
+        // and the launched skill files its own issues and makes its own
+        // branches (#114). The command after `--` is quoted like any other.
+        let launch = isolated_creation(
+            CreationKind::Task
+                .with_text("wire the exporter")
+                .expect("text given"),
+        );
+        assert_eq!(
+            launch.agent_argv(),
+            vec![
+                "dl".to_string(),
+                "blooop/wayfinder".to_string(),
+                "--".to_string(),
+                "'claude' '--dangerously-skip-permissions' '/wf-one wire the exporter'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_notice_names_what_a_creation_starts_and_where() {
+        // The launch notice is the last thing wf says: for a creation there is
+        // no `#n` to name, so it names the act.
+        let creation = CreationKind::Map.with_text("").expect("seedless map");
+        match plan_create(&cache(), "blooop/wayfinder", creation) {
+            Targets::One(l) => {
+                assert_eq!(l.describe(), "new map in /data/proj/wayfinder");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            isolated_creation(CreationKind::Task.with_text("x").expect("text")).describe(),
+            "new task in blooop/wayfinder (devlaunch)"
+        );
+    }
+
+    #[test]
+    fn a_creation_resolves_checkouts_like_any_other_launch() {
+        // Same cache, same rules: none registered refuses, several prompt.
+        let creation = || CreationKind::Map.with_text("").expect("seedless map");
+        assert_eq!(
+            plan_create(&cache(), "blooop/dotfiles", creation()),
+            Targets::Unregistered
+        );
+        match plan_create(&cache(), "kinisi/kinisi_ros", creation()) {
+            Targets::Many(launches) => assert_eq!(launches.len(), 2),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1632,15 +1896,28 @@ mod tests {
     fn isolated_ticket(number: u64, route: Route, mode: LaunchMode) -> Launch {
         Launch {
             repo: "blooop/wayfinder".to_string(),
-            aim: Aim::Ticket {
-                number,
-                ticket_type: TicketType::Task,
-                stage: Launchable::Ready,
-            },
-            map_issue: 67,
             cwd: PathBuf::from("/data/proj/wayfinder"),
-            route,
-            mode,
+            job: Job::Node {
+                aim: Aim::Ticket {
+                    number,
+                    ticket_type: TicketType::Task,
+                    stage: Launchable::Ready,
+                },
+                map_issue: 67,
+                route,
+                mode,
+            },
+            isolation: Isolation::Devlaunch,
+        }
+    }
+
+    /// A creation launch forced into a container, for the same reason as
+    /// [`isolated`]: `plan_create` reads the real filesystem.
+    fn isolated_creation(creation: Creation) -> Launch {
+        Launch {
+            repo: "blooop/wayfinder".to_string(),
+            cwd: PathBuf::from("/data/proj/wayfinder"),
+            job: Job::Create(creation),
             isolation: Isolation::Devlaunch,
         }
     }
@@ -1713,11 +1990,13 @@ mod tests {
         // own container, keyed by the map issue since there is no ticket.
         let launch = Launch {
             repo: "blooop/wayfinder".to_string(),
-            aim: Aim::Map,
-            map_issue: 67,
             cwd: PathBuf::from("/data/proj/wayfinder"),
-            route: Route::WayfinderAuto,
-            mode: auto(""),
+            job: Job::Node {
+                aim: Aim::Map,
+                map_issue: 67,
+                route: Route::WayfinderAuto,
+                mode: auto(""),
+            },
             isolation: Isolation::Devlaunch,
         };
         assert_eq!(
