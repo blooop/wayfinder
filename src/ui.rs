@@ -552,9 +552,12 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
-/// Draw the full screen: bordered frame with the scope in the title, the
-/// clusters, then the anchored bottom chrome — the match-count line (with the
-/// load hint and any one-shot notice), the fzf-style prompt, and the key hints.
+/// Draw the full screen: bordered frame with the scope in the title, then the
+/// search chrome anchored at the *top* — the fzf-style prompt and, under it, the
+/// match-count line (with the load hint and any one-shot notice) — the clusters
+/// filling what is left, and the key hints on the last line. The prompt leads
+/// because it is what you type into: `fzf --reverse`'s order, and it keeps the
+/// count line against the query whose matches it counts.
 /// The which-checkout picker, when open, floats over all of it.
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let mut block = match &app.scope {
@@ -569,13 +572,22 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let inner = block.inner(frame.area());
     frame.render_widget(block, frame.area());
 
-    let [body_area, count_area, prompt_area, hint_area] = Layout::vertical([
+    let [prompt_area, count_area, body_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Min(0),
-        Constraint::Length(1),
-        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  > ", Style::new().fg(Color::Cyan)),
+            Span::raw(app.query.clone()),
+            Span::styled("█", Style::new().add_modifier(Modifier::DIM)),
+        ])),
+        prompt_area,
+    );
 
     // Scroll only as far as it takes to keep the cursor's line on screen —
     // several clusters can be taller than the body area (#50), and a cursor
@@ -637,14 +649,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         frame.render_widget(Paragraph::new(Line::from(count_spans)), count_area);
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("  > ", Style::new().fg(Color::Cyan)),
-            Span::raw(app.query.clone()),
-            Span::styled("█", Style::new().add_modifier(Modifier::DIM)),
-        ])),
-        prompt_area,
-    );
     frame.render_widget(
         Paragraph::new(KEY_HINTS).style(Style::new().add_modifier(Modifier::DIM)),
         hint_area,
@@ -1171,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn bottom_chrome_has_count_prompt_and_hint_lines() {
+    fn the_chrome_has_count_prompt_and_hint_lines() {
         let screen = render(&fixture_app());
         assert!(screen.contains("5/5"));
         assert!(screen.contains("> █"));
@@ -1180,6 +1184,30 @@ mod tests {
         assert!(screen.contains("ctrl-r refresh"));
         assert!(screen.contains("esc quit"));
         assert!(screen.contains("wf · blooop/wayfinder"));
+    }
+
+    #[test]
+    fn the_search_prompt_leads_the_screen_with_the_count_under_it() {
+        // The prompt is the first line inside the border and the count line the
+        // second, so both sit against the title rather than drifting to
+        // wherever the body happens to end. Only the hints stay anchored to the
+        // bottom.
+        let screen = render(&fixture_app());
+        let lines: Vec<&str> = screen.lines().collect();
+        assert!(lines[0].contains("wf · blooop/wayfinder"), "{screen}");
+        assert!(lines[1].contains("> █"), "{screen}");
+        assert!(lines[2].contains("5/5"), "{screen}");
+        // The body follows, still opening on its own blank spacer line — which
+        // now reads as the gap between the chrome and the first cluster.
+        let header = lines
+            .iter()
+            .position(|l| l.contains("▌ wayfinder · Map: wf"))
+            .expect("cluster header on screen");
+        assert_eq!(header, 4, "{screen}");
+        assert!(
+            lines[lines.len() - 2].contains("enter launch"),
+            "hints stay on the last line: {screen}"
+        );
     }
 
     #[test]

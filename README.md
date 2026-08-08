@@ -211,7 +211,7 @@ and the rows themselves are right there. Both are ordinary cursor stops: put
 the cursor on one and `→` opens it in place (`▾`), listing what it held as rows
 you can select and launch, and `←` shuts it again — so nothing is ever merely a
 number you cannot reach. A map with nothing takeable
-leaves the body entirely, counted on the bottom line as `· N idle maps hidden`.
+leaves the body entirely, counted on the count line as `· N idle maps hidden`.
 
 **A row that heads a branch carries the same rollup of what is beneath it**,
 written `(beneath) ⊘2` at the end of the line — so a takeable ticket says the
@@ -226,7 +226,10 @@ blocker; edges the tree cannot show are annotated `⤷ also needs #n`.
 
 **Typing sifts**: a live query prunes whichever screen `tab` had toggled down to
 the rows that matched, keeping the tree they sit in; clearing it restores that
-screen whole. Matching is fuzzy but **tight** — every character the query lands
+screen whole. The `>` prompt sits at the **top**, directly under the title, with
+the count line under it and the rows beneath both — you type at the top of the
+screen and watch the tree sift below it, as `fzf --reverse` does. Only the key
+hints stay anchored to the bottom. Matching is fuzzy but **tight** — every character the query lands
 on has to start a word or sit against another matched one, so `map` finds "the
 **m**anager-**a**gent **p**rotocol" and sub`tree` matches mid-word, while
 letters picked out of the middles of three unrelated words do not: `tree`
