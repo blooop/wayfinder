@@ -89,7 +89,7 @@ An open, unassigned ticket is unclaimed. Claim **before any work**.
 
 ## Frontier query
 
-Open, unblocked, unclaimed children of the map — one round trip, however many children the map has. This is the same single-hop GraphQL query the `wf` binary issues to render a map: every child arrives with its `blockedBy` edges attached, so there is nothing left to fetch per child. (GraphQL spells enum values in caps: `OPEN`, not `open`.)
+Open, unblocked, unclaimed children of the map — one round trip for up to 100 children (the `first: 100` below, the same cap the binary uses; maps do not grow that wide). This is the same single-hop GraphQL query the `wf` binary issues to render a map: every child arrives with its `blockedBy` edges attached, so there is nothing left to fetch per child. (GraphQL spells enum values in caps: `OPEN`, not `open`.)
 
 ```bash
 gh api graphql -F owner="${REPO%/*}" -F name="${REPO#*/}" -F number=MAP_NUMBER -f query='

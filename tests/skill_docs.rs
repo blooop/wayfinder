@@ -35,8 +35,8 @@ fn frontier_snippet() -> String {
         .to_string()
 }
 
-/// The frontier costs one round trip, however many children the map has —
-/// not a serial REST call per open child.
+/// The frontier costs one round trip (up to the query's `first: 100` cap,
+/// same as the binary's) — not a serial REST call per open child.
 #[test]
 fn frontier_is_one_round_trip() {
     let snippet = frontier_snippet();

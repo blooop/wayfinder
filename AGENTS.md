@@ -112,15 +112,18 @@ RUSTFLAGS=-D\ warnings RUSTDOCFLAGS=-D\ warnings sh -c '
   cargo fmt --all --check &&
   cargo clippy --all-targets --all-features --locked &&
   cargo test --locked --lib --bins --examples &&
+  cargo test --locked --test skill_docs &&
   cargo doc --no-deps --all-features --locked'
 ```
 
-Run all four before pushing, `cargo fmt --all` first — a formatting diff fails
-the build before any of the interesting checks get a chance to run.
+Run the whole chain before pushing, `cargo fmt --all` first — a formatting diff
+fails the build before any of the interesting checks get a chance to run.
 
 The `tests/live_*.rs` files are excluded from that test command on purpose: they
 talk to real GitHub and drive a real pty. Run them by name when the thing you
-changed is what they cover.
+changed is what they cover. `tests/skill_docs.rs` is the exception under
+`tests/` — offline shape checks on the skill docs' snippets, so it runs in the
+chain (and in CI) like any unit test.
 
 ## House style
 
