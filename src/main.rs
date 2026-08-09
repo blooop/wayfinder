@@ -403,6 +403,11 @@ async fn main() -> Result<()> {
 
     let (tx, updates) = mpsc::unbounded_channel();
     let discovery = wf::refresh::spawn_discovery(repos, cache_path.clone(), tx.clone());
+    // And what a `wf reap` would claim (#137), read behind the screen exactly
+    // as the search is: a `dl --ls --json` subprocess and one batched GraphQL
+    // call, neither of them on the way to a frame. It folds into the count line
+    // when it lands, says nothing when it fails, and can delete nothing.
+    let survey = wf::refresh::spawn_survey(wf::reclaim::survey_live(), tx.clone());
 
     // cwd-open enters the project, on the first frame and unconditionally.
     //
@@ -416,7 +421,7 @@ async fn main() -> Result<()> {
     if let Some((_, slug)) = &here {
         app.enter(slug);
     }
-    let ending = run(&mut terminal, app, discovery, tx, updates).await;
+    let ending = run(&mut terminal, app, discovery, survey, tx, updates).await;
 
     // The one ordering that matters, and the reason the exec is here rather
     // than in the loop: the terminal must be back in the shell's hands before
@@ -579,6 +584,7 @@ async fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
     discovery: JoinHandle<()>,
+    survey: JoinHandle<()>,
     tx: UnboundedSender<LoadEvent>,
     mut updates: UnboundedReceiver<LoadEvent>,
 ) -> Result<Ending> {
@@ -639,6 +645,13 @@ async fn run(
                         }
                     }
                 }
+                // The background reading landed (#137). A plain state write on
+                // a screen that has been up and answering keys the whole time —
+                // it changes one dim segment of the count line and nothing else,
+                // and it arrives at most once because nothing asks again.
+                LoadEvent::Reclaimable(found) => {
+                    app.reclaimable = Some(found);
+                }
             }
         }
 
@@ -668,6 +681,11 @@ async fn run(
                         loaders.shutdown().await;
                         discovery.abort();
                         let _ = discovery.await;
+                        // The reading holds a `dl` and a `gh` of its own, and
+                        // the same reasoning applies: an in-flight child that
+                        // outlives the `exec` is inherited by the agent.
+                        survey.abort();
+                        let _ = survey.await;
                         return Ok(Ending::Handover(launch));
                     }
                     Outcome::Continue => {}
@@ -683,6 +701,36 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().copied().map(String::from).collect()
+    }
+
+    #[test]
+    fn the_reclaim_reading_is_spawned_and_never_awaited_on_the_way_to_a_frame() {
+        // #137's "off the critical path", pinned where it could be lost.
+        // Everything else about the reading is testable against a value; this
+        // is the one claim that lives in this file's control flow, and the way
+        // to break it is a single `.await` — so the guard is that the reading
+        // is *handed to* the spawner and mentioned nowhere else.
+        //
+        // The startup path is the reason it matters: the screen goes up before
+        // any network call, over a ~0.6 s warm start and a ~2.5 s map search
+        // that are both already overlapped with a drawn UI. A subprocess and a
+        // GraphQL round trip awaited here would be neither.
+        // Spelt in pieces so the needle is not itself a match in this file.
+        let call = format!("{}::{}()", "wf::reclaim", "survey_live");
+        let spawned = format!("{}({call},", "spawn_survey");
+        let compact: String = include_str!("main.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(
+            compact.matches(&call).count(),
+            1,
+            "the reading is taken in exactly one place"
+        );
+        assert!(
+            compact.contains(&spawned),
+            "the reading must be handed to the spawner, never awaited"
+        );
     }
 
     #[test]

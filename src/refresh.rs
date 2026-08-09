@@ -20,6 +20,7 @@
 //! failed load leaves the picker up with a notice rather than taking it down.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ use tokio::task::JoinHandle;
 use crate::fetch;
 use crate::model::{Map, MapId, MapSet};
 use crate::projects::ProjectsCache;
+use crate::reclaim::Reclaimable;
 
 /// How long the map search waits before trying again. The only recurring timer
 /// left: nothing polls, but a search that never answers would leave `wf`
@@ -59,6 +61,12 @@ pub enum LoadEvent {
     SearchFailed,
     /// One map's load reported.
     Fetched { id: MapId, outcome: MapFetch },
+    /// The background reading found workspaces a `wf reap` would claim (#137).
+    ///
+    /// Only ever sent when there is something to say: a reading that failed and
+    /// a reading that found nothing are the same silence, because neither is
+    /// anything the screen should draw.
+    Reclaimable(Reclaimable),
 }
 
 /// Has the `wayfinder:map` label search answered yet?
@@ -324,6 +332,38 @@ pub fn spawn_discovery(
     })
 }
 
+/// Take the background reading of what a `wf reap` would claim, off the path to
+/// the first frame (#137).
+///
+/// The same shape as [`spawn_discovery`] and for the same reason: the reading
+/// costs a `dl --ls --json` subprocess and one batched GraphQL call, and the
+/// picker is already drawn and answering keys. Nothing on the way to the first
+/// frame waits for this — it folds into the view when it lands, through the one
+/// channel everything else arrives on.
+///
+/// The reading is handed in as a *future* rather than taken as a capability
+/// this could invoke: what reaches the screen is a value, and nothing in this
+/// module can ask for a deletion or perform one.
+///
+/// Silent by construction: the future answers `Option`, and a `None` — no `dl`,
+/// a listing that failed, a tracker that would not answer, nothing to reclaim —
+/// sends nothing at all. There is no failure event because there is no failure
+/// worth a word.
+///
+/// Returns its handle so the launch path can stop it and wait, exactly as it
+/// does for the map loads: the reading holds child processes of its own, and an
+/// in-flight one outliving the `exec` would be inherited by the agent.
+pub fn spawn_survey<S>(survey: S, tx: mpsc::UnboundedSender<LoadEvent>) -> JoinHandle<()>
+where
+    S: Future<Output = Option<Reclaimable>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Some(found) = survey.await {
+            let _ = tx.send(LoadEvent::Reclaimable(found));
+        }
+    })
+}
+
 /// Where the cursor lands after a load or a refresh swaps the ticket list.
 ///
 /// Identity wins over position: if the previously selected row still exists
@@ -350,6 +390,85 @@ pub fn preserve_cursor<K: PartialEq>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This module's source with the comments stripped, for the structural
+    /// guard below — what the code can do, not what the prose says it does.
+    fn code_only() -> String {
+        include_str!("refresh.rs")
+            .lines()
+            .take_while(|line| !line.starts_with("#[cfg(test)]"))
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A reading that never answers — the reading `wf` must be able to draw
+    /// over. A `pending` future rather than a long sleep, so "the picker did
+    /// not wait" is a fact about the code and not about a timer.
+    async fn never() -> Option<Reclaimable> {
+        std::future::pending().await
+    }
+
+    #[tokio::test]
+    async fn the_picker_never_waits_on_the_reading() {
+        // The claim that keeps this off the critical path: spawning the reading
+        // hands back control immediately, and the loop that draws the first
+        // frame finds an empty channel rather than a value it had to wait for.
+        // The reading here *never* completes, so anything that awaited it would
+        // hang this test rather than slow it.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let handle = spawn_survey(never(), tx.clone());
+            assert!(
+                rx.try_recv().is_err(),
+                "nothing may be on the channel before the reading lands"
+            );
+            handle.abort();
+        })
+        .await
+        .expect("the picker must not wait for the reading");
+    }
+
+    #[tokio::test]
+    async fn a_reading_that_lands_folds_in_through_the_one_channel() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let found = Reclaimable::for_test(&["ws-a"], 0);
+        spawn_survey(std::future::ready(Some(found.clone())), tx.clone())
+            .await
+            .expect("the reading task");
+        match rx.try_recv() {
+            Ok(LoadEvent::Reclaimable(got)) => assert_eq!(got, found),
+            other => panic!("the reading must arrive as its own event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reading_that_found_nothing_says_nothing() {
+        // No `dl`, a failed listing, a tracker that would not answer, or simply
+        // nothing to reclaim: one silence, no event, and above all no error.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_survey(std::future::ready(None), tx.clone())
+            .await
+            .expect("the reading task");
+        assert!(
+            rx.try_recv().is_err(),
+            "a reading with nothing to say must send nothing"
+        );
+    }
+
+    #[test]
+    fn the_background_reading_carries_a_value_and_never_a_capability() {
+        // #137's safety claim, at the seam that spawns the work: this module
+        // takes a future that answers with a reading. It cannot reach `reap`'s
+        // deletion side, because it cannot reach `reap` at all.
+        let code = code_only();
+        for forbidden in ["reap::", "\"rm\"", "--force", "Command"] {
+            assert!(
+                !code.contains(forbidden),
+                "the background reading must not be able to delete: it names {forbidden:?}"
+            );
+        }
+    }
 
     const A: (&str, u64) = ("wayfinder", 6);
     const B: (&str, u64) = ("wayfinder", 7);

@@ -27,6 +27,7 @@ pub mod launch;
 pub mod model;
 pub mod projects;
 pub mod reap;
+pub mod reclaim;
 pub mod refresh;
 pub mod skills;
 pub mod ui;

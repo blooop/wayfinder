@@ -28,6 +28,12 @@
 //! left alone. A suspicion is worth printing and never worth acting on, which
 //! is why [`Verdict::Warn`] exists and why [`doomed`] is the single place that
 //! decides what actually goes.
+//!
+//! The *deciding* is all here; the *noticing* is [`reclaim`](crate::reclaim),
+//! which calls [`plan`] and [`doomed`] behind the picker so `wf` can say what a
+//! reap would claim without being asked (#137). It adds no deletion path — it
+//! reads these two functions and renders a sentence, and everything that
+//! destroys anything is still reached only by a human typing `wf reap`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;

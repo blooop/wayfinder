@@ -52,7 +52,7 @@ async fn discovery_then_every_map_arrives_through_one_channel() {
             // The search retries, so a blip is survivable rather than fatal:
             // go round and wait for the next event.
             LoadEvent::SearchFailed => {}
-            other @ LoadEvent::Fetched { .. } => {
+            other => {
                 panic!("expected discovery first, got {other:?}")
             }
         }

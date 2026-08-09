@@ -17,6 +17,7 @@ use crate::app::{App, Overlay};
 use crate::filter;
 use crate::launch::{Agent, Candidate, Launch, Staged};
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
+use crate::reclaim::Reclaimable;
 use crate::view::{Branch, Fold, GroupKind, Item, Plan, ProjectRow};
 
 /// One colour per glyph meaning, shared by the row column and the rollup
@@ -573,6 +574,24 @@ pub fn failure_note(app: &App) -> String {
     }
 }
 
+/// The `· N reclaimable: …` segment on the count line (#137): what a
+/// `wf reap` would claim, once the background reading has landed.
+///
+/// Empty while the reading is out, and empty forever if it failed or found
+/// nothing — the three are one silence on purpose, because none of them is
+/// something a person picking a ticket needs told about.
+///
+/// It names the workspaces rather than only counting them: a bare number is
+/// something a reader has no way to agree or disagree with, and the point of
+/// surfacing this at all is that `wf reap` is then a decision rather than an
+/// errand. The picker does nothing with it — the segment *is* the feature.
+pub fn reclaim_note(app: &App) -> String {
+    app.reclaimable
+        .as_ref()
+        .map(Reclaimable::hint)
+        .unwrap_or_default()
+}
+
 /// The `· N idle maps hidden` segment on the count line (#51): the leverage
 /// view drops a map with nothing takeable from the body, and the count is the
 /// only trace of it — silence would read as the map not existing at all. The
@@ -856,11 +875,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     // staged — the staged launch is a modal now (#62's line became
     // [`draw_launch_picker`]), and a modal does not need the row it covers to
     // move out of its way.
-    let status = [app.startup.hint(), failure_note(app), idle_note(&plan)]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let status = [
+        app.startup.hint(),
+        failure_note(app),
+        idle_note(&plan),
+        reclaim_note(app),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ");
     let (shown, total) = app.counts();
     let mut count_spans = vec![
         Span::raw(format!("  {shown}/{total}")),
@@ -1373,6 +1397,53 @@ mod tests {
             screen.contains("└─  ● #2 Choose the stack"),
             "the done ticket hangs off the group line: {screen}"
         );
+    }
+
+    #[test]
+    fn the_first_frame_says_nothing_about_reclaimable_workspaces() {
+        // The reading is a `dl` subprocess and a GraphQL call behind the
+        // screen. Until it lands — and forever, if it failed or found nothing —
+        // the picker looks exactly as it did before #137.
+        let app = fixture_app();
+        assert_eq!(app.reclaimable, None, "nothing has been read yet");
+        let screen = render(&app);
+        assert!(
+            !screen.contains("reclaimable"),
+            "the picker must not mention a reading it has not got: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_count_line_names_what_a_reap_would_claim_once_the_reading_lands() {
+        // A count alone cannot be judged, so the segment names the workspaces
+        // and the command that acts on them. Nothing here deletes anything —
+        // the whole feature is this sentence.
+        let mut app = fixture_app();
+        app.reclaimable = Some(Reclaimable::for_test(&["ws-a", "ws-b"], 0));
+        let screen = render(&app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("reclaimable"))
+            .unwrap_or_else(|| panic!("the count line says so: {screen}"));
+        assert!(line.contains("2 reclaimable"), "{line}");
+        assert!(line.contains("ws-a"), "{line}");
+        assert!(line.contains("ws-b"), "{line}");
+        assert!(line.contains("wf reap"), "{line}");
+    }
+
+    #[test]
+    fn a_warned_workspace_is_never_drawn_as_reclaimable() {
+        // #128's posture, at the last place it could be lost: the warned count
+        // is an aside, and the leading number is the doomed set's alone.
+        let mut app = fixture_app();
+        app.reclaimable = Some(Reclaimable::for_test(&["ws-a"], 2));
+        let screen = render(&app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("reclaimable"))
+            .unwrap_or_else(|| panic!("the count line says so: {screen}"));
+        assert!(line.contains("1 reclaimable"), "{line}");
+        assert!(line.contains("+2 to check by hand"), "{line}");
     }
 
     #[test]

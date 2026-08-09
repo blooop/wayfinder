@@ -377,6 +377,26 @@ refetches everything when you want it — after closing a ticket in the browser,
 say. A fetch that fails says so on the count line and stays failed until you
 ask again.
 
+**What a `wf reap` would claim is read in the background too**, and lands on the
+count line when it arrives:
+
+```
+  12/30    · 2 reclaimable: devlaunch-…-127-c, devlaunch-…-80-f — wf reap
+```
+
+It is the same reading `wf reap` prints, taken by the same code — a `dl --ls
+--json` and one batched tracker query, neither of them on the way to a frame.
+The picker draws at exactly the speed it did without it. Nothing is deleted, and
+nothing can be: this names workspaces and a command, and you type the command.
+It names them rather than only counting them, because "2 reclaimable" is not
+something you can agree or disagree with.
+
+It **fails silent**. No `dl` on PATH, a listing that failed, a GraphQL error, no
+network, or simply nothing to reclaim: the segment is absent, and there is no
+error and no delay. A cleanup convenience is not worth a degraded launcher.
+Workspaces `wf reap` would *warn* about rather than delete are never counted
+into it — they show up only as a `(+N to check by hand)` aside.
+
 ## Launching
 
 Picking a ticket runs the agent chosen in the launch picker, with that project's
@@ -753,7 +773,9 @@ an agent exiting. `dl <ws> stop`, `dl <ws> rm` and `dl --ls` are yours to run.
 ### `wf reap` — clearing away finished tickets
 
 A workspace per ticket means workspaces accumulate as fast as tickets are
-worked. `wf reap` removes the ones whose **work is over**:
+worked. `wf reap` removes the ones whose **work is over** — and the picker
+[says so on its count line](#startup) without being asked, so running it is a
+decision rather than a thing you have to remember:
 
 ```
 $ wf reap
@@ -806,7 +828,13 @@ tickets someone has claimed, and anything **running** — a ticket closing is no
 evidence that the session in the container ended.
 
 One `gh api graphql` call per repo answers all of this, however many workspaces
-that repo has.
+that repo has — which is also what makes the picker's background reading cheap
+enough to take on every start.
+
+**Deleting stays yours.** `wf` notices; it never reaps unattended. The plan is
+printed so a reason you disagree with can be caught while "no" is still an
+answer, and the count-line hint is the same reading with the same posture: it
+names what would go and stops there.
 
 Kept by default but waivable: a workspace whose clone holds uncommitted or
 unpushed work. `-f` reaps those too, and the plan says what it is discarding:
