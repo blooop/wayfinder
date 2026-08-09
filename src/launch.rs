@@ -2855,6 +2855,127 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
     }
 
+    /// The same node launched both ways — into a container and on the host —
+    /// so the container seam can be asserted against what the host's agent is
+    /// handed, rather than against a second spelling of it.
+    fn both_ways(title: &str, route: Route, mode: LaunchMode) -> (Launch, Launch) {
+        let job = Job::Node {
+            aim: Aim::Ticket {
+                number: 80,
+                title: title.to_string(),
+                ticket_type: TicketType::Task,
+                stage: Launchable::Ready,
+                prs: vec![],
+            },
+            map: map_ref(67),
+            route,
+            mode,
+        };
+        let built = |isolation| Launch {
+            repo: "blooop/wayfinder".to_string(),
+            cwd: PathBuf::from("/data/proj/wayfinder"),
+            job: job.clone(),
+            isolation,
+        };
+        (built(Isolation::Devlaunch), built(Isolation::Host))
+    }
+
+    /// The argument vector a container would actually run, recovered by giving
+    /// the single shell command `dl` passes to `devpod ssh --command` to a
+    /// **real POSIX shell**.
+    ///
+    /// A hand-written inverse of [`shell_quote`] would only prove this module
+    /// agrees with itself; `sh` is the thing on the other side of the seam, so
+    /// it is what does the unquoting here. `set --` performs exactly the word
+    /// splitting and quote removal a command line gets, without running the
+    /// agent, and NUL separation keeps a recovered argument's own spaces from
+    /// being mistaken for a boundary.
+    fn container_argv(launch: &Launch) -> Vec<String> {
+        let argv = launch.agent_argv();
+        assert_eq!(argv[0], DEVLAUNCH, "the isolated form is a `dl` launch");
+        assert_eq!(argv[2], "--", "the agent command follows a bare `--`");
+        let script = format!(
+            "set -- {}\nfor arg; do printf '%s\\0' \"$arg\"; done",
+            argv[3]
+        );
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("a POSIX shell");
+        assert!(
+            out.status.success(),
+            "the container's shell refused the command {:?}",
+            argv[3]
+        );
+        let recovered = String::from_utf8(out.stdout).expect("the arguments are utf-8");
+        let mut words: Vec<String> = recovered.split('\0').map(str::to_string).collect();
+        assert_eq!(
+            words.pop().as_deref(),
+            Some(""),
+            "every argument is NUL-terminated"
+        );
+        words
+    }
+
+    #[test]
+    fn the_containers_own_shell_hands_the_agent_what_the_host_would() {
+        // The seam the ticket insists on: an isolated launch's prompt is not
+        // an argv entry by the time it arrives — `dl` joins everything after
+        // `--` and hands one string to `devpod ssh --command`, which a shell
+        // inside the container parses. So the claim is that the shell rebuilds
+        // the context block byte for byte, with a title carrying every
+        // character that would end the argument early if the quoting were
+        // wrong: a single quote, a command substitution and a double quote.
+        let (contained, host) = both_ways(
+            r#"don't $(touch pwned) "x""#,
+            Route::Tdd,
+            interactive("merge when green"),
+        );
+        assert_eq!(container_argv(&contained), host.agent_argv());
+        assert_eq!(
+            host.agent_argv(),
+            vec![
+                "claude".to_string(),
+                Agent::Claude.skip_permissions().to_string(),
+                concat!(
+                    r#"/wf-tdd 80 ctx: {"v":1,"repo":"blooop/wayfinder","#,
+                    r#""map":{"repo":"blooop/wayfinder","number":67,"title":"the dev-process tree"},"#,
+                    r#""aim":{"ticket":{"number":80,"title":"don't $(touch pwned) \"x\"","#,
+                    r#""ticket_type":"task","stage":"ready","prs":[]}}} steer: merge when green"#
+                )
+                .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_map_launch_survives_the_container_seam_too() {
+        // The other aim, and the plain session that carries no block at all:
+        // both have to come back out of the shell as they went in.
+        let (contained, host) = both_ways("the ticket", Route::Plain, plain("look around"));
+        assert_eq!(container_argv(&contained), host.agent_argv());
+        let map = Launch {
+            repo: "blooop/wayfinder".to_string(),
+            cwd: PathBuf::from("/data/proj/wayfinder"),
+            job: Job::Node {
+                aim: Aim::Map,
+                map: map_ref(67),
+                route: Route::WayfinderAuto,
+                mode: auto(""),
+            },
+            isolation: Isolation::Devlaunch,
+        };
+        assert_eq!(
+            container_argv(&map).last().expect("a prompt"),
+            concat!(
+                r#"/wf-auto 67 ctx: {"v":1,"repo":"blooop/wayfinder","#,
+                r#""map":{"repo":"blooop/wayfinder","number":67,"title":"the dev-process tree"},"#,
+                r#""aim":"map"}"#
+            )
+        );
+    }
+
     #[test]
     fn the_notice_names_the_container_when_there_is_one_and_stays_quiet_otherwise() {
         // An isolated launch works in its workspace, not in the checkout —
