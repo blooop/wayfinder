@@ -19,7 +19,7 @@
 //! workspace holds that says "not yet" — unsaved work, a running container — is
 //! `dl`'s fact, read here rather than argued with.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
@@ -256,9 +256,10 @@ pub fn node_of(workspace: &Workspace) -> Option<Node> {
 
 /// Decide every workspace's fate, in listing order.
 ///
-/// `finished` is the set of nodes the tracker says are closed — gathered once,
-/// [`finished_nodes`], because that is one network call for the lot rather than
-/// one per workspace.
+/// `known` is what the tracker said about each node — gathered once,
+/// [`node_facts`], because that is one network call per repo rather than one
+/// per workspace. A node appears once however many workspaces name it: the fact
+/// is the node's, and the guards below are each workspace's own.
 ///
 /// The guards run before the reason to delete, and their order is the safety
 /// argument: work that would be lost outranks a closed ticket, and a live
@@ -277,7 +278,17 @@ pub fn node_of(workspace: &Workspace) -> Option<Node> {
 /// about bytes on disk. The plan names what is being overridden either way, so
 /// the waiver is read before it is granted, and `dl` gets `--force` only for the
 /// workspaces the human just saw described.
-pub fn plan(workspaces: &[Workspace], finished: &BTreeSet<Node>, insist: bool) -> Vec<Verdict> {
+///
+/// The `Warn` rows never delete, which is why they do not borrow the reap
+/// row's "discarding" cadence: nothing is discarded on a row `wf` will not act
+/// on. Under `-f` they still name the unsaved work, because the reap they are
+/// advising would throw it away — the discard belongs to the by-hand reap, and
+/// the sentence says so.
+pub fn plan(
+    workspaces: &[Workspace],
+    known: &BTreeMap<Node, NodeFact>,
+    insist: bool,
+) -> Vec<Verdict> {
     let mut verdicts = Vec::new();
     for workspace in workspaces {
         let Some(node) = node_of(workspace) else {
@@ -286,35 +297,64 @@ pub fn plan(workspaces: &[Workspace], finished: &BTreeSet<Node>, insist: bool) -
             continue;
         };
         let id = workspace.id.clone();
+        let name = format!("{}#{}", short_repo(&node.repo), node.number);
+        // Naming the waived work in the acted-on line, not only in the keep
+        // line it replaced: this is the row the human is about to approve, and
+        // "and discarding …" is the part they might stop at.
+        let discard = match (&workspace.unsaved, insist) {
+            (Some(unsaved), true) => format!(", discarding {unsaved}"),
+            _ => String::new(),
+        };
         if let (Some(unsaved), false) = (&workspace.unsaved, insist) {
             verdicts.push(Verdict::Keep {
                 id,
                 reason: format!("holds {unsaved}"),
             });
-        } else if workspace.state.as_deref() == Some("Running") {
+            continue;
+        }
+        if workspace.state.as_deref() == Some("Running") {
             verdicts.push(Verdict::Keep {
                 id,
                 reason: "still running — stop it first".to_string(),
             });
-        } else if finished.contains(&node) {
-            let node_name = format!("{}#{} is closed", short_repo(&node.repo), node.number);
-            verdicts.push(Verdict::Reap {
-                id,
-                // Naming the waived work in the reap line, not only in the
-                // keep line it replaced: this is the row the human is about to
-                // approve, and "and discarding …" is the part they might stop
-                // at.
-                reason: match (&workspace.unsaved, insist) {
-                    (Some(unsaved), true) => format!("{node_name}, discarding {unsaved}"),
-                    _ => node_name,
-                },
-            });
-        } else {
+            continue;
+        }
+        let Some(fact) = known.get(&node) else {
+            // Unreachable while the fetch stays never-partial, and deliberately
+            // not an `Unstarted`: a question that went unanswered is not an
+            // observation about the node.
             verdicts.push(Verdict::Keep {
                 id,
-                reason: format!("{}#{} is still open", short_repo(&node.repo), node.number),
+                reason: format!("no tracker answer for {name}"),
             });
-        }
+            continue;
+        };
+        verdicts.push(match fact {
+            NodeFact::Closed => Verdict::Reap {
+                id,
+                reason: format!("{name} is closed{discard}"),
+            },
+            NodeFact::DoneByMerge { pr } => Verdict::Reap {
+                id,
+                reason: format!("{name} open but its PR #{pr} merged{discard}"),
+            },
+            NodeFact::Superseded { pr } => Verdict::Warn {
+                id,
+                reason: format!(
+                    "{name}'s PR #{pr} closed unmerged — superseded? reap by hand if so{discard}"
+                ),
+            },
+            NodeFact::Unstarted => Verdict::Warn {
+                id,
+                reason: format!(
+                    "{name} unclaimed and no PR — an abandoned stage? reap by hand if so{discard}"
+                ),
+            },
+            NodeFact::InFlight { .. } | NodeFact::Claimed => Verdict::Keep {
+                id,
+                reason: format!("{name} is still open"),
+            },
+        });
     }
     verdicts
 }
@@ -668,14 +708,27 @@ mod tests {
         assert_eq!(node_of(&unrecorded), None);
     }
 
+    /// The fact map `plan` decides by, keyed the way the batch answers.
+    fn facts<const N: usize>(entries: [(Node, NodeFact); N]) -> BTreeMap<Node, NodeFact> {
+        BTreeMap::from(entries)
+    }
+
     #[test]
     fn a_closed_ticket_is_reaped_and_an_open_one_is_kept() {
+        // The regression pin: the verdict that existed before reap could read
+        // anything but "closed", said in the same words.
         let listing = vec![
             workspace("done", "blooop/devlaunch", "wayfinder/devlaunch-80"),
             workspace("open", "blooop/devlaunch", "wayfinder/devlaunch-81"),
         ];
-        let finished = BTreeSet::from([node("blooop/devlaunch", 80)]);
-        let verdicts = plan(&listing, &finished, false);
+        let known = facts([
+            (node("blooop/devlaunch", 80), NodeFact::Closed),
+            (
+                node("blooop/devlaunch", 81),
+                NodeFact::InFlight { pr: 91 },
+            ),
+        ]);
+        let verdicts = plan(&listing, &known, false);
         assert_eq!(
             verdicts,
             vec![
@@ -692,14 +745,291 @@ mod tests {
     }
 
     #[test]
+    fn an_open_ticket_whose_only_pr_merged_is_reaped_as_done_by_merge() {
+        // What the stage lattice already calls Done: with nothing in flight, a
+        // merge means done whatever the ticket still says. The row names both
+        // halves, because the open ticket is the part a reader might stop at.
+        let ws = workspace("done", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        let known = facts([(
+            node("blooop/devlaunch", 80),
+            NodeFact::DoneByMerge { pr: 97 },
+        )]);
+        assert_eq!(
+            plan(&[ws], &known, false),
+            vec![Verdict::Reap {
+                id: "done".to_string(),
+                reason: "devlaunch#80 open but its PR #97 merged".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn an_open_or_draft_pr_still_keeps_and_never_warns() {
+        // The half of the old `Open` catch-all that is the least dead thing wf
+        // manages: in-review is where review fixes happen.
+        let ws = workspace("live", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        for pr in [40, 42] {
+            let known = facts([(node("blooop/devlaunch", 80), NodeFact::InFlight { pr })]);
+            assert_eq!(
+                plan(std::slice::from_ref(&ws), &known, false),
+                vec![Verdict::Keep {
+                    id: "live".to_string(),
+                    reason: "devlaunch#80 is still open".to_string()
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn all_prs_closed_unmerged_warns_and_never_lands_in_the_doomed_set() {
+        // A closed unmerged PR is a human's "not this way", not "this branch is
+        // disposable" — wf's model refuses to read it as evidence and reap must
+        // not invent a stronger reading. So: named, never deleted.
+        let ws = workspace("super", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        let known = facts([(
+            node("blooop/devlaunch", 80),
+            NodeFact::Superseded { pr: 97 },
+        )]);
+        let verdicts = plan(&[ws], &known, false);
+        assert_eq!(
+            verdicts,
+            vec![Verdict::Warn {
+                id: "super".to_string(),
+                reason: "devlaunch#80's PR #97 closed unmerged — superseded? reap by hand if so"
+                    .to_string()
+            }]
+        );
+        assert!(doomed(&verdicts).is_empty());
+    }
+
+    #[test]
+    fn an_unclaimed_node_with_no_pr_warns_instead_of_keeping_quietly() {
+        // Nothing has come of this node: nobody took it up and nothing came
+        // out. The row says only what was observed — never "prewarmed",
+        // "never entered" or "never attached", none of which wf knows.
+        let ws = workspace("ghost", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        let known = facts([(node("blooop/devlaunch", 80), NodeFact::Unstarted)]);
+        let verdicts = plan(&[ws], &known, false);
+        assert_eq!(
+            verdicts,
+            vec![Verdict::Warn {
+                id: "ghost".to_string(),
+                reason: "devlaunch#80 unclaimed and no PR — an abandoned stage? reap by hand if so"
+                    .to_string()
+            }]
+        );
+        for forbidden in ["prewarm", "never entered", "never attached"] {
+            assert!(!verdicts[0].reason().contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn a_claimed_node_with_no_pr_is_kept_silently() {
+        // The same workspace and the same empty rollup, one assignee apart.
+        // That bit is the whole decision, so it gets its own test: an explicit
+        // claim is a person's statement of intent, and a claim left behind by
+        // an agent that died is settled by the re-entry ritual, not by reap.
+        let ws = workspace("claimed", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        let known = facts([(node("blooop/devlaunch", 80), NodeFact::Claimed)]);
+        assert_eq!(
+            plan(&[ws], &known, false),
+            vec![Verdict::Keep {
+                id: "claimed".to_string(),
+                reason: "devlaunch#80 is still open".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_warned_workspace_never_reaches_the_doomed_set_even_with_y_and_f() {
+        // The safety property of the whole Warn arm, and the reason the doomed
+        // set has one definition instead of a partition at the call site: no
+        // combination of flags turns a warning into a deletion. `-y` only skips
+        // the prompt, so `-f` is the whole flag surface plan can even see.
+        for fact in [NodeFact::Superseded { pr: 97 }, NodeFact::Unstarted] {
+            let mut ws = workspace("warned", "blooop/devlaunch", "wayfinder/devlaunch-80");
+            ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+            let known = facts([(node("blooop/devlaunch", 80), fact)]);
+            for insist in [false, true] {
+                let verdicts = plan(std::slice::from_ref(&ws), &known, insist);
+                assert!(
+                    doomed(&verdicts).is_empty(),
+                    "insist={insist} put a warned workspace in the doomed set"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_warning_rows_advise_a_reap_by_hand_rather_than_announcing_a_discard() {
+        // A row that never deletes must not borrow the reap row's cadence:
+        // nothing is being discarded here. Under -f the discard is real but it
+        // belongs to the by-hand reap being advised, which is where the clause
+        // sits — and the wording is the same for both warning facts.
+        for fact in [NodeFact::Superseded { pr: 97 }, NodeFact::Unstarted] {
+            let mut ws = workspace("warned", "blooop/devlaunch", "wayfinder/devlaunch-80");
+            ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+            let known = facts([(node("blooop/devlaunch", 80), fact)]);
+            let quiet = plan(std::slice::from_ref(&ws), &known, false);
+            assert!(!quiet[0].reason().contains("discarding"));
+            let loud = plan(std::slice::from_ref(&ws), &known, true);
+            assert!(loud[0].reason().ends_with(
+                "reap by hand if so, discarding 1 uncommitted change(s) (pixi.lock)"
+            ));
+        }
+    }
+
+    #[test]
+    fn the_lockfile_dirty_prewarm_shows_its_warning_only_under_f() {
+        // A postCreateCommand that dirties a tracked lockfile hides the warning
+        // behind the unsaved guard. That under-fire is the existing -f contract
+        // doing its job, and the deliberate direction: the advisory row is the
+        // one that can afford to be missed.
+        let mut ws = workspace("ghost", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+        let known = facts([(node("blooop/devlaunch", 80), NodeFact::Unstarted)]);
+        assert_eq!(
+            plan(std::slice::from_ref(&ws), &known, false),
+            vec![Verdict::Keep {
+                id: "ghost".to_string(),
+                reason: "holds 1 uncommitted change(s) (pixi.lock)".to_string()
+            }]
+        );
+        assert_eq!(
+            plan(&[ws], &known, true),
+            vec![Verdict::Warn {
+                id: "ghost".to_string(),
+                reason: "devlaunch#80 unclaimed and no PR — an abandoned stage? \
+                         reap by hand if so, discarding 1 uncommitted change(s) (pixi.lock)"
+                    .to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_running_prewarm_reads_as_running_first() {
+        // A just-abandoned prewarm's container is Running — its own `dl up`
+        // started it — so the guard wins the row with or without -f, and the
+        // warning surfaces on the next run. That is the correct next action.
+        let mut ws = workspace("ghost", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        ws.state = Some("Running".to_string());
+        let known = facts([(node("blooop/devlaunch", 80), NodeFact::Unstarted)]);
+        for insist in [false, true] {
+            assert_eq!(
+                plan(std::slice::from_ref(&ws), &known, insist),
+                vec![Verdict::Keep {
+                    id: "ghost".to_string(),
+                    reason: "still running — stop it first".to_string()
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn done_by_merge_yields_to_unsaved_without_f_and_to_running_always() {
+        // The new facts are a second way for the tracker to say "finished
+        // enough", orthogonal to the guards and beneath them.
+        let known = facts([(
+            node("blooop/devlaunch", 80),
+            NodeFact::DoneByMerge { pr: 97 },
+        )]);
+        let mut dirty = workspace("merged", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        dirty.unsaved = Some("2 uncommitted change(s)".to_string());
+        assert_eq!(
+            plan(&[dirty], &known, false),
+            vec![Verdict::Keep {
+                id: "merged".to_string(),
+                reason: "holds 2 uncommitted change(s)".to_string()
+            }]
+        );
+        let mut running = workspace("merged", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        running.state = Some("Running".to_string());
+        for insist in [false, true] {
+            assert_eq!(
+                plan(std::slice::from_ref(&running), &known, insist),
+                vec![Verdict::Keep {
+                    id: "merged".to_string(),
+                    reason: "still running — stop it first".to_string()
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn insisting_on_done_by_merge_names_the_discard() {
+        let mut ws = workspace("merged", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+        let known = facts([(
+            node("blooop/devlaunch", 80),
+            NodeFact::DoneByMerge { pr: 97 },
+        )]);
+        assert_eq!(
+            plan(&[ws], &known, true),
+            vec![Verdict::Reap {
+                id: "merged".to_string(),
+                reason: "devlaunch#80 open but its PR #97 merged, \
+                         discarding 1 uncommitted change(s) (pixi.lock)"
+                    .to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn two_workspaces_of_one_node_share_the_fact_but_keep_their_own_guards() {
+        // The fact is computed once per node and applied identically to every
+        // workspace whose branch names it; the per-workspace guards are what
+        // differentiate them.
+        let mut running = workspace("live", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        running.state = Some("Running".to_string());
+        let stopped = workspace("idle", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        let known = facts([(
+            node("blooop/devlaunch", 80),
+            NodeFact::DoneByMerge { pr: 97 },
+        )]);
+        assert_eq!(
+            plan(&[running, stopped], &known, false),
+            vec![
+                Verdict::Keep {
+                    id: "live".to_string(),
+                    reason: "still running — stop it first".to_string()
+                },
+                Verdict::Reap {
+                    id: "idle".to_string(),
+                    reason: "devlaunch#80 open but its PR #97 merged".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_node_the_batch_did_not_answer_for_is_never_acted_on() {
+        // The fetch is never-partial, so this should be unreachable — but the
+        // one shape it could degrade into is the sentinel this whole design
+        // exists to refuse: a missing answer read as "nothing has come of it".
+        // It is neither reaped nor warned about; it says the tracker went
+        // unanswered, which is the truth.
+        let ws = workspace("unknown", "blooop/devlaunch", "wayfinder/devlaunch-80");
+        for insist in [false, true] {
+            let verdicts = plan(std::slice::from_ref(&ws), &BTreeMap::new(), insist);
+            assert_eq!(
+                verdicts,
+                vec![Verdict::Keep {
+                    id: "unknown".to_string(),
+                    reason: "no tracker answer for devlaunch#80".to_string()
+                }]
+            );
+        }
+    }
+
+    #[test]
     fn unsaved_work_keeps_a_workspace_whose_ticket_is_closed() {
         // dl's fact, read rather than argued with: dl would refuse this delete,
         // and a caller that walks into a refusal it could have anticipated is
         // one that eventually learns to pass --force.
         let mut ws = workspace("done", "blooop/devlaunch", "wayfinder/devlaunch-80");
         ws.unsaved = Some("2 uncommitted change(s)".to_string());
-        let finished = BTreeSet::from([node("blooop/devlaunch", 80)]);
-        let verdicts = plan(&[ws], &finished, false);
+        let known = facts([(node("blooop/devlaunch", 80), NodeFact::Closed)]);
+        let verdicts = plan(&[ws], &known, false);
         assert_eq!(
             verdicts,
             vec![Verdict::Keep {
@@ -714,9 +1044,9 @@ mod tests {
         // The ticket closing does not mean the session in the container ended.
         let mut ws = workspace("done", "blooop/devlaunch", "wayfinder/devlaunch-80");
         ws.state = Some("Running".to_string());
-        let finished = BTreeSet::from([node("blooop/devlaunch", 80)]);
+        let known = facts([(node("blooop/devlaunch", 80), NodeFact::Closed)]);
         assert_eq!(
-            plan(&[ws], &finished, false),
+            plan(&[ws], &known, false),
             vec![Verdict::Keep {
                 id: "done".to_string(),
                 reason: "still running — stop it first".to_string()
@@ -729,10 +1059,8 @@ mod tests {
         let mut ws = workspace("done", "blooop/devlaunch", "wayfinder/devlaunch-80");
         ws.state = Some("Running".to_string());
         ws.unsaved = Some("1 unpushed commit(s)".to_string());
-        let finished = BTreeSet::from([node("blooop/devlaunch", 80)]);
-        assert!(plan(&[ws], &finished, false)[0]
-            .reason()
-            .contains("unpushed"));
+        let known = facts([(node("blooop/devlaunch", 80), NodeFact::Closed)]);
+        assert!(plan(&[ws], &known, false)[0].reason().contains("unpushed"));
     }
 
     #[test]
@@ -746,7 +1074,11 @@ mod tests {
             workspace("mine", "blooop/devlaunch", "wayfinder/devlaunch-81"),
             workspace("plain", "blooop/devlaunch", "main"),
         ];
-        let verdicts = plan(&listing, &BTreeSet::new(), false);
+        let known = facts([(
+            node("blooop/devlaunch", 81),
+            NodeFact::InFlight { pr: 91 },
+        )]);
+        let verdicts = plan(&listing, &known, false);
         assert_eq!(verdicts.len(), 1);
         assert_eq!(verdicts[0].id(), "mine");
     }
@@ -777,19 +1109,20 @@ mod tests {
         // that is the row being approved.
         let mut ws = workspace("done", "blooop/devlaunch", "wayfinder/devlaunch-80");
         ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
-        let finished = BTreeSet::from([node("blooop/devlaunch", 80)]);
+        let known = facts([(node("blooop/devlaunch", 80), NodeFact::Closed)]);
         assert_eq!(
-            plan(std::slice::from_ref(&ws), &finished, true),
+            plan(std::slice::from_ref(&ws), &known, true),
             vec![Verdict::Reap {
                 id: "done".to_string(),
                 reason: "devlaunch#80 is closed, discarding 1 uncommitted change(s) (pixi.lock)"
                     .to_string()
             }]
         );
-        // And it is only ever a waiver of *that* guard: an open ticket is still
-        // an open ticket.
+        // And it is only ever a waiver of *that* guard: an open ticket someone
+        // is working is still an open ticket.
+        let open = facts([(node("blooop/devlaunch", 80), NodeFact::Claimed)]);
         assert!(matches!(
-            plan(&[ws], &BTreeSet::new(), true).as_slice(),
+            plan(&[ws], &open, true).as_slice(),
             [Verdict::Keep { .. }]
         ));
     }
@@ -803,9 +1136,9 @@ mod tests {
         let mut ws = workspace("done", "blooop/devlaunch", "wayfinder/devlaunch-80");
         ws.state = Some("Running".to_string());
         ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
-        let finished = BTreeSet::from([node("blooop/devlaunch", 80)]);
+        let known = facts([(node("blooop/devlaunch", 80), NodeFact::Closed)]);
         assert_eq!(
-            plan(&[ws], &finished, true),
+            plan(&[ws], &known, true),
             vec![Verdict::Keep {
                 id: "done".to_string(),
                 reason: "still running — stop it first".to_string()
