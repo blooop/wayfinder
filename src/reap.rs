@@ -26,6 +26,8 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
 
+use crate::model::PrStatus;
+
 /// The branch prefix `wf` mints its workspaces under (#106): the full branch is
 /// `wayfinder/<short-repo>-<n>`, which is also the branch `/wf-tdd` works on.
 const BRANCH_PREFIX: &str = "wayfinder/";
@@ -57,26 +59,162 @@ pub struct Workspace {
     pub unsaved: Option<String>,
 }
 
-/// What `wf` decided about one workspace. Two arms, both carrying a reason,
+/// What `wf` decided about one workspace. Three arms, each carrying a reason,
 /// because the plan is printed before anything is deleted and a reason the
 /// reader disagrees with is only useful while saying no is still possible.
+///
+/// `Warn` is display-only: a row `wf` wants read but will not act on. It is a
+/// separate arm rather than a flag on `Keep` so that every site deciding what
+/// to print — and, more to the point, what to delete — has to say at compile
+/// time which of the three it means.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Reap { id: String, reason: String },
+    Warn { id: String, reason: String },
     Keep { id: String, reason: String },
 }
 
 impl Verdict {
     pub fn id(&self) -> &str {
         match self {
-            Verdict::Reap { id, .. } | Verdict::Keep { id, .. } => id,
+            Verdict::Reap { id, .. } | Verdict::Warn { id, .. } | Verdict::Keep { id, .. } => id,
         }
     }
 
     pub fn reason(&self) -> &str {
         match self {
-            Verdict::Reap { reason, .. } | Verdict::Keep { reason, .. } => reason,
+            Verdict::Reap { reason, .. }
+            | Verdict::Warn { reason, .. }
+            | Verdict::Keep { reason, .. } => reason,
         }
+    }
+}
+
+/// The workspaces a plan would actually delete.
+///
+/// The one definition of the doomed set, kept here rather than as a `matches!`
+/// at the call site: "a warned workspace is never deleted" is the safety
+/// property of the whole `Warn` arm, and a property nothing owns is a property
+/// nothing can pin. Every caller partitions through this.
+pub fn doomed(verdicts: &[Verdict]) -> Vec<&Verdict> {
+    verdicts
+        .iter()
+        .filter(|v| matches!(v, Verdict::Reap { .. }))
+        .collect()
+}
+
+/// What one linked PR says about whether its node is still alive — reap's
+/// projection of the badge reading, not a second reading of the tracker.
+///
+/// Three arms, because reap asks less of a PR than the screen does: does this
+/// PR keep the node alive, did it finish it, or does it say nothing. Checks,
+/// review and draftness are all the same answer here.
+///
+/// Every arm carries its number, since that number is the whole content of the
+/// row the human is about to approve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrOutcome {
+    /// Open, draft — or unreadable. See [`PrOutcome::project`].
+    InFlight { pr: u64 },
+    Merged { pr: u64 },
+    ClosedUnmerged { pr: u64 },
+}
+
+impl PrOutcome {
+    /// Project one PR's badge reading, which is [`fetch`](crate::fetch)'s job
+    /// and is not redone here — `status` is exactly what the badge parse made
+    /// of it, and `None` is that parse declining a `state` this binary does not
+    /// recognise.
+    ///
+    /// **An unreadable PR is in flight.** It is the only claim that stays true
+    /// whatever a newer GitHub state turns out to mean, and it is the arm that
+    /// keeps the workspace and prints nothing — so a state added after this
+    /// binary shipped costs a workspace that stays, never one that goes. The
+    /// alternative is worse than wrong: dropping it would leave the node
+    /// looking like it has no PR at all, which reads as
+    /// [`NodeFact::Unstarted`] — a warning invented out of a parse failure.
+    pub fn project(number: u64, status: Option<&PrStatus>) -> PrOutcome {
+        match status {
+            Some(PrStatus::Merged) => PrOutcome::Merged { pr: number },
+            Some(PrStatus::Closed) => PrOutcome::ClosedUnmerged { pr: number },
+            Some(PrStatus::Draft | PrStatus::Open { .. }) | None => {
+                PrOutcome::InFlight { pr: number }
+            }
+        }
+    }
+}
+
+/// What the tracker says about one node, in the terms reap decides by.
+///
+/// Six unconfusable values where a boolean "is it closed" used to be, so that
+/// "closed", "done by merge", "superseded", "in flight", "claimed" and
+/// "nothing has come of it" cannot be mistaken for each other, and so that
+/// every match site has to say out loud what it does with each.
+///
+/// Derived at every read from the batch the tracker just answered — never
+/// stored, so it cannot go stale, be orphaned, or outlive the workspace it
+/// describes. `Unstarted` in particular is a *positive observation* (open, no
+/// PRs, nobody assigned) and is never reachable from a lookup that failed: a
+/// node the batch did not answer for is an error, not an `Unstarted` node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeFact {
+    /// The ticket is closed.
+    Closed,
+    /// Open, but a PR merged and nothing is still in flight — what wf's own
+    /// stage lattice already calls Done, whatever the ticket still says.
+    DoneByMerge { pr: u64 },
+    /// Open, every linked PR closed unmerged. A human's "not this way", which
+    /// is not the same as "this branch is disposable".
+    Superseded { pr: u64 },
+    /// Open, with an open or draft PR: the least dead thing `wf` manages.
+    InFlight { pr: u64 },
+    /// Open, no PRs, but someone has taken it up. An explicit claim is a
+    /// person's statement of intent and reap does not overrule it.
+    Claimed,
+    /// Open, no PRs, unclaimed: nothing has come of this node.
+    Unstarted,
+}
+
+/// Read one node the way reap decides by it — the stage lattice's table,
+/// applied to the same fields the map query already returns.
+///
+/// Total over its inputs, and the order is the argument: a live PR dominates a
+/// merged sibling (a multi-PR ticket between merges is still being worked), a
+/// merge outranks the closed PRs beside it, and only a node with no PR
+/// evidence at all falls through to the claim.
+pub fn node_fact(is_open: bool, is_assigned: bool, prs: &[PrOutcome]) -> NodeFact {
+    if !is_open {
+        return NodeFact::Closed;
+    }
+    let earliest = |pick: fn(&PrOutcome) -> Option<u64>| prs.iter().filter_map(pick).min();
+    if let Some(pr) = earliest(|o| match o {
+        PrOutcome::InFlight { pr } => Some(*pr),
+        _ => None,
+    }) {
+        return NodeFact::InFlight { pr };
+    }
+    if let Some(pr) = earliest(|o| match o {
+        PrOutcome::Merged { pr } => Some(*pr),
+        _ => None,
+    }) {
+        return NodeFact::DoneByMerge { pr };
+    }
+    // Everything left is closed-unmerged, so the highest number is the last
+    // word anyone had on this node.
+    if let Some(pr) = prs
+        .iter()
+        .filter_map(|o| match o {
+            PrOutcome::ClosedUnmerged { pr } => Some(*pr),
+            _ => None,
+        })
+        .max()
+    {
+        return NodeFact::Superseded { pr };
+    }
+    if is_assigned {
+        NodeFact::Claimed
+    } else {
+        NodeFact::Unstarted
     }
 }
 
@@ -313,6 +451,7 @@ pub async fn remove(id: &str, insist: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Checks, Review};
 
     fn workspace(id: &str, repo: &str, branch: &str) -> Workspace {
         Workspace {
@@ -330,6 +469,142 @@ mod tests {
             repo: repo.to_string(),
             number,
         }
+    }
+
+    fn open_pr() -> PrStatus {
+        PrStatus::Open {
+            checks: Checks::Passing,
+            review: Review::NotRequired,
+        }
+    }
+
+    #[test]
+    fn a_pr_this_binary_cannot_read_still_counts_as_a_pr_in_flight() {
+        // The badge parse yields nothing for a state this binary does not
+        // recognise -- on purpose, since no badge beats a wrong one. Reap must
+        // still see a PR there. "In flight" is the only claim that stays true
+        // whatever the new state turns out to mean, and it is the arm that
+        // keeps the workspace and prints nothing; the alternative is a node
+        // that reads as having no PR at all and slides into `Unstarted`.
+        assert_eq!(PrOutcome::project(44, None), PrOutcome::InFlight { pr: 44 });
+    }
+
+    #[test]
+    fn the_pr_projection_is_total_over_every_reading_the_badge_parse_can_yield() {
+        // Three arms over the four badge statuses: reap's question is only
+        // "does this PR keep the node alive, finish it, or say nothing".
+        assert_eq!(
+            PrOutcome::project(1, Some(&PrStatus::Draft)),
+            PrOutcome::InFlight { pr: 1 }
+        );
+        assert_eq!(
+            PrOutcome::project(2, Some(&open_pr())),
+            PrOutcome::InFlight { pr: 2 }
+        );
+        assert_eq!(
+            PrOutcome::project(3, Some(&PrStatus::Merged)),
+            PrOutcome::Merged { pr: 3 }
+        );
+        assert_eq!(
+            PrOutcome::project(4, Some(&PrStatus::Closed)),
+            PrOutcome::ClosedUnmerged { pr: 4 }
+        );
+    }
+
+    #[test]
+    fn node_fact_is_total_over_the_rollup_and_the_claim() {
+        let cases: Vec<(&str, Vec<PrOutcome>, NodeFact, NodeFact)> = vec![
+            // (rollup name, rollup, open+assigned, open+unassigned)
+            ("no PRs", vec![], NodeFact::Claimed, NodeFact::Unstarted),
+            (
+                "a draft PR",
+                vec![PrOutcome::project(42, Some(&PrStatus::Draft))],
+                NodeFact::InFlight { pr: 42 },
+                NodeFact::InFlight { pr: 42 },
+            ),
+            (
+                "an open PR",
+                vec![PrOutcome::project(40, Some(&open_pr()))],
+                NodeFact::InFlight { pr: 40 },
+                NodeFact::InFlight { pr: 40 },
+            ),
+            (
+                "a merged PR",
+                vec![PrOutcome::project(33, Some(&PrStatus::Merged))],
+                NodeFact::DoneByMerge { pr: 33 },
+                NodeFact::DoneByMerge { pr: 33 },
+            ),
+            (
+                "a closed-unmerged PR",
+                vec![PrOutcome::project(43, Some(&PrStatus::Closed))],
+                NodeFact::Superseded { pr: 43 },
+                NodeFact::Superseded { pr: 43 },
+            ),
+            (
+                "a merged PR beside an open one",
+                vec![
+                    PrOutcome::project(33, Some(&PrStatus::Merged)),
+                    PrOutcome::project(40, Some(&open_pr())),
+                ],
+                NodeFact::InFlight { pr: 40 },
+                NodeFact::InFlight { pr: 40 },
+            ),
+            (
+                // fetch's own unknown-state fixture, carried the whole way in:
+                // it must not read as "no PR" and slide into `Unstarted`.
+                "a PR this binary cannot read",
+                vec![PrOutcome::project(44, None)],
+                NodeFact::InFlight { pr: 44 },
+                NodeFact::InFlight { pr: 44 },
+            ),
+        ];
+        for (name, prs, claimed, unclaimed) in cases {
+            assert_eq!(node_fact(true, true, &prs), claimed, "open, assigned, {name}");
+            assert_eq!(
+                node_fact(true, false, &prs),
+                unclaimed,
+                "open, unassigned, {name}"
+            );
+            for assigned in [true, false] {
+                assert_eq!(
+                    node_fact(false, assigned, &prs),
+                    NodeFact::Closed,
+                    "closed, assigned={assigned}, {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_fact_names_the_pr_its_reason_line_will_quote() {
+        // Which PR the arm carries is the whole content of the printed row, so
+        // it is pinned rather than left to the iteration order: the earliest
+        // live PR for work in flight, the earliest merge for the merge that
+        // finished it, and the *last* word on a superseded node.
+        let in_flight = [
+            PrOutcome::project(40, Some(&open_pr())),
+            PrOutcome::project(37, Some(&PrStatus::Draft)),
+        ];
+        assert_eq!(
+            node_fact(true, false, &in_flight),
+            NodeFact::InFlight { pr: 37 }
+        );
+        let merged = [
+            PrOutcome::project(97, Some(&PrStatus::Merged)),
+            PrOutcome::project(91, Some(&PrStatus::Merged)),
+        ];
+        assert_eq!(
+            node_fact(true, false, &merged),
+            NodeFact::DoneByMerge { pr: 91 }
+        );
+        let superseded = [
+            PrOutcome::project(90, Some(&PrStatus::Closed)),
+            PrOutcome::project(97, Some(&PrStatus::Closed)),
+        ];
+        assert_eq!(
+            node_fact(true, false, &superseded),
+            NodeFact::Superseded { pr: 97 }
+        );
     }
 
     #[test]
