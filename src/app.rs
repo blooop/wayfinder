@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::launch::{self, Agent, Candidate, Launch, LaunchMode, Route, Staged, Targets};
+use crate::launch::{self, Agent, Candidate, Launch, LaunchMode, MapRef, Route, Staged, Targets};
 use crate::model::{stage, Activity, Map, MapId, MapSet, Status, Ticket};
 use crate::projects::Checkout;
 use crate::refresh::Startup;
@@ -36,7 +36,12 @@ pub enum Outcome {
     Refresh,
     /// Run this ticket's agent. The last thing `wf` ever does: the loop
     /// returns, the terminal is restored, and the process becomes the agent.
-    Launch(Launch),
+    ///
+    /// Boxed because it is by far the largest thing an outcome can carry — a
+    /// launch holds the whole snapshot it hands its agent (#124) — and every
+    /// other outcome is a keystroke's worth of nothing. One allocation on the
+    /// last keypress of the session buys a small `Outcome` for all the rest.
+    Launch(Box<Launch>),
 }
 
 /// A modal layer over the main screen: the staged second step of a launch
@@ -680,8 +685,7 @@ impl App {
                 Outcome::Continue
             }
             Some(Stop::Map(id)) => {
-                let title = self.clusters[&id].title.clone();
-                let staged = Staged::map(&id, &title);
+                let staged = Staged::map(&MapRef::new(&id, &self.clusters[&id].title));
                 self.prewarm(&staged);
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
@@ -724,7 +728,11 @@ impl App {
             ));
             return Outcome::Continue;
         }
-        match Staged::ticket(ticket, row.map.number, stage(&ticket.prs, &ticket.status)) {
+        // The map the row was picked in, carried whole: a ticket can sit on a
+        // map in another repo, and a bare number would name the wrong issue
+        // there (#124).
+        let map = MapRef::new(&row.map, &self.clusters[&row.map].title);
+        match Staged::ticket(ticket, &map, stage(&ticket.prs, &ticket.status)) {
             None => {
                 self.notice = Some(format!("#{} is done — nothing to launch", ticket.number));
                 Outcome::Continue
@@ -824,7 +832,7 @@ impl App {
             }
             Targets::One(launch) => {
                 self.notice = Some(format!("→ {}", launch.describe()));
-                Outcome::Launch(launch)
+                Outcome::Launch(Box::new(launch))
             }
             Targets::Many(launches) => {
                 self.notice = Some(format!("{repo}{key}: which checkout?"));
@@ -935,7 +943,7 @@ impl App {
                     .nth(cursor)
                     .expect("picker cursor stays in range");
                 self.notice = Some(format!("→ {}", launch.describe()));
-                Outcome::Launch(launch)
+                Outcome::Launch(Box::new(launch))
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.overlay = Overlay::PickCheckout {
@@ -1895,7 +1903,11 @@ mod tests {
                     "a task is a decision node"
                 );
                 assert_eq!(staged.key(), "#6");
-                assert_eq!(staged.title, "Re-entry breadcrumbs", "the picker names it");
+                assert_eq!(
+                    staged.title(),
+                    "Re-entry breadcrumbs",
+                    "the picker names it"
+                );
                 assert_eq!(
                     *candidate,
                     Candidate::Launch {
@@ -1916,7 +1928,10 @@ mod tests {
         assert_eq!(launch.key(), "wayfinder#6");
         assert_eq!(launch.cwd(), std::path::Path::new("/data/proj/wayfinder"));
         // The map issue is the cluster's — not a per-repo lookup.
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wf 1 6");
+        assert_eq!(
+            launch::eliding_ctx(launch.agent_argv().last().unwrap()),
+            "/wf 1 6 ctx: …"
+        );
         assert_eq!(app.overlay, Overlay::None, "one candidate must not prompt");
         assert!(app
             .notice
@@ -1933,7 +1948,7 @@ mod tests {
                 .flat_map(|m| &m.tickets)
                 .find(|t| t.number == 6)
                 .expect("#6 is in the fixture"),
-            1,
+            &MapRef::new(&MapId::new("blooop/wayfinder", 1), "Map: wf"),
             crate::model::Stage::Ready,
         )
         .expect("ready is launchable")
@@ -1976,7 +1991,7 @@ mod tests {
         // one session must warm both, since they are two workspaces.
         let mut app = fixture_app();
         let six = staged_six(&app);
-        let map = Staged::map(&MapId::new("blooop/wayfinder", 1), "a map");
+        let map = Staged::map(&MapRef::new(&MapId::new("blooop/wayfinder", 1), "a map"));
         assert_ne!(six.node_workspace(), map.node_workspace());
         assert!(app.claim_prewarm(&six, true));
         assert!(app.claim_prewarm(&map, true));
@@ -2029,7 +2044,10 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wf 47 6");
+        assert_eq!(
+            launch::eliding_ctx(launch.agent_argv().last().unwrap()),
+            "/wf 47 6 ctx: …"
+        );
     }
 
     #[test]
@@ -2167,8 +2185,8 @@ mod tests {
         };
         assert_eq!(launch.agent(), Agent::Codex);
         assert_eq!(
-            launch.agent_argv().last().expect("one prompt"),
-            "$wf 1 6 steer: keep me"
+            launch::eliding_ctx(launch.agent_argv().last().expect("one prompt")),
+            "$wf 1 6 ctx: … steer: keep me"
         );
     }
 
@@ -2218,8 +2236,8 @@ mod tests {
             other => panic!("expected a launch, got {other:?}"),
         };
         assert_eq!(
-            launch.agent_argv().last().unwrap(),
-            "/wf-auto 1 6 steer: something"
+            launch::eliding_ctx(launch.agent_argv().last().unwrap()),
+            "/wf-auto 1 6 ctx: … steer: something"
         );
     }
 
@@ -2238,7 +2256,10 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wf-auto 4 103");
+        assert_eq!(
+            launch::eliding_ctx(launch.agent_argv().last().unwrap()),
+            "/wf-auto 4 103 ctx: …"
+        );
     }
 
     #[test]
@@ -2283,8 +2304,8 @@ mod tests {
             other => panic!("expected a launch, got {other:?}"),
         };
         assert_eq!(
-            launch.agent_argv().last().unwrap(),
-            "/wf-auto 1 6",
+            launch::eliding_ctx(launch.agent_argv().last().unwrap()),
+            "/wf-auto 1 6 ctx: …",
             "the staged ticket, not whatever landed at its old index"
         );
 
@@ -2309,7 +2330,10 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wf-auto 1 6");
+        assert_eq!(
+            launch::eliding_ctx(launch.agent_argv().last().unwrap()),
+            "/wf-auto 1 6 ctx: …"
+        );
     }
 
     #[test]
@@ -2324,7 +2348,7 @@ mod tests {
         match &app.overlay {
             Overlay::PickLaunch { staged, .. } => {
                 assert_eq!(staged.key(), "#1");
-                assert_eq!(staged.title, "Map: wf", "the picker names the map");
+                assert_eq!(staged.title(), "Map: wf", "the picker names the map");
                 assert_eq!(staged.route(Mode::Interactive), Some(Route::Wayfinder));
                 assert_eq!(staged.route(Mode::Auto), Some(Route::WayfinderAuto));
             }
@@ -2335,7 +2359,10 @@ mod tests {
             other => panic!("expected a launch, got {other:?}"),
         };
         assert_eq!(launch.key(), "wayfinder#1");
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wf 1");
+        assert_eq!(
+            launch::eliding_ctx(launch.agent_argv().last().unwrap()),
+            "/wf 1 ctx: …"
+        );
 
         let mut app = launchable_app();
         go_to(&mut app, "map #1");
@@ -2345,7 +2372,10 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wf-auto 1");
+        assert_eq!(
+            launch::eliding_ctx(launch.agent_argv().last().unwrap()),
+            "/wf-auto 1 ctx: …"
+        );
     }
 
     /// An app focused on a registered repo that has no open map — what `wf`
@@ -2634,7 +2664,10 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wf-tdd 65");
+        assert_eq!(
+            launch::eliding_ctx(launch.agent_argv().last().unwrap()),
+            "/wf-tdd 65 ctx: …"
+        );
 
         let mut in_review = build_app(vec![PrLink {
             repo: "blooop/wayfinder".to_string(),
@@ -2655,7 +2688,10 @@ mod tests {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        assert_eq!(launch.agent_argv().last().unwrap(), "/wf-review 65");
+        assert_eq!(
+            launch::eliding_ctx(launch.agent_argv().last().unwrap()),
+            "/wf-review 65 ctx: …"
+        );
 
         // A merged PR with nothing open means done — stage, not ticket state,
         // is what refuses the launch.

@@ -583,7 +583,7 @@ fn draw_launch_picker(
         agent.label(),
         staged.repo,
         staged.key(),
-        staged.title
+        staged.title()
     );
     let width = lines
         .iter()
