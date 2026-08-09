@@ -73,13 +73,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked
 
-      # The unit tests, the ones that need nothing but a compiler. Everything
-      # under `tests/` is a `live_*` integration test — a real `gh`, real
-      # network, and assertions against this project's own tracker as it stands
-      # today — so running them here would make CI fail whenever the map moves
-      # on. They are compiled below instead of run.
+      # The unit tests, the ones that need nothing but a compiler. The `live_*`
+      # integration tests under `tests/` — a real `gh`, real network, and
+      # assertions against this project's own tracker as it stands today — are
+      # excluded, because running them here would make CI fail whenever the map
+      # moves on. They are compiled below instead of run.
       - name: Unit tests
         run: cargo test --locked --lib --bins --examples
+
+      # The other offline resident of `tests/`: shape checks on the doc
+      # snippets agents copy-paste, no network and no `gh` — the seam is the
+      # doc text itself. It has to be named here because the step above stops
+      # at `--lib --bins --examples`, and an assertion no workflow runs is not
+      # an assertion.
+      - name: Skill doc shape checks
+        run: cargo test --locked --test skill_docs
 
       # The one part of `tests/` that needs neither network nor `gh`: the
       # fixture's own diagnostic, which decides what a failing live test tells
