@@ -40,6 +40,37 @@ use crate::reap::{self, Node, NodeFact, Verdict, Workspace};
 /// three because this shares one line with the load state and the match count.
 const NAMED: usize = 3;
 
+/// The shortest workspace name worth printing.
+///
+/// Below this an abbreviation has eaten the name — `de…c8` identifies nothing —
+/// and the line is better spent on the command, which is the half a reader can
+/// act on. Eight characters is enough for both ends of a `dl` id to show.
+const READABLE: usize = 8;
+
+/// The two fixed halves of the sentence. The pointer is what makes the hint
+/// actionable and the aside is #128's whole posture, so neither is ever what
+/// gets clipped: the names are budgeted around them.
+const POINTER: &str = " — wf reap";
+
+/// One id, shortened in the middle to `max` characters if it is longer.
+///
+/// Both ends survive because both carry meaning: `dl` puts the tool and the
+/// repo at the front and the ticket number at the back, and the number is what
+/// tells two workspaces of one project apart. The tail therefore gets the odd
+/// character when the budget is odd.
+fn abbreviate(id: &str, max: usize) -> String {
+    let len = id.chars().count();
+    if len <= max {
+        return id.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let tail = keep.div_ceil(2);
+    let head = keep - tail;
+    let front: String = id.chars().take(head).collect();
+    let back: String = id.chars().skip(len - tail).collect();
+    format!("{front}…{back}")
+}
+
 /// What a reap would claim, ready to say on one line.
 ///
 /// Constructible only from a set of [`Verdict`]s, through the private `read`
@@ -103,25 +134,56 @@ impl Reclaimable {
         self.warned
     }
 
-    /// The count-line segment: how many, which ones, and what to type.
+    /// The count-line segment, in `width` characters: how many, which ones,
+    /// and what to type.
     ///
     /// The warned count is a parenthesised aside so the leading number cannot
     /// be read as including it — the whole point of the `Warn` arm is that
     /// those rows are not part of what would go.
-    pub fn hint(&self) -> String {
-        let mut named: Vec<String> = self.ids.iter().take(NAMED).cloned().collect();
-        if self.ids.len() > NAMED {
-            named.push(format!("+{} more", self.ids.len() - NAMED));
-        }
+    ///
+    /// **The width is a budget, not a suggestion.** This shares one line with
+    /// the load state and the match count, and a real `dl` id is ~40
+    /// characters, so three of them written out unconditionally push the
+    /// `wf reap` pointer and the warned aside off the end of an 80-column
+    /// terminal — leaving a hint that names things and says nothing about what
+    /// to do with them, which is the one shape #137 rules out. So the two ends
+    /// of the sentence are laid down first and the names take what is left:
+    /// as many whole ones as fit, then one shortened in the middle, then —
+    /// only on a screen too narrow for any readable name — none.
+    pub fn hint(&self, width: usize) -> String {
+        let head = format!("· {} reclaimable", self.ids.len());
         let aside = match self.warned {
             0 => String::new(),
             n => format!(" (+{n} to check by hand)"),
         };
-        format!(
-            "· {} reclaimable: {}{aside} — wf reap",
-            self.ids.len(),
-            named.join(", ")
-        )
+        let fixed = head.chars().count() + aside.chars().count() + POINTER.chars().count();
+        // ": " is the cost of naming anything at all.
+        let room = width.saturating_sub(fixed + 2);
+        let say = |names: &str| format!("{head}: {names}{aside}{POINTER}");
+
+        // Whole names, as many as the room allows.
+        for count in (1..=NAMED.min(self.ids.len())).rev() {
+            let mut spelt: Vec<String> = self.ids.iter().take(count).cloned().collect();
+            if self.ids.len() > count {
+                spelt.push(format!("+{} more", self.ids.len() - count));
+            }
+            let names = spelt.join(", ");
+            if names.chars().count() <= room {
+                return say(&names);
+            }
+        }
+
+        // Not even one whole name. One shortened one still says which project
+        // and which ticket, which is what the reader is checking.
+        let rest = match self.ids.len() {
+            1 => String::new(),
+            n => format!(", +{} more", n - 1),
+        };
+        let left = room.saturating_sub(rest.chars().count());
+        if left >= READABLE {
+            return say(&format!("{}{rest}", abbreviate(&self.ids[0], left)));
+        }
+        format!("{head}{aside}{POINTER}")
     }
 }
 
@@ -292,18 +354,40 @@ mod tests {
         // The `Warn` count is allowed (#128 lets warnings be counted) and must
         // stay on its own side of the sentence: the reclaimable list is the
         // doomed ids, and the warning is an aside the leading number excludes.
+        //
+        // The three `Keep`s are not scenery. "How many did we warn about" and
+        // "how many did we not reap" are different numbers, and the second one
+        // — every healthy workspace on the machine — is much the larger. An
+        // aside computed as `verdicts.len() - doomed.len()` would read `+4` on
+        // this fixture and tell the user to go and inspect four workspaces, of
+        // which three are simply in use.
         let workspaces = vec![
             workspace("doomed", "blooop/devlaunch", 80),
             workspace("warned", "blooop/devlaunch", 96),
+            workspace("claimed", "blooop/devlaunch", 97),
+            workspace("in-flight", "blooop/devlaunch", 98),
+            {
+                let mut dirty = workspace("dirty", "blooop/devlaunch", 99);
+                dirty.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+                dirty
+            },
         ];
         let known = facts([
             (node("blooop/devlaunch", 80), NodeFact::Closed),
             (node("blooop/devlaunch", 96), NodeFact::Unstarted),
+            (node("blooop/devlaunch", 97), NodeFact::Claimed),
+            (node("blooop/devlaunch", 98), NodeFact::InFlight { pr: 9 }),
+            (node("blooop/devlaunch", 99), NodeFact::Closed),
         ]);
         let reading = reading(&workspaces, &known).expect("one workspace is doomed");
         assert_eq!(reading.ids(), ["doomed"]);
-        assert_eq!(reading.warned(), 1);
-        let hint = reading.hint();
+        assert_eq!(
+            reading.warned(),
+            1,
+            "one row was warned about; the other three are kept, which is not \
+             the same thing and is not a person's problem"
+        );
+        let hint = reading.hint(120);
         assert!(
             hint.starts_with("· 1 reclaimable: doomed"),
             "the count and the names are the doomed set's alone: {hint}"
@@ -363,7 +447,7 @@ mod tests {
         ]);
         let reading = reading(&workspaces, &known).expect("five closed tickets");
         assert_eq!(
-            reading.hint(),
+            reading.hint(120),
             "· 5 reclaimable: ws-0, ws-1, ws-2, +2 more — wf reap"
         );
         // One is spelt outright, with no count of the unspelt.
@@ -371,7 +455,88 @@ mod tests {
             ids: vec!["only".to_string()],
             warned: 0,
         };
-        assert_eq!(one.hint(), "· 1 reclaimable: only — wf reap");
+        assert_eq!(one.hint(120), "· 1 reclaimable: only — wf reap");
+    }
+
+    /// Three workspaces named the way `dl` actually names them: 41 characters
+    /// each, because the id carries the host, the owner, the repo and the
+    /// ticket. Every width claim below is measured against these rather than
+    /// against `ws-0`, which fits anywhere and therefore proves nothing.
+    fn realistic() -> Reclaimable {
+        Reclaimable {
+            ids: vec![
+                "devlaunch-github-com-blooop-wayfinder-129".to_string(),
+                "devlaunch-github-com-blooop-wayfinder-127".to_string(),
+                "devlaunch-github-com-blooop-wayfinder-80x".to_string(),
+            ],
+            warned: 1,
+        }
+    }
+
+    #[test]
+    fn the_pointer_and_the_aside_survive_real_workspace_names_on_a_narrow_screen() {
+        // The failure this exists for: three 41-character ids written out
+        // unconditionally are 123 characters before the sentence reaches
+        // `— wf reap`, so on an 80-column terminal the hint named some
+        // workspaces and then stopped — no aside, no command, nothing to do.
+        // Whatever the width, the reader can still see how many, how many need
+        // a human, and what to type.
+        for width in [60, 70, 80, 100, 120] {
+            let hint = realistic().hint(width);
+            assert!(
+                hint.chars().count() <= width,
+                "{width}: the hint must fit the budget it was given: {hint:?}"
+            );
+            assert!(
+                hint.starts_with("· 3 reclaimable"),
+                "{width}: the count leads: {hint:?}"
+            );
+            assert!(
+                hint.ends_with("(+1 to check by hand) — wf reap"),
+                "{width}: the aside and the pointer are never what gets cut: {hint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_too_long_for_the_line_is_shortened_at_both_ends_rather_than_dropped() {
+        // 80 columns has no room for a whole 41-character id beside the aside
+        // and the pointer, and a bare "3 reclaimable" is exactly the
+        // unjudgeable count #137 rules out. So one name is kept, shortened in
+        // the middle — the front says whose it is, the back says which ticket.
+        let hint = realistic().hint(80);
+        assert!(hint.contains('…'), "{hint}");
+        assert!(
+            hint.contains("devlaunch"),
+            "the front of the name survives: {hint}"
+        );
+        assert!(
+            hint.contains("129"),
+            "so does the ticket number, which is what identifies it: {hint}"
+        );
+        assert!(
+            hint.contains("+2 more"),
+            "and the two it could not name are still counted: {hint}"
+        );
+    }
+
+    #[test]
+    fn a_screen_too_narrow_for_any_readable_name_keeps_the_command() {
+        // The last resort, and the right one: half a name is not something a
+        // reader can check, while `wf reap` is still something they can run.
+        let hint = realistic().hint(45);
+        assert_eq!(hint, "· 3 reclaimable (+1 to check by hand) — wf reap");
+    }
+
+    #[test]
+    fn abbreviating_keeps_both_ends_and_never_grows_a_name() {
+        assert_eq!(abbreviate("short", 20), "short", "it already fits");
+        assert_eq!(abbreviate("short", 5), "short", "exactly, and still whole");
+        assert_eq!(abbreviate("devlaunch-wayfinder-127", 12), "devla…er-127");
+        for max in 2..30 {
+            let out = abbreviate("devlaunch-github-com-blooop-wayfinder-127", max);
+            assert_eq!(out.chars().count(), max, "{max}: {out}");
+        }
     }
 
     #[tokio::test]
@@ -453,33 +618,105 @@ mod tests {
         );
     }
 
-    /// This module's own source, with the comments and the tests stripped —
-    /// the guard below is about what the code can do, not about what the prose
-    /// says it does.
-    fn code_only() -> String {
-        include_str!("reclaim.rs")
-            .lines()
-            .take_while(|line| !line.starts_with("#[cfg(test)]"))
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// A `dl --ls --json` listing over three workspaces of this repo, in the
+    /// shape devlaunch 0.0.21 and newer emit — one finished ticket, one the
+    /// planner warns about, one in use.
+    const DL_LISTING: &str = r#"[
+      {"id":"wf-129-closed","devlaunch":true,"repo":"blooop/wayfinder",
+       "branch":"wayfinder/wayfinder-129","state":"Stopped"},
+      {"id":"wf-138-unstarted","devlaunch":true,"repo":"blooop/wayfinder",
+       "branch":"wayfinder/wayfinder-138","state":"Stopped"},
+      {"id":"wf-137-open","devlaunch":true,"repo":"blooop/wayfinder",
+       "branch":"wayfinder/wayfinder-137","state":"Running"}
+    ]"#;
+
+    /// The tracker's answer to the batched question those three nodes raise:
+    /// #129 closed (a reap), #138 open with nobody on it and no PR (a warning),
+    /// #137 open and claimed (a keep).
+    const GH_FACTS: &str = r#"{"data":{"repository":{
+      "i129":{"state":"CLOSED","assignees":{"nodes":[]},
+              "closedByPullRequestsReferences":{"nodes":[]}},
+      "i137":{"state":"OPEN","assignees":{"nodes":[{"login":"blooop"}]},
+              "closedByPullRequestsReferences":{"nodes":[]}},
+      "i138":{"state":"OPEN","assignees":{"nodes":[]},
+              "closedByPullRequestsReferences":{"nodes":[]}}
+    }}}"#;
+
+    /// The reading taken for real, in a child process whose `dl` and `gh` are
+    /// the fixtures above and whose every invocation is written down. The
+    /// `#[ignore]` is what keeps it out of an ordinary run: without the shims
+    /// on `PATH` it would be asking this machine about its actual workspaces.
+    #[tokio::test]
+    #[ignore = "run by `probe::record` from the two tests below, under recording shims"]
+    async fn survey_live_probe() {
+        if !crate::probe::is_child() {
+            return;
+        }
+        let said = match survey_live().await {
+            Some(found) => found.hint(120),
+            None => "no reading at all".to_string(),
+        };
+        println!("{}{said}", crate::probe::MARK);
+    }
+
+    #[test]
+    fn the_surfacing_path_runs_two_reads_and_nothing_else() {
+        // #137's safety claim, as a fact about a run rather than a grep over
+        // the source. `reap::workspaces` and `reap::node_facts` both reach a
+        // PATH-resolved binary, so everything this path is *capable* of doing
+        // to a workspace shows up here as argv — whatever it was spelt as in
+        // Rust, in whichever module, and whether or not it named any word a
+        // reader thought to forbid. A `dl <ws> rm` added anywhere between
+        // `survey_live` and the reading it returns fails this test.
+        let run = crate::probe::record("reclaim::tests::survey_live_probe", DL_LISTING, GH_FACTS);
+        run.destroyed_nothing();
+        assert_eq!(
+            run.argv.len(),
+            2,
+            "one listing and one batched query, and nothing else: {:?}",
+            run.argv
+        );
+        assert_eq!(
+            run.argv[0], "dl <--ls> <--json>",
+            "the only thing this path asks `dl` for is what exists"
+        );
+        assert!(
+            run.argv[1].starts_with("gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>"),
+            "one batched read of the tracker: {}",
+            run.argv[1]
+        );
+    }
+
+    #[test]
+    fn the_reading_over_a_real_dl_and_gh_says_what_a_reap_would_claim() {
+        // The other half of the same run: not just that it destroyed nothing,
+        // but that it did the work. A `survey_live` that answered `None`, or a
+        // reading that never reached the sentence, leaves this with nothing to
+        // match — which is the point, because "surfaces nothing, ever" is the
+        // failure mode a guard on capability alone would call a pass.
+        let run = crate::probe::record("reclaim::tests::survey_live_probe", DL_LISTING, GH_FACTS);
+        assert_eq!(
+            run.printed(),
+            ["· 1 reclaimable: wf-129-closed (+1 to check by hand) — wf reap"],
+            "the live reading is the same sentence the offline tests pin"
+        );
     }
 
     #[test]
     fn no_deletion_is_reachable_from_the_surfacing_path() {
-        // The whole safety claim of #137, asserted structurally because there
-        // is no behaviour to observe: this module must have no way to destroy
-        // anything, so what is pinned is that it does not name the means.
-        // `reap::remove` is the one function that deletes, `dl <ws> rm` the one
-        // command, `--force` the one waiver, and a `Command` of its own would
-        // be a way around all three.
-        let code = code_only();
+        // The structural half, which the run above cannot cover: a subprocess
+        // is observable, and `std::fs::remove_dir_all` is not. So argv is
+        // watched at run time and the means of destruction that leave no argv
+        // are pinned here — this module reads two functions and formats a
+        // sentence, and has no business naming any of these.
+        let code = crate::probe::code_only(include_str!("reclaim.rs"));
         for forbidden in [
             "remove",
             "\"rm\"",
             "--force",
             "Command",
             "process::",
+            "fs::",
             "unsafe",
         ] {
             assert!(
@@ -493,15 +730,11 @@ mod tests {
             code.contains("reap::plan(workspaces, known, false)"),
             "the reading must plan without insisting"
         );
-    }
-
-    #[test]
-    fn the_surfaced_set_comes_from_doomed_rather_than_a_partition_written_twice() {
         // #129's single definition, pinned at the one site that could quietly
         // grow a second one. A `matches!(v, Verdict::Reap { .. })` here would
-        // pass every behavioural test in this file on the day it was written
-        // and drift the first time `doomed` changed.
-        let code = code_only();
+        // agree with `doomed` on the day it was written — so every behavioural
+        // test in this file passes over it — and drift the first time `doomed`
+        // changed. Nothing but source text can see a duplicate that agrees.
         assert!(
             code.contains("reap::doomed(verdicts)"),
             "the doomed set must be asked for, not re-derived"

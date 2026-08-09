@@ -585,10 +585,16 @@ pub fn failure_note(app: &App) -> String {
 /// something a reader has no way to agree or disagree with, and the point of
 /// surfacing this at all is that `wf reap` is then a decision rather than an
 /// errand. The picker does nothing with it — the segment *is* the feature.
-pub fn reclaim_note(app: &App) -> String {
+///
+/// `width` is what is left of the count line once everything else on it has
+/// been laid down. Real workspace ids are ~40 characters, so this segment is
+/// the one on the line that has to be *sized* rather than written and clipped:
+/// see [`Reclaimable::hint`] for what it gives up first, and what it never
+/// gives up.
+pub fn reclaim_note(app: &App, width: usize) -> String {
     app.reclaimable
         .as_ref()
-        .map(Reclaimable::hint)
+        .map(|found| Reclaimable::hint(found, width))
         .unwrap_or_default()
 }
 
@@ -875,27 +881,44 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     // staged — the staged launch is a modal now (#62's line became
     // [`draw_launch_picker`]), and a modal does not need the row it covers to
     // move out of its way.
-    let status = [
-        app.startup.hint(),
-        failure_note(app),
-        idle_note(&plan),
-        reclaim_note(app),
-    ]
-    .into_iter()
-    .filter(|part| !part.is_empty())
-    .collect::<Vec<_>>()
-    .join(" ");
+    let mut parts: Vec<String> = [app.startup.hint(), failure_note(app), idle_note(&plan)]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect();
     let (shown, total) = app.counts();
+    let counts = format!("  {shown}/{total}");
+    let notice = app
+        .notice
+        .as_ref()
+        .map(|notice| format!("   {notice}"))
+        .unwrap_or_default();
+    // The reclaim segment is sized rather than written and clipped, because it
+    // is the only one on this line whose content is unbounded — a `dl`
+    // workspace id is ~40 characters and there can be three of them. It goes
+    // last and takes what the rest of the line has left, which is why the rest
+    // of the line is measured first.
+    let spent = counts.chars().count()
+        + 2
+        + parts
+            .iter()
+            .map(|part| part.chars().count() + 1)
+            .sum::<usize>()
+        + notice.chars().count();
+    let note = reclaim_note(app, (count_area.width as usize).saturating_sub(spent));
+    if !note.is_empty() {
+        parts.push(note);
+    }
+    let status = parts.join(" ");
     let mut count_spans = vec![
-        Span::raw(format!("  {shown}/{total}")),
+        Span::raw(counts),
         Span::styled(
             format!("  {status}"),
             Style::new().add_modifier(Modifier::DIM),
         ),
     ];
-    if let Some(notice) = &app.notice {
+    if !notice.is_empty() {
         count_spans.push(Span::styled(
-            format!("   {notice}"),
+            notice,
             Style::new().add_modifier(Modifier::DIM),
         ));
     }
@@ -984,7 +1007,13 @@ mod tests {
 
     /// Render the app through `TestBackend` and return the screen as text.
     fn render(app: &App) -> String {
-        let backend = TestBackend::new(90, 24);
+        render_at(90, app)
+    }
+
+    /// The same, on a terminal of a stated width — for the claims that are
+    /// about what survives a narrow one.
+    fn render_at(width: u16, app: &App) -> String {
+        let backend = TestBackend::new(width, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|f| draw(f, app)).expect("draw");
         let buf = terminal.backend().buffer();
@@ -1444,6 +1473,44 @@ mod tests {
             .unwrap_or_else(|| panic!("the count line says so: {screen}"));
         assert!(line.contains("1 reclaimable"), "{line}");
         assert!(line.contains("+2 to check by hand"), "{line}");
+    }
+
+    #[test]
+    fn the_count_line_keeps_the_command_when_the_names_are_real_ones() {
+        // `ws-a` fits anywhere and proves nothing. A `dl` workspace id is ~40
+        // characters, and three of them written out unconditionally push the
+        // aside and the `wf reap` pointer past the right edge of an
+        // 80-column terminal — leaving a segment that names workspaces and
+        // says nothing about what to do with them.
+        let mut app = fixture_app();
+        app.reclaimable = Some(Reclaimable::for_test(
+            &[
+                "devlaunch-github-com-blooop-wayfinder-129",
+                "devlaunch-github-com-blooop-wayfinder-127",
+                "devlaunch-github-com-blooop-wayfinder-80x",
+            ],
+            1,
+        ));
+        for width in [80, 100, 120] {
+            let screen = render_at(width, &app);
+            let line = screen
+                .lines()
+                .find(|line| line.contains("reclaimable"))
+                .unwrap_or_else(|| panic!("{width}: the count line says so: {screen}"));
+            assert!(line.contains("3 reclaimable"), "{width}: {line}");
+            assert!(
+                line.contains("(+1 to check by hand)"),
+                "{width}: the aside is never what gets clipped: {line}"
+            );
+            assert!(
+                line.contains("wf reap"),
+                "{width}: nor is the command: {line}"
+            );
+            assert!(
+                line.contains("129"),
+                "{width}: and a workspace is still named: {line}"
+            );
+        }
     }
 
     #[test]

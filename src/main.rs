@@ -32,8 +32,14 @@ use wf::launch::{Agent, Launch};
 use wf::model::{Map, MapId};
 use wf::projects::{self, ProjectsCache};
 use wf::reap;
-use wf::refresh::{LoadEvent, Loaders, MapFetch, Startup};
+use wf::refresh::{LoadEvent, Loaders, MapFetch, Startup, Survey};
 use wf::skills;
+
+/// Test scaffolding shared with the library's own tests — the same
+/// `src/probe.rs`, compiled into this crate too, because that is the only way
+/// the binary's tests can reach it. Never compiled into a release.
+#[cfg(test)]
+mod probe;
 
 /// How long the loop waits on a keypress before redrawing — the cadence at
 /// which streamed load events reach the screen.
@@ -573,6 +579,96 @@ enum Ending {
     Handover(Box<Launch>),
 }
 
+/// Fold one arrival into what the screen draws.
+///
+/// Split out of [`run`]'s loop so the wiring can be *tested*, which is the
+/// whole difficulty with an event loop: everything between the channel and the
+/// screen used to be reachable only by standing up a terminal and driving it.
+/// Each arm below is now a call a test can make and a frame it can read.
+///
+/// **Deliberately not `async`.** Folding an arrival into the app state reads no
+/// file, runs no process and waits for nothing — the work was all done by the
+/// task that sent the event. Saying so in the signature is what makes #137's
+/// separation structural at this end of the path: this is where a reap would be
+/// wired if anyone ever wired one, and a function that cannot await cannot ask
+/// `dl` to remove anything.
+fn fold(
+    event: LoadEvent,
+    app: &mut App,
+    clusters: &mut BTreeMap<MapId, Map>,
+    loaders: &mut Loaders,
+    tx: &UnboundedSender<LoadEvent>,
+) {
+    match event {
+        LoadEvent::Discovered(found) => {
+            // Reconciling the loaders *is* the load for every map the
+            // seed did not already cover: those fetches are all in
+            // flight at once and each lands on screen as it arrives.
+            loaders.reconcile(&found, tx);
+            app.startup.searched(&found);
+            // Nothing to apply here any more: the level was decided
+            // before the first frame and discovery has no say in it.
+            // A repo the search finds no map for renders its project
+            // row saying so, which is both the notice this used to
+            // post and somewhere to act on it.
+            //
+            // Maps the search dropped must stop being rendered as well as
+            // stop being fetched — their rows are as stale as their load.
+            // A map that is no longer open also stops being a *failure*:
+            // there is nothing left to have failed.
+            clusters.retain(|id, _| found.contains(id));
+            app.failed.retain(|id| found.contains(id));
+            app.open_maps = found;
+            app.replace_clusters(clusters.clone());
+        }
+        // Discovery retries, so this is a status report and not an end
+        // state: `wf` stays on screen and recovers when the search does.
+        LoadEvent::SearchFailed => {
+            app.notice = Some("map search failed — retrying".to_string());
+        }
+        LoadEvent::Fetched { id, outcome } => {
+            app.startup.record_arrival(&id);
+            match outcome {
+                MapFetch::Loaded(new_map) => {
+                    app.failed.remove(&id);
+                    clusters.insert(id, new_map);
+                    app.replace_clusters(clusters.clone());
+                }
+                // Nothing polls any more, so a failed load is not a blip
+                // the next cycle papers over — it is the final word on
+                // that map until someone asks again. Recorded as state
+                // rather than announced as a notice, because a notice
+                // is gone on the next keypress and this is not.
+                MapFetch::Failed => {
+                    app.failed.insert(id);
+                }
+            }
+        }
+        // The background reading landed (#137). A plain state write on
+        // a screen that has been up and answering keys the whole time —
+        // it changes one dim segment of the count line and nothing else,
+        // and it arrives at most once because nothing asks again.
+        LoadEvent::Reclaimable(found) => {
+            app.reclaimable = Some(found);
+        }
+    }
+}
+
+/// Stop everything running behind the screen, and wait for it to be gone.
+///
+/// The last thing before a handover, and the reason it is a function of its
+/// own: "aborted *and awaited*" is a claim about two tasks that a test can now
+/// make on both at once. Nothing after this point can be drawn, and the process
+/// is about to be replaced — an in-flight `gh` or `dl` that outlives the `exec`
+/// is inherited by the agent as a child holding the terminal it just took over.
+async fn stop_background(discovery: JoinHandle<()>, survey: Survey) {
+    discovery.abort();
+    let _ = discovery.await;
+    // The reading holds a `dl` and a `gh` of its own, and the same reasoning
+    // applies — [`Survey::stop`] is where the waiting is spelt out.
+    survey.stop().await;
+}
+
 /// The event loop. It starts with **no data at all** (#27): which repos even
 /// have maps, and the maps themselves, arrive as [`LoadEvent`]s while the screen
 /// is already up and answering keys.
@@ -584,7 +680,7 @@ async fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
     discovery: JoinHandle<()>,
-    survey: JoinHandle<()>,
+    survey: Survey,
     tx: UnboundedSender<LoadEvent>,
     mut updates: UnboundedReceiver<LoadEvent>,
 ) -> Result<Ending> {
@@ -600,59 +696,7 @@ async fn run(
         // cluster; App::replace_clusters keeps the cursor pinned to row
         // identity, query and scope untouched.
         while let Ok(event) = updates.try_recv() {
-            match event {
-                LoadEvent::Discovered(found) => {
-                    // Reconciling the loaders *is* the load for every map the
-                    // seed did not already cover: those fetches are all in
-                    // flight at once and each lands on screen as it arrives.
-                    loaders.reconcile(&found, &tx);
-                    app.startup.searched(&found);
-                    // Nothing to apply here any more: the level was decided
-                    // before the first frame and discovery has no say in it.
-                    // A repo the search finds no map for renders its project
-                    // row saying so, which is both the notice this used to
-                    // post and somewhere to act on it.
-                    //
-                    // Maps the search dropped must stop being rendered as well as
-                    // stop being fetched — their rows are as stale as their load.
-                    // A map that is no longer open also stops being a *failure*:
-                    // there is nothing left to have failed.
-                    clusters.retain(|id, _| found.contains(id));
-                    app.failed.retain(|id| found.contains(id));
-                    app.open_maps = found;
-                    app.replace_clusters(clusters.clone());
-                }
-                // Discovery retries, so this is a status report and not an end
-                // state: `wf` stays on screen and recovers when the search does.
-                LoadEvent::SearchFailed => {
-                    app.notice = Some("map search failed — retrying".to_string());
-                }
-                LoadEvent::Fetched { id, outcome } => {
-                    app.startup.record_arrival(&id);
-                    match outcome {
-                        MapFetch::Loaded(new_map) => {
-                            app.failed.remove(&id);
-                            clusters.insert(id, new_map);
-                            app.replace_clusters(clusters.clone());
-                        }
-                        // Nothing polls any more, so a failed load is not a blip
-                        // the next cycle papers over — it is the final word on
-                        // that map until someone asks again. Recorded as state
-                        // rather than announced as a notice, because a notice
-                        // is gone on the next keypress and this is not.
-                        MapFetch::Failed => {
-                            app.failed.insert(id);
-                        }
-                    }
-                }
-                // The background reading landed (#137). A plain state write on
-                // a screen that has been up and answering keys the whole time —
-                // it changes one dim segment of the count line and nothing else,
-                // and it arrives at most once because nothing asks again.
-                LoadEvent::Reclaimable(found) => {
-                    app.reclaimable = Some(found);
-                }
-            }
+            fold(event, &mut app, &mut clusters, &mut loaders, &tx);
         }
 
         terminal.draw(|frame| wf::ui::draw(frame, &app))?;
@@ -679,13 +723,7 @@ async fn run(
                     // as a zombie holding the terminal it just took over.
                     Outcome::Launch(launch) => {
                         loaders.shutdown().await;
-                        discovery.abort();
-                        let _ = discovery.await;
-                        // The reading holds a `dl` and a `gh` of its own, and
-                        // the same reasoning applies: an in-flight child that
-                        // outlives the `exec` is inherited by the agent.
-                        survey.abort();
-                        let _ = survey.await;
+                        stop_background(discovery, survey).await;
                         return Ok(Ending::Handover(launch));
                     }
                     Outcome::Continue => {}
@@ -703,33 +741,127 @@ mod tests {
         args.iter().copied().map(String::from).collect()
     }
 
-    #[test]
-    fn the_reclaim_reading_is_spawned_and_never_awaited_on_the_way_to_a_frame() {
-        // #137's "off the critical path", pinned where it could be lost.
-        // Everything else about the reading is testable against a value; this
-        // is the one claim that lives in this file's control flow, and the way
-        // to break it is a single `.await` — so the guard is that the reading
-        // is *handed to* the spawner and mentioned nowhere else.
-        //
-        // The startup path is the reason it matters: the screen goes up before
-        // any network call, over a ~0.6 s warm start and a ~2.5 s map search
-        // that are both already overlapped with a drawn UI. A subprocess and a
-        // GraphQL round trip awaited here would be neither.
-        // Spelt in pieces so the needle is not itself a match in this file.
-        let call = format!("{}::{}()", "wf::reclaim", "survey_live");
-        let spawned = format!("{}({call},", "spawn_survey");
-        let compact: String = include_str!("main.rs")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join("");
-        assert_eq!(
-            compact.matches(&call).count(),
-            1,
-            "the reading is taken in exactly one place"
+    /// The reading a `wf reap` of this machine would produce, built the one way
+    /// production builds one — through [`wf::reclaim::reading`], over a plan.
+    /// There is no test-only constructor to reach from here, which is the point:
+    /// what the loop folds is what the survey would have sent.
+    fn a_reading() -> wf::reclaim::Reclaimable {
+        let ws = reap::Workspace {
+            id: "devlaunch-github-com-blooop-wayfinder-129".to_string(),
+            devlaunch: true,
+            repo: Some("blooop/wayfinder".to_string()),
+            branch: Some("wayfinder/wayfinder-129".to_string()),
+            state: Some("Stopped".to_string()),
+            unsaved: None,
+        };
+        let known = [(
+            reap::Node {
+                repo: "blooop/wayfinder".to_string(),
+                number: 129,
+            },
+            reap::NodeFact::Closed,
+        )]
+        .into_iter()
+        .collect();
+        wf::reclaim::reading(&[ws], &known).expect("a closed ticket is reclaimable")
+    }
+
+    /// Fold a landed reading into a fresh app and draw the screen it produces.
+    /// Run in a child process by the two tests below, under a `PATH` whose `dl`
+    /// and `gh` write down everything they are asked to do.
+    #[tokio::test]
+    #[ignore = "run by `probe::record` from the two tests below, under recording shims"]
+    async fn reclaimable_arm_probe() {
+        if !probe::is_child() {
+            return;
+        }
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::empty();
+        let mut clusters = BTreeMap::new();
+        let mut loaders = Loaders::new();
+        fold(
+            LoadEvent::Reclaimable(a_reading()),
+            &mut app,
+            &mut clusters,
+            &mut loaders,
+            &tx,
         );
-        assert!(
-            compact.contains(&spawned),
-            "the reading must be handed to the spawner, never awaited"
+        let backend = ratatui::backend::TestBackend::new(100, 12);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| wf::ui::draw(frame, &app))
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            let mut line = String::new();
+            for x in 0..buf.area.width {
+                line.push_str(buf[(x, y)].symbol());
+            }
+            println!("{}{}", probe::MARK, line.trim_end());
+        }
+    }
+
+    #[test]
+    fn a_landed_reading_reaches_the_screen() {
+        // The wiring #137 is, end to end at this end of it: the event arrives,
+        // the loop folds it, and the count line says what a reap would claim.
+        // An arm that dropped the payload on the floor — `Reclaimable(_) => {}`
+        // — leaves every other test in this tree green, because every other
+        // test hands the reading to the thing it is testing.
+        let run = probe::record("tests::reclaimable_arm_probe", "", "");
+        let screen = run.printed();
+        let line = screen
+            .iter()
+            .find(|line| line.contains("reclaimable"))
+            .unwrap_or_else(|| panic!("the count line must say so:\n{}", screen.join("\n")));
+        assert!(line.contains("1 reclaimable"), "{line}");
+        assert!(line.contains("129"), "it names the workspace: {line}");
+        assert!(line.contains("wf reap"), "and the command: {line}");
+    }
+
+    #[test]
+    fn folding_a_reading_into_the_screen_runs_nothing_at_all() {
+        // #137 ships ahead of #138 on one argument: reading what a reap would
+        // claim and performing one are separated. This arm is exactly where a
+        // reap would be wired — `use wf::reap;` is already in scope in this
+        // file — so the separation is asserted here as a fact about a run.
+        // Anything this path asks of `dl` or `gh`, by any spelling, in any
+        // module it calls into, is recorded; the whole fold must record none.
+        let run = probe::record("tests::reclaimable_arm_probe", "", "");
+        run.ran_nothing();
+    }
+
+    #[tokio::test]
+    async fn a_handover_leaves_no_background_work_running() {
+        // The last thing before `exec`, and the one that cannot be seen from
+        // the outside afterwards: both tasks must be aborted *and waited for*,
+        // because it is dropping their futures that closes the `gh` and `dl`
+        // they hold. An `abort()` without the wait, a handle dropped, a handle
+        // forgotten — all three leave a child alive for the agent to inherit.
+        //
+        // Each task holds an `Arc` that cannot be released until its future is
+        // dropped, so the counts are the witness.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let witness = std::sync::Arc::new(());
+        let for_discovery = std::sync::Arc::clone(&witness);
+        let for_survey = std::sync::Arc::clone(&witness);
+        let discovery = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(for_discovery);
+        });
+        let survey = wf::refresh::spawn_survey(
+            async move {
+                std::future::pending::<()>().await;
+                drop(for_survey);
+                None
+            },
+            tx,
+        );
+        stop_background(discovery, survey).await;
+        assert_eq!(
+            std::sync::Arc::strong_count(&witness),
+            1,
+            "background work outlived the handover"
         );
     }
 

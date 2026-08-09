@@ -381,7 +381,7 @@ ask again.
 count line when it arrives:
 
 ```
-  12/30    · 2 reclaimable: devlaunch-…-127-c, devlaunch-…-80-f — wf reap
+  12/30  · 2 reclaimable: devlaunch-github-…oop-wayfinder-127, +1 more — wf reap
 ```
 
 It is the same reading `wf reap` prints, taken by the same code — a `dl --ls
@@ -390,6 +390,15 @@ The picker draws at exactly the speed it did without it. Nothing is deleted, and
 nothing can be: this names workspaces and a command, and you type the command.
 It names them rather than only counting them, because "2 reclaimable" is not
 something you can agree or disagree with.
+
+A `dl` workspace id is around forty characters and this segment shares one line
+with the load state and the match count, so the line is **budgeted** rather than
+written and clipped: the count, the `(+N to check by hand)` aside and the
+`— wf reap` pointer are laid down first, and the names take what is left. As many
+are spelt out whole as fit; the next one is shortened in the middle, keeping the
+project at the front and the ticket number at the back; the rest are counted as
+`+N more`. On a terminal too narrow for a name anybody could read, the names go
+and the command stays.
 
 It **fails silent**. No `dl` on PATH, a listing that failed, a GraphQL error, no
 network, or simply nothing to reclaim: the segment is absent, and there is no

@@ -25,6 +25,11 @@ pub mod fetch;
 pub mod filter;
 pub mod launch;
 pub mod model;
+/// Test scaffolding shared by more than one module, and by both crates —
+/// `src/probe.rs` is declared here *and* in `src/main.rs`, which is the only
+/// way the binary's tests can reach it. Never compiled into a release.
+#[cfg(test)]
+mod probe;
 pub mod projects;
 pub mod reap;
 pub mod reclaim;

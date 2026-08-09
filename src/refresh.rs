@@ -350,18 +350,59 @@ pub fn spawn_discovery(
 /// sends nothing at all. There is no failure event because there is no failure
 /// worth a word.
 ///
-/// Returns its handle so the launch path can stop it and wait, exactly as it
+/// Returns a [`Survey`] so the launch path can stop it and wait, exactly as it
 /// does for the map loads: the reading holds child processes of its own, and an
 /// in-flight one outliving the `exec` would be inherited by the agent.
-pub fn spawn_survey<S>(survey: S, tx: mpsc::UnboundedSender<LoadEvent>) -> JoinHandle<()>
+pub fn spawn_survey<S>(survey: S, tx: mpsc::UnboundedSender<LoadEvent>) -> Survey
 where
     S: Future<Output = Option<Reclaimable>> + Send + 'static,
 {
-    tokio::spawn(async move {
+    Survey(tokio::spawn(async move {
         if let Some(found) = survey.await {
             let _ = tx.send(LoadEvent::Reclaimable(found));
         }
-    })
+    }))
+}
+
+/// The running reading, as something that can only be **stopped**.
+///
+/// A `JoinHandle` would do the job and did, until the guard on "the picker
+/// never waits for this" turned out to be a grep over `main.rs` — which passes
+/// happily for `let _ = survey.await;` written any of the several ways that
+/// spelling admits. A handle nobody can await is a stronger statement than a
+/// test that nobody awaited it: the only thing this type offers is
+/// [`stop`](Survey::stop), and waiting for the reading before the first frame
+/// stops being a thing that compiles.
+///
+/// Which leaves exactly one hazard, and [`stop`](Survey::stop) is where it is
+/// answered.
+#[derive(Debug)]
+pub struct Survey(JoinHandle<()>);
+
+impl Survey {
+    /// Stop the reading and wait until it is really gone.
+    ///
+    /// Both halves matter, and only on the launch path. `abort` asks; the
+    /// `await` is what waits for the task's future to be *dropped*, and
+    /// dropping it is what closes the `dl` or `gh` this reading may have in
+    /// flight (`kill_on_drop`). Skipping the wait — or dropping the handle, or
+    /// forgetting it — leaves a live child that outlives the `exec`, and the
+    /// agent that replaces `wf` inherits it holding the terminal it just took
+    /// over.
+    pub async fn stop(self) {
+        self.0.abort();
+        let _ = self.0.await;
+    }
+
+    /// Wait for the reading to finish of its own accord.
+    ///
+    /// Test-only, and that is the whole point of the type: production has no
+    /// way to wait for this, so the tests below can wait for a reading that
+    /// answers immediately without opening the door `main.rs` must not have.
+    #[cfg(test)]
+    pub(crate) async fn settle(self) {
+        self.0.await.expect("the reading task");
+    }
 }
 
 /// Where the cursor lands after a load or a refresh swaps the ticket list.
@@ -391,17 +432,6 @@ pub fn preserve_cursor<K: PartialEq>(
 mod tests {
     use super::*;
 
-    /// This module's source with the comments stripped, for the structural
-    /// guard below — what the code can do, not what the prose says it does.
-    fn code_only() -> String {
-        include_str!("refresh.rs")
-            .lines()
-            .take_while(|line| !line.starts_with("#[cfg(test)]"))
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     /// A reading that never answers — the reading `wf` must be able to draw
     /// over. A `pending` future rather than a long sleep, so "the picker did
     /// not wait" is a fact about the code and not about a timer.
@@ -418,12 +448,12 @@ mod tests {
         // hang this test rather than slow it.
         let (tx, mut rx) = mpsc::unbounded_channel();
         tokio::time::timeout(Duration::from_secs(5), async {
-            let handle = spawn_survey(never(), tx.clone());
+            let survey = spawn_survey(never(), tx.clone());
             assert!(
                 rx.try_recv().is_err(),
                 "nothing may be on the channel before the reading lands"
             );
-            handle.abort();
+            survey.stop().await;
         })
         .await
         .expect("the picker must not wait for the reading");
@@ -434,8 +464,8 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let found = Reclaimable::for_test(&["ws-a"], 0);
         spawn_survey(std::future::ready(Some(found.clone())), tx.clone())
-            .await
-            .expect("the reading task");
+            .settle()
+            .await;
         match rx.try_recv() {
             Ok(LoadEvent::Reclaimable(got)) => assert_eq!(got, found),
             other => panic!("the reading must arrive as its own event, got {other:?}"),
@@ -448,11 +478,40 @@ mod tests {
         // nothing to reclaim: one silence, no event, and above all no error.
         let (tx, mut rx) = mpsc::unbounded_channel();
         spawn_survey(std::future::ready(None), tx.clone())
-            .await
-            .expect("the reading task");
+            .settle()
+            .await;
         assert!(
             rx.try_recv().is_err(),
             "a reading with nothing to say must send nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_the_reading_waits_for_it_to_be_gone() {
+        // `abort` on its own only *asks*. What the launch path needs is that
+        // the task's future has been dropped by the time this returns, because
+        // dropping it is what kills the `dl` or `gh` the reading may still have
+        // in flight — an `abort` without the wait, or a handle simply forgotten,
+        // leaves that child alive to be inherited by the agent `wf` execs.
+        //
+        // The witness is an `Arc` the task holds: the future cannot be dropped
+        // while the count is above one, and cannot survive once it is one.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let witness = std::sync::Arc::new(());
+        let held = std::sync::Arc::clone(&witness);
+        let survey = spawn_survey(
+            async move {
+                std::future::pending::<()>().await;
+                drop(held);
+                None
+            },
+            tx,
+        );
+        survey.stop().await;
+        assert_eq!(
+            std::sync::Arc::strong_count(&witness),
+            1,
+            "the reading is still running after it was stopped"
         );
     }
 
@@ -461,7 +520,7 @@ mod tests {
         // #137's safety claim, at the seam that spawns the work: this module
         // takes a future that answers with a reading. It cannot reach `reap`'s
         // deletion side, because it cannot reach `reap` at all.
-        let code = code_only();
+        let code = crate::probe::code_only(include_str!("refresh.rs"));
         for forbidden in ["reap::", "\"rm\"", "--force", "Command"] {
             assert!(
                 !code.contains(forbidden),
