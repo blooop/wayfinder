@@ -36,10 +36,10 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{MapId, PrLink, Stage, Ticket, TicketType};
-use crate::projects::Checkout;
+use crate::projects::{Checkout, Resume, Session};
 
 /// Which interactive coding agent `wf` becomes after a launch.
 ///
@@ -49,7 +49,11 @@ use crate::projects::Checkout;
 /// command-line permission switch. Keeping that translation here means the
 /// picker cannot display one agent while the exec path silently starts the
 /// other.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// It is also the one half of a [`Resume`] that
+/// cannot be re-derived, so it goes to disk with one — spelt in lower case,
+/// which is what a human editing that cache would write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Agent {
     /// Claude Code, which is the longstanding `wf` default.
     #[default]
@@ -80,6 +84,27 @@ impl Agent {
         match self {
             Agent::Claude => '/',
             Agent::Codex => '$',
+        }
+    }
+
+    /// How this CLI is told to rejoin the conversation in its working
+    /// directory, as argv between the program and its permission switch.
+    ///
+    /// Both are **cwd-scoped**, which is the fact the whole resume rests on:
+    /// `claude --continue` continues "the most recent conversation in the
+    /// current directory", and `codex resume` filters by cwd unless `--all`
+    /// says otherwise. `wf` already gives every node a working directory of
+    /// its own — the per-node workspace — so rejoining is a matter of exec'ing
+    /// in the same place, and no session id ever has to be stored, matched or
+    /// go stale.
+    ///
+    /// Codex spells it as a subcommand, which is why this returns a slice
+    /// rather than a flag: the bypass switch and the prompt both have to come
+    /// after it.
+    fn resume_argv(self) -> &'static [&'static str] {
+        match self {
+            Agent::Claude => &["--continue"],
+            Agent::Codex => &["resume", "--last"],
         }
     }
 
@@ -412,6 +437,15 @@ pub enum Candidate {
     Launch { mode: Mode, route: Route },
     /// Start something new in the staged node's repo.
     Create(CreationKind),
+    /// Rejoin the conversation a previous launch of this node left on this
+    /// machine (#35) — no skill, no context block, no fresh session.
+    ///
+    /// Carries the agent from the record rather than taking the picker's,
+    /// because a Claude conversation is not rejoinable by Codex: the row is
+    /// only offered for the CLI that actually ran, and that is the CLI it
+    /// runs. Which is also why the picker's `←/→` does nothing while it is
+    /// picked — see [`Candidate::agent`].
+    Resume { agent: Agent },
 }
 
 impl Candidate {
@@ -420,6 +454,7 @@ impl Candidate {
         match self {
             Candidate::Launch { mode, .. } => mode.label(),
             Candidate::Create(kind) => kind.label(),
+            Candidate::Resume { .. } => "resume",
         }
     }
 
@@ -428,22 +463,51 @@ impl Candidate {
         match self {
             Candidate::Launch { mode, .. } => mode.blurb(),
             Candidate::Create(kind) => kind.blurb(),
+            // Says what it does, not how long ago: the age is a fact about
+            // *this* record and is drawn from it, beside the row.
+            Candidate::Resume { .. } => "pick the conversation back up where you left it",
         }
     }
 
-    /// The skill this row execs — already resolved, whichever arm.
-    pub fn route(self) -> Route {
+    /// Which CLI this row would run: the picked agent for everything that
+    /// starts something, and the recorded one for a resume.
+    ///
+    /// The one place that difference is decided, so the row the picker *draws*
+    /// and the process the exec *becomes* cannot disagree — which is exactly
+    /// the failure this would otherwise have: a title reading Codex over a row
+    /// that runs Claude.
+    pub fn agent(self, picked: Agent) -> Agent {
         match self {
-            Candidate::Launch { route, .. } => route,
-            Candidate::Create(kind) => kind.route(),
+            Candidate::Launch { .. } | Candidate::Create(_) => picked,
+            Candidate::Resume { agent } => agent,
+        }
+    }
+
+    /// How the row's invocation reads in the picker's skill column: the skill
+    /// a launch or creation routes to, or the way back into a conversation.
+    ///
+    /// Replaces a `route()` that could only answer for the two arms that run a
+    /// skill. A resume runs none — that is the whole difference between it and
+    /// [`Mode::Plain`], which starts a fresh bare session in the same place —
+    /// so the column shows the argv it actually execs.
+    pub fn invocation(self, picked: Agent) -> String {
+        let agent = self.agent(picked);
+        match self {
+            Candidate::Launch { route, .. } => route.invocation(agent),
+            Candidate::Create(kind) => kind.route().invocation(agent),
+            Candidate::Resume { .. } => {
+                format!("{} {}", agent.program(), agent.resume_argv().join(" "))
+            }
         }
     }
 
     /// What the text field means while this row is picked: launch rows steer
-    /// the agent; creation rows take the task or the seed.
+    /// the agent; creation rows take the task or the seed; a resume takes the
+    /// first thing the rejoined session hears, which both CLIs accept beside
+    /// their resume flag.
     pub fn field(self) -> &'static str {
         match self {
-            Candidate::Launch { .. } => "steer",
+            Candidate::Launch { .. } | Candidate::Resume { .. } => "steer",
             Candidate::Create(kind) => kind.field(),
         }
     }
@@ -732,6 +796,15 @@ pub enum StagedAt {
         /// ticket listed twice was launched from, and the launch target itself
         /// when the cursor was on the cluster header.
         map: MapRef,
+        /// The conversation a previous launch of this node left on this
+        /// machine, if there is one (#35).
+        ///
+        /// **Here rather than on [`Staged`]**, which is what makes a resume
+        /// row on a project stop unrepresentable: a project names no node, so
+        /// there is nothing whose conversation this could be. The picker's
+        /// resume row is built from this field alone, so a node nobody has
+        /// launched cannot be offered one.
+        resume: Option<Resume>,
     },
     /// A whole project: the repo-level stop every project screen opens on,
     /// and the only stop creation hangs off.
@@ -754,6 +827,7 @@ impl Staged {
                     prs: ticket.prs.clone(),
                 },
                 map: map.clone(),
+                resume: None,
             },
         })
     }
@@ -767,7 +841,34 @@ impl Staged {
             at: StagedAt::Node {
                 aim: Aim::Map,
                 map: map.clone(),
+                resume: None,
             },
+        }
+    }
+
+    /// Attach the conversation a previous launch of this node left (#35) — the
+    /// one thing that puts a resume row in the picker.
+    ///
+    /// A builder rather than a constructor argument because the two node
+    /// constructors above are total without it: a node that has never run is
+    /// the ordinary case, and `None` is not a decision anyone needs to make at
+    /// every call site. On a project stop this is a **no-op** — there is no
+    /// node to have left a conversation, and the field only exists in the node
+    /// arm, so nothing can be attached rather than something being quietly
+    /// dropped.
+    #[must_use]
+    pub fn with_resume(mut self, resume: Resume) -> Staged {
+        if let StagedAt::Node { resume: slot, .. } = &mut self.at {
+            *slot = Some(resume);
+        }
+        self
+    }
+
+    /// The conversation this stop can be resumed into, if any.
+    pub fn resume(&self) -> Option<&Resume> {
+        match &self.at {
+            StagedAt::Node { resume, .. } => resume.as_ref(),
+            StagedAt::Project => None,
         }
     }
 
@@ -812,12 +913,14 @@ impl Staged {
         }
     }
 
-    /// The row the picker opens on: the first row this stop offers. On a node
-    /// that is the default mode's launch row — creation is never the default,
-    /// because `enter` on a node still means "launch this node" first. On the
-    /// project row there is no node to launch, so the first creation row
-    /// leads — and since that row is where an untouched cursor sits, it is
-    /// what `enter` type `enter` runs.
+    /// The row the picker opens on: the first row this stop offers.
+    ///
+    /// On a node that is its **resume** row when a previous launch left a
+    /// conversation there (#35), and the default mode's launch row otherwise —
+    /// creation is never the default, because `enter` on a node still means
+    /// "work this node" first. On the project row there is no node to launch,
+    /// so the first creation row leads — and since that row is where an
+    /// untouched cursor sits, it is what `enter` type `enter` runs.
     ///
     /// # Panics
     ///
@@ -839,14 +942,23 @@ impl Staged {
     /// none of them the repo. So the header's picker is the three modes again,
     /// exactly like a ticket's, and the only difference between them is what
     /// they aim at.
+    ///
+    /// A node you have launched before **leads** with its resume (#35), which
+    /// is the one place this list is not simply the modes. `enter enter` on a
+    /// ticket you were working an hour ago should put you back in that
+    /// conversation rather than open a second one beside it — the same
+    /// argument that put the project row under the untouched cursor, applied
+    /// to the picker: the default is the likeliest act, and starting over is
+    /// one arrow away.
     pub fn candidates(&self) -> Vec<Candidate> {
         match &self.at {
-            StagedAt::Node { aim, .. } => Mode::all()
-                .into_iter()
-                .map(|mode| Candidate::Launch {
+            StagedAt::Node { aim, resume, .. } => resume
+                .iter()
+                .map(|r| Candidate::Resume { agent: r.agent })
+                .chain(Mode::all().into_iter().map(|mode| Candidate::Launch {
                     mode,
                     route: route(aim, mode),
-                })
+                }))
                 .collect(),
             // A project names nothing that exists yet, so there is nothing to
             // launch — only the three ways to start something.
@@ -862,7 +974,9 @@ impl Staged {
     /// name until a skill files one.
     pub fn key(&self) -> String {
         match &self.at {
-            StagedAt::Node { aim: Aim::Map, map } => format!("#{}", map.id.number),
+            StagedAt::Node {
+                aim: Aim::Map, map, ..
+            } => format!("#{}", map.id.number),
             StagedAt::Node {
                 aim: Aim::Ticket { number, .. },
                 ..
@@ -893,7 +1007,7 @@ impl Staged {
     ///   as backing out.
     pub fn node_workspace(&self) -> Option<String> {
         match &self.at {
-            StagedAt::Node { aim, map } => Some(node_workspace_name(
+            StagedAt::Node { aim, map, .. } => Some(node_workspace_name(
                 &self.repo,
                 match aim {
                     Aim::Map => map.id.number,
@@ -912,7 +1026,8 @@ impl Staged {
 /// Two states, not three: there is no "wanted isolation but could not get it".
 /// [`Isolation::detect`] is total — it answers with what will actually happen,
 /// so a launch cannot carry an intention the exec then fails to honour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Isolation {
     /// No compatible isolation path: the selected agent runs in the checkout
     /// directly.
@@ -1051,6 +1166,20 @@ enum Job {
     },
     /// Start something new in the repo — the skill files the issues.
     Create { creation: Creation, agent: Agent },
+    /// Rejoin the conversation a previous launch of this node left (#35).
+    ///
+    /// Carries the node's number so [`Launch::workspace`] resolves to the same
+    /// per-node workspace the original launch ran in — which is the whole
+    /// mechanism, since that workspace is the cwd both CLIs key their
+    /// conversation history by. No aim, no map and no route: a resume names
+    /// nothing to the agent, because the session it is rejoining already knows
+    /// all of it.
+    Resume {
+        number: u64,
+        agent: Agent,
+        /// The first thing the rejoined session hears, or nothing at all.
+        prompt: Option<String>,
+    },
 }
 
 impl Job {
@@ -1068,15 +1197,16 @@ impl Job {
                 Aim::Ticket { number, .. } => *number,
             }),
             Job::Create { .. } => None,
+            Job::Resume { number, .. } => Some(*number),
         }
     }
 
-    /// The CLI that executes this job, held on both arms because creation has
-    /// no launch mode of its own.
+    /// The CLI that executes this job, held on every arm because neither
+    /// creation nor resume has a launch mode of its own.
     fn agent(&self) -> Agent {
         match self {
             Job::Node { mode, .. } => mode.agent(),
-            Job::Create { agent, .. } => *agent,
+            Job::Create { agent, .. } | Job::Resume { agent, .. } => *agent,
         }
     }
 }
@@ -1141,6 +1271,11 @@ impl Launch {
             Job::Node { .. } => self.key(),
             // A creation has no `#n` to name yet, so the notice names the act.
             Job::Create { creation, .. } => creation.kind().label().to_string(),
+            // A resume has a number, so it names the node *and* says that it
+            // is going back rather than starting: the two are one keystroke
+            // apart in the picker and the notice is the last chance to see
+            // which one was taken.
+            Job::Resume { .. } => format!("resume {}", self.key()),
         };
         format!("{what} in {place}{}", self.isolation.suffix())
     }
@@ -1150,9 +1285,19 @@ impl Launch {
     /// no steering receives no prompt at all.
     fn agent_argv_inner(&self) -> Vec<String> {
         let agent = self.agent();
+        // A resume is the one shape whose argv is not
+        // `<agent> <bypass> [prompt]`: Codex spells it as a subcommand, and a
+        // subcommand has to come before the switches it takes.
         let prompt = match &self.job {
             Job::Node { mode, .. } => mode.opening_prompt(self.skill_invocation()),
             Job::Create { creation, .. } => Some(creation.invocation(agent)),
+            Job::Resume { prompt, .. } => {
+                let mut argv = vec![agent.program().to_string()];
+                argv.extend(agent.resume_argv().iter().map(|a| (*a).to_string()));
+                argv.push(agent.skip_permissions().to_string());
+                argv.extend(prompt.clone());
+                return argv;
+            }
         };
         let mut argv = vec![
             agent.program().to_string(),
@@ -1160,6 +1305,23 @@ impl Launch {
         ];
         argv.extend(prompt);
         argv
+    }
+
+    /// The record this launch leaves for a later resume (#35) — `None` for a
+    /// creation, which has no node to key one on until its skill files one.
+    ///
+    /// Taken from the resolved launch rather than from the picker's intent, so
+    /// what is remembered is the tree the agent actually ran in — including
+    /// which of several checkouts the human picked, which is precisely the bit
+    /// that decides whose conversation comes back.
+    pub fn session(&self) -> Option<Session> {
+        Some(Session::new(
+            self.repo.clone(),
+            self.job.number()?,
+            self.agent(),
+            self.cwd.clone(),
+            self.isolation,
+        ))
     }
 
     /// The selected agent's skill invocation, its arguments, and the context
@@ -1540,7 +1702,7 @@ pub enum Targets {
 /// second derivation here, so what execs is what the row named (#114). This
 /// function answers only *where* the agent can run.
 pub fn plan(checkouts: &[Checkout], staged: &Staged, route: Route, mode: &LaunchMode) -> Targets {
-    let StagedAt::Node { aim, map } = &staged.at else {
+    let StagedAt::Node { aim, map, .. } = &staged.at else {
         // Unreachable from the picker: [`Staged::candidates`] offers no launch
         // row on a project stop, so nothing there can ask for a node
         // launch. Refusing rather than inventing a node — there is no aim and
@@ -1577,6 +1739,48 @@ pub fn plan_create(
             agent,
         },
     )
+}
+
+/// Resolve a resume of the staged node (#35) — `None` when the stop has no
+/// conversation to go back to, which is every stop the picker never drew a
+/// resume row on.
+///
+/// **Deliberately not a [`Targets`]**, and the only launch path that is not.
+/// Everything else asks the cache *where* the agent could run and prompts when
+/// several trees answer; a resume is not a choice about where, because the
+/// conversation exists in exactly one place and the record says which. So this
+/// never consults [`candidate_checkouts`], never prompts, and cannot resolve
+/// into a tree the original launch did not use — including when the human has
+/// since registered a second checkout of the same repo, which is the case a
+/// checkout picker would silently get wrong half the time.
+///
+/// Isolation is re-detected rather than stored: it is a fact about the tree,
+/// the tree is the same one, and a fresh reading cannot disagree with itself
+/// the way a stored copy could once a devcontainer was added or `dl` removed.
+pub fn resume_launch(staged: &Staged, steer: &str) -> Option<Launch> {
+    let resume = staged.resume()?;
+    let number = match &staged.at {
+        StagedAt::Node {
+            aim: Aim::Map, map, ..
+        } => map.id.number,
+        StagedAt::Node {
+            aim: Aim::Ticket { number, .. },
+            ..
+        } => *number,
+        // Unreachable: `Staged::resume` already answered `None` here.
+        StagedAt::Project => return None,
+    };
+    let steer = steer.trim();
+    Some(Launch {
+        repo: staged.repo.clone(),
+        cwd: resume.checkout.clone(),
+        job: Job::Resume {
+            number,
+            agent: resume.agent,
+            prompt: (!steer.is_empty()).then(|| steer.to_string()),
+        },
+        isolation: resume.isolation,
+    })
 }
 
 /// The shared half of [`plan`] and [`plan_create`]: every registered checkout
@@ -1690,6 +1894,264 @@ mod tests {
             checkout("/data/proj/wayfinder", "blooop/wayfinder"),
             checkout("/data/proj/dotfiles", "upstream/dotfiles"),
         ]
+    }
+
+    /// A conversation a previous launch left in the wayfinder checkout.
+    fn resume(agent: Agent) -> Resume {
+        Resume {
+            agent,
+            checkout: PathBuf::from("/data/proj/wayfinder"),
+            isolation: Isolation::Host,
+            at: 1_000,
+        }
+    }
+
+    /// The staged ticket the resume tests work: node #117 of map #47, with
+    /// whatever conversation the cache had for it.
+    fn staged_with(resume: Option<Resume>) -> Staged {
+        let staged = Staged::ticket(
+            &ticket("blooop/wayfinder", 117),
+            &map_ref(47),
+            Stage::Building,
+        )
+        .expect("building is launchable");
+        match resume {
+            Some(resume) => staged.with_resume(resume),
+            None => staged,
+        }
+    }
+
+    #[test]
+    fn a_node_you_have_launched_before_leads_its_picker_with_the_way_back() {
+        // The whole point of the row: come back to a ticket you were working
+        // and `enter enter` rejoins the conversation rather than starting a
+        // second one beside it. So resume is not merely present, it *leads* —
+        // an untouched picker cursor sits on it.
+        let staged = staged_with(Some(resume(Agent::Claude)));
+        assert_eq!(
+            staged.candidates().first(),
+            Some(&Candidate::Resume {
+                agent: Agent::Claude
+            })
+        );
+        assert_eq!(
+            staged.default_candidate(),
+            Candidate::Resume {
+                agent: Agent::Claude
+            }
+        );
+        // And the three ways to start fresh are all still there, in order,
+        // one arrow away.
+        let modes: Vec<Candidate> = staged.candidates().into_iter().skip(1).collect();
+        assert_eq!(modes, staged_with(None).candidates());
+    }
+
+    #[test]
+    fn a_node_nobody_has_launched_offers_no_way_back() {
+        // The row is unrepresentable without the record it is built from, so
+        // this is the compiler's claim as much as the test's: nothing here
+        // can invent a resume for a node that has never run.
+        let staged = staged_with(None);
+        assert!(staged
+            .candidates()
+            .iter()
+            .all(|c| !matches!(c, Candidate::Resume { .. })));
+        assert_eq!(
+            staged.default_candidate(),
+            Candidate::Launch {
+                mode: Mode::Interactive,
+                // The fixture is a task, so interactive routes to /wf — the
+                // point is only that the default is a *launch* row again.
+                route: Route::Wayfinder,
+            },
+            "with nothing to rejoin, the default is what it always was"
+        );
+    }
+
+    #[test]
+    fn a_project_row_has_no_node_and_therefore_no_way_back() {
+        // Creation rows name work that does not exist yet, so there is no
+        // conversation for them to rejoin. Attaching one is not an error, it
+        // is a no-op: the field lives in the node arm, so the state cannot be
+        // built in the first place.
+        let staged = Staged::project("blooop/wayfinder").with_resume(resume(Agent::Claude));
+        assert_eq!(
+            staged.candidates(),
+            Staged::project("blooop/wayfinder").candidates()
+        );
+        assert!(staged
+            .candidates()
+            .iter()
+            .all(|c| !matches!(c, Candidate::Resume { .. })));
+    }
+
+    #[test]
+    fn resuming_execs_each_agents_own_way_back_and_nothing_else() {
+        // The flags are the contract with the two CLIs, so they are pinned
+        // literally. Both are cwd-scoped — `claude --continue` continues "the
+        // most recent conversation in the current directory", and `codex
+        // resume` filters by cwd unless `--all` — which is what makes a
+        // per-node workspace sufficient and a session id unnecessary.
+        // One rule for both: the program, how it is told to go back, then the
+        // switches. Codex forces it — `resume` is a subcommand and has to
+        // precede the flags it takes — and Claude follows the same shape
+        // rather than keeping the bypass in the second slot every *other*
+        // launch puts it in, so there is one ordering here instead of two.
+        let claude = resumed(Agent::Claude, "");
+        assert_eq!(
+            claude.agent_argv(),
+            vec!["claude", "--continue", "--dangerously-skip-permissions"]
+        );
+        let codex = resumed(Agent::Codex, "");
+        assert_eq!(
+            codex.agent_argv(),
+            vec![
+                "codex",
+                "resume",
+                "--last",
+                "--dangerously-bypass-approvals-and-sandbox"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_resume_carries_the_typed_text_as_the_prompt_it_wakes_up_on() {
+        // Both CLIs take a prompt beside the resume flag, so the picker's text
+        // field keeps meaning something on this row: rejoin *and* say this.
+        // It is the whole prompt, not a ` steer: …` suffix — there is no skill
+        // invocation in front of it for a suffix to be addressed to.
+        assert_eq!(
+            resumed(Agent::Claude, "run the tests").agent_argv().last(),
+            Some(&"run the tests".to_string())
+        );
+        assert_eq!(
+            resumed(Agent::Codex, "run the tests").agent_argv().last(),
+            Some(&"run the tests".to_string())
+        );
+    }
+
+    #[test]
+    fn a_resume_hands_no_context_block_because_the_conversation_already_has_one() {
+        // #124's block exists to save a fresh session its rediscovery. A
+        // resumed session did that discovery already, and re-handing it would
+        // be telling an agent mid-conversation what it worked out an hour ago.
+        let prompt = resumed(Agent::Claude, "carry on").agent_argv().join(" ");
+        assert!(!prompt.contains("ctx:"), "{prompt}");
+        assert!(
+            !prompt.contains("/wf"),
+            "a resume invokes no skill: {prompt}"
+        );
+    }
+
+    #[test]
+    fn a_resume_goes_back_into_the_node_workspace_it_was_launched_in() {
+        // The conversation is keyed by cwd, so the way back is the same
+        // workspace — never the repo's default one, which is a different tree
+        // with a different conversation in it.
+        let launch = Launch {
+            repo: "blooop/wayfinder".to_string(),
+            cwd: PathBuf::from("/data/proj/wayfinder"),
+            job: Job::Resume {
+                number: 117,
+                agent: Agent::Claude,
+                prompt: None,
+            },
+            isolation: Isolation::Devlaunch,
+        };
+        let argv = launch.agent_argv();
+        assert_eq!(argv[0], "dl");
+        assert_eq!(argv[1], "blooop/wayfinder@wayfinder/wayfinder-117");
+        assert_eq!(argv[2], "--");
+        assert_eq!(
+            argv[3], "'claude' '--continue' '--dangerously-skip-permissions'",
+            "the agent command still crosses dl's shell quoted"
+        );
+    }
+
+    #[test]
+    fn a_resume_goes_back_the_way_it_went_out_not_the_way_the_tree_looks_now() {
+        // Isolation is **recorded**, never re-detected. An isolated launch's
+        // conversation lives in the container, at a cwd inside `dl`'s own
+        // clone — so if the host checkout later loses its `.devcontainer/`, a
+        // fresh detection would answer Host and quietly resume *the
+        // checkout's* conversation instead, which is a different one and
+        // possibly the human's own. `/nonexistent` has no devcontainer and
+        // could never detect as isolated, which is exactly the point.
+        let recorded = Resume {
+            agent: Agent::Claude,
+            checkout: PathBuf::from("/nonexistent/proj/wayfinder"),
+            isolation: Isolation::Devlaunch,
+            at: 1_000,
+        };
+        let launch = resume_launch(&staged_with(Some(recorded)), "").expect("resolves");
+        assert_eq!(
+            launch.agent_argv().first().map(String::as_str),
+            Some("dl"),
+            "a resume must go back into the container it ran in"
+        );
+        // And the other way: a launch that ran on the host stays on the host,
+        // even once someone adds a devcontainer to that tree. Its conversation
+        // is in the checkout, and a container would be a fresh one.
+        let recorded = Resume {
+            agent: Agent::Claude,
+            checkout: PathBuf::from("/nonexistent/proj/wayfinder"),
+            isolation: Isolation::Host,
+            at: 1_000,
+        };
+        let launch = resume_launch(&staged_with(Some(recorded)), "").expect("resolves");
+        assert_eq!(
+            launch.agent_argv().first().map(String::as_str),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn a_node_launch_leaves_the_session_a_later_resume_is_offered_on() {
+        // The record is written from the launch itself rather than from the
+        // picker's intent, so what is remembered is what actually ran.
+        let launch = match plan_wf(&cache(), &ticket("blooop/wayfinder", 117), 47) {
+            Targets::One(launch) => launch,
+            other => panic!("one checkout, got {other:?}"),
+        };
+        let session = launch.session().expect("a node launch is resumable");
+        assert_eq!(session.repo, "blooop/wayfinder");
+        assert_eq!(session.number, 117);
+        assert_eq!(session.resume.agent, Agent::Claude);
+        assert_eq!(
+            session.resume.checkout,
+            PathBuf::from("/data/proj/wayfinder")
+        );
+    }
+
+    #[test]
+    fn a_creation_leaves_no_session_because_it_names_no_node_yet() {
+        // `/wf-one` files its ticket after the exec, so at record time there
+        // is no number to key a resume on. A sentinel zero would put a lie in
+        // the cache and offer node #0 a way back.
+        let creation = Creation::Task {
+            task: "add a flag".to_string(),
+        };
+        let launch = match plan_create(&cache(), "blooop/wayfinder", &creation, Agent::Claude) {
+            Targets::One(launch) => launch,
+            other => panic!("one checkout, got {other:?}"),
+        };
+        assert_eq!(launch.session(), None);
+    }
+
+    #[test]
+    fn resuming_a_node_re_records_it_so_the_way_back_stays_the_latest_one() {
+        // A resume is itself a launch, and the conversation it leaves behind
+        // is the one to come back to next time.
+        assert_eq!(
+            resumed(Agent::Codex, "").session().map(|s| s.number),
+            Some(117)
+        );
+    }
+
+    /// A resolved resume of node #117, as the second enter builds it.
+    fn resumed(agent: Agent, steer: &str) -> Launch {
+        let staged = staged_with(Some(resume(agent)));
+        resume_launch(&staged, steer).expect("a staged resume resolves")
     }
 
     #[test]
@@ -1902,8 +2364,11 @@ mod tests {
         );
         // Every row names the skill it execs — the creation rows' routes are
         // their own rather than any node's.
-        let routes: Vec<Route> = project.iter().map(|c| c.route()).collect();
-        assert_eq!(routes, [Route::One, Route::Wayfinder, Route::WayfinderAuto]);
+        let shown: Vec<String> = project
+            .iter()
+            .map(|c| c.invocation(Agent::Claude))
+            .collect();
+        assert_eq!(shown, ["/wf-one", "/wf", "/wf-auto"]);
     }
 
     #[test]

@@ -389,7 +389,9 @@ async fn main() -> Result<()> {
     // [`wf::refresh::spawn_discovery`]); this only decides what `wf` fetches
     // while waiting for it.
     let seed = cache.map_seed();
-    let mut app = App::empty().with_checkouts(cache.checkouts.clone());
+    let mut app = App::empty()
+        .with_checkouts(cache.checkouts.clone())
+        .with_sessions(cache.sessions.clone());
     app.open_maps = seed.clone();
     app.startup = Startup::seeded(&seed);
 
@@ -451,7 +453,25 @@ async fn main() -> Result<()> {
             // refusing a launch over, and the only cost of losing this is one
             // project sitting lower in a list than it might have.
             let mut cache = ProjectsCache::load_or_default(&cache_path);
-            if cache.touch(launch.cwd()) {
+            let mut changed = cache.touch(launch.cwd());
+            // And record the conversation this launch is about to start, so a
+            // later run can offer the way back into it (#35).
+            //
+            // Written **here**, immediately before the terminal is restored
+            // and the image replaced, because this is the last moment `wf`
+            // exists — and written from the resolved launch rather than from
+            // the picker, so what is remembered is the tree the agent actually
+            // gets. A creation records nothing: it has no node to key on until
+            // its skill files one.
+            //
+            // Best-effort like the stamp above it, and for a smaller cost: a
+            // record that fails to write means the resume row is missing next
+            // time, not that anything is wrong with the launch.
+            if let Some(session) = launch.session() {
+                cache.record_session(session);
+                changed = true;
+            }
+            if changed {
                 let _ = cache.save(&cache_path);
             }
             // The prompts the selected agent is about to run. `wf skills

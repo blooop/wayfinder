@@ -50,7 +50,13 @@ fn glyph_style(glyph: RowGlyph) -> Style {
 /// half of what a ticket is matched against and the rows below do not draw it:
 /// typing a project name would otherwise sift the whole screen down to one
 /// cluster while underlining nothing anywhere.
-fn cluster_header(id: &MapId, map: &Map, lit: &[usize], under_cursor: bool) -> Line<'static> {
+fn cluster_header(
+    id: &MapId,
+    map: &Map,
+    lit: &[usize],
+    under_cursor: bool,
+    resumable: bool,
+) -> Line<'static> {
     let cyan = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     // The cursor rides *before* the `▌`, not after it: the bar is the cluster's
     // left edge and every row below hangs off it, so a marker inside it would
@@ -58,6 +64,14 @@ fn cluster_header(id: &MapId, map: &Map, lit: &[usize], under_cursor: bool) -> L
     let mut spans = vec![cursor_span(under_cursor), Span::styled("▌ ", cyan)];
     spans.extend(lit_spans(id.short_repo(), lit, cyan));
     spans.push(Span::styled(format!(" · {}", map.title), cyan));
+    // A map is a node, so a charting session is as resumable as a build one —
+    // and the header is the only place the list can say so (#35).
+    if resumable {
+        spans.push(Span::styled(
+            RESUME_BADGE,
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
+        ));
+    }
     for (glyph, count) in map.tally() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -266,6 +280,11 @@ fn pr_badge(ticket_repo: &str, pr: &PrLink) -> Vec<Span<'static>> {
 /// `lit` is where a live query landed in the `#n title` half — the only part of
 /// the row that was matched against, and so the only part that can honestly
 /// claim to be why the row is on screen.
+///
+/// `resumable` adds the `⏎` badge (#35): a conversation from a previous launch
+/// is waiting on this node. A bare flag rather than the record itself, because
+/// the row says only *that* there is a way back — how old it is belongs to the
+/// picker, where the choice is actually made.
 fn ticket_line(
     ticket: &Ticket,
     prefix: &str,
@@ -273,6 +292,7 @@ fn ticket_line(
     branch: &Branch,
     lit: &[usize],
     under_cursor: bool,
+    resumable: bool,
 ) -> Line<'static> {
     // Nested rows carry the cursor column as extra indent, so a branch begins
     // directly under the glyph of the row it hangs from instead of to its left.
@@ -296,6 +316,12 @@ fn ticket_line(
         spans.push(Span::styled(
             format!(" [{name}]"),
             Style::new().add_modifier(Modifier::DIM),
+        ));
+    }
+    if resumable {
+        spans.push(Span::styled(
+            RESUME_BADGE,
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
         ));
     }
     for pr in &ticket.prs {
@@ -325,7 +351,10 @@ fn ticket_line(
 /// by omission: a row the query landed on is a match, and a match is drawn as
 /// [`Item::Ticket`], never as one of these.
 fn context_line(ticket: &Ticket, prefix: &str) -> Line<'static> {
-    ticket_line(ticket, prefix, &[], &Branch::Plain, &[], false)
+    // No resume badge either, for the same reason it carries no cursor: a
+    // context row is not somewhere `enter` can be pressed, so a badge about
+    // what `enter` would do there would be an offer the row cannot honour.
+    ticket_line(ticket, prefix, &[], &Branch::Plain, &[], false, false)
         .patch_style(Style::new().add_modifier(Modifier::DIM))
 }
 
@@ -417,7 +446,13 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
             Item::Header(id) => {
                 let map = &app.clusters[id];
                 let lit = query.as_mut().map(|q| q.in_repo(map)).unwrap_or_default();
-                lines.push(cluster_header(id, map, &lit, under_cursor));
+                lines.push(cluster_header(
+                    id,
+                    map,
+                    &lit,
+                    under_cursor,
+                    app.resume(&id.repo, id.number).is_some(),
+                ));
             }
             Item::Ticket {
                 row,
@@ -439,6 +474,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                     branch,
                     &lit,
                     under_cursor,
+                    app.resume(&ticket.repo, ticket.number).is_some(),
                 ));
             }
             Item::Project(project) => lines.push(project_line(project, under_cursor)),
@@ -549,6 +585,38 @@ pub fn idle_note(plan: &Plan) -> String {
     }
 }
 
+/// The badge a row carries when a previous launch left a conversation on it
+/// (#35) — the same glyph as the key that rejoins it.
+const RESUME_BADGE: &str = "  ⏎";
+
+/// How long ago `then` was, from `now`, in the one unit that reads: `20m ago`,
+/// `3h ago`, `5d ago`.
+///
+/// A pure function of the two instants rather than a method reading the clock,
+/// so the rendering is pinned by tests instead of raced against a wall clock —
+/// the same reason the launch context carries no snapshot instant.
+///
+/// A clock that moved backwards between the launch and now reads as **the
+/// present**. Both alternatives are worse: a negative age cannot be spelt, and
+/// an unsigned subtraction would wrap to an age of a hundred billion years.
+fn ago(then: u64, now: u64) -> String {
+    let secs = now.saturating_sub(then);
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{}m ago", secs / 60),
+        3_600..=86_399 => format!("{}h ago", secs / 3_600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+/// Now, in seconds since the Unix epoch — read once per frame that draws an
+/// age, and never anywhere a test asserts on.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// A centered box `width`×`height` (clamped) inside `area`.
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let [area] = Layout::horizontal([Constraint::Length(width.min(area.width))])
@@ -592,13 +660,22 @@ fn draw_launch_picker(
         } else {
             Style::new().add_modifier(Modifier::DIM)
         };
+        // A resume names when the conversation was left, which its label
+        // cannot: three weeks old and twenty minutes old are the same row
+        // otherwise, and they are not the same decision.
+        let blurb = match (option, staged.resume()) {
+            (Candidate::Resume { .. }, Some(resume)) => {
+                format!("{} · {}", ago(resume.at, now_secs()), option.blurb())
+            }
+            _ => option.blurb().to_string(),
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("  {marker} {:<14}", option.label()), emphasis),
             Span::styled(
-                format!("{:<10}", option.route().invocation(agent)),
+                format!("{:<18}", option.invocation(agent)),
                 Style::new().fg(Color::Cyan),
             ),
-            Span::styled(option.blurb(), Style::new().add_modifier(Modifier::DIM)),
+            Span::styled(blurb, Style::new().add_modifier(Modifier::DIM)),
         ]));
     }
     lines.push(Line::default());
@@ -625,9 +702,12 @@ fn draw_launch_picker(
     // something new in the repo it belongs to. Naming only the node would be
     // true of half the list — and the repo is exactly what creation would
     // otherwise have to ask for.
+    // The picked row decides which agent the title names: on a resume it is
+    // the recorded one, since that is what `enter` will become. Anything else
+    // would put a Codex title over a row that runs Claude.
     let title = format!(
         " launch {} · {} · {} {} ",
-        agent.label(),
+        candidate.agent(agent).label(),
         staged.repo,
         staged.key(),
         staged.title()
@@ -892,6 +972,98 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// The fixture app, with a conversation left on `number`.
+    fn app_resuming(number: u64) -> App {
+        fixture_app().with_sessions(vec![crate::projects::Session::new(
+            "blooop/wayfinder".to_string(),
+            number,
+            Agent::Claude,
+            std::path::PathBuf::from("/data/proj/wayfinder"),
+            crate::launch::Isolation::Host,
+        )])
+    }
+
+    #[test]
+    fn a_row_you_left_a_conversation_on_says_so_before_anything_is_fetched() {
+        // The badge is drawn from the local cache, so it is on the *first*
+        // frame — the same frame-zero rule the project list follows. Nothing
+        // asks `dl`, and nothing waits for the map search.
+        let screen = render(&app_resuming(7));
+        let row = screen
+            .lines()
+            .find(|l| l.contains("#7 Supervising"))
+            .expect("the row is on screen");
+        assert!(row.contains('⏎'), "{row}");
+        // And only that row: the badge is a fact about one node.
+        let other = screen
+            .lines()
+            .find(|l| l.contains("#6 Re-entry"))
+            .expect("the neighbour is on screen");
+        assert!(!other.contains('⏎'), "{other}");
+    }
+
+    #[test]
+    fn a_map_you_have_charted_before_carries_the_badge_too() {
+        // A map is a node (#96) and its picker offers the resume row, so the
+        // list has to say so — otherwise the only way to discover a charting
+        // session is waiting is to press enter on every header.
+        let screen = render(&app_resuming(1));
+        let header = screen
+            .lines()
+            .find(|l| l.contains("Map: wf"))
+            .expect("the cluster header is on screen");
+        assert!(header.contains('⏎'), "{header}");
+    }
+
+    #[test]
+    fn the_resume_row_says_how_long_ago_you_left_it() {
+        // Whether a conversation is twenty minutes or three weeks old changes
+        // whether you want it back, and it is the one thing the row's label
+        // cannot say. The rendering is a pure function of the two instants, so
+        // it is pinned here rather than against a wall clock.
+        assert_eq!(ago(1_000, 1_000), "just now");
+        assert_eq!(ago(1_000, 1_030), "just now");
+        assert_eq!(ago(1_000, 1_000 + 20 * 60), "20m ago");
+        assert_eq!(ago(1_000, 1_000 + 3 * 3_600), "3h ago");
+        assert_eq!(ago(1_000, 1_000 + 5 * 86_400), "5d ago");
+        // A clock that went backwards between the launch and now reads as the
+        // present rather than as a negative age or a huge one.
+        assert_eq!(ago(2_000, 1_000), "just now");
+    }
+
+    #[test]
+    fn the_picker_draws_the_way_back_as_the_argv_it_will_actually_run() {
+        // The skill column names what execs. Every other row names a skill;
+        // this one has none, so it names the agent's own resume flags — which
+        // is exactly the difference between resuming and `plain`, and the two
+        // sit one row apart.
+        let mut app = app_resuming(6);
+        down(&mut app, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("resume"), "{screen}");
+        assert!(screen.contains("claude --continue"), "{screen}");
+    }
+
+    #[test]
+    fn the_picker_title_names_the_agent_that_will_actually_rejoin() {
+        // The title is the agent axis's readout, and on the resume row the
+        // axis is the record's rather than the picker's. A Codex title over a
+        // row that runs Claude is the one lie this screen could tell.
+        let mut app = fixture_app().with_sessions(vec![crate::projects::Session::new(
+            "blooop/wayfinder".to_string(),
+            6,
+            Agent::Codex,
+            std::path::PathBuf::from("/data/proj/wayfinder"),
+            crate::launch::Isolation::Host,
+        )]);
+        down(&mut app, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("launch Codex"), "{screen}");
+        assert!(screen.contains("codex resume --last"), "{screen}");
     }
 
     #[test]

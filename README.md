@@ -213,8 +213,12 @@ registers that checkout.
 
 The registry is a per-machine cache at `~/.cache/wf/projects.json`
 (`$XDG_CACHE_HOME` respected) holding `{path, repo, used}` per checkout, plus
-every open map that the last search found. Deleting it is safe — projects
-re-accrete as you open them, and the maps are re-found on the next start.
+every open map that the last search found and a `{repo, number, agent,
+checkout, at}` session per node you have launched an agent on (see
+[Resuming](#resuming-picking-a-conversation-back-up)). Deleting it is safe —
+projects re-accrete as you open them, the maps are re-found on the next start,
+and the only thing actually lost is the offer to rejoin conversations, which
+still exist where their agents left them.
 
 `used` is what orders the project list: a local stamp, written when you open
 `wf` in a checkout and when you launch an agent from one. A *local* stamp, and
@@ -458,6 +462,66 @@ there are no launch rows, and `enter` with an empty `task` field refuses on the
 count line rather than filing something blank. Which is why the creating default
 is safe: `enter enter` on a fresh screen does nothing at all.
 
+### Resuming: picking a conversation back up
+
+A node you have launched an agent on before carries a `⏎` in the list, and its
+picker leads with a **resume** row:
+
+```
+┌ launch Claude · blooop/wayfinder · #117 The one project surface ────────────┐
+│                                                                             │
+│  ▶ resume        claude --continue   20m ago · pick the conversation back up│
+│    interactive   /wf-tdd             you are in the loop; it grills you     │
+│    auto          /wf-auto            the agent decides alone and drives it  │
+│    plain         claude              no skill; a bare session on the branch │
+│                                                                             │
+│    steer  █                                                                 │
+│                                                                             │
+│  enter launch · ↑/↓ pick · type to fill · esc cancel                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+So coming back to work you left is `enter enter`, the same two keys as starting
+it. Starting fresh instead is one `↓`. The row leads for the reason the project
+row takes the cursor on the screen behind it: the default should be the likeliest
+act, and the alternative should cost one key.
+
+**It needs no session store, because neither agent has one worth storing.**
+`claude --continue` continues "the most recent conversation in the current
+directory", and `codex resume --last` filters by cwd unless told `--all`. `wf`
+already gives every node a working directory of its own — that is exactly what
+the per-node workspace `owner/repo@wayfinder/<repo>-<n>` *is* — so going back is
+a matter of exec'ing in the same place. No ids are matched, nothing can point at
+a conversation that moved, and a resume is the same exec every other launch is
+with the agent's own flag in place of a skill.
+
+What `wf` records at each launch is therefore three facts and no more, in the
+same `projects.json` the checkouts live in — the three that between them say
+*where the conversation is*: **which tree**, **host or container**, and **which
+CLI**. The tree is the half a fresh reading cannot recover once you have two
+checkouts of one repo, which is why a resume never asks *which checkout* where a
+fresh launch would: the conversation exists in exactly one of them and the
+record says which. Host-or-container is recorded rather than re-detected because
+an isolated launch's history lives inside `dl`'s clone — re-detecting from a
+checkout that has since lost its `.devcontainer/` would answer "host" and
+quietly resume the checkout's own, different conversation. And the CLI cannot be
+re-derived at all, since a Claude conversation is not rejoinable by Codex — so
+the picker's `←`/`→` is deliberately dead on this row, and the title names the
+recorded agent rather than the picked one.
+
+The workspace name is deliberately *not* recorded: it is a pure function of the
+node (`owner/repo@wayfinder/<repo>-<n>`), so a stored copy could only ever
+disagree with a fresh derivation.
+
+Two honest limits. The record says **`wf` launched an agent here**, not that a
+conversation exists — that is the strongest thing `wf` can know without reading
+the agent's own store, which for an isolated launch is inside a container at a
+path devpod chose. A launch that died before its agent wrote anything leaves a
+resume row that lands on the agent's own "no conversation found". And this is
+**same-machine** only, by construction: it is a local cache of local
+directories. Coming back on another machine is what the breadcrumbs on the
+ticket are for.
+
 **A node launches and a project creates, and neither does the other's job.** A
 cluster header is a *map*, so its picker is the three modes and wraps, exactly
 like a ticket's — the only difference between the two is what they aim at. The
@@ -548,7 +612,8 @@ an empty one.
 | `→` | reveal: enter the project on the project list, else open a `▸ done`/`▸ blocked` group, else step forward one stop — which *is* descending, since a subtree's first row follows its parent |
 | `←` | close: from a project's own row, back out to the project list; else shut an open group, back out to the parent, or step one stop back — which, from a cluster's first row, is that cluster's header |
 | `enter` | on the project list: enter that project. On a project's screen: open the launch picker — the creation rows on the project's own row, the launch modes on a ticket or a cluster header — and a second `enter` runs the agent here and exits. On a group line it folds instead, since there is no agent to run |
-| `←`/`→`, `↑`/`↓` or `tab`, *type*, then `enter`* | in the launch picker: pick Claude/Codex, pick the row, fill its field (a steering prompt, a task, or a map seed), launch — `esc` backs out with the query and cursor intact |
+| `←`/`→`, `↑`/`↓` or `tab`, *type*, then `enter`* | in the launch picker: pick Claude/Codex, pick the row, fill its field (a steering prompt, a task, or a map seed), launch — `esc` backs out with the query and cursor intact. `←`/`→` does nothing on a `resume` row, whose agent comes from the record |
+| `⏎` in a row | a previous launch left a conversation on this node: its picker leads with `resume`, and `enter enter` rejoins it |
 | `ctrl-r` | refetch every map in place, keeping your query, level and cursor |
 | `esc` | clear the query; on an empty query, quit |
 | `q` | quit — on an empty query only, since mid-query it types |

@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::launch::{self, Agent, Candidate, Launch, LaunchMode, MapRef, Route, Staged, Targets};
 use crate::model::{stage, Activity, Map, MapId, MapSet, Status, Ticket};
-use crate::projects::{self, Checkout};
+use crate::projects::{self, Checkout, Resume, Session};
 use crate::refresh::Startup;
 use crate::view::{self, Expanded, GroupId, Lens, Plan, Screen, Stop, StopAt};
 
@@ -227,6 +227,9 @@ pub struct App {
     /// Launch input from the projects cache (#15 handoff): which checkouts
     /// exist on this machine.
     pub checkouts: Vec<Checkout>,
+    /// The other half of that handoff (#35): the conversations previous
+    /// launches left here, at most one per node.
+    pub sessions: Vec<Session>,
     /// Maps whose last fetch failed — **state, not a message.**
     ///
     /// A failure has to be drawn on every frame, and the one-shot `notice` is
@@ -273,6 +276,7 @@ impl App {
             level: Level::Projects,
             notice: None,
             checkouts: Vec::new(),
+            sessions: Vec::new(),
             failed: BTreeSet::new(),
             startup: Startup::loaded(),
             overlay: Overlay::None,
@@ -301,6 +305,38 @@ impl App {
     pub fn with_checkouts(mut self, checkouts: Vec<Checkout>) -> Self {
         self.checkouts = checkouts;
         self
+    }
+
+    /// Attach the conversations previous launches left on this machine (#35) —
+    /// what puts a resume row under the picker's cursor, and a `⏎` beside the
+    /// rows that have one.
+    ///
+    /// Read from the same cache as the checkouts and at the same moment, which
+    /// is what keeps this a **frame-zero** fact: the badge is drawn on the
+    /// first paint, before the map search has answered, because it was never
+    /// the tracker's to answer. Nothing here asks `dl` anything.
+    #[must_use]
+    pub fn with_sessions(mut self, sessions: Vec<Session>) -> Self {
+        self.sessions = sessions;
+        self
+    }
+
+    /// The conversation a previous launch of this node left, if any.
+    pub fn resume(&self, repo: &str, number: u64) -> Option<&Resume> {
+        self.sessions
+            .iter()
+            .find(|s| s.repo == repo && s.number == number)
+            .map(|s| &s.resume)
+    }
+
+    /// Attach `staged`'s resume, if its node has one. One helper rather than
+    /// the same lookup at the two staging sites, so a ticket and a map cannot
+    /// end up disagreeing about what counts as resumable.
+    fn resumable(&self, staged: Staged, number: u64) -> Staged {
+        match self.resume(&staged.repo, number) {
+            Some(resume) => staged.with_resume(resume.clone()),
+            None => staged,
+        }
     }
 
     /// The repo whose screen is up, or `None` on the project list.
@@ -764,6 +800,9 @@ impl App {
             }
             Some(Stop::Map(id)) => {
                 let staged = Staged::map(&MapRef::new(&id, &self.clusters[&id].title));
+                // A map is a node (#96), so a charting session is as
+                // resumable as a build one — and rather more worth resuming.
+                let staged = self.resumable(staged, id.number);
                 self.prewarm(&staged);
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
@@ -828,6 +867,7 @@ impl App {
                 Outcome::Continue
             }
             Some(staged) => {
+                let staged = self.resumable(staged, ticket.number);
                 self.prewarm(&staged);
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
@@ -971,6 +1011,18 @@ impl App {
                         &LaunchMode::picked(agent, mode, &steer),
                     )
                 }
+                // A resume needs no resolution: the record already names the
+                // one tree its conversation lives in, so there is nothing for
+                // the checkout picker to ask about and no `Targets` to walk.
+                Candidate::Resume { .. } => {
+                    if let Some(launch) = launch::resume_launch(&staged, &steer) {
+                        self.notice = Some(format!("→ {}", launch.describe()));
+                        return Outcome::Launch(Box::new(launch));
+                    }
+                    // Unreachable: the row is built from the record, so a
+                    // resume row without one cannot be drawn to be picked.
+                    self.notice = Some("nothing to resume here".to_string());
+                }
                 Candidate::Create(kind) => match kind.with_text(&steer) {
                     Some(creation) => return self.resolve_creation(&staged.repo, &creation, agent),
                     // The one per-row refusal (#114): `/wf-one` with no task is
@@ -986,7 +1038,13 @@ impl App {
             // the arrows because it is what the rest of the screen uses to move
             // through a list, and it steps the way `down` does rather than
             // toggling.
-            KeyCode::Left | KeyCode::Right => agent = next_agent(agent),
+            // Dead on the resume row, and only there: that row's agent comes
+            // from the record — a Claude conversation is not rejoinable by
+            // Codex — so moving the axis could only put a title over the row
+            // that disagreed with what `enter` runs.
+            KeyCode::Left | KeyCode::Right if !matches!(candidate, Candidate::Resume { .. }) => {
+                agent = next_agent(agent);
+            }
             KeyCode::Up => candidate = previous_candidate(&staged, candidate),
             KeyCode::Down | KeyCode::Tab => candidate = next_candidate(&staged, candidate),
             KeyCode::Backspace => {
@@ -1159,7 +1217,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::launch::{CreationKind, Mode, Route};
+    use crate::launch::{CreationKind, Isolation, Mode, Route};
     use crate::model::{classify, Checks, PrLink, PrStatus, Review, TicketType};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -2448,6 +2506,165 @@ mod tests {
             launch::eliding_ctx(launch.agent_argv().last().unwrap()),
             "/wf-auto 1 6 ctx: …"
         );
+    }
+
+    /// The launchable app, plus a conversation left on `number` by a previous
+    /// launch in the wayfinder checkout.
+    fn app_resuming(number: u64, agent: Agent) -> App {
+        launchable_app().with_sessions(vec![Session::new(
+            PROJECT.to_string(),
+            number,
+            agent,
+            std::path::PathBuf::from("/data/proj/wayfinder"),
+            Isolation::Host,
+        )])
+    }
+
+    #[test]
+    fn a_ticket_you_were_working_stages_with_the_way_back_under_the_cursor() {
+        // The point of the whole feature, read off one keystroke: come back to
+        // a ticket you had an agent on and the picker opens *on* the resume
+        // row, so `enter enter` rejoins instead of starting a second session
+        // beside the first.
+        let mut app = app_resuming(6, Agent::Claude);
+        go_to(&mut app, "#6");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        match &app.overlay {
+            Overlay::PickLaunch {
+                staged, candidate, ..
+            } => {
+                assert_eq!(staged.key(), "#6");
+                assert_eq!(
+                    *candidate,
+                    Candidate::Resume {
+                        agent: Agent::Claude
+                    }
+                );
+            }
+            other => panic!("expected the launch picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_ticket_with_no_session_of_its_own_stages_exactly_as_it_always_did() {
+        // The record is per node, so the neighbour of a resumable ticket is
+        // not resumable — the row would otherwise rejoin the wrong work, which
+        // is the one mistake this feature could make that costs real time.
+        let mut app = app_resuming(9, Agent::Claude);
+        go_to(&mut app, "#6");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        match &app.overlay {
+            Overlay::PickLaunch { candidate, .. } => assert_eq!(
+                *candidate,
+                Candidate::Launch {
+                    mode: Mode::Interactive,
+                    route: Route::Wayfinder,
+                }
+            ),
+            other => panic!("expected the launch picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resuming_execs_into_the_tree_the_conversation_is_in_without_asking() {
+        // Two enters and nothing else. The dotfiles repo has two registered
+        // checkouts, so a *fresh* launch of one of its tickets would stop to
+        // ask which tree; a resume never does, because the conversation exists
+        // in exactly one of them and the record says which.
+        let mut app = launchable_app().with_sessions(vec![Session::new(
+            "blooop/dotfiles".to_string(),
+            103,
+            Agent::Claude,
+            std::path::PathBuf::from("/data/k2/dotfiles"),
+            Isolation::Host,
+        )]);
+        app.enter("blooop/dotfiles");
+        go_to(&mut app, "#103");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(launch.cwd(), std::path::Path::new("/data/k2/dotfiles"));
+        assert!(
+            launch.agent_argv().contains(&"--continue".to_string()),
+            "the exec must be the agent's own way back: {:?}",
+            launch.agent_argv()
+        );
+        assert!(
+            launch.describe().starts_with("resume dotfiles#103"),
+            "the notice says it is going back, not starting: {}",
+            launch.describe()
+        );
+    }
+
+    #[test]
+    fn the_agent_keys_are_dead_on_the_resume_row_because_the_record_decides() {
+        // A Claude conversation cannot be rejoined by Codex. The picker's
+        // horizontal axis is a real choice on every other row, so on this one
+        // it has to visibly do nothing rather than change a title over a row
+        // that will run the other CLI regardless.
+        let mut app = app_resuming(6, Agent::Claude);
+        go_to(&mut app, "#6");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Right));
+        match &app.overlay {
+            Overlay::PickLaunch {
+                agent, candidate, ..
+            } => {
+                assert_eq!(*agent, Agent::Claude, "the arrow must not have moved it");
+                assert_eq!(candidate.agent(*agent), Agent::Claude);
+            }
+            other => panic!("expected the launch picker, got {other:?}"),
+        }
+        // And on any other row it is alive again, so nothing was disabled but
+        // the one row that cannot honour it.
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Right));
+        match &app.overlay {
+            Overlay::PickLaunch { agent, .. } => assert_eq!(*agent, Agent::Codex),
+            other => panic!("expected the launch picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_map_you_have_charted_before_can_be_rejoined_too() {
+        // The record is keyed by node, and a map is a node (#96) — charting
+        // sessions are exactly the long conversations worth coming back to.
+        let mut app = app_resuming(1, Agent::Codex);
+        go_to(&mut app, "map #1");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        match &app.overlay {
+            Overlay::PickLaunch { candidate, .. } => assert_eq!(
+                *candidate,
+                Candidate::Resume {
+                    agent: Agent::Codex
+                }
+            ),
+            other => panic!("expected the launch picker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_project_row_offers_no_resume_however_many_sessions_the_repo_has() {
+        // Creation names work that does not exist yet. The repo having live
+        // conversations on three tickets says nothing about a fourth that has
+        // not been filed.
+        let mut app = app_resuming(6, Agent::Claude);
+        go_to(&mut app, &format!("project {PROJECT}"));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        match &app.overlay {
+            Overlay::PickLaunch {
+                staged, candidate, ..
+            } => {
+                assert_eq!(*candidate, Candidate::Create(CreationKind::Task));
+                assert!(staged
+                    .candidates()
+                    .iter()
+                    .all(|c| !matches!(c, Candidate::Resume { .. })));
+            }
+            other => panic!("expected the launch picker, got {other:?}"),
+        }
     }
 
     #[test]
