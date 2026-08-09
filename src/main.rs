@@ -524,7 +524,7 @@ enum Ending {
     /// The user quit.
     Quit,
     /// A ticket was picked. `wf`'s last act is to become its agent.
-    Handover(Launch),
+    Handover(Box<Launch>),
 }
 
 /// The event loop. It starts with **no data at all** (#27): which repos even

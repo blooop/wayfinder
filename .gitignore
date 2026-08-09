@@ -7,3 +7,12 @@
 # build output. Only the worktree directory is ignored: `.claude/` also holds
 # settings and skills, which are worth committing.
 /.claude/worktrees/
+
+# The container-seam test's canary (#124). Its fixture title carries
+# `$(touch pwned)` so that a *broken* `shell_quote` is caught by the file
+# appearing rather than only by an argv mismatch — the substitution firing is
+# the whole evidence. The test now runs its shell in a scratch directory so the
+# canary lands there, but a mutation experiment run from an older tree (or from
+# a shell that inherits the crate root) still drops one here, and this file was
+# once committed to a public repo that way.
+/pwned

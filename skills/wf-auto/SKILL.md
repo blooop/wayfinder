@@ -65,6 +65,8 @@ Blocking is the tracker's native dependency edge, so the frontier renders in the
 
 **Not yet specified** is in-scope fog you can't yet phrase sharply; **Out of scope** is work past the destination. Ticket it when the question is already sharp, even if blocked and unactionable; leave it as fog when it isn't.
 
+A launch from `wf` reads `<sigil>wf-auto <map> [<ticket>] ctx: <json> [steer: <text>]`. The block is the snapshot `wf` already held — the map's title, and for a ticket its type, stage and linked PRs — so a run can open on the node it was handed without rediscovering it. It is an **accelerator, never a precondition**, it never survives into a subagent's own invocation unexamined, and every gate below is still checked from live tracker state. See **The launch context** in [GITHUB_TRACKER.md](../wf/GITHUB_TRACKER.md).
+
 Tracker mechanics — pinning the repo, creating and parenting issues, blocking edges, the frontier query, the local-markdown fallback — live in [GITHUB_TRACKER.md](../wf/GITHUB_TRACKER.md) in the sibling `wf` skill. Pin the repo from the working repo's own remote, pass it explicitly on every call, and push branches by name: a fork's map belongs to the fork, never its parent. State the repo and its visibility in your first line of output — an autonomous run on a public repo publishes the whole fog sketch, and the invocation is the only consent there is for that.
 
 ## A run is a manager

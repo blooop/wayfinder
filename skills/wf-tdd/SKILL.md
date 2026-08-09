@@ -15,7 +15,9 @@ Adapted from aihero.dev's `/tdd` + `/implement` (see `research/aihero-spine.md` 
 
 ## Invocation
 
-`wf-tdd <ticket>` — an issue number or URL. Resolve the repo explicitly from the working checkout's remote and pass `--repo` on every `gh` call.
+`wf-tdd <ticket> [ctx: <json>] [steer: <text>]` — an issue number or URL. Resolve the repo explicitly from the working checkout's remote and pass `--repo` on every `gh` call.
+
+A launch from `wf` adds a `ctx: <json>` block after the ticket number: the parent map, the ticket's type and stage, and its linked PRs, all already fetched — so the map lookup this stage opens with is a read you can skip. It is an **accelerator, never a precondition**; a hand-typed invocation carries none and discovers exactly as it always has, and the claim below is a live call either way. See **The launch context** in [GITHUB_TRACKER.md](../wf/GITHUB_TRACKER.md).
 
 ## The contract is the ticket
 

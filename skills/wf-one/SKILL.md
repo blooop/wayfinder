@@ -15,6 +15,8 @@ Two issues, not one: wf's cluster header is a map and headers are not cursor sto
 
 ## Set it up
 
+A `wf-one` launch is a **creation**: it names work that does not exist on the tracker yet, so its line is `<sigil>wf-one <task>` and never carries a `ctx: <json>` block. Nor may you synthesize one when handing the ticket to `wf-tdd` or `wf-review` below — the block is `wf`'s record of what it fetched, and a hand-written one would be a claim about tracker state nobody read. Those subagents discover from the ticket, exactly as a hand-typed invocation does. See **The launch context** in [GITHUB_TRACKER.md](../wf/GITHUB_TRACKER.md).
+
 Tracker mechanics — pinning the repo, creating and parenting issues, labels, claiming — are in [GITHUB_TRACKER.md](../wf/GITHUB_TRACKER.md) in the sibling `wf` skill. Pin the repo from the working repo's own remote and pass it explicitly on every `gh` call; push branches by name.
 
 1. **The map** (`wayfinder:map`), titled as the work. Body is short, because a one-ticket map has no route to index:

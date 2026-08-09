@@ -134,6 +134,7 @@ Claude and `$` for Codex):
 
 - `<sigil>wf <map> [<ticket>]` — everything below as written
 - `<sigil>wf <map> <ticket> steer: <steering>` — with a steering prompt
+- `<sigil>wf <map> [<ticket>] ctx: <json> [steer: <steering>]` — the same, with the snapshot `wf` already held: the map's title, and for a ticket its type, stage and linked PRs. An **accelerator, never a precondition** — orient from it, verify live before any write, and ignore it entirely if it is absent or disagrees with your arguments. See **The launch context** in [GITHUB_TRACKER.md](GITHUB_TRACKER.md).
 
 ### Chart the map
 

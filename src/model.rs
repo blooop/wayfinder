@@ -213,7 +213,11 @@ pub fn stage(prs: &[PrLink], status: &Status) -> Stage {
 /// ordinary value rather than a missing one. Every site that decides something
 /// from a type matches all six arms with no wildcard, which is what makes a
 /// new `wayfinder:*` type a compile error rather than a silent misreading.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized as its own snake-case name in the launch context (#124), so a
+/// launched agent is told how to open without re-reading the issue's labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TicketType {
     /// `wayfinder:build` — the one execution type (#61): a ticket that is a
     /// build contract, worked by `/tdd` and `/review` across its stages rather
@@ -313,7 +317,12 @@ impl TicketType {
 /// (closing keywords and manual links, mentions excluded; the #49 resolution),
 /// shown as a `⇄` badge on the ticket's row. Evidence of progress, never a row
 /// of its own (#47).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialized straight into the launch context a picked ticket hands its agent
+/// (#124) — which PR to diff is `wf-review`'s whole rediscovery cost — rather
+/// than copied into a wire type beside this one, so there is nothing here for a
+/// second declaration to drift from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrLink {
     /// Full slug of the repo the PR lives in. Links are cross-repo capable,
     /// so this may differ from the ticket's repo — the badge says so when it
@@ -334,7 +343,8 @@ impl PrLink {
 /// boundary, so "draft" is a state of its own rather than a flag to remember
 /// to check. Only an open, ready PR carries the live signals: checks and
 /// review are questions about something still in flight.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PrStatus {
     Draft,
     Open { checks: Checks, review: Review },
@@ -345,7 +355,8 @@ pub enum PrStatus {
 /// The check rollup on an open PR. `Absent` is its own meaning — no checks
 /// configured — parsed from the *nullable* `statusCheckRollup` (#49), not a
 /// stand-in for "unknown".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Checks {
     Absent,
     Pending,
@@ -356,7 +367,8 @@ pub enum Checks {
 /// The review decision on an open PR. A null `reviewDecision` means no review
 /// is required (#49) — `NotRequired`, a settled state — where `Required` is a
 /// review asked for and not yet given.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Review {
     NotRequired,
     Required,

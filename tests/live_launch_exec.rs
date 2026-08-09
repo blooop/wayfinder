@@ -397,7 +397,28 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     // line was empty). `/wf-auto` cannot appear — that needs the word
     // `auto` typed — and neither can a bare map launch, since the default
     // cursor skips cluster headers (#96).
-    let (skill, numbers) = prompt.split_once(' ').expect("a skill and arguments");
+    // A launched skill is handed the context `wf` already had (#124), as a
+    // one-line JSON block after the skill's own arguments. Split it off before
+    // the numeric checks below: it is the rest of the prompt, and the steering
+    // line was empty, so nothing follows it.
+    let (invocation, ctx) = prompt
+        .split_once(" ctx: ")
+        .unwrap_or_else(|| panic!("a launched skill carries its context: {prompt:?}"));
+    let ctx: serde_json::Value = serde_json::from_str(ctx)
+        .unwrap_or_else(|e| panic!("the context block is JSON: {e} in {prompt:?}"));
+    assert_eq!(ctx["v"], 1, "the schema this binary writes");
+    assert_eq!(
+        ctx["repo"], "blooop/wayfinder",
+        "the context is anchored to the repo the launch was picked in"
+    );
+    // The claim is unrepresentable in the schema, which is what makes the
+    // block safe to orient from: whatever the live tracker said about this
+    // node, no assignee can have reached the agent.
+    let flat = ctx.to_string();
+    for forbidden in ["assignee", "claim"] {
+        assert!(!flat.contains(forbidden), "{forbidden:?} in {flat}");
+    }
+    let (skill, numbers) = invocation.split_once(' ').expect("a skill and arguments");
     let halves: Vec<&str> = match skill {
         "/wf" => numbers.splitn(2, ' ').collect(),
         "/wf-tdd" | "/wf-review" => vec![numbers],

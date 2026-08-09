@@ -36,7 +36,9 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::model::{MapId, Stage, Ticket, TicketType};
+use serde::Serialize;
+
+use crate::model::{MapId, PrLink, Stage, Ticket, TicketType};
 use crate::projects::Checkout;
 
 /// Which interactive coding agent `wf` becomes after a launch.
@@ -520,7 +522,12 @@ impl LaunchMode {
 /// no `Option` for the three later steps to carry, wonder about and re-refuse.
 /// Blocked never reaches here at all: blocked is [`crate::model::Status`], not
 /// a stage, and the picker refuses it before anything is staged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// This is also the stage the launch *hands the agent* in its context block,
+/// and deliberately the same type rather than a copy of it: a handed context
+/// claiming a done node is a compile error rather than a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Launchable {
     Ready,
     Building,
@@ -550,17 +557,91 @@ impl Launchable {
 /// from a node's PRs and a map has none. So the two are arms of one sum rather
 /// than a ticket struct with optional fields, and every consumer that needs a
 /// ticket number has to say which case it is answering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// It is also what a launch hands its agent as the `aim` of the context block
+/// (#124), serialized **directly**. A parallel `CtxAim` mirroring these arms
+/// would be the same sum written twice and free to drift; one type serialized
+/// once cannot disagree with itself, and the wire spelling is pinned by the
+/// golden literals in this module's tests rather than by a second declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Aim {
     /// The cluster header: the map itself, charted or driven as a whole.
     Map,
-    /// One ticket in the map, carrying the pair its route turns on.
+    /// One ticket in the map, carrying the pair its route turns on — and the
+    /// facts an agent would otherwise rediscover from the tracker before it
+    /// could start: what the ticket is called, and which PRs are linked to it.
+    ///
+    /// What is *not* here is the claim. There is no assignee and no ticket
+    /// status, so the one fact whose staleness is dangerous — is this still
+    /// mine to take — cannot be read out of a handed context at all, and
+    /// "orient from it, verify live" is a shape rather than a rule to
+    /// remember. Blockers are absent for a different reason: the picker
+    /// refuses a blocked node before anything is staged, so a launched ticket
+    /// never has open ones.
     Ticket {
         number: u64,
+        title: String,
         ticket_type: TicketType,
         stage: Launchable,
+        prs: Vec<PrLink>,
     },
 }
+
+/// The map a launch was picked in: its identity *and* its title (#124).
+///
+/// Carries the whole [`MapId`] rather than a bare issue number because a
+/// ticket can sit on a map in another repo — the tracker models it and the
+/// fetch parses it — so a number alone would point a cross-repo launch at
+/// whatever issue happens to hold that number in the ticket's own repo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MapRef {
+    /// Flattened, so the map reads as one object (`repo`, `number`, `title`)
+    /// rather than an identity nested inside a wrapper.
+    #[serde(flatten)]
+    pub id: MapId,
+    /// The map issue's title as the picker showed it.
+    pub title: String,
+}
+
+impl MapRef {
+    /// The map under `id`, titled as the cluster header reads.
+    pub fn new(id: &MapId, title: &str) -> MapRef {
+        MapRef {
+            id: id.clone(),
+            title: title.to_string(),
+        }
+    }
+}
+
+/// What a launch hands its agent in the prompt's `ctx:` block (#124): a
+/// snapshot of what `wf` already knew at exec time, so the session's first
+/// tracker call can be the **claim** rather than a rediscovery of the map, the
+/// ticket and its PRs.
+///
+/// A borrowed, serialize-only view over the launch's own facts — never a
+/// parallel copy of them. Nothing here is a new fact: `wf` fetched every field
+/// to draw the row the human picked.
+///
+/// Deliberately **not** carrying a snapshot instant. No consumer in the
+/// contract reads one — the staleness guard is the mandatory live claim, not a
+/// timestamp comparison — and reading a wall clock would make prompt building
+/// non-deterministic for no gain.
+#[derive(Debug, Serialize)]
+struct LaunchContext<'a> {
+    /// Schema version, and the reading agent's first gate: a `v` it does not
+    /// recognise means discard the block whole and discover as it always did.
+    v: u32,
+    /// The ticket's own repo, full slug — the anchor a reader compares
+    /// against its pinned `$REPO` before trusting anything else here.
+    repo: &'a str,
+    map: &'a MapRef,
+    aim: &'a Aim,
+}
+
+/// The schema this binary writes. Bumped only when a reader that understands
+/// the old shape would misread the new one.
+const CONTEXT_VERSION: u32 = 1;
 
 /// Resolve which skill a launch runs, from what it is aimed at and who is
 /// deciding. Total on every axis (#96): adding a stage, a type or a mode
@@ -633,9 +714,6 @@ pub struct Staged {
     /// What was stood on: a node fetched from the tracker, or a registered
     /// repo with no map at all.
     pub at: StagedAt,
-    /// Its title as it read when the picker opened — the picker is showing the
-    /// human what they picked, not re-reporting a row that may have moved.
-    pub title: String,
 }
 
 /// What the picker was opened on (#114). A map-less repo is not a node with a
@@ -644,16 +722,16 @@ pub struct Staged {
 /// than a node struct with optional fields. Which rows the picker offers falls
 /// out of this: a node launches (and a map also creates), a bare repo only
 /// creates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StagedAt {
     /// A node the tracker knows about.
     Node {
         /// What the launch picker names: the map, or one ticket in it.
         aim: Aim,
-        /// The map issue of the cluster the row was picked in (#50) — which
-        /// map a ticket listed twice was launched from, and the launch target
-        /// itself when the cursor was on the cluster header.
-        map_issue: u64,
+        /// The map of the cluster the row was picked in (#50) — which map a
+        /// ticket listed twice was launched from, and the launch target itself
+        /// when the cursor was on the cluster header.
+        map: MapRef,
     },
     /// A registered checkout whose repo has no open map: the empty-state door
     /// this repo's *first* map is charted from.
@@ -661,35 +739,35 @@ pub enum StagedAt {
 }
 
 impl Staged {
-    /// Stage a launch of `ticket`, picked in the cluster of `map_issue`.
-    /// `None` for a finished ticket, which has no launchable stage — the one
-    /// refusal, made here so that everything downstream is total.
-    pub fn ticket(ticket: &Ticket, map_issue: u64, stage: Stage) -> Option<Staged> {
+    /// Stage a launch of `ticket`, picked in the cluster of `map`. `None` for a
+    /// finished ticket, which has no launchable stage — the one refusal, made
+    /// here so that everything downstream is total.
+    pub fn ticket(ticket: &Ticket, map: &MapRef, stage: Stage) -> Option<Staged> {
         Some(Staged {
             repo: ticket.repo.clone(),
             at: StagedAt::Node {
                 aim: Aim::Ticket {
                     number: ticket.number,
+                    title: ticket.title.clone(),
                     ticket_type: ticket.ticket_type,
                     stage: Launchable::parse(stage)?,
+                    prs: ticket.prs.clone(),
                 },
-                map_issue,
+                map: map.clone(),
             },
-            title: ticket.title.clone(),
         })
     }
 
     /// Stage a launch of a whole map — the cursor was on its cluster header.
     /// Total, unlike the ticket case: a map has no stage to be finished at,
     /// and a finished map is not on screen to put the cursor on.
-    pub fn map(id: &MapId, title: &str) -> Staged {
+    pub fn map(map: &MapRef) -> Staged {
         Staged {
-            repo: id.repo.clone(),
+            repo: map.id.repo.clone(),
             at: StagedAt::Node {
                 aim: Aim::Map,
-                map_issue: id.number,
+                map: map.clone(),
             },
-            title: title.to_string(),
         }
     }
 
@@ -699,7 +777,25 @@ impl Staged {
         Staged {
             repo: repo.to_string(),
             at: StagedAt::Project,
-            title: "no map".to_string(),
+        }
+    }
+
+    /// How the staged stop reads to the human: the ticket's title, the map's,
+    /// or the map-less door's own words.
+    ///
+    /// Derived rather than stored (#124). The title the picker draws and the
+    /// title the launch hands the agent are one fact, and a second copy beside
+    /// the aim would be a field free to disagree with it.
+    pub fn title(&self) -> &str {
+        match &self.at {
+            StagedAt::Node {
+                aim: Aim::Ticket { title, .. },
+                ..
+            } => title,
+            StagedAt::Node {
+                aim: Aim::Map, map, ..
+            } => &map.title,
+            StagedAt::Project => "no map",
         }
     }
 
@@ -734,17 +830,17 @@ impl Staged {
     /// merge concerns the stop grammar keeps apart. The map-less door has no
     /// node, so it offers the creation rows alone.
     pub fn candidates(&self) -> Vec<Candidate> {
-        let launches = |aim: Aim| {
+        let launches = |aim: &Aim| {
             Mode::all()
                 .into_iter()
-                .map(move |mode| Candidate::Launch {
+                .map(|mode| Candidate::Launch {
                     mode,
-                    route: route(&aim, mode),
+                    route: route(aim, mode),
                 })
                 .collect::<Vec<_>>()
         };
         let creations = || CreationKind::all().into_iter().map(Candidate::Create);
-        match self.at {
+        match &self.at {
             StagedAt::Node {
                 aim: aim @ Aim::Ticket { .. },
                 ..
@@ -764,10 +860,7 @@ impl Staged {
     /// name until a skill files one.
     pub fn key(&self) -> String {
         match &self.at {
-            StagedAt::Node {
-                aim: Aim::Map,
-                map_issue,
-            } => format!("#{map_issue}"),
+            StagedAt::Node { aim: Aim::Map, map } => format!("#{}", map.id.number),
             StagedAt::Node {
                 aim: Aim::Ticket { number, .. },
                 ..
@@ -798,10 +891,10 @@ impl Staged {
     ///   as backing out.
     pub fn node_workspace(&self) -> Option<String> {
         match &self.at {
-            StagedAt::Node { aim, map_issue } => Some(node_workspace_name(
+            StagedAt::Node { aim, map } => Some(node_workspace_name(
                 &self.repo,
                 match aim {
-                    Aim::Map => *map_issue,
+                    Aim::Map => map.id.number,
                     Aim::Ticket { number, .. } => *number,
                 },
             )),
@@ -944,9 +1037,10 @@ enum Job {
     Node {
         /// The map, or one ticket in it.
         aim: Aim,
-        /// The map issue — `/wf`'s first argument, and its only one when the
-        /// aim is the map itself.
-        map_issue: u64,
+        /// The map the node was picked in — `/wf`'s first argument, its only
+        /// one when the aim is the map itself, and half of what the launch
+        /// hands the agent (#124).
+        map: MapRef,
         /// The skill this launch execs, resolved from (type, stage).
         route: Route,
         /// What the launch picker settled on. The mode half already picked
@@ -967,8 +1061,8 @@ impl Job {
     /// — they are two renderings of the same fact.
     fn number(&self) -> Option<u64> {
         match self {
-            Job::Node { aim, map_issue, .. } => Some(match aim {
-                Aim::Map => *map_issue,
+            Job::Node { aim, map, .. } => Some(match aim {
+                Aim::Map => map.id.number,
                 Aim::Ticket { number, .. } => *number,
             }),
             Job::Create { .. } => None,
@@ -1066,31 +1160,54 @@ impl Launch {
         argv
     }
 
-    /// The selected agent's skill invocation and arguments for a node. Plain
-    /// mode has no skill, while creation prompts are built by [`Creation`].
+    /// The selected agent's skill invocation, its arguments, and the context
+    /// block that follows them (#124). Plain mode has no skill, while creation
+    /// prompts are built by [`Creation`].
+    ///
+    /// The block goes **after** the skill's own arguments and before any
+    /// ` steer: …` suffix [`LaunchMode::opening_prompt`] adds, which is the
+    /// whole grammar: `steer:`'s existing "everything after this is the
+    /// human's text" rule is undisturbed, and a steer containing the letters
+    /// `ctx:` cannot be mistaken for a block.
+    ///
+    /// A creation is handed none because it names nothing that exists yet, and
+    /// a plain session because there is no skill for it to be addressed to.
+    ///
+    /// The `expect` on the serializer is unreachable: [`LaunchContext`] is a
+    /// fixed set of strings, integers and unit enums, so every failure
+    /// `serde_json` defines for a serializer — a non-string map key, a
+    /// non-finite float, a `Serialize` impl that errors — is impossible here.
     fn skill_invocation(&self) -> Option<String> {
         let Job::Node {
-            aim,
-            map_issue,
-            route,
-            ..
+            aim, map, route, ..
         } = &self.job
         else {
             return None;
         };
         route.bundled_skill()?;
         let skill = route.invocation(self.agent());
-        match (route, aim) {
-            (Route::One, _) => Some(skill),
-            (_, Aim::Map) => Some(format!("{skill} {map_issue}")),
-            (Route::Tdd | Route::Review, Aim::Ticket { number, .. }) => {
-                Some(format!("{skill} {number}"))
-            }
+        let invocation = match (route, aim) {
+            // `/wf-one` is a creation's route, and its own doc says a `wf-one`
+            // line never carries a block — it names work that does not exist
+            // on the tracker yet. A node routed here is unreachable from the
+            // picker but representable ([`plan`] takes any [`Route`]), so the
+            // answer is given here rather than left to depend on that.
+            (Route::One, _) => return Some(skill),
+            (_, Aim::Map) => format!("{skill} {}", map.id.number),
+            (Route::Tdd | Route::Review, Aim::Ticket { number, .. }) => format!("{skill} {number}"),
             (Route::Wayfinder | Route::WayfinderAuto, Aim::Ticket { number, .. }) => {
-                Some(format!("{skill} {map_issue} {number}"))
+                format!("{skill} {} {number}", map.id.number)
             }
-            (Route::Plain, _) => None,
-        }
+            (Route::Plain, _) => return None,
+        };
+        let ctx = serde_json::to_string(&LaunchContext {
+            v: CONTEXT_VERSION,
+            repo: &self.repo,
+            map,
+            aim,
+        })
+        .expect("the launch context is plain data and always serializes");
+        Some(format!("{invocation} ctx: {ctx}"))
     }
 
     /// What `wf` becomes: the agent, or `dl` carrying the agent into the
@@ -1210,6 +1327,40 @@ fn resolve_on_path(program: &str) -> Result<PathBuf, anyhow::Error> {
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
         .ok_or_else(|| anyhow::anyhow!("`{program}` is not on PATH — is it installed?"))
+}
+
+/// A launch prompt with the JSON of every `ctx:` block replaced by `…` (#124).
+///
+/// Test-only, and a reading aid rather than a parser: the block's own bytes
+/// are pinned byte-for-byte by the golden literals in this module's tests, so
+/// every *other* test — the ones about which skill a node routes to, where the
+/// steering suffix lands, and that the prompt is one argv entry — stays about
+/// what it is about instead of restating a snapshot. Brace counting is enough
+/// because the block is `serde_json`'s own output and no fixture title carries
+/// a brace.
+#[cfg(test)]
+pub(crate) fn eliding_ctx(prompt: &str) -> String {
+    let mut out = String::new();
+    let mut rest = prompt;
+    while let Some((head, json)) = rest.split_once(" ctx: {") {
+        out.push_str(head);
+        out.push_str(" ctx: …");
+        let mut depth = 1usize;
+        rest = "";
+        for (i, c) in json.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                rest = &json[i + 1..];
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The name half of a repo slug (`blooop/wayfinder` → `wayfinder`). Display
@@ -1387,7 +1538,7 @@ pub enum Targets {
 /// second derivation here, so what execs is what the row named (#114). This
 /// function answers only *where* the agent can run.
 pub fn plan(checkouts: &[Checkout], staged: &Staged, route: Route, mode: &LaunchMode) -> Targets {
-    let StagedAt::Node { aim, map_issue } = staged.at else {
+    let StagedAt::Node { aim, map } = &staged.at else {
         // Unreachable from the picker: [`Staged::candidates`] offers no launch
         // row on the map-less door, so nothing there can ask for a node
         // launch. Refusing rather than inventing a node — there is no aim and
@@ -1398,8 +1549,8 @@ pub fn plan(checkouts: &[Checkout], staged: &Staged, route: Route, mode: &Launch
         checkouts,
         &staged.repo,
         &Job::Node {
-            aim,
-            map_issue,
+            aim: aim.clone(),
+            map: map.clone(),
             route,
             mode: mode.clone(),
         },
@@ -1461,8 +1612,11 @@ fn resolve(checkouts: &[Checkout], repo: &str, job: &Job) -> Targets {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
-    use crate::model::{classify, Status, TicketType};
+    use crate::model::{classify, Checks, PrLink, PrStatus, Review, Status, TicketType};
 
     fn ticket(repo: &str, number: u64) -> Ticket {
         Ticket {
@@ -1474,6 +1628,15 @@ mod tests {
             blocked_by: vec![],
             prs: vec![],
         }
+    }
+
+    /// The map every ticket fixture is picked in — its own repo, number and
+    /// title, all three of which the launch hands the agent.
+    fn map_ref(number: u64) -> MapRef {
+        MapRef::new(
+            &MapId::new("blooop/wayfinder", number),
+            "the dev-process tree",
+        )
     }
 
     fn checkout(path: &str, repo: &str) -> Checkout {
@@ -1504,7 +1667,8 @@ mod tests {
     /// every checkout-resolution test wants (route and mode are orthogonal to
     /// which trees are candidates).
     fn plan_wf(checkouts: &[Checkout], ticket: &Ticket, map_issue: u64) -> Targets {
-        let staged = Staged::ticket(ticket, map_issue, Stage::Ready).expect("ready is launchable");
+        let staged =
+            Staged::ticket(ticket, &map_ref(map_issue), Stage::Ready).expect("ready is launchable");
         plan_picked(
             checkouts,
             &staged,
@@ -1556,10 +1720,9 @@ mod tests {
                 assert!(matches!(
                     &launch.job,
                     Job::Node {
-                        map_issue: 1,
                         aim: Aim::Ticket { number: 16, .. },
                         ..
-                    }
+                    } if launch.job.number() == Some(16)
                 ));
             }
             other => panic!("expected One, got {other:?}"),
@@ -1599,18 +1762,18 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(
-            launch.agent_argv(),
+            elided_argv(&launch),
             vec![
                 "claude".to_string(),
                 Agent::Claude.skip_permissions().to_string(),
-                "/wf 1 16".to_string()
+                "/wf 1 16 ctx: …".to_string()
             ]
         );
     }
 
     #[test]
     fn the_agent_runs_codex_with_a_skill_mention_and_one_prompt_argument() {
-        let staged = Staged::ticket(&ticket("blooop/wayfinder", 16), 1, Stage::Ready)
+        let staged = Staged::ticket(&ticket("blooop/wayfinder", 16), &map_ref(1), Stage::Ready)
             .expect("ready is launchable");
         let launch = match plan(
             &cache(),
@@ -1622,11 +1785,11 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(
-            launch.agent_argv(),
+            elided_argv(&launch),
             vec![
                 "codex".to_string(),
                 Agent::Codex.skip_permissions().to_string(),
-                "$wf 1 16 steer: try it".to_string(),
+                "$wf 1 16 ctx: … steer: try it".to_string(),
             ]
         );
     }
@@ -1681,8 +1844,8 @@ mod tests {
     fn a_ticket_picker_lists_exactly_the_three_launch_modes() {
         // #114: creation is a repo-level act, and a ticket is not a repo-level
         // stop — its picker stays the pure mode list, concerns unmerged.
-        let staged =
-            Staged::ticket(&ticket("blooop/wayfinder", 16), 1, Stage::Ready).expect("launchable");
+        let staged = Staged::ticket(&ticket("blooop/wayfinder", 16), &map_ref(1), Stage::Ready)
+            .expect("launchable");
         assert_eq!(
             staged.candidates(),
             vec![
@@ -1707,7 +1870,7 @@ mod tests {
         // rows, then the three ways to start something new in this repo. Each
         // candidate is complete — it carries its own resolved route, the
         // `Targets::Many` move — so a row and its launch cannot disagree.
-        let staged = Staged::map(&MapId::new("blooop/wayfinder", 59), "the dev-process tree");
+        let staged = Staged::map(&map_ref(59));
         let candidates = staged.candidates();
         assert_eq!(
             candidates,
@@ -1745,7 +1908,7 @@ mod tests {
         // a generic default.
         let mut node = ticket("blooop/wayfinder", 16);
         node.ticket_type = TicketType::Build;
-        let staged = Staged::ticket(&node, 1, Stage::Ready).expect("launchable");
+        let staged = Staged::ticket(&node, &map_ref(1), Stage::Ready).expect("launchable");
         assert_eq!(
             staged.candidates()[0],
             Candidate::Launch {
@@ -1955,7 +2118,7 @@ mod tests {
     fn ticket_argv(ticket_type: TicketType, stage: Stage, mode: &LaunchMode) -> Vec<String> {
         let mut node = ticket("blooop/wayfinder", 16);
         node.ticket_type = ticket_type;
-        let staged = Staged::ticket(&node, 1, stage).expect("a launchable stage");
+        let staged = Staged::ticket(&node, &map_ref(1), stage).expect("a launchable stage");
         match plan_picked(&cache(), &staged, mode) {
             Targets::One(l) => l.agent_argv(),
             other => panic!("{other:?}"),
@@ -1971,9 +2134,19 @@ mod tests {
             .clone()
     }
 
+    /// A prompt with its context block elided — see [`eliding_ctx`].
+    fn elided(prompt: &str) -> String {
+        eliding_ctx(prompt)
+    }
+
+    /// The whole argv of a launch, each entry read the same way.
+    fn elided_argv(launch: &Launch) -> Vec<String> {
+        launch.agent_argv().iter().map(|a| elided(a)).collect()
+    }
+
     /// The whole argv of a launch aimed at the whole map.
     fn map_argv(mode: &LaunchMode) -> Vec<String> {
-        let staged = Staged::map(&MapId::new("blooop/wayfinder", 59), "the dev-process tree");
+        let staged = Staged::map(&map_ref(59));
         match plan_picked(&cache(), &staged, mode) {
             Targets::One(l) => l.agent_argv(),
             other => panic!("{other:?}"),
@@ -1990,52 +2163,467 @@ mod tests {
         // The route picks the skill; only the wayfinder skills take the map
         // argument. The mode is *not* in the suffix — it chose the skill.
         assert_eq!(
-            ticket_prompt(TicketType::Build, Stage::Ready, &interactive("")),
-            "/wf-tdd 16"
+            elided(&ticket_prompt(
+                TicketType::Build,
+                Stage::Ready,
+                &interactive("")
+            )),
+            "/wf-tdd 16 ctx: …"
         );
         assert_eq!(
-            ticket_prompt(TicketType::Build, Stage::InReview, &interactive("")),
-            "/wf-review 16"
+            elided(&ticket_prompt(
+                TicketType::Build,
+                Stage::InReview,
+                &interactive("")
+            )),
+            "/wf-review 16 ctx: …"
         );
         assert_eq!(
-            ticket_prompt(TicketType::Grilling, Stage::Ready, &interactive("")),
-            "/wf 1 16"
+            elided(&ticket_prompt(
+                TicketType::Grilling,
+                Stage::Ready,
+                &interactive("")
+            )),
+            "/wf 1 16 ctx: …"
         );
         assert_eq!(
-            ticket_prompt(TicketType::Grilling, Stage::Ready, &auto("")),
-            "/wf-auto 1 16"
+            elided(&ticket_prompt(
+                TicketType::Grilling,
+                Stage::Ready,
+                &auto("")
+            )),
+            "/wf-auto 1 16 ctx: …"
         );
         // Steering rides as a suffix, whatever the route.
         assert_eq!(
-            ticket_prompt(
+            elided(&ticket_prompt(
                 TicketType::Grilling,
                 Stage::Ready,
                 &auto("skip the flaky suite")
-            ),
-            "/wf-auto 1 16 steer: skip the flaky suite"
+            )),
+            "/wf-auto 1 16 ctx: … steer: skip the flaky suite"
         );
+        assert_eq!(
+            elided(&ticket_prompt(
+                TicketType::Build,
+                Stage::Ready,
+                &interactive("try the other approach")
+            )),
+            "/wf-tdd 16 ctx: … steer: try the other approach"
+        );
+    }
+
+    /// The context block a build launch of the fixture node hands its agent —
+    /// the whole `ctx:` argument, spelt out rather than rebuilt from the
+    /// serializer, so a renamed field or a re-spelt variant fails here (#124).
+    const BUILD_CTX: &str = concat!(
+        r#"{"v":1,"repo":"blooop/wayfinder","#,
+        r#""map":{"repo":"blooop/wayfinder","number":1,"title":"the dev-process tree"},"#,
+        r#""aim":{"ticket":{"number":16,"title":"the ticket","#,
+        r#""ticket_type":"build","stage":"ready","prs":[]}}}"#
+    );
+
+    /// The `ctx:` block of a prompt, or `None` when it carries none.
+    fn ctx_of(prompt: &str) -> Option<&str> {
+        let block = prompt.split_once(" ctx: ")?.1;
+        Some(match block.split_once(" steer: ") {
+            Some((ctx, _)) => ctx,
+            None => block,
+        })
+    }
+
+    #[test]
+    fn a_ticket_launch_hands_the_agent_what_wf_already_knows() {
+        // #124: the discovery prelude every ticket launch runs today — which
+        // map, which PR, what type and stage — is answered in the prompt
+        // itself, so the agent's first tracker call can be the claim. Asserted
+        // as the whole literal argument, because *where* the block sits is the
+        // grammar: after the skill's own arguments, before any steering text.
+        assert_eq!(
+            ticket_prompt(TicketType::Build, Stage::Ready, &interactive("")),
+            format!("/wf-tdd 16 ctx: {BUILD_CTX}")
+        );
+        // A decision route keeps its map argument, and the block follows it.
+        assert_eq!(
+            ticket_prompt(TicketType::Grilling, Stage::Ready, &interactive("")),
+            format!(
+                "/wf 1 16 ctx: {}",
+                BUILD_CTX.replace(r#""ticket_type":"build""#, r#""ticket_type":"grilling""#)
+            )
+        );
+    }
+
+    #[test]
+    fn the_context_sits_between_the_skill_arguments_and_the_steering_text() {
+        // The `steer:` rule is untouched (#122): everything after it is the
+        // human's text, so the block goes in front of it and a steer that
+        // itself contains "ctx:" cannot be mistaken for one.
         assert_eq!(
             ticket_prompt(
                 TicketType::Build,
                 Stage::Ready,
                 &interactive("try the other approach")
             ),
-            "/wf-tdd 16 steer: try the other approach"
+            format!("/wf-tdd 16 ctx: {BUILD_CTX} steer: try the other approach")
         );
+    }
+
+    #[test]
+    fn a_map_launch_is_handed_the_map_and_names_no_ticket() {
+        // A map is not a ticket with missing fields: the aim serializes as the
+        // bare word, and the map's own identity is carried once, in `map`.
+        assert_eq!(
+            map_prompt(&interactive("")),
+            concat!(
+                r#"/wf 59 ctx: {"v":1,"repo":"blooop/wayfinder","#,
+                r#""map":{"repo":"blooop/wayfinder","number":59,"title":"the dev-process tree"},"#,
+                r#""aim":"map"}"#
+            )
+        );
+    }
+
+    #[test]
+    fn the_handed_context_carries_the_prs_a_reviewer_would_otherwise_hunt_for() {
+        // The rediscovery this exists to kill: a review launch's argv is a
+        // bare ticket number, so finding the PR to diff is a tracker round
+        // trip of its own. The link arrives with the launch instead —
+        // cross-repo capable, because the tracker's links are.
+        let mut node = ticket("blooop/wayfinder", 16);
+        node.ticket_type = TicketType::Build;
+        node.prs = vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 90,
+            status: PrStatus::Open {
+                checks: Checks::Passing,
+                review: Review::Approved,
+            },
+        }];
+        let staged =
+            Staged::ticket(&node, &map_ref(1), Stage::InReview).expect("in review launches");
+        let prompt = match plan_picked(&cache(), &staged, &interactive("")) {
+            Targets::One(l) => l.agent_argv().last().expect("a prompt").clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            prompt,
+            concat!(
+                r#"/wf-review 16 ctx: {"v":1,"repo":"blooop/wayfinder","#,
+                r#""map":{"repo":"blooop/wayfinder","number":1,"title":"the dev-process tree"},"#,
+                r#""aim":{"ticket":{"number":16,"title":"the ticket","ticket_type":"build","#,
+                r#""stage":"in_review","prs":[{"repo":"blooop/wayfinder","number":90,"#,
+                r#""status":{"open":{"checks":"passing","review":"approved"}}}]}}}"#
+            )
+        );
+    }
+
+    /// Every field name a serialized block contains, at any depth — including
+    /// the tag keys the enums write (`ticket`, `open`).
+    fn keys_of(value: &serde_json::Value) -> BTreeSet<String> {
+        let mut keys = BTreeSet::new();
+        let mut stack = vec![value];
+        while let Some(node) = stack.pop() {
+            match node {
+                serde_json::Value::Object(fields) => {
+                    for (key, child) in fields {
+                        keys.insert(key.clone());
+                        stack.push(child);
+                    }
+                }
+                serde_json::Value::Array(items) => stack.extend(items),
+                _ => {}
+            }
+        }
+        keys
+    }
+
+    #[test]
+    fn the_handed_context_cannot_speak_about_the_claim() {
+        // The one fact whose staleness is dangerous — is this ticket still
+        // mine to take — is absent from the *type*, not merely from this
+        // fixture, so "trust it for orientation, re-read before mutating" is a
+        // shape rather than a rule to remember.
+        //
+        // Asserted over the block's *field names*, and as the whole set rather
+        // than a list of forbidden words. Both halves matter. A substring scan
+        // of the block's text cannot tell a key from a value, so it read
+        // `"stage":"needs_attention"` — a legal, spec-mandated value — as the
+        // word "needs" and would have failed on a node that is simply awaiting
+        // attention. And a blacklist only catches the names someone thought of:
+        // an exact key set fails on *any* new field, which is the only way this
+        // stays true as the schema grows.
+        let with_pr = |stage| {
+            let mut node = ticket("blooop/wayfinder", 16);
+            node.ticket_type = TicketType::Build;
+            node.prs = vec![PrLink {
+                repo: "blooop/wayfinder".to_string(),
+                number: 90,
+                status: PrStatus::Open {
+                    checks: Checks::Failing,
+                    review: Review::ChangesRequested,
+                },
+            }];
+            let staged = Staged::ticket(&node, &map_ref(1), stage).expect("a launchable stage");
+            let prompt = match plan_picked(&cache(), &staged, &interactive("")) {
+                Targets::One(l) => l.agent_argv().last().expect("a prompt").clone(),
+                other => panic!("{other:?}"),
+            };
+            let ctx = ctx_of(&prompt)
+                .expect("a ticket launch carries context")
+                .to_string();
+            keys_of(&serde_json::from_str(&ctx).expect("the block is JSON"))
+        };
+        let named = |names: &[&str]| {
+            names
+                .iter()
+                .map(|n| (*n).to_string())
+                .collect::<BTreeSet<String>>()
+        };
+        // The richest block the schema can produce: a ticket aim with a linked
+        // PR open enough to carry both live signals.
+        let expected = named(&[
+            "v",
+            "repo",
+            "map",
+            "number",
+            "title",
+            "aim",
+            "ticket",
+            "ticket_type",
+            "stage",
+            "prs",
+            "status",
+            "open",
+            "checks",
+            "review",
+        ]);
+        assert_eq!(with_pr(Stage::InReview), expected);
+        // The node the old substring guard would have failed on: awaiting
+        // attention is a stage, not a claim.
+        assert_eq!(with_pr(Stage::NeedsAttention), expected);
+        for forbidden in [
+            "assignee",
+            "assignees",
+            "claim",
+            "frontier",
+            "blocked_by",
+            "needs",
+        ] {
+            assert!(
+                !expected.contains(forbidden),
+                "{forbidden:?} must be unrepresentable in the handed context"
+            );
+        }
+    }
+
+    /// The golden wire words, one exhaustive `match` per enumerated field.
+    ///
+    /// These four are the whole vocabulary the tracker doc publishes, written
+    /// as literals traceable to it rather than derived from the types — a
+    /// derivation would only prove serde agrees with itself. Being `match`es
+    /// with no wildcard is the other half: adding a type, a stage, a check
+    /// rollup or a review decision stops this module compiling until the new
+    /// word has been decided and pinned here.
+    fn type_word(ticket_type: TicketType) -> &'static str {
+        match ticket_type {
+            TicketType::Build => "build",
+            TicketType::Research => "research",
+            TicketType::Task => "task",
+            TicketType::Grilling => "grilling",
+            TicketType::Prototype => "prototype",
+            TicketType::Untyped => "untyped",
+        }
+    }
+
+    /// See [`type_word`].
+    fn stage_word(stage: Launchable) -> &'static str {
+        match stage {
+            Launchable::Ready => "ready",
+            Launchable::Building => "building",
+            Launchable::InReview => "in_review",
+            Launchable::NeedsAttention => "needs_attention",
+        }
+    }
+
+    /// See [`type_word`].
+    fn checks_word(checks: Checks) -> &'static str {
+        match checks {
+            Checks::Absent => "absent",
+            Checks::Pending => "pending",
+            Checks::Passing => "passing",
+            Checks::Failing => "failing",
+        }
+    }
+
+    /// See [`type_word`].
+    fn review_word(review: Review) -> &'static str {
+        match review {
+            Review::NotRequired => "not_required",
+            Review::Required => "required",
+            Review::Approved => "approved",
+            Review::ChangesRequested => "changes_requested",
+        }
+    }
+
+    /// See [`type_word`]. An open PR is the one state that carries more, so
+    /// its word is the tag and the two live signals under it.
+    fn status_words(status: &PrStatus) -> String {
+        match status {
+            PrStatus::Draft => r#""status":"draft""#.to_string(),
+            PrStatus::Merged => r#""status":"merged""#.to_string(),
+            PrStatus::Closed => r#""status":"closed""#.to_string(),
+            PrStatus::Open { checks, review } => format!(
+                r#""status":{{"open":{{"checks":"{}","review":"{}"}}}}"#,
+                checks_word(*checks),
+                review_word(*review)
+            ),
+        }
+    }
+
+    /// Every value the block's enumerated fields can hold, launched for real
+    /// and spelled out (#122 §4).
+    ///
+    /// One test over the whole matrix rather than a property run: the
+    /// vocabularies are small and closed, so every cell fits, and a golden
+    /// literal per cell says what a generator never can — *which* word the wire
+    /// uses. Before this, only `ready`, `build` and a single open PR were ever
+    /// emitted by any test, so every other word the tracker doc publishes
+    /// rested on the doc's say-so.
+    #[test]
+    fn every_stage_type_and_pr_state_spells_itself_on_the_wire() {
+        let types = [
+            TicketType::Build,
+            TicketType::Research,
+            TicketType::Task,
+            TicketType::Grilling,
+            TicketType::Prototype,
+            TicketType::Untyped,
+        ];
+        let stages = [
+            (Stage::Ready, Launchable::Ready),
+            (Stage::Building, Launchable::Building),
+            (Stage::InReview, Launchable::InReview),
+            (Stage::NeedsAttention, Launchable::NeedsAttention),
+        ];
+        for ticket_type in types {
+            for (stage, launchable) in stages {
+                let ctx = ctx_of(&ticket_prompt(ticket_type, stage, &interactive("")))
+                    .expect("a ticket launch carries context")
+                    .to_string();
+                let expected = format!(
+                    r#""ticket_type":"{}","stage":"{}""#,
+                    type_word(ticket_type),
+                    stage_word(launchable)
+                );
+                assert!(ctx.contains(&expected), "expected {expected} in {ctx}");
+            }
+        }
+        let mut pr_states = vec![PrStatus::Draft, PrStatus::Merged, PrStatus::Closed];
+        for checks in [
+            Checks::Absent,
+            Checks::Pending,
+            Checks::Passing,
+            Checks::Failing,
+        ] {
+            for review in [
+                Review::NotRequired,
+                Review::Required,
+                Review::Approved,
+                Review::ChangesRequested,
+            ] {
+                pr_states.push(PrStatus::Open { checks, review });
+            }
+        }
+        for status in pr_states {
+            let expected = status_words(&status);
+            let ctx = ctx_of(&pr_prompt(status))
+                .expect("a ticket launch carries context")
+                .to_string();
+            assert!(ctx.contains(&expected), "expected {expected} in {ctx}");
+        }
+        // The other arm of the matrix's aim axis: a map launch names none of
+        // the ticket vocabulary at all, rather than nulling it out.
+        let map = ctx_of(&map_prompt(&interactive("")))
+            .expect("a map launch carries context")
+            .to_string();
+        assert!(map.ends_with(r#""aim":"map"}"#), "{map}");
+        for absent in ["ticket_type", "stage", "prs"] {
+            assert!(!map.contains(absent), "a map aim names no {absent}: {map}");
+        }
+    }
+
+    /// A review-stage launch whose one linked PR stands where the caller says.
+    fn pr_prompt(status: PrStatus) -> String {
+        let mut node = ticket("blooop/wayfinder", 16);
+        node.ticket_type = TicketType::Build;
+        node.prs = vec![PrLink {
+            repo: "blooop/wayfinder".to_string(),
+            number: 90,
+            status,
+        }];
+        let staged = Staged::ticket(&node, &map_ref(1), Stage::InReview).expect("in review");
+        match plan_picked(&cache(), &staged, &interactive("")) {
+            Targets::One(l) => l.agent_argv().last().expect("a prompt").clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_that_has_no_skill_to_address_is_handed_context() {
+        // The block is addressed to a skill. A plain session has none, and a
+        // creation names nothing that exists yet — so neither carries one, and
+        // the fallback path (a hand-invoked skill, which never saw the picker)
+        // stays exactly what it is today.
+        assert_eq!(
+            ctx_of(
+                &ticket_argv(TicketType::Build, Stage::Ready, &plain("rebase onto main")).join(" ")
+            ),
+            None
+        );
+        assert_eq!(ctx_of(&map_argv(&plain("")).join(" ")), None);
+        for (kind, text) in [
+            (CreationKind::Task, "wire the exporter"),
+            (CreationKind::Map, "a caching layer"),
+            (CreationKind::MapAuto, ""),
+        ] {
+            assert_eq!(ctx_of(&creation_argv(kind, text).join(" ")), None);
+        }
+        // `/wf-one` is the creation route, and the picker never routes a node
+        // there — but `plan` takes any route, so the block's absence is decided
+        // by the route rather than by that being hard to reach. `wf-one`'s own
+        // doc forbids the block, and the code has to agree with it even on the
+        // combination nothing constructs.
+        let one = Launch {
+            repo: "blooop/wayfinder".to_string(),
+            cwd: PathBuf::from("/data/proj/wayfinder"),
+            job: Job::Node {
+                aim: Aim::Ticket {
+                    number: 16,
+                    title: "the ticket".to_string(),
+                    ticket_type: TicketType::Build,
+                    stage: Launchable::Ready,
+                    prs: vec![],
+                },
+                map: map_ref(1),
+                route: Route::One,
+                mode: interactive(""),
+            },
+            isolation: Isolation::Host,
+        };
+        assert_eq!(one.agent_argv().last().map(String::as_str), Some("/wf-one"));
     }
 
     #[test]
     fn a_map_launch_is_the_skill_and_the_map_number_alone() {
         // No ticket argument exists to pass, so none is passed — the map aim
         // is the whole subject (#96).
-        assert_eq!(map_prompt(&interactive("")), "/wf 59");
-        assert_eq!(map_prompt(&auto("")), "/wf-auto 59");
+        assert_eq!(elided(&map_prompt(&interactive(""))), "/wf 59 ctx: …");
+        assert_eq!(elided(&map_prompt(&auto(""))), "/wf-auto 59 ctx: …");
         assert_eq!(
-            map_prompt(&auto("merge when green")),
-            "/wf-auto 59 steer: merge when green"
+            elided(&map_prompt(&auto("merge when green"))),
+            "/wf-auto 59 ctx: … steer: merge when green"
         );
         // A map's key is its own issue number, not a ticket's.
-        let staged = Staged::map(&MapId::new("blooop/wayfinder", 59), "the dev-process tree");
+        let staged = Staged::map(&map_ref(59));
         assert_eq!(staged.key(), "#59");
         match plan_picked(&cache(), &staged, &interactive("")) {
             Targets::One(l) => assert_eq!(l.key(), "wayfinder#59"),
@@ -2094,8 +2682,10 @@ mod tests {
     fn aim(ticket_type: TicketType, stage: Launchable) -> Aim {
         Aim::Ticket {
             number: 16,
+            title: "the ticket".to_string(),
             ticket_type,
             stage,
+            prs: vec![],
         }
     }
 
@@ -2215,7 +2805,7 @@ mod tests {
             let mut node = ticket("blooop/wayfinder", 16);
             node.ticket_type = ticket_type;
             assert_eq!(
-                Staged::ticket(&node, 1, Stage::Done),
+                Staged::ticket(&node, &map_ref(1), Stage::Done),
                 None,
                 "{ticket_type:?}"
             );
@@ -2320,10 +2910,12 @@ mod tests {
             job: Job::Node {
                 aim: Aim::Ticket {
                     number,
+                    title: "the ticket".to_string(),
                     ticket_type: TicketType::Task,
                     stage: Launchable::Ready,
+                    prs: vec![],
                 },
-                map_issue: 67,
+                map: map_ref(67),
                 route,
                 mode,
             },
@@ -2354,18 +2946,20 @@ mod tests {
         // prompt has to arrive already quoted or it lands as three arguments;
         // the workspace spec is a plain argv entry and is not quoted.
         assert_eq!(
-            isolated(Route::Wayfinder, interactive("")).agent_argv(),
+            elided_argv(&isolated(Route::Wayfinder, interactive(""))),
             vec![
                 "dl".to_string(),
                 "blooop/wayfinder@wayfinder/wayfinder-80".to_string(),
                 "--".to_string(),
-                "'claude' '--dangerously-skip-permissions' '/wf 67 80'".to_string(),
+                "'claude' '--dangerously-skip-permissions' '/wf 67 80 ctx: …'".to_string(),
             ]
         );
-        // The steering suffix rides inside the same quoted argument.
+        // The steering suffix rides inside the same quoted argument, after the
+        // context block.
         assert_eq!(
-            isolated(Route::WayfinderAuto, auto("merge when green")).agent_argv()[3],
-            "'claude' '--dangerously-skip-permissions' '/wf-auto 67 80 steer: merge when green'"
+            elided_argv(&isolated(Route::WayfinderAuto, auto("merge when green")))[3],
+            "'claude' '--dangerously-skip-permissions' \
+             '/wf-auto 67 80 ctx: … steer: merge when green'"
         );
     }
 
@@ -2397,13 +2991,16 @@ mod tests {
         // builds must be the one the second enter's `dl` finds. One naming
         // function serves both, and this pins that they cannot drift.
         let node = ticket("blooop/wayfinder", 80);
-        let staged = Staged::ticket(&node, 67, Stage::Ready).expect("launchable");
+        let staged = Staged::ticket(&node, &map_ref(67), Stage::Ready).expect("launchable");
         assert_eq!(
             staged.node_workspace().as_deref(),
             Some(isolated_ticket(80, Route::Tdd, interactive("")).agent_argv()[1].as_str())
         );
         // A staged map warms the map's own node, same as launching it.
-        let map = Staged::map(&MapId::new("blooop/wayfinder", 67), "the tree");
+        let map = Staged::map(&MapRef::new(
+            &MapId::new("blooop/wayfinder", 67),
+            "the tree",
+        ));
         assert_eq!(
             map.node_workspace().as_deref(),
             Some("blooop/wayfinder@wayfinder/wayfinder-67")
@@ -2449,7 +3046,7 @@ mod tests {
         // for a launch that will run on the host. An unregistered repo warms
         // nothing either — there is nothing to launch into at all.
         let node = ticket("blooop/wayfinder", 80);
-        let staged = Staged::ticket(&node, 67, Stage::Ready).expect("launchable");
+        let staged = Staged::ticket(&node, &map_ref(67), Stage::Ready).expect("launchable");
         assert_eq!(prewarm(&cache(), &staged), None);
         assert_eq!(prewarm(&[], &staged), None);
     }
@@ -2479,19 +3076,19 @@ mod tests {
             cwd: PathBuf::from("/data/proj/wayfinder"),
             job: Job::Node {
                 aim: Aim::Map,
-                map_issue: 67,
+                map: map_ref(67),
                 route: Route::WayfinderAuto,
                 mode: auto(""),
             },
             isolation: Isolation::Devlaunch,
         };
         assert_eq!(
-            launch.agent_argv(),
+            elided_argv(&launch),
             vec![
                 "dl".to_string(),
                 "blooop/wayfinder@wayfinder/wayfinder-67".to_string(),
                 "--".to_string(),
-                "'claude' '--dangerously-skip-permissions' '/wf-auto 67'".to_string(),
+                "'claude' '--dangerously-skip-permissions' '/wf-auto 67 ctx: …'".to_string(),
             ]
         );
     }
@@ -2502,12 +3099,164 @@ mod tests {
         // closes, escapes, reopens — the argument stays one argument.
         let launch = isolated(Route::Tdd, interactive("don't touch the CI; rm -rf /"));
         assert_eq!(
-            launch.agent_argv()[3],
-            r"'claude' '--dangerously-skip-permissions' '/wf-tdd 80 steer: don'\''t touch the CI; rm -rf /'"
+            elided_argv(&launch)[3],
+            r"'claude' '--dangerously-skip-permissions' '/wf-tdd 80 ctx: … steer: don'\''t touch the CI; rm -rf /'"
         );
         // Every metacharacter a shell would otherwise act on is inside quotes.
         assert_eq!(shell_quote("a b|c;d&e$f`g"), "'a b|c;d&e$f`g'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    /// The same node launched both ways — into a container and on the host —
+    /// so the container seam can be asserted against what the host's agent is
+    /// handed, rather than against a second spelling of it.
+    fn both_ways(title: &str, route: Route, mode: LaunchMode) -> (Launch, Launch) {
+        let job = Job::Node {
+            aim: Aim::Ticket {
+                number: 80,
+                title: title.to_string(),
+                ticket_type: TicketType::Task,
+                stage: Launchable::Ready,
+                prs: vec![],
+            },
+            map: map_ref(67),
+            route,
+            mode,
+        };
+        let built = |isolation| Launch {
+            repo: "blooop/wayfinder".to_string(),
+            cwd: PathBuf::from("/data/proj/wayfinder"),
+            job: job.clone(),
+            isolation,
+        };
+        (built(Isolation::Devlaunch), built(Isolation::Host))
+    }
+
+    /// Names the scratch directory each recovery runs in, so two calls in one
+    /// test process cannot read each other's leavings.
+    static NEXT_SCRATCH: AtomicUsize = AtomicUsize::new(0);
+
+    /// The argument vector a container would actually run, recovered by giving
+    /// the single shell command `dl` passes to `devpod ssh --command` to a
+    /// **real POSIX shell**.
+    ///
+    /// A hand-written inverse of [`shell_quote`] would only prove this module
+    /// agrees with itself; `sh` is the thing on the other side of the seam, so
+    /// it is what does the unquoting here. `set --` performs exactly the word
+    /// splitting and quote removal a command line gets, without running the
+    /// agent, and NUL separation keeps a recovered argument's own spaces from
+    /// being mistaken for a boundary.
+    ///
+    /// The shell runs in a scratch directory of its own, and the directory is
+    /// asserted empty afterwards. The fixture title carries `$(touch pwned)`
+    /// precisely so that a broken [`shell_quote`] is caught by *evidence the
+    /// substitution ran* rather than by an argv mismatch alone — but a canary
+    /// dropped in whatever directory `cargo test` happened to start in is
+    /// litter, and once got committed to this public repo. Relative to the
+    /// shell's own cwd it lands here instead, where the emptiness check reads
+    /// it: the canary got stronger (nothing asserted on it before) and stopped
+    /// writing outside its own scratch.
+    fn container_argv(launch: &Launch) -> Vec<String> {
+        let argv = launch.agent_argv();
+        assert_eq!(argv[0], DEVLAUNCH, "the isolated form is a `dl` launch");
+        assert_eq!(argv[2], "--", "the agent command follows a bare `--`");
+        let scratch = std::env::temp_dir().join(format!(
+            "wf-seam-{}-{}",
+            std::process::id(),
+            NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&scratch).expect("a scratch directory for the shell");
+        let script = format!(
+            "set -- {}\nfor arg; do printf '%s\\0' \"$arg\"; done",
+            argv[3]
+        );
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .current_dir(&scratch)
+            .output()
+            .expect("a POSIX shell");
+        assert!(
+            out.status.success(),
+            "the container's shell refused the command {:?}",
+            argv[3]
+        );
+        let spilled: Vec<_> = std::fs::read_dir(&scratch)
+            .expect("the scratch directory outlives the shell")
+            .map(|entry| entry.expect("a readable entry").file_name())
+            .collect();
+        std::fs::remove_dir_all(&scratch).expect("the scratch directory is ours to remove");
+        assert!(
+            spilled.is_empty(),
+            "the shell executed something the quoting should have made inert, \
+             leaving {spilled:?} behind"
+        );
+        let recovered = String::from_utf8(out.stdout).expect("the arguments are utf-8");
+        let mut words: Vec<String> = recovered.split('\0').map(str::to_string).collect();
+        assert_eq!(
+            words.pop().as_deref(),
+            Some(""),
+            "every argument is NUL-terminated"
+        );
+        words
+    }
+
+    #[test]
+    fn the_containers_own_shell_hands_the_agent_what_the_host_would() {
+        // The seam the ticket insists on: an isolated launch's prompt is not
+        // an argv entry by the time it arrives — `dl` joins everything after
+        // `--` and hands one string to `devpod ssh --command`, which a shell
+        // inside the container parses. So the claim is that the shell rebuilds
+        // the context block byte for byte, with a title carrying every
+        // character that would end the argument early if the quoting were
+        // wrong: a single quote, a command substitution and a double quote.
+        let (contained, host) = both_ways(
+            r#"don't $(touch pwned) "x""#,
+            Route::Tdd,
+            interactive("merge when green"),
+        );
+        assert_eq!(container_argv(&contained), host.agent_argv());
+        assert_eq!(
+            host.agent_argv(),
+            vec![
+                "claude".to_string(),
+                Agent::Claude.skip_permissions().to_string(),
+                concat!(
+                    r#"/wf-tdd 80 ctx: {"v":1,"repo":"blooop/wayfinder","#,
+                    r#""map":{"repo":"blooop/wayfinder","number":67,"title":"the dev-process tree"},"#,
+                    r#""aim":{"ticket":{"number":80,"title":"don't $(touch pwned) \"x\"","#,
+                    r#""ticket_type":"task","stage":"ready","prs":[]}}} steer: merge when green"#
+                )
+                .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_map_launch_survives_the_container_seam_too() {
+        // The other aim, and the plain session that carries no block at all:
+        // both have to come back out of the shell as they went in.
+        let (contained, host) = both_ways("the ticket", Route::Plain, plain("look around"));
+        assert_eq!(container_argv(&contained), host.agent_argv());
+        let map = Launch {
+            repo: "blooop/wayfinder".to_string(),
+            cwd: PathBuf::from("/data/proj/wayfinder"),
+            job: Job::Node {
+                aim: Aim::Map,
+                map: map_ref(67),
+                route: Route::WayfinderAuto,
+                mode: auto(""),
+            },
+            isolation: Isolation::Devlaunch,
+        };
+        assert_eq!(
+            container_argv(&map).last().expect("a prompt"),
+            concat!(
+                r#"/wf-auto 67 ctx: {"v":1,"repo":"blooop/wayfinder","#,
+                r#""map":{"repo":"blooop/wayfinder","number":67,"title":"the dev-process tree"},"#,
+                r#""aim":"map"}"#
+            )
+        );
     }
 
     #[test]
