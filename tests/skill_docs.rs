@@ -117,10 +117,10 @@ fn context_section() -> String {
 /// from the launch itself, or the docs are only checked against a second copy
 /// of themselves.
 fn launched_prompt(ticket: &Ticket, map: &MapRef, stage: Stage) -> String {
-    let checkout = wf::projects::Checkout {
-        path: std::path::PathBuf::from("/data/proj/checkout"),
-        repo: ticket.repo.clone(),
-    };
+    let checkout = wf::projects::Checkout::new(
+        std::path::PathBuf::from("/data/proj/checkout"),
+        ticket.repo.clone(),
+    );
     let staged = wf::launch::Staged::ticket(ticket, map, stage).expect("a launchable stage");
     let mode = wf::launch::LaunchMode::picked(
         wf::launch::Agent::Claude,

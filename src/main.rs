@@ -8,9 +8,10 @@
 //! 3. One `wayfinder:map` label search reconciles that set; every map streams
 //!    in as it lands. `ctrl-r` asks again. Nothing polls: `wf` is on screen for
 //!    seconds and restarts warm in ~0.6 s.
-//! 4. Inside a checkout whose repo has a map, the screen opens focused on
-//!    it (`Scope::Project`, repo column dropped); `ctrl-g` widens to all
-//!    projects, `ctrl-f` re-focuses.
+//! 4. Inside a checkout, the screen opens **on that project** and nowhere
+//!    else; run outside one and it opens on the project list, most recently
+//!    used first. Both are drawn from the cache, so neither waits on the
+//!    search — and `←` walks between them.
 //! 5. `enter` picks a ticket, and that is the end of `wf`: the loop returns,
 //!    the terminal is restored, and this process is replaced by the agent
 //!    ([`wf::launch::Launch::exec`]). The one ordering that matters —
@@ -26,7 +27,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use wf::app::{App, Outcome, Scope};
+use wf::app::{App, Outcome};
 use wf::launch::{Agent, Launch};
 use wf::model::{Map, MapId};
 use wf::projects::{self, ProjectsCache};
@@ -71,10 +72,11 @@ usage: wf [--version | --help]
        wf skills [install]
        wf reap [-y] [-f]
 
-With no arguments: opens the picker over every mapped project, focused on the
-checkout you are standing in. enter runs an agent on the picked ticket, in that
-checkout, replacing wf — so wf is gone by the time the agent draws. ctrl-f and
-ctrl-g narrow and widen the scope, ctrl-r refetches, esc quits.
+With no arguments: opens on the project you are standing in, or on the list of
+every registered project — most recently used first — when you are not standing
+in one. enter selects a project, or runs an agent on the picked ticket in that
+project's checkout, replacing wf — so wf is gone by the time the agent draws.
+Left backs out, ctrl-r refetches, esc quits.
 
 wf skills          report which prompt each route would actually run
 wf skills install  link this build's skills into ~/.claude/skills and ~/.codex/skills
@@ -398,22 +400,21 @@ async fn main() -> Result<()> {
     spawn_terminal_guard();
 
     let (tx, updates) = mpsc::unbounded_channel();
-    let discovery = wf::refresh::spawn_discovery(repos, cache_path, tx.clone());
+    let discovery = wf::refresh::spawn_discovery(repos, cache_path.clone(), tx.clone());
 
-    // cwd-open focuses the project (lazygit-style). Only the map *search* can
-    // say authoritatively whether this repo has a map, so the focus is handed to
-    // the loop to apply the moment discovery lands — but a seeded repo can be
-    // focused from the first frame, and usually is, so the picker no longer
-    // opens wide and jumps a couple of seconds later. `focus` is kept either
-    // way: the search still gets to overrule a seed that has gone stale.
-    let focus = here.map(|(_, slug)| slug);
-    if let Some(slug) = focus
-        .as_ref()
-        .filter(|slug| seed.iter().any(|id| &id.repo == *slug))
-    {
-        app.scope = Scope::Project(slug.clone());
+    // cwd-open enters the project, on the first frame and unconditionally.
+    //
+    // It used to wait: the focus was only applied to a repo the cached seed
+    // already knew had a map, and otherwise handed to the loop to apply when
+    // discovery landed, because a focused repo with no maps rendered an empty
+    // screen. It cannot now — a project's screen leads with the project's own
+    // row, which is a place to stand whether or not anything has been filed in
+    // the repo, let alone fetched. So the level is decided by one local `git`
+    // call, before any network call, and nothing arriving later moves it.
+    if let Some((_, slug)) = &here {
+        app.enter(slug);
     }
-    let ending = run(&mut terminal, app, discovery, tx, updates, focus).await;
+    let ending = run(&mut terminal, app, discovery, tx, updates).await;
 
     // The one ordering that matters, and the reason the exec is here rather
     // than in the loop: the terminal must be back in the shell's hands before
@@ -433,6 +434,26 @@ async fn main() -> Result<()> {
     match ending? {
         Ending::Quit => Ok(()),
         Ending::Handover(launch) => {
+            // The launch is a use of this project, and the last chance to say
+            // so: after the exec there is no `wf` left to write anything. This
+            // is what keeps the project list ordered for someone who reaches
+            // their projects *through* it — opening `wf` in a checkout stamps
+            // it, and for everyone else launching is the only other act that
+            // means "this is what I am working on".
+            //
+            // Re-read before writing, exactly as the discovery task does: it
+            // writes the search's findings to this same file while the picker
+            // is up, so the copy loaded before the first frame is stale by
+            // now, and saving it would trade this stamp for next run's head
+            // start.
+            //
+            // Best-effort on purpose. A cache that will not write is not worth
+            // refusing a launch over, and the only cost of losing this is one
+            // project sitting lower in a list than it might have.
+            let mut cache = ProjectsCache::load_or_default(&cache_path);
+            if cache.touch(launch.cwd()) {
+                let _ = cache.save(&cache_path);
+            }
             // The prompts the selected agent is about to run. `wf skills
             // install` links its skills directory at a *copy* of the bundle,
             // and a copy is a thing that can fall behind a `pixi global update
@@ -540,7 +561,6 @@ async fn run(
     discovery: JoinHandle<()>,
     tx: UnboundedSender<LoadEvent>,
     mut updates: UnboundedReceiver<LoadEvent>,
-    mut focus: Option<String>,
 ) -> Result<Ending> {
     let mut clusters: BTreeMap<MapId, Map> = BTreeMap::new();
     // The cached seed starts fetching immediately (#28); the search's answer
@@ -561,21 +581,12 @@ async fn run(
                     // flight at once and each lands on screen as it arrives.
                     loaders.reconcile(&found, &tx);
                     app.startup.searched(&found);
-                    if let Some(slug) = focus.take() {
-                        // Focused either way now (#114). A repo with no open
-                        // map used to send the focus back to every project,
-                        // which left the repo you were standing in with
-                        // nothing on screen and no way to chart its first map.
-                        // Focused, it renders the empty-state door instead —
-                        // so the answer to "this repo has no map" is somewhere
-                        // to start one rather than somebody else's tickets.
-                        let mapless = !found.iter().any(|id| id.repo == slug);
-                        app.scope = Scope::Project(slug.clone());
-                        if mapless {
-                            app.notice =
-                                Some(format!("{slug} has no wayfinder:map — enter starts one"));
-                        }
-                    }
+                    // Nothing to apply here any more: the level was decided
+                    // before the first frame and discovery has no say in it.
+                    // A repo the search finds no map for renders its project
+                    // row saying so, which is both the notice this used to
+                    // post and somewhere to act on it.
+                    //
                     // Maps the search dropped must stop being rendered as well as
                     // stop being fetched — their rows are as stale as their load.
                     // A map that is no longer open also stops being a *failure*:
@@ -617,15 +628,7 @@ async fn run(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                let scope_before = app.scope.clone();
-                let outcome = app.handle_key(key);
-                // A scope the user chose while the load was still out is theirs
-                // to keep: the pending cwd focus is dropped rather than applied
-                // over their `ctrl-g` when discovery lands a moment later.
-                if app.scope != scope_before {
-                    focus = None;
-                }
-                match outcome {
+                match app.handle_key(key) {
                     Outcome::Quit => return Ok(Ending::Quit),
                     // Through the loaders, not alongside them: a refetch that
                     // raced an in-flight load used to be silently overwritten

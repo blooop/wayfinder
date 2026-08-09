@@ -14,16 +14,35 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::launch::{self, Agent, Candidate, Launch, LaunchMode, MapRef, Route, Staged, Targets};
 use crate::model::{stage, Activity, Map, MapId, MapSet, Status, Ticket};
-use crate::projects::Checkout;
+use crate::projects::{self, Checkout};
 use crate::refresh::Startup;
 use crate::view::{self, Expanded, GroupId, Lens, Plan, Screen, Stop, StopAt};
 
-/// Project scope: everything, or one repo focused via `ctrl-f`. A repo, not a
-/// map: focusing where you stand means seeing every open map of that repo.
+/// Which of the two screens is up — the whole of `wf`'s navigation.
+///
+/// This replaces the old `Scope { All, Project }`, and the difference is not
+/// cosmetic. A scope was a *filter* on one screen: `Scope::All` rendered every
+/// project's clusters at once and `ctrl-f` narrowed them to one, so both states
+/// ran the same cluster-rendering code and the repo you were standing in was
+/// something the body had to be searched for. A level is the screen itself. The
+/// project list has no cluster code in it at all, and [`Level::Project`] always
+/// names a repo — so the map-less repo, which used to be an exception carved
+/// into the widened screen, is just a project whose list of maps is empty.
+///
+/// Two arms, and no `All` among them: seeing every project means seeing the
+/// *projects*, not every project's tickets poured into one tree. That is the
+/// reversal — one screen per project, reached by picking one — and it is what
+/// retires `ctrl-f`, `ctrl-g` and `ctrl-p` together, since focusing, widening
+/// and finding a project are all now just moving.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Scope {
-    All,
-    Project(String),
+pub enum Level {
+    /// The project list: every registered repo, most recently used first.
+    /// Where `wf` opens when it was not run inside a checkout.
+    Projects,
+    /// One project: its maps, under the project's own row. Where `wf` opens
+    /// when it *was* run inside a checkout, and where selecting a project from
+    /// the list arrives — the same screen either way.
+    Project { repo: String },
 }
 
 /// What the event loop should do after a keypress.
@@ -101,7 +120,7 @@ fn previous_candidate(staged: &Staged, candidate: Candidate) -> Candidate {
 /// # Panics
 ///
 /// Never: [`Staged::candidates`] is never empty — every stop offers rows, its
-/// launch rows or the map-less door's creation rows — so the modulo below is
+/// launch rows or a project row's creation rows — so the modulo below is
 /// never by zero.
 fn stepped(staged: &Staged, candidate: Candidate, delta: usize) -> Candidate {
     let candidates = staged.candidates();
@@ -151,7 +170,7 @@ pub enum StopKey {
     Map(MapId),
     Ticket(RowKey),
     Group(GroupId),
-    /// The empty-state door, by repo slug — already index-free, like the
+    /// A whole project, by repo slug — already index-free, like the
     /// map and group keys.
     Project(String),
 }
@@ -200,7 +219,8 @@ pub struct App {
     /// search's answer afterwards. This is what `ctrl-r` refetches.
     pub open_maps: MapSet,
     pub query: String,
-    pub scope: Scope,
+    /// Which screen is up: the project list, or one project's own.
+    pub level: Level,
     /// One-shot status message shown on the count line; cleared on the next
     /// keypress.
     pub notice: Option<String>,
@@ -250,7 +270,7 @@ impl App {
             clusters,
             open_maps: MapSet::new(),
             query: String::new(),
-            scope: Scope::All,
+            level: Level::Projects,
             notice: None,
             checkouts: Vec::new(),
             failed: BTreeSet::new(),
@@ -283,11 +303,47 @@ impl App {
         self
     }
 
-    fn in_scope(&self, id: &MapId) -> bool {
-        match &self.scope {
-            Scope::All => true,
-            Scope::Project(repo) => &id.repo == repo,
+    /// The repo whose screen is up, or `None` on the project list.
+    pub fn current_repo(&self) -> Option<&str> {
+        match &self.level {
+            Level::Projects => None,
+            Level::Project { repo } => Some(repo),
         }
+    }
+
+    /// The registered repos, most recently used first — the project list's
+    /// body, and the order the cursor walks.
+    pub fn projects(&self) -> Vec<String> {
+        projects::mru_repos(&self.checkouts)
+    }
+
+    /// Enter a project: its screen, from the top. The cursor is deliberately
+    /// *not* carried over — the stop it was on was a project row on another
+    /// screen, and the new screen's own first stop is this project's row,
+    /// which is where an untouched cursor already means.
+    pub fn enter(&mut self, repo: &str) {
+        self.level = Level::Project {
+            repo: repo.to_string(),
+        };
+        self.query.clear();
+        self.cursor = Cursor::Untouched;
+    }
+
+    /// Back out to the project list, with the cursor on the project just left
+    /// — so `←` then `↓` walks to the next project rather than starting over
+    /// at the top of the list.
+    fn leave(&mut self) {
+        let Level::Project { repo } = &self.level else {
+            return;
+        };
+        let key = StopKey::Project(repo.clone());
+        self.level = Level::Projects;
+        self.query.clear();
+        self.point_at(&key);
+    }
+
+    fn in_scope(&self, id: &MapId) -> bool {
+        self.current_repo() == Some(id.repo.as_str())
     }
 
     /// The clusters currently in scope, in render order: **work before
@@ -354,47 +410,40 @@ impl App {
     /// The body, planned: every line the screen shows, in on-screen order —
     /// what the draw walks and what the cursor navigates, so the two can never
     /// disagree about order.
+    ///
+    /// The two levels are two plans, and neither can draw the other's lines:
+    /// the project list has no cluster in it, and a project screen never lists
+    /// a repo that is not its own.
     pub fn plan(&self) -> Plan {
-        view::plan(
-            &self.scoped_clusters(),
-            self.screen(),
-            &self.expanded,
-            self.mapless_door().as_deref(),
-        )
-    }
-
-    /// The repo whose empty-state door this screen is showing, if it is
-    /// showing one (#114).
-    ///
-    /// Deliberately only the **focused** empty state: a registered repo with
-    /// no open map, with the scope on it and nothing rendered. That is the
-    /// case `wf` opened inside a fresh checkout lands in, and it is where the
-    /// repo's *first* map has otherwise had no way in — the picker's rows all
-    /// hang off stops, and a repo with no map renders no stop.
-    ///
-    /// A row per map-less project on the *widened* screen is the version this
-    /// is not: permanent furniture on a screen that is otherwise all signal,
-    /// one extra row every frame for an occasional act. Reaching those repos
-    /// is the project surface's job, not the tree's.
-    fn mapless_door(&self) -> Option<String> {
-        // Not until the load has landed. A focused repo whose maps are still
-        // in flight looks identical to one that has none, and drawing the door
-        // then would put a creation row under `enter` for the second or two
-        // before the clusters arrive — turning an ordinary launch into a new
-        // map. Same reason [`crate::ui::heading`] will not say "no projects"
-        // while the search is out.
-        if !self.startup.is_loaded() {
-            return None;
+        match &self.level {
+            Level::Projects => view::projects(
+                &self.projects(),
+                &self.clusters,
+                self.startup.is_loaded(),
+                &self.query,
+            ),
+            // The project's own row leads whenever there is no query — it is a
+            // place to stand, not a report on what was found, so it is there
+            // whether the repo has ten maps, none, or none *yet*. That is the
+            // whole of what the map-less empty-state door used to be, minus
+            // the door.
+            //
+            // A live query drops it, and that is not a detail: an untouched
+            // cursor means the first stop, so a project row surviving a sift
+            // would take `enter` on a freshly typed query away from the best
+            // match and give it to *create a new task* — the one place where
+            // the creating default this row exists for is the wrong one. The
+            // row is also not a match, and a sifted body is matches and the
+            // structure that places them.
+            Level::Project { repo } => view::plan(
+                &self.scoped_clusters(),
+                self.screen(),
+                &self.expanded,
+                self.query
+                    .is_empty()
+                    .then(|| view::ProjectRow::new(repo, &self.clusters, self.startup.is_loaded())),
+            ),
         }
-        let Scope::Project(repo) = &self.scope else {
-            return None;
-        };
-        // Registered, and nothing of it on screen: a repo whose clusters are
-        // merely filtered out by a query still *has* maps, and its door would
-        // be a second answer to a question the query is already answering.
-        let registered = self.checkouts.iter().any(|c| &c.repo == repo);
-        let has_clusters = self.clusters.keys().any(|id| &id.repo == repo);
-        (registered && !has_clusters).then(|| repo.clone())
     }
 
     /// Every cursor stop with its depth, in on-screen order (#57). The cursor
@@ -404,10 +453,26 @@ impl App {
         self.plan().stops()
     }
 
-    /// Ticket rows on screen — what the match count counts. A subset of
-    /// [`App::stops`].
+    /// Ticket rows on screen. A subset of [`App::stops`].
     pub fn visible(&self) -> Vec<Row> {
         self.plan().rows()
+    }
+
+    /// The count line's `shown/total` — **of whatever this screen is a list
+    /// of**, which is the only reading that stays true across the two levels.
+    ///
+    /// A project list counting *tickets* would read `0/0` on a screen with
+    /// nine projects on it: a fetch that has not landed and a repo with
+    /// nothing open would look identical to the screen being empty, and the
+    /// number a query narrows would not be the number the query narrowed.
+    pub fn counts(&self) -> (usize, usize) {
+        match self.level {
+            Level::Projects => (
+                self.stops().len(),
+                projects::mru_repos(&self.checkouts).len(),
+            ),
+            Level::Project { .. } => (self.visible().len(), self.scoped().len()),
+        }
     }
 
     /// The ticket a row names.
@@ -479,18 +544,6 @@ impl App {
             let map: &Map = &self.clusters[&row.map];
             &map.tickets[row.index]
         })
-    }
-
-    /// Which map the cursor is in, whichever kind of stop it is on — what
-    /// `ctrl-f` focuses. `None` on the empty-state door: it names a repo that
-    /// has no map, which is the one stop that belongs to no cluster.
-    pub fn cursor_map(&self) -> Option<MapId> {
-        match self.cursor_stop()? {
-            Stop::Map(id) => Some(id),
-            Stop::Ticket(row) => Some(row.map),
-            Stop::Group(id) => Some(id.map),
-            Stop::Project(_) => None,
-        }
     }
 
     /// The cursor's stable identity.
@@ -595,6 +648,15 @@ impl App {
     /// and the same step carries on to whatever comes next, which is what keeps
     /// the key live everywhere — held down, `→` visits every stop in order.
     fn descend(&mut self) {
+        // On the project list there is only one thing deeper than a row, and
+        // it is the project: `→` enters it, which is the same move `enter`
+        // makes there. Stepping to the next project instead would make the
+        // depth key a second `↓` on the one screen where depth means
+        // something.
+        if let (Level::Projects, Some(Stop::Project(repo))) = (&self.level, self.cursor_stop()) {
+            self.enter(&repo);
+            return;
+        }
         if let Some(Stop::Group(id)) = self.cursor_stop() {
             if !self.expanded.contains(&id) {
                 self.expanded.insert(id);
@@ -608,9 +670,25 @@ impl App {
     }
 
     /// `←`: close — shut an open group, else out to the parent, else back one
-    /// stop. The mirror of [`App::descend`]: it only ever moves earlier in the
-    /// body, and the last clause is what stops it dying at depth 0.
+    /// stop, else out of the project entirely. The mirror of [`App::descend`]:
+    /// it only ever moves earlier in the body, and the last clause is what
+    /// stops it dying at depth 0.
+    ///
+    /// That last clause is the **back key**. `←` held down walks out of a
+    /// subtree, up its cluster, onto the project row, and then out to the
+    /// project list — one key from anywhere on screen to the top level, which
+    /// is what `ctrl-g` used to be for. `esc` is deliberately not this: it
+    /// still clears the query and quits, so leaving `wf` never needs you to
+    /// know how deep you are.
     fn ascend(&mut self) {
+        // On the project's own row, "out" is the list it was entered from.
+        // Keyed on the stop rather than on position 0, so a sifted screen —
+        // whose first stop is a match, not the project — still answers `←`
+        // with an ordinary step back.
+        if let (Level::Project { .. }, Some(Stop::Project(_))) = (&self.level, self.cursor_stop()) {
+            self.leave();
+            return;
+        }
         if let Some(Stop::Group(id)) = self.cursor_stop() {
             if self.expanded.remove(&id) {
                 return; // shut it; the cursor stays on the line
@@ -695,9 +773,21 @@ impl App {
                 };
                 Outcome::Continue
             }
-            // The empty-state door (#114): nothing to launch here, so the
-            // picker opens straight onto the creation rows.
+            // One stop, two screens, and the screen decides — which is the
+            // only place in the key handler that is true, and is what makes
+            // the level a level rather than a filter.
+            //
+            // On the list, a project is somewhere to *go*: `enter` selects it,
+            // exactly as `→` does. On its own screen it is somewhere to
+            // *start*: there is no node here, so the picker opens straight
+            // onto the creation rows, and since this is also where an
+            // untouched cursor sits, `enter` type `enter` files a task in the
+            // repo you are standing in without touching a single other key.
             Some(Stop::Project(repo)) => {
+                if matches!(self.level, Level::Projects) {
+                    self.enter(&repo);
+                    return Outcome::Continue;
+                }
                 let staged = Staged::project(&repo);
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
@@ -777,7 +867,7 @@ impl App {
     ///
     /// Nothing is recorded while the prewarm is off — `&&` short-circuits —
     /// so a session that exports `WF_PREWARM` and re-stages a node still
-    /// warms it. A stop with no workspace to warm (the map-less door) is not
+    /// warms it. A stop with no workspace to warm (a project row) is not
     /// recorded either, because there is nothing to record it under. A node
     /// whose launch turns out to be host-only *is* recorded: it plans nothing
     /// now and would plan nothing later, and remembering that saves
@@ -992,24 +1082,11 @@ impl App {
                 self.notice = Some("refreshing…".to_string());
                 Outcome::Refresh
             }
-            KeyCode::Char('f') if ctrl => {
-                if let Some(map) = self.cursor_map() {
-                    let anchor = self.cursor_anchor();
-                    self.scope = Scope::Project(map.repo);
-                    if let Some(key) = anchor {
-                        self.point_at(&key);
-                    }
-                }
-                Outcome::Continue
-            }
-            KeyCode::Char('g') if ctrl => {
-                let anchor = self.cursor_anchor();
-                self.scope = Scope::All;
-                if let Some(key) = anchor {
-                    self.point_at(&key);
-                }
-                Outcome::Continue
-            }
+            // `ctrl-f` and `ctrl-g` are gone, not merely undocumented: focusing
+            // a project is entering it and widening is `←` out of it, so both
+            // chords named a move the arrows already make. They fall through
+            // to nothing here rather than being caught and ignored — an unbound
+            // key is unbound.
             // Toggle the structural lens (#51): leverage ⇄ forest. The cursor
             // stays on its ticket if the other screen shows it; a live query
             // keeps flattening either lens until it is cleared.
@@ -1112,7 +1189,24 @@ mod tests {
         }
     }
 
-    /// Two clusters: the wayfinder map and a dotfiles map.
+    /// The one project nearly every fixture below stands on. Named because a
+    /// project screen is a repo's, so the slug is now load-bearing in a way it
+    /// was not when every fixture's clusters simply all rendered.
+    const PROJECT: &str = "blooop/wayfinder";
+
+    /// An app standing on `repo`'s screen — the level every cluster test is
+    /// about. `App::new` opens on the project *list*, which is what `wf` run
+    /// outside a checkout shows and which draws no cluster at all, so a test
+    /// about clusters has to say which project's it means.
+    fn app_on(repo: &str, clusters: BTreeMap<MapId, Map>) -> App {
+        let mut app = App::new(clusters);
+        app.enter(repo);
+        app
+    }
+
+    /// Two clusters on one project's screen: the wayfinder map and a dotfiles
+    /// map. Both repos stay registered — a checkout of each — because the
+    /// which-checkout and cross-repo tests below step between their screens.
     fn fixture_app() -> App {
         let mut clusters = BTreeMap::new();
         clusters.insert(
@@ -1171,7 +1265,7 @@ mod tests {
                 )],
             },
         );
-        App::new(clusters)
+        app_on("blooop/wayfinder", clusters)
     }
 
     /// A one-ticket cluster with a given last-activity stamp, open or finished.
@@ -1199,85 +1293,82 @@ mod tests {
         // most recently touched, and it still belongs at the bottom — a map with
         // nothing left to do is history, however fresh.
         let clusters: BTreeMap<MapId, Map> = [
-            cluster("blooop/finished", 1, Some("2026-08-06T12:00:00Z"), false),
-            cluster("blooop/stale", 2, Some("2026-08-01T09:00:00Z"), true),
-            cluster("blooop/fresh", 3, Some("2026-08-05T09:00:00Z"), true),
-            cluster("blooop/undated", 4, None, true),
+            cluster(PROJECT, 1, Some("2026-08-06T12:00:00Z"), false),
+            cluster(PROJECT, 2, Some("2026-08-01T09:00:00Z"), true),
+            cluster(PROJECT, 3, Some("2026-08-05T09:00:00Z"), true),
+            cluster(PROJECT, 4, None, true),
         ]
         .into_iter()
         .collect();
         assert_eq!(
-            cluster_order(&App::new(clusters)),
+            cluster_order(&app_on(PROJECT, clusters)),
             vec![
-                MapId::new("blooop/fresh", 3),
-                MapId::new("blooop/stale", 2),
+                MapId::new(PROJECT, 3),
+                MapId::new(PROJECT, 2),
                 // An unparsed stamp is not guessed into the middle of the live
                 // maps: it sorts after every dated one…
-                MapId::new("blooop/undated", 4),
+                MapId::new(PROJECT, 4),
                 // …and the finished map is still below it.
-                MapId::new("blooop/finished", 1),
+                MapId::new(PROJECT, 1),
             ]
         );
     }
 
     #[test]
-    fn equal_activity_falls_back_to_repo_then_number() {
+    fn equal_activity_falls_back_to_the_map_id() {
         // Same instant on three maps: the order has to be *some* fixed one, or
-        // the screen reshuffles itself between frames for no reason.
+        // the screen reshuffles itself between frames for no reason. The
+        // tie-break is the whole `MapId`; on one project's screen — the only
+        // kind there is — that is the map number.
         let stamp = Some("2026-08-06T12:00:00Z");
         let clusters: BTreeMap<MapId, Map> = [
-            cluster("blooop/wayfinder", 47, stamp, true),
-            cluster("kinisi/zeta", 4, stamp, true),
-            cluster("blooop/wayfinder", 1, stamp, true),
+            cluster(PROJECT, 47, stamp, true),
+            cluster(PROJECT, 4, stamp, true),
+            cluster(PROJECT, 1, stamp, true),
         ]
         .into_iter()
         .collect();
         assert_eq!(
-            cluster_order(&App::new(clusters)),
+            cluster_order(&app_on(PROJECT, clusters)),
             vec![
-                MapId::new("blooop/wayfinder", 1),
-                MapId::new("blooop/wayfinder", 47),
-                MapId::new("kinisi/zeta", 4),
+                MapId::new(PROJECT, 1),
+                MapId::new(PROJECT, 4),
+                MapId::new(PROJECT, 47),
             ]
         );
     }
 
     #[test]
-    fn an_untouched_cursor_stays_on_the_top_row_as_maps_stream_in() {
-        let mut app = App::new(BTreeMap::from([cluster(
-            "blooop/slow",
-            1,
-            Some("2026-08-01T00:00:00Z"),
-            true,
-        )]));
-        assert_eq!(app.cursor_pos(), 1, "past the header");
+    fn an_untouched_cursor_sits_on_the_project_row_whatever_streams_in() {
+        // What #88 and #89 were fighting for, won outright by the project row:
+        // an untouched cursor used to mean "the top row", and the top row was
+        // whichever map had arrived and sorted highest — so the default
+        // selection moved under the human as fetches landed. The first stop is
+        // now the project itself, which is known from a local `git` call before
+        // any fetch and cannot be outranked by anything that arrives later.
+        let mut app = app_on(
+            PROJECT,
+            BTreeMap::from([cluster(PROJECT, 1, Some("2026-08-01T00:00:00Z"), true)]),
+        );
+        assert_eq!(app.cursor_pos(), 0);
+        assert_eq!(app.cursor_stop(), Some(Stop::Project(PROJECT.to_string())));
 
         let mut both = BTreeMap::new();
-        both.extend([cluster(
-            "blooop/slow",
-            1,
-            Some("2026-08-01T00:00:00Z"),
-            true,
-        )]);
-        both.extend([cluster(
-            "blooop/fresh",
-            2,
-            Some("2026-08-07T00:00:00Z"),
-            true,
-        )]);
+        both.extend([cluster(PROJECT, 1, Some("2026-08-01T00:00:00Z"), true)]);
+        both.extend([cluster(PROJECT, 2, Some("2026-08-07T00:00:00Z"), true)]);
         app.replace_clusters(both);
 
-        // the fresher map now renders first
-        assert_eq!(app.cursor_pos(), 1);
+        assert_eq!(app.cursor_pos(), 0, "a fresher map cannot move it");
+        assert_eq!(app.cursor_stop(), Some(Stop::Project(PROJECT.to_string())));
     }
 
-    /// Two live maps, the second of them older, so a map fresher than both sorts
-    /// above the pair and pushes every existing stop down by two — its header
-    /// and its row (#96).
+    /// Two live maps of one project, the second of them older, so a map fresher
+    /// than both sorts above the pair and pushes every existing stop down by
+    /// two — its header and its row (#96).
     fn streaming_pair() -> BTreeMap<MapId, Map> {
         [
-            cluster("blooop/slow", 1, Some("2026-08-01T00:00:00Z"), true),
-            cluster("blooop/older", 3, Some("2026-07-01T00:00:00Z"), true),
+            cluster(PROJECT, 1, Some("2026-08-01T00:00:00Z"), true),
+            cluster(PROJECT, 3, Some("2026-07-01T00:00:00Z"), true),
         ]
         .into_iter()
         .collect()
@@ -1287,12 +1378,7 @@ mod tests {
     /// stop moves down two.
     fn streaming_trio() -> BTreeMap<MapId, Map> {
         let mut all = streaming_pair();
-        all.extend([cluster(
-            "blooop/fresh",
-            2,
-            Some("2026-08-07T00:00:00Z"),
-            true,
-        )]);
+        all.extend([cluster(PROJECT, 2, Some("2026-08-07T00:00:00Z"), true)]);
         all
     }
 
@@ -1301,59 +1387,66 @@ mod tests {
         // The #50/#57 behaviour, which #88 must not cost: a row someone moved to
         // is pinned by identity, so an arriving map slides it down the screen
         // rather than stealing the selection.
-        let mut app = App::new(streaming_pair());
-        for _ in 0..3 {
-            app.handle_key(key(KeyCode::Down)); // past slow's header and row, onto older's
+        let mut app = app_on(PROJECT, streaming_pair());
+        // Past the project row, then map #1's header and row, onto #3's.
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Down));
         }
-        assert_eq!(app.cursor_pos(), 3);
-        assert_eq!(app.cursor_map(), Some(MapId::new("blooop/older", 3)));
+        assert_eq!(app.cursor_pos(), 4);
+        assert_eq!(
+            app.cursor_row().map(|row| row.map),
+            Some(MapId::new(PROJECT, 3))
+        );
 
         app.replace_clusters(streaming_trio());
 
-        assert_eq!(app.cursor_pos(), 5, "the fresher map pushed the row down");
+        assert_eq!(app.cursor_pos(), 6, "the fresher map pushed the row down");
         assert_eq!(
-            app.cursor_map(),
-            Some(MapId::new("blooop/older", 3)),
+            app.cursor_row().map(|row| row.map),
+            Some(MapId::new(PROJECT, 3)),
             "still the row they chose"
         );
     }
 
     #[test]
     fn choosing_the_top_row_pins_it_rather_than_re_defaulting_to_the_top() {
-        // The case a sentinel cannot serve. This cursor sits on exactly the stop
-        // a fresh one resolves to, and must behave like the *opposite* of a
-        // fresh one: the human put it there, so a map arriving above carries it
-        // down. Read the position as "untouched" and this test lands on
-        // blooop/fresh.
-        let mut app = App::new(streaming_pair());
-        app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Up)); // deliberately back on the top row
-        assert_eq!(app.cursor_pos(), 1);
-        assert_eq!(app.cursor_map(), Some(MapId::new("blooop/slow", 1)));
+        // The case a sentinel cannot serve. This cursor sits on the first
+        // *ticket*, and must behave like the opposite of a fresh one: the human
+        // put it there, so a map arriving above carries it down rather than
+        // leaving it on whatever is now first.
+        let mut app = app_on(PROJECT, streaming_pair());
+        for _ in 0..2 {
+            app.handle_key(key(KeyCode::Down)); // project row, header, row
+        }
+        assert_eq!(app.cursor_pos(), 2);
+        assert_eq!(
+            app.cursor_row().map(|row| row.map),
+            Some(MapId::new(PROJECT, 1))
+        );
 
         app.replace_clusters(streaming_trio());
 
         assert_eq!(
-            app.cursor_map(),
-            Some(MapId::new("blooop/slow", 1)),
+            app.cursor_row().map(|row| row.map),
+            Some(MapId::new(PROJECT, 1)),
             "their stop, not whatever is on top now"
         );
-        assert_eq!(app.cursor_pos(), 3);
+        assert_eq!(app.cursor_pos(), 4);
     }
 
     #[test]
     fn toggling_the_lens_does_not_turn_an_untouched_cursor_into_a_choice() {
-        // `tab`, `ctrl-f` and `ctrl-g` rebuild the list under the cursor and keep
-        // it on its stop — but keeping an *untouched* cursor on the row that
-        // merely happens to be first would anchor a default, letting the bug back
-        // in through a key that was never about the selection at all.
-        let mut app = App::new(streaming_pair());
+        // `tab` rebuilds the list under the cursor and keeps it on its stop —
+        // but keeping an *untouched* cursor on the row that merely happens to
+        // be first would anchor a default, letting #88 back in through a key
+        // that was never about the selection at all.
+        let mut app = app_on(PROJECT, streaming_pair());
         app.handle_key(key(KeyCode::Tab));
 
         app.replace_clusters(streaming_trio());
 
-        assert_eq!(app.cursor_pos(), 1);
-        assert_eq!(app.cursor_map(), Some(MapId::new("blooop/fresh", 2)));
+        assert_eq!(app.cursor_pos(), 0);
+        assert_eq!(app.cursor_stop(), Some(Stop::Project(PROJECT.to_string())));
     }
 
     /// One map with finished work in it, so the leverage lens gives it a `Done`
@@ -1361,15 +1454,15 @@ mod tests {
     /// not have.
     fn map_with_a_done_group() -> BTreeMap<MapId, Map> {
         BTreeMap::from([(
-            MapId::new("blooop/slow", 1),
+            MapId::new(PROJECT, 1),
             Map {
-                title: "Map: blooop/slow".to_string(),
+                title: "Map: the slow one".to_string(),
                 last_activity: Some(
                     Activity::parse("2026-08-01T00:00:00Z").expect("fixture stamp parses"),
                 ),
                 tickets: vec![
-                    ticket("blooop/slow", 1, "takeable", true, false, vec![]),
-                    ticket("blooop/slow", 2, "finished", false, false, vec![]),
+                    ticket(PROJECT, 1, "takeable", true, false, vec![]),
+                    ticket(PROJECT, 2, "finished", false, false, vec![]),
                 ],
             },
         )])
@@ -1378,11 +1471,17 @@ mod tests {
     #[test]
     fn a_lens_toggle_off_a_vanished_group_line_leaves_no_choice_behind() {
         // #88, re-entered through the lens door. The forest lens emits no group
-        // lines, so `tab` from a `Done` line deletes the very stop being held —
-        // and recording position 0 for the stop that vanished is a default written
-        // down as a choice, the one state `Cursor` exists to forbid. The symptom is
-        // #88's own: the next map to sort above drags the cursor off the top row.
-        let mut app = App::new(map_with_a_done_group());
+        // lines, so `tab` from a `Done` line deletes the very stop being held,
+        // and recording a position for the stop that vanished is a default
+        // written down as a choice — the one state `Cursor` exists to forbid.
+        //
+        // The old symptom (the next map to sort above drags the cursor off the
+        // top row) can no longer be *observed* on a project screen: the first
+        // stop is the project row now, so an untouched cursor and a
+        // wrongly-recorded `Chosen(0)` resolve to the same line. What is still
+        // worth pinning is that the toggle lands the cursor there rather than
+        // on some stop the human never picked.
+        let mut app = app_on(PROJECT, map_with_a_done_group());
         while !matches!(app.cursor_stop(), Some(Stop::Group(_))) {
             app.handle_key(key(KeyCode::Down));
         }
@@ -1390,18 +1489,13 @@ mod tests {
         app.handle_key(key(KeyCode::Tab)); // the forest has no group line to keep
 
         let mut fresher = map_with_a_done_group();
-        fresher.extend([cluster(
-            "blooop/fresh",
-            2,
-            Some("2026-08-07T00:00:00Z"),
-            true,
-        )]);
+        fresher.extend([cluster(PROJECT, 2, Some("2026-08-07T00:00:00Z"), true)]);
         app.replace_clusters(fresher);
 
-        assert_eq!(app.cursor_pos(), 1);
+        assert_eq!(app.cursor_pos(), 0);
         assert_eq!(
-            app.cursor_map(),
-            Some(MapId::new("blooop/fresh", 2)),
+            app.cursor_stop(),
+            Some(Stop::Project(PROJECT.to_string())),
             "nothing was chosen, so the cursor still means the top of the list"
         );
     }
@@ -1456,13 +1550,17 @@ mod tests {
 
     #[test]
     fn down_walks_the_takeable_tickets_and_steps_over_their_context() {
-        // Clusters order by (repo, number): dotfiles#4 before wayfinder#1.
-        // The depth-0 axis is each cluster's header (#96), then its rows:
-        // dotfiles #103, then wayfinder's takeable #6 and #9, then its Done
-        // group — #7 hangs under #6 as context and is *not* on this axis,
+        // The depth-0 axis of a project's screen: its own row first (#114's
+        // creation stop, now the place the cursor starts), then each cluster's
+        // header (#96) and that cluster's takeable rows — #6 and #9 — then its
+        // Done group. #7 hangs under #6 as context and is *not* on this axis,
         // which is the whole point of #57.
         let mut app = fixture_app();
-        assert_eq!(at(&app), "#103", "the default skips the header above it");
+        assert_eq!(
+            at(&app),
+            "project blooop/wayfinder",
+            "the default is the project, not a ticket"
+        );
         app.handle_key(key(KeyCode::Down));
         assert_eq!(at(&app), "map #1");
         app.handle_key(key(KeyCode::Down));
@@ -1474,17 +1572,7 @@ mod tests {
         for _ in 0..10 {
             app.handle_key(key(KeyCode::Down));
         }
-        assert_eq!(at(&app), "Done", "clamped at the last stop");
-        app.handle_key(ctrl('k'));
-        assert_eq!(at(&app), "#9");
-        for _ in 0..10 {
-            app.handle_key(key(KeyCode::Up));
-        }
-        assert_eq!(
-            at(&app),
-            "map #4",
-            "clamped at the first stop, across clusters"
-        );
+        assert_eq!(at(&app), "Done", "the last stop holds");
     }
 
     #[test]
@@ -1530,7 +1618,7 @@ mod tests {
                 ],
             },
         );
-        let mut app = App::new(clusters);
+        let mut app = app_on(PROJECT, clusters);
         go_to(&mut app, "#6");
         app.handle_key(key(KeyCode::Right));
         assert_eq!(at(&app), "#7");
@@ -1567,7 +1655,7 @@ mod tests {
                 ],
             },
         );
-        App::new(clusters)
+        app_on("blooop/bencher", clusters)
     }
 
     #[test]
@@ -1587,16 +1675,25 @@ mod tests {
                 // Try it from every reachable position, with the group both
                 // shut and open, since folding changes the stop list.
                 for open_group in [false, true] {
-                    let mut app = knotty_app();
-                    if open_group {
-                        while !matches!(app.cursor_stop(), Some(Stop::Group(_))) {
-                            app.handle_key(key(KeyCode::Down));
+                    // A fresh app per start, because a key is allowed to change
+                    // the *screen* and not just the cursor: `←` on the project
+                    // row leaves for the project list, and every later start
+                    // would then be probing a screen this loop never meant to
+                    // be on.
+                    let build = || {
+                        let mut app = knotty_app();
+                        if open_group {
+                            while !matches!(app.cursor_stop(), Some(Stop::Group(_))) {
+                                app.handle_key(key(KeyCode::Down));
+                            }
+                            app.handle_key(key(KeyCode::Right));
+                            app.cursor = Cursor::Chosen(0);
                         }
-                        app.handle_key(key(KeyCode::Right));
-                        app.cursor = Cursor::Chosen(0);
-                    }
-                    let total = app.stops().len();
+                        app
+                    };
+                    let total = build().stops().len();
                     for start in 0..total {
+                        let mut app = build();
                         app.cursor = Cursor::Chosen(start);
                         let before = (app.cursor_pos(), app.stops().len());
                         app.handle_key(key(code));
@@ -1711,7 +1808,7 @@ mod tests {
                 ],
             },
         );
-        let mut app = App::new(clusters);
+        let mut app = app_on("blooop/bencher", clusters);
         go_to(&mut app, "#1069");
         app.handle_key(key(KeyCode::Right)); // into #1070
         assert_eq!(at(&app), "#1070");
@@ -1742,7 +1839,14 @@ mod tests {
         }
         assert_eq!(
             seen,
-            vec!["map #1064", "#1069", "#1070", "#1071", "#1072"],
+            vec![
+                "project blooop/bencher",
+                "map #1064",
+                "#1069",
+                "#1070",
+                "#1071",
+                "#1072"
+            ],
             "↓ walked the whole tree"
         );
     }
@@ -1815,11 +1919,12 @@ mod tests {
         // The forest shows done #2 as a row and reorders — the cursor follows
         // its ticket, not its old position.
         assert_eq!(at(&app), "#7");
-        assert_eq!(app.visible().len(), 5, "the forest is total");
+        assert_eq!(app.visible().len(), 4, "the forest is total");
         assert_eq!(
             app.stops().len(),
-            7,
-            "and holds nothing back to open — the two extra stops are the headers"
+            6,
+            "and holds nothing back to open — the two extra stops are the \
+             project row and this cluster's header"
         );
 
         app.handle_key(key(KeyCode::Tab));
@@ -1871,15 +1976,23 @@ mod tests {
     /// The fixture app plus launch inputs: one checkout of wayfinder, two of
     /// dotfiles.
     fn launchable_app() -> App {
-        let checkout = |path: &str, repo: &str| Checkout {
-            path: std::path::PathBuf::from(path),
-            repo: repo.to_string(),
+        let checkout = |path: &str, repo: &str| {
+            Checkout::new(std::path::PathBuf::from(path), repo.to_string())
         };
         fixture_app().with_checkouts(vec![
             checkout("/data/proj/wayfinder", "blooop/wayfinder"),
             checkout("/data/k1/dotfiles", "blooop/dotfiles"),
             checkout("/data/k2/dotfiles", "blooop/dotfiles"),
         ])
+    }
+
+    /// The same, standing on the dotfiles project — the repo with two
+    /// checkouts, and so the only one whose launch reaches the which-checkout
+    /// picker. Its ticket is on *its* screen, not wayfinder's.
+    fn two_checkout_app() -> App {
+        let mut app = launchable_app();
+        app.enter("blooop/dotfiles");
+        app
     }
 
     #[test]
@@ -2003,10 +2116,10 @@ mod tests {
         // Even claimed, a launch with no container to start plans no command:
         // the fixture's checkout paths do not exist, so no candidate can
         // declare a devcontainer, which is exactly the host case.
-        let app = fixture_app().with_checkouts(vec![Checkout {
-            path: std::path::PathBuf::from("/data/proj/wayfinder"),
-            repo: "blooop/wayfinder".to_string(),
-        }]);
+        let app = fixture_app().with_checkouts(vec![Checkout::new(
+            std::path::PathBuf::from("/data/proj/wayfinder"),
+            "blooop/wayfinder".to_string(),
+        )]);
         assert_eq!(launch::prewarm(&app.checkouts, &staged_six(&app)), None);
     }
 
@@ -2032,10 +2145,10 @@ mod tests {
                 },
             );
         }
-        let mut app = App::new(clusters).with_checkouts(vec![Checkout {
-            path: std::path::PathBuf::from("/data/proj/wayfinder"),
-            repo: "blooop/wayfinder".to_string(),
-        }]);
+        let mut app = app_on("blooop/wayfinder", clusters).with_checkouts(vec![Checkout::new(
+            std::path::PathBuf::from("/data/proj/wayfinder"),
+            "blooop/wayfinder".to_string(),
+        )]);
         // Both clusters hold a #6; the second one is map #47's copy.
         go_to(&mut app, "map #47");
         go_to(&mut app, "#6");
@@ -2062,7 +2175,7 @@ mod tests {
 
     #[test]
     fn several_checkouts_open_the_picker_and_enter_launches_the_pick() {
-        let mut app = launchable_app();
+        let mut app = two_checkout_app();
         // dotfiles#103 — a repo with two checkouts. The first enter stages the
         // launch; the second resolves it to the picker.
         go_to(&mut app, "#103");
@@ -2092,7 +2205,7 @@ mod tests {
 
     #[test]
     fn the_picker_clamps_and_esc_cancels_it() {
-        let mut app = launchable_app();
+        let mut app = two_checkout_app();
         go_to(&mut app, "#103");
         app.handle_key(key(KeyCode::Enter)); // dotfiles#103: stage the launch
         app.handle_key(key(KeyCode::Enter)); // resolve — two checkouts: picker
@@ -2119,6 +2232,7 @@ mod tests {
         // cluster and cannot be missing. The line still opens (the route is a
         // fact about the ticket); the *resolution* is what has nowhere to run.
         let mut app = fixture_app();
+        go_to(&mut app, "#6");
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         let notice = app.notice.as_deref().unwrap();
@@ -2246,7 +2360,7 @@ mod tests {
         // Two checkouts of dotfiles: the mode is settled in the launch
         // overlay, the checkout picker only answers *where* — the pick must
         // not lose the `auto`.
-        let mut app = launchable_app();
+        let mut app = two_checkout_app();
         go_to(&mut app, "#103");
         app.handle_key(key(KeyCode::Enter)); // dotfiles#103: stage
         app.handle_key(key(KeyCode::Down)); // to the auto row
@@ -2378,22 +2492,24 @@ mod tests {
         );
     }
 
-    /// An app focused on a registered repo that has no open map — what `wf`
-    /// opened inside a fresh checkout is looking at.
+    /// An app on a registered repo that has no open map — what `wf` opened
+    /// inside a fresh checkout is looking at.
     fn mapless_app() -> App {
-        let mut app = App::new(BTreeMap::new()).with_checkouts(vec![Checkout {
-            path: std::path::PathBuf::from("/data/proj/newthing"),
-            repo: "blooop/newthing".to_string(),
-        }]);
-        app.scope = Scope::Project("blooop/newthing".to_string());
+        let mut app = App::new(BTreeMap::new()).with_checkouts(vec![Checkout::new(
+            std::path::PathBuf::from("/data/proj/newthing"),
+            "blooop/newthing".to_string(),
+        )]);
+        app.enter("blooop/newthing");
         app
     }
 
     #[test]
-    fn a_focused_repo_with_no_map_renders_one_slim_header_to_start_from() {
-        // #114's empty-state door: this screen used to render nothing at all,
-        // which is where the first map of a repo had no way in. The header is
-        // a stop, so the cursor can name it and `enter` can act on it.
+    fn a_project_screen_leads_with_its_own_row_even_with_no_map() {
+        // The row is a place to stand, not a report on what was found: this
+        // screen used to render nothing at all, which is where the first map
+        // of a repo had no way in. It is a stop, so the cursor can name it and
+        // `enter` can act on it — and it is the *first* stop, so an untouched
+        // cursor is already on it.
         let app = mapless_app();
         assert_eq!(
             app.stops()
@@ -2405,6 +2521,22 @@ mod tests {
         assert_eq!(
             app.cursor_stop(),
             Some(Stop::Project("blooop/newthing".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_project_row_leads_a_screen_that_has_maps_too() {
+        // Not only the empty case: the row is the repo-level stop wherever the
+        // screen is, and the clusters follow it.
+        let app = fixture_app();
+        let stops: Vec<Stop> = app.stops().iter().map(|at| at.stop.clone()).collect();
+        assert_eq!(
+            stops.first(),
+            Some(&Stop::Project("blooop/wayfinder".to_string()))
+        );
+        assert!(
+            stops.iter().any(|s| matches!(s, Stop::Map(_))),
+            "the clusters still follow it: {stops:?}"
         );
     }
 
@@ -2443,57 +2575,68 @@ mod tests {
     }
 
     #[test]
-    fn the_door_waits_for_the_load_rather_than_flashing_up_mid_fetch() {
-        // A focused repo whose maps have not arrived *yet* looks exactly like
-        // one that has none — the same ambiguity `Startup` exists to remove
-        // for the "no projects" heading. Rendering the door on that screen
-        // would put a creation row under `enter` for the second or two before
-        // the clusters land, so an ordinary launch would start a new map.
+    fn the_project_row_is_a_stop_before_the_load_lands() {
+        // The old empty-state door had to wait for the search, because a repo
+        // whose maps were still in flight looked exactly like one that had
+        // none and the door was the *answer* to having none. This row is not
+        // an answer, so it does not wait: it is the same stop, meaning the
+        // same thing, on the first frame. Which is what lets `wf` in a checkout
+        // start a task before a single `gh` call has returned.
         let mut app = mapless_app();
         app.startup = Startup::default();
-        assert!(app.stops().is_empty(), "no door while the search is out");
-        let found: MapSet = [MapId::new("blooop/newthing", 3)].into_iter().collect();
-        app.startup.searched(&found);
-        assert!(app.stops().is_empty(), "nor while its map is still coming");
-        // Only once the load has actually landed and left nothing behind.
-        app.startup = Startup::loaded();
-        assert_eq!(app.stops().len(), 1);
+        assert_eq!(app.stops().len(), 1, "the row is there while searching");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert!(
+            matches!(app.overlay, Overlay::PickLaunch { .. }),
+            "and enter still opens the creation rows on it"
+        );
     }
 
     #[test]
-    fn map_less_repos_stay_off_the_widened_screen() {
-        // The door is the *focused* empty state, not a row per project on the
-        // main screen: permanent furniture for an occasional act is what #114
-        // ruled out. Widening drops it.
-        let mut app = mapless_app();
-        app.scope = Scope::All;
-        assert!(app.stops().is_empty());
+    fn every_registered_repo_is_a_row_on_the_project_list() {
+        // The reversal of #114's "map-less repos stay off the widened screen":
+        // one row per project is not permanent furniture on a ticket screen
+        // any more, it *is* the top-level screen. A repo with no map is a row
+        // there like any other — which is how it is reached from outside.
+        // Stamped rather than left to the clock: the order is the assertion,
+        // so two checkouts registered in the same second would make it a
+        // coin toss.
+        let used = |path: &str, repo: &str, at: u64| Checkout {
+            path: std::path::PathBuf::from(path),
+            repo: repo.to_string(),
+            used: Some(at),
+        };
+        let mut app = fixture_app().with_checkouts(vec![
+            used("/data/proj/wayfinder", "blooop/wayfinder", 100),
+            used("/data/proj/newthing", "blooop/newthing", 200),
+        ]);
+        app.level = Level::Projects;
+        let stops: Vec<Stop> = app.stops().iter().map(|at| at.stop.clone()).collect();
+        assert_eq!(
+            stops,
+            vec![
+                Stop::Project("blooop/newthing".to_string()),
+                Stop::Project("blooop/wayfinder".to_string()),
+            ],
+            "both projects, mapped or not, most recently used first — and no \
+             cluster among them"
+        );
     }
 
     #[test]
-    fn a_header_picker_reaches_the_creation_rows_and_a_ticket_picker_has_none() {
-        // #114: creation is a repo-level act, so the rows exist exactly where
-        // the stop is repo-level. On a header the walk reaches them after the
-        // launch modes; on a ticket the same walk wraps among the three modes.
-        let mut app = launchable_app();
-        go_to(&mut app, "map #1");
-        app.handle_key(key(KeyCode::Enter));
+    fn only_the_project_stop_reaches_the_creation_rows() {
+        // Creation is a repo-level act, so the rows exist exactly where the
+        // stop is a repo — and nowhere else. A cluster header is a *map*, so
+        // its picker walks the three modes and wraps, exactly as a ticket's
+        // does: the only difference between the two is what they aim at.
         let picked = |app: &App| match &app.overlay {
             Overlay::PickLaunch { candidate, .. } => *candidate,
             other => panic!("expected the launch picker, got {other:?}"),
         };
-        assert_eq!(
-            picked(&app),
-            Candidate::Launch {
-                mode: Mode::Interactive,
-                route: Route::Wayfinder
-            },
-            "opens on the default launch row"
-        );
-        // Down past the three modes lands on the creation rows, in order.
-        for _ in 0..3 {
-            app.handle_key(key(KeyCode::Down));
-        }
+
+        let mut app = launchable_app();
+        assert_eq!(at(&app), "project blooop/wayfinder");
+        app.handle_key(key(KeyCode::Enter));
         assert_eq!(picked(&app), Candidate::Create(CreationKind::Task));
         app.handle_key(key(KeyCode::Down));
         assert_eq!(picked(&app), Candidate::Create(CreationKind::Map));
@@ -2502,41 +2645,32 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         assert_eq!(
             picked(&app),
-            Candidate::Launch {
-                mode: Mode::Interactive,
-                route: Route::Wayfinder
-            },
-            "and wraps back to the top"
+            Candidate::Create(CreationKind::Task),
+            "and wraps: there is nothing else on a project's picker"
         );
-        // Up from the top wraps onto the last creation row.
-        app.handle_key(key(KeyCode::Up));
-        assert_eq!(picked(&app), Candidate::Create(CreationKind::MapAuto));
 
-        // A ticket stop walks only the modes: three downs is a full lap.
-        let mut app = launchable_app();
-        go_to(&mut app, "#6");
-        app.handle_key(key(KeyCode::Enter));
-        for _ in 0..3 {
-            app.handle_key(key(KeyCode::Down));
+        // A header and a ticket both walk only the modes: three downs is a
+        // full lap on either.
+        for stop in ["map #1", "#6"] {
+            let mut app = launchable_app();
+            go_to(&mut app, stop);
+            app.handle_key(key(KeyCode::Enter));
+            for _ in 0..3 {
+                app.handle_key(key(KeyCode::Down));
+            }
+            assert!(
+                matches!(picked(&app), Candidate::Launch { .. }),
+                "no creation rows on {stop}"
+            );
         }
-        assert_eq!(
-            picked(&app),
-            Candidate::Launch {
-                mode: Mode::Interactive,
-                route: Route::Wayfinder
-            },
-            "no creation rows on a ticket"
-        );
     }
 
     #[test]
     fn a_new_task_launches_wf_one_and_refuses_an_empty_task() {
         let mut app = launchable_app();
-        go_to(&mut app, "map #1");
+        // The project row is where an untouched cursor already is, and `new
+        // task` is the row its picker opens on: `enter`, type, `enter`.
         app.handle_key(key(KeyCode::Enter));
-        for _ in 0..3 {
-            app.handle_key(key(KeyCode::Down)); // onto `new task`
-        }
         // Enter with nothing typed refuses on the count line — the overlay
         // stays up, as a done or blocked node already refuses.
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
@@ -2565,11 +2699,8 @@ mod tests {
     fn a_new_map_launches_the_charting_skill_with_the_text_as_its_seed() {
         // The seed is optional: bare `/wf` charts from nothing.
         let mut app = launchable_app();
-        go_to(&mut app, "map #1");
         app.handle_key(key(KeyCode::Enter));
-        for _ in 0..4 {
-            app.handle_key(key(KeyCode::Down)); // onto `new map`
-        }
+        app.handle_key(key(KeyCode::Down)); // onto `new map`
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
@@ -2578,7 +2709,6 @@ mod tests {
 
         // And seeded, alone: the auto charting row takes the idea verbatim.
         let mut app = launchable_app();
-        go_to(&mut app, "map #1");
         app.handle_key(key(KeyCode::Enter));
         app.handle_key(key(KeyCode::Up)); // wrap straight onto `new map, auto`
         type_str(&mut app, "a caching layer");
@@ -2646,13 +2776,14 @@ mod tests {
                     tickets: vec![t],
                 },
             );
-            App::new(clusters).with_checkouts(vec![Checkout {
-                path: std::path::PathBuf::from("/data/proj/wayfinder"),
-                repo: "blooop/wayfinder".to_string(),
-            }])
+            app_on("blooop/wayfinder", clusters).with_checkouts(vec![Checkout::new(
+                std::path::PathBuf::from("/data/proj/wayfinder"),
+                "blooop/wayfinder".to_string(),
+            )])
         };
 
         let mut ready = build_app(vec![]);
+        go_to(&mut ready, "#65");
         ready.handle_key(key(KeyCode::Enter));
         match &ready.overlay {
             Overlay::PickLaunch { staged, .. } => {
@@ -2677,6 +2808,7 @@ mod tests {
                 review: Review::Approved,
             },
         }]);
+        go_to(&mut in_review, "#65");
         in_review.handle_key(key(KeyCode::Enter));
         match &in_review.overlay {
             Overlay::PickLaunch { staged, .. } => {
@@ -2700,6 +2832,7 @@ mod tests {
             number: 90,
             status: PrStatus::Merged,
         }]);
+        go_to(&mut done, "#65");
         assert_eq!(done.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         assert_eq!(done.overlay, Overlay::None);
         assert!(done.notice.as_deref().unwrap().contains("done"));
@@ -2715,27 +2848,28 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_f_focuses_cursor_rows_project_and_ctrl_g_widens() {
+    fn the_retired_chords_do_nothing_at_all() {
+        // `ctrl-f` and `ctrl-g` are unbound, not merely undocumented: focusing
+        // a project is entering it and widening is `←` out of it. Pressing
+        // either must not change the level, move the cursor, or type a letter
+        // into the query.
         let mut app = fixture_app();
         go_to(&mut app, "#6");
-        app.handle_key(ctrl('f'));
-        assert_eq!(app.scope, Scope::Project("blooop/wayfinder".to_string()));
-        assert_eq!(
-            app.visible().len(),
-            3,
-            "leverage rows: #6, #7 beneath it, #9"
-        );
-        assert_eq!(app.cursor_ticket().unwrap().number, 6);
-        app.handle_key(ctrl('g'));
-        assert_eq!(app.scope, Scope::All);
-        assert_eq!(app.visible().len(), 4);
-        // cursor stayed anchored on the same ticket
-        assert_eq!(app.cursor_ticket().unwrap().number, 6);
+        let before = (app.level.clone(), app.cursor_pos(), app.query.clone());
+        for chord in ['f', 'g'] {
+            assert_eq!(app.handle_key(ctrl(chord)), Outcome::Continue);
+            assert_eq!(
+                (app.level.clone(), app.cursor_pos(), app.query.clone()),
+                before,
+                "ctrl-{chord} did something"
+            );
+        }
     }
 
     #[test]
-    fn focus_keeps_every_open_map_of_the_repo() {
-        // Two maps on one repo: focusing the repo is not focusing one map.
+    fn entering_a_project_keeps_every_open_map_of_it_and_nobody_elses() {
+        // Two maps on one repo: a project is a repo, not a map, so entering it
+        // shows both — and the other repo's map is on another screen entirely.
         let mut clusters = BTreeMap::new();
         clusters.insert(
             MapId::new("blooop/wayfinder", 1),
@@ -2761,45 +2895,16 @@ mod tests {
                 tickets: vec![ticket("blooop/dotfiles", 103, "t103", true, false, vec![])],
             },
         );
-        let mut app = App::new(clusters);
-        app.handle_key(key(KeyCode::Down)); // cursor onto wayfinder#6 (map #1)
-        app.handle_key(ctrl('f'));
-        assert_eq!(app.scope, Scope::Project("blooop/wayfinder".to_string()));
+        let app = app_on("blooop/wayfinder", clusters);
         let visible = app.visible();
-        assert_eq!(visible.len(), 2, "both wayfinder maps stay on screen");
+        assert_eq!(visible.len(), 2, "both wayfinder maps are on this screen");
         assert!(visible.iter().all(|row| row.map.repo == "blooop/wayfinder"));
     }
 
     #[test]
-    fn ctrl_r_requests_refresh_and_replace_clusters_keeps_anchor() {
-        let mut app = fixture_app();
-        assert_eq!(app.handle_key(ctrl('r')), Outcome::Refresh);
-        go_to(&mut app, "#6");
-        let same = app.clusters.clone();
-        app.replace_clusters(same);
-        assert_eq!(app.cursor_ticket().unwrap().number, 6);
-    }
-
-    #[test]
-    fn replace_clusters_does_not_teleport_when_cursor_ticket_vanishes() {
-        let mut app = fixture_app();
-        go_to(&mut app, "#6"); // position 3: two stops per cluster ahead of it
-        let mut smaller = app.clusters.clone();
-        smaller
-            .get_mut(&MapId::new("blooop/wayfinder", 1))
-            .unwrap()
-            .tickets
-            .retain(|t| t.number != 6);
-        app.replace_clusters(smaller);
-        // Identity gone: cursor stays at the same position, clamped.
-        assert_eq!(app.cursor_pos(), 3);
-        assert_eq!(app.cursor_ticket().unwrap().number, 9);
-    }
-
-    #[test]
-    fn focus_separates_a_fork_from_its_upstream() {
-        // Two repos sharing a short name: identity and scope are the slug,
-        // so focusing one must not drag the other's rows in.
+    fn a_project_screen_separates_a_fork_from_its_upstream() {
+        // Two repos sharing a short name: identity is the slug, so one
+        // project's screen must not drag the other's rows in.
         let mut clusters = BTreeMap::new();
         for owner in ["blooop", "upstream"] {
             clusters.insert(
@@ -2818,18 +2923,169 @@ mod tests {
                 },
             );
         }
-        let mut app = App::new(clusters);
-        while app.cursor_ticket().map(|t| t.repo.as_str()) != Some("upstream/dotfiles") {
-            app.handle_key(key(KeyCode::Down));
-        }
-        app.handle_key(ctrl('f'));
-        assert_eq!(app.scope, Scope::Project("upstream/dotfiles".to_string()));
+        let app = app_on("upstream/dotfiles", clusters);
         assert_eq!(
             app.visible().len(),
             1,
             "the fork's identically-numbered row must not show"
         );
-        assert_eq!(app.cursor_ticket().unwrap().repo, "upstream/dotfiles");
+        assert_eq!(app.visible()[0].map.repo, "upstream/dotfiles");
+    }
+
+    #[test]
+    fn a_query_on_the_project_list_matches_slugs_and_keeps_no_tickets() {
+        // One query field, one register per level: at the top it is looking for
+        // a project, so it matches the slug and nothing else — a ticket title
+        // that would match cannot pull its project's rows onto this screen.
+        let mut app = launchable_app();
+        app.level = Level::Projects;
+        type_str(&mut app, "dotf");
+        assert_eq!(
+            app.stops()
+                .iter()
+                .map(|at| at.stop.clone())
+                .collect::<Vec<_>>(),
+            vec![Stop::Project("blooop/dotfiles".to_string())]
+        );
+        assert!(app.visible().is_empty(), "no ticket rows on the list");
+
+        // And a query that matches no project empties the list rather than
+        // falling back to something.
+        app.query.clear();
+        type_str(&mut app, "zzzz");
+        assert!(app.stops().is_empty());
+    }
+
+    #[test]
+    fn the_count_line_counts_whatever_the_screen_is_a_list_of() {
+        // Tickets on a project's screen, projects on the list. Counting
+        // tickets on the list would read `0/0` under nine projects — the same
+        // number an empty screen shows — and a query would narrow a count it
+        // was not narrowing.
+        let mut app = launchable_app();
+        assert_eq!(
+            app.counts(),
+            (3, 4),
+            "the wayfinder map's rows, its done one collapsed"
+        );
+
+        app.level = Level::Projects;
+        assert_eq!(app.counts(), (2, 2), "wayfinder and dotfiles");
+        type_str(&mut app, "dotf");
+        assert_eq!(app.counts(), (1, 2), "narrowed, out of all of them");
+    }
+
+    #[test]
+    fn a_query_puts_the_best_matching_project_first() {
+        // The fzf order the clusters already follow: with a query live it is
+        // the query's turn to decide, so `enter` after typing runs the thing
+        // you were most plainly reaching for rather than whatever you happened
+        // to open last.
+        let stamped = |path: &str, repo: &str, at: u64| Checkout {
+            path: std::path::PathBuf::from(path),
+            repo: repo.to_string(),
+            used: Some(at),
+        };
+        let mut app = fixture_app().with_checkouts(vec![
+            stamped("/a", "blooop/way", 300),
+            stamped("/b", "blooop/wayfinder", 100),
+        ]);
+        app.level = Level::Projects;
+        assert_eq!(at(&app), "project blooop/way", "most recently used first");
+        type_str(&mut app, "wayfinder");
+        assert_eq!(
+            at(&app),
+            "project blooop/wayfinder",
+            "and the query outranks that"
+        );
+    }
+
+    #[test]
+    fn a_query_hands_enter_back_to_the_best_match() {
+        // The creating default must not survive a sift. An untouched cursor
+        // means the first stop, so a project row left on a sifted screen would
+        // take `enter` on a freshly typed query away from the match and give it
+        // to *new task* — the one place where opening on the project is wrong.
+        let mut app = launchable_app();
+        assert_eq!(at(&app), "project blooop/wayfinder");
+        type_str(&mut app, "bread");
+        assert_eq!(at(&app), "#6", "the hit, not the project");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        match &app.overlay {
+            Overlay::PickLaunch { staged, .. } => {
+                assert!(
+                    matches!(staged.candidates()[0], Candidate::Launch { .. }),
+                    "a ticket's picker, not the creation rows"
+                );
+            }
+            other => panic!("expected the launch picker, got {other:?}"),
+        }
+        // Clearing the query puts the row back, and the cursor with it.
+        app.overlay = Overlay::None;
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(at(&app), "project blooop/wayfinder");
+    }
+
+    #[test]
+    fn enter_and_right_both_enter_a_project_and_left_comes_back_to_it() {
+        // The whole of the two-level navigation, in one walk. `←` is the back
+        // key: from inside a project it climbs to the project row and then out
+        // to the list, landing on the project just left rather than at the top.
+        let mut app = launchable_app();
+        app.level = Level::Projects;
+        go_to(&mut app, "project blooop/wayfinder");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.level,
+            Level::Project {
+                repo: "blooop/wayfinder".to_string()
+            }
+        );
+        // Down into the maps, then `←` all the way back out.
+        go_to(&mut app, "#6");
+        while app.current_repo().is_some() {
+            app.handle_key(key(KeyCode::Left));
+        }
+        assert_eq!(app.level, Level::Projects);
+        assert_eq!(
+            app.cursor_stop(),
+            Some(Stop::Project("blooop/wayfinder".to_string())),
+            "back out onto the project just left"
+        );
+        // `→` is the same door as `enter`.
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            app.level,
+            Level::Project {
+                repo: "blooop/wayfinder".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn ctrl_r_requests_refresh_and_replace_clusters_keeps_anchor() {
+        let mut app = fixture_app();
+        assert_eq!(app.handle_key(ctrl('r')), Outcome::Refresh);
+        go_to(&mut app, "#6");
+        let same = app.clusters.clone();
+        app.replace_clusters(same);
+        assert_eq!(app.cursor_ticket().unwrap().number, 6);
+    }
+
+    #[test]
+    fn replace_clusters_does_not_teleport_when_cursor_ticket_vanishes() {
+        let mut app = fixture_app();
+        go_to(&mut app, "#6"); // position 2: the project row and the header
+        let mut smaller = app.clusters.clone();
+        smaller
+            .get_mut(&MapId::new("blooop/wayfinder", 1))
+            .unwrap()
+            .tickets
+            .retain(|t| t.number != 6);
+        app.replace_clusters(smaller);
+        // Identity gone: cursor stays at the same position, clamped.
+        assert_eq!(app.cursor_pos(), 2);
+        assert_eq!(app.cursor_ticket().unwrap().number, 9);
     }
 
     #[test]

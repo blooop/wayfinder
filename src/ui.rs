@@ -13,11 +13,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Overlay, Scope};
+use crate::app::{App, Overlay};
 use crate::filter;
 use crate::launch::{Agent, Candidate, Launch, Staged};
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
-use crate::view::{Branch, Fold, GroupKind, Item, Plan};
+use crate::view::{Branch, Fold, GroupKind, Item, Plan, ProjectRow};
 
 /// One colour per glyph meaning, shared by the row column and the rollup
 /// pairs: calm colours for the flowing stages, red for the two that demand
@@ -68,19 +68,49 @@ fn cluster_header(id: &MapId, map: &Map, lit: &[usize], under_cursor: bool) -> L
     Line::from(spans)
 }
 
-/// The slim header of a focused repo with no open map (#114): the same left
-/// edge every cluster has, so it reads as somewhere to stand rather than as an
-/// error — but dim and countless, because there are no stages to count and
-/// nothing here to launch. `enter` on it opens the creation rows.
-fn mapless_header(repo: &str, under_cursor: bool) -> Line<'static> {
+/// A project row: the body of the project list, and the line a project's own
+/// screen opens on.
+///
+/// The same left edge every cluster has, one shade quieter — a project is the
+/// container its maps sit in, so it reads as somewhere to stand rather than as
+/// something that has happened. It carries the full `owner/name` rather than
+/// the short name the cluster headers show, because this is the one place two
+/// forks of one repo sit next to each other and the short names would be
+/// identical.
+///
+/// The tail says what is inside, and has three honest answers: the stage
+/// rollup once maps are on hand, `no map — enter to start one` once the search
+/// has answered and found none, and `loading…` in between. That third one is
+/// the whole reason [`ProjectRow::loaded`] exists — a repo whose maps are still
+/// in flight and a repo that has none are the same zero, and calling the first
+/// "no map" is the lie [`crate::refresh::Startup`] exists to prevent.
+fn project_line(row: &ProjectRow, under_cursor: bool) -> Line<'static> {
     let dim = Style::new().add_modifier(Modifier::DIM);
-    Line::from(vec![
-        cursor_span(under_cursor),
-        Span::styled("▌ ", dim),
-        // The name half, as every cluster header shows it.
-        Span::styled(repo.split('/').next_back().unwrap_or(repo).to_string(), dim),
-        Span::styled(" · no map — enter to start one", dim),
-    ])
+    let cyan = Style::new().fg(Color::Cyan);
+    let mut spans = vec![cursor_span(under_cursor), Span::styled("▌ ", cyan)];
+    spans.extend(lit_spans(&row.repo, &row.lit, cyan));
+    match (row.maps, row.loaded) {
+        (0, false) => spans.push(Span::styled(" · loading…", dim)),
+        (0, true) => spans.push(Span::styled(" · no map — enter to start one", dim)),
+        (n, _) => {
+            spans.push(Span::styled(
+                if n == 1 {
+                    " · 1 map".to_string()
+                } else {
+                    format!(" · {n} maps")
+                },
+                dim,
+            ));
+            for &(glyph, count) in &row.rollup {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("{}{count}", glyph.char()),
+                    glyph_style(glyph),
+                ));
+            }
+        }
+    }
+    Line::from(spans)
 }
 
 /// A rollup's trailing spans: a dim word for what the counts are *of*, then
@@ -411,7 +441,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                     under_cursor,
                 ));
             }
-            Item::MaplessHeader(repo) => lines.push(mapless_header(repo, under_cursor)),
+            Item::Project(project) => lines.push(project_line(project, under_cursor)),
             Item::Context { row, prefix } => lines.push(context_line(app.ticket(row), prefix)),
             Item::Group { id, held, fold } => {
                 lines.push(group_line(id.kind, *held, fold, under_cursor));
@@ -426,30 +456,50 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
 /// agent right here and `wf` is gone (#34); `esc` clears the query first and
 /// quits on an empty one, and `q` only quits when the query is empty (mid-query
 /// it types).
-const KEY_HINTS: &str =
-    "  enter launch · ←→ open · tab structure · ctrl-f focus · ctrl-r refresh · esc quit";
+/// The hint line, which is the level's — because the keys mean different
+/// enough things on the two screens that one line would have to be vague about
+/// both. `enter` opens a project up here and launches an agent down there;
+/// `tab` and the depth keys have nothing to toggle or descend into on a flat
+/// list of projects; and `←` being the way *back* is worth saying exactly where
+/// there is somewhere to go back to.
+fn key_hints(app: &App) -> &'static str {
+    if app.current_repo().is_some() {
+        "  enter launch · ←→ open · ← back · tab structure · ctrl-r refresh · esc quit"
+    } else {
+        "  enter open · ↑↓ move · type to filter · ctrl-r refresh · esc quit"
+    }
+}
 
 /// The project heading in the title bar.
 ///
-/// An empty screen has three meanings — still loading (#27), every fetch
-/// failed, or genuinely no projects — and telling a user with three registered
-/// projects that they have none is the exact ambiguity
-/// [`crate::refresh::Startup`] exists to remove. So both other cases are named
-/// before "no projects" is claimed. With clusters on screen, the heading
-/// counts the ground they cover: the one repo's slug, or how many projects.
+/// On a project's own screen it is that project — the level *is* the screen, so
+/// the title says which one whatever the fetch has managed so far.
+///
+/// On the project list it counts the registered repos, which is a fact off the
+/// cache and needs no network, so the ambiguity the old heading had to
+/// disentangle is gone with the screen that had it: an empty list now means one
+/// thing (nothing registered) instead of three (still loading, every fetch
+/// failed, or genuinely none). A failed *map* fetch no longer empties this
+/// screen at all — the projects are still listed — so it is named here only
+/// while it is the most interesting thing true, and on the count line
+/// ([`failure_note`]) in every case.
 ///
 /// # Panics
 ///
 /// Never: the arm that takes the single failed id has already matched on
 /// `len() == 1`.
 pub fn heading(app: &App) -> String {
-    if app.clusters.is_empty() {
-        if !app.startup.is_loaded() {
-            return "loading…".to_string();
-        }
-        // Naming the map is the whole value when there is one: "GitHub is
-        // unreachable" and "you have no projects" are different problems with
-        // different fixes, and the empty list looks identical either way.
+    if let Some(repo) = app.current_repo() {
+        return repo.to_string();
+    }
+    let projects = app.projects();
+    if projects.is_empty() {
+        return "no projects — run wf inside a checkout to register it".to_string();
+    }
+    // Naming the map is the whole value when there is one: "GitHub is
+    // unreachable" and "that project has nothing open" are different problems
+    // with different fixes, and a bare count reads the same either way.
+    if app.clusters.is_empty() && app.startup.is_loaded() {
         match app.failed.len() {
             0 => {}
             1 => {
@@ -458,12 +508,9 @@ pub fn heading(app: &App) -> String {
             }
             n => return format!("{n} maps failed to fetch — ctrl-r retries"),
         }
-        return "no projects — run wf inside a checkout to register it".to_string();
     }
-    let repos: std::collections::BTreeSet<&str> =
-        app.clusters.keys().map(|id| id.repo.as_str()).collect();
-    match repos.len() {
-        1 => (*repos.iter().next().expect("len checked")).to_string(),
+    match projects.len() {
+        1 => projects.into_iter().next().expect("len checked"),
         n => format!("{n} projects"),
     }
 }
@@ -585,6 +632,7 @@ fn draw_launch_picker(
         staged.key(),
         staged.title()
     );
+    let title = title.trim_end().to_string() + " ";
     let width = lines
         .iter()
         .map(|l| l.width() as u16 + 4)
@@ -681,14 +729,12 @@ fn draw_checkout_picker(frame: &mut Frame<'_>, launches: &[Launch], cursor: usiz
 /// count line against the query whose matches it counts.
 /// The which-checkout picker, when open, floats over all of it.
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
-    let mut block = match &app.scope {
-        Scope::All => Block::bordered().title(format!(" wf · {} ", heading(app))),
-        // The focused title names the project by its full slug — with one
-        // project on screen there is room, and it disambiguates forks.
-        Scope::Project(repo) => Block::bordered().title(format!(" wf · {repo} — focused ")),
-    };
-    if app.scope != Scope::All {
-        block = block.title_top(Line::from(" ctrl-g all projects ").right_aligned());
+    let mut block = Block::bordered().title(format!(" wf · {} ", heading(app)));
+    // The way back, named on the screen it applies to. A project screen is the
+    // only one with anywhere to go back to, and `←` is the only key that goes
+    // there — so this line appears exactly when it is true.
+    if app.current_repo().is_some() {
+        block = block.title_top(Line::from(" ← all projects ").right_aligned());
     }
     let inner = block.inner(frame.area());
     frame.render_widget(block, frame.area());
@@ -735,8 +781,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
+    let (shown, total) = app.counts();
     let mut count_spans = vec![
-        Span::raw(format!("  {}/{}", app.visible().len(), app.scoped().len())),
+        Span::raw(format!("  {shown}/{total}")),
         Span::styled(
             format!("  {status}"),
             Style::new().add_modifier(Modifier::DIM),
@@ -751,7 +798,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(count_spans)), count_area);
 
     frame.render_widget(
-        Paragraph::new(KEY_HINTS).style(Style::new().add_modifier(Modifier::DIM)),
+        Paragraph::new(key_hints(app)).style(Style::new().add_modifier(Modifier::DIM)),
         hint_area,
     );
     draw_overlay(frame, app);
@@ -803,10 +850,26 @@ mod tests {
         }
     }
 
+    /// An app standing on `repo`'s screen. `App::new` opens on the project
+    /// *list*, which draws no cluster at all, so a test about what a cluster
+    /// looks like has to say which project's screen it is on.
+    fn app_on(repo: &str, clusters: BTreeMap<MapId, Map>) -> App {
+        let mut app = App::new(clusters);
+        app.enter(repo);
+        app
+    }
+
     fn fixture_app() -> App {
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
-        App::new(clusters)
+        app_on("blooop/wayfinder", clusters)
+    }
+
+    /// Step the cursor down `n` stops.
+    fn down(app: &mut App, n: usize) {
+        for _ in 0..n {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
     }
 
     fn type_str(app: &mut App, s: &str) {
@@ -878,7 +941,7 @@ mod tests {
         }];
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), map);
-        let screen = render(&App::new(clusters));
+        let screen = render(&app_on("blooop/wayfinder", clusters));
         // ○0 is not drawn: the counts name the stages the map is actually in.
         assert!(
             screen.contains("▌ wayfinder · Map: wf  ◍1  !1  ●1  ⊘2"),
@@ -1001,7 +1064,7 @@ mod tests {
         }];
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), map);
-        let app = App::new(clusters);
+        let app = app_on("blooop/wayfinder", clusters);
         let screen = render(&app);
         // Same-repo badge: `⇄ PR#n <state>` after the [type] suffix.
         assert!(
@@ -1047,7 +1110,7 @@ mod tests {
         }];
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), map);
-        let screen = render(&App::new(clusters));
+        let screen = render(&app_on("blooop/wayfinder", clusters));
         assert!(screen.contains("◍ #6 Re-entry breadcrumbs"), "{screen}");
         assert!(screen.contains("! #9 Main screen design"), "{screen}");
         // Blocked still overrides whatever stage lies beneath.
@@ -1074,7 +1137,7 @@ mod tests {
         }];
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), map);
-        let mut app = App::new(clusters);
+        let mut app = app_on("blooop/wayfinder", clusters);
         let screen = render(&app);
         assert!(screen.contains("● 1 done (hidden) ◐1"), "{screen}");
 
@@ -1108,7 +1171,7 @@ mod tests {
         }];
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), map);
-        let screen = render(&App::new(clusters));
+        let screen = render(&app_on("blooop/wayfinder", clusters));
         assert!(screen.contains("⇄ PR#14 open"), "{screen}");
         assert!(!screen.contains('✓'), "{screen}");
         assert!(!screen.contains('✗'), "{screen}");
@@ -1144,13 +1207,15 @@ mod tests {
     fn idle_maps_drop_to_the_count_line_and_tab_brings_them_back() {
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
+        // A second map of the *same* project: a screen is one repo's, so an
+        // idle map has to be one of this repo's to be dropped from it.
         clusters.insert(
-            MapId::new("blooop/dotfiles", 4),
+            MapId::new("blooop/wayfinder", 4),
             Map {
-                title: "Map: dotfiles".to_string(),
+                title: "Map: the archive".to_string(),
                 last_activity: None,
                 tickets: vec![ticket(
-                    "blooop/dotfiles",
+                    "blooop/wayfinder",
                     103,
                     "All done here",
                     false,
@@ -1159,17 +1224,20 @@ mod tests {
                 )],
             },
         );
-        let mut app = App::new(clusters);
+        let mut app = app_on("blooop/wayfinder", clusters);
         let screen = render(&app);
         assert!(
-            !screen.contains("▌ dotfiles"),
+            !screen.contains("Map: the archive"),
             "an idle map leaves the body: {screen}"
         );
         assert!(screen.contains("· 1 idle map hidden"), "{screen}");
         // The forest is the escape hatch: everything renders there.
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let screen = render(&app);
-        assert!(screen.contains("▌ dotfiles · Map: dotfiles"), "{screen}");
+        assert!(
+            screen.contains("▌ wayfinder · Map: the archive"),
+            "{screen}"
+        );
         assert!(!screen.contains("idle map"), "{screen}");
     }
 
@@ -1194,7 +1262,7 @@ mod tests {
                 )],
             },
         );
-        let app = App::new(clusters);
+        let app = app_on("blooop/wayfinder", clusters);
         let screen = render(&app);
         let first = screen
             .find("▌ wayfinder · Map: wf")
@@ -1218,12 +1286,12 @@ mod tests {
         // of the keys that would have put it there are deliberately set here.
         let mut clusters = BTreeMap::new();
         clusters.insert(
-            MapId::new("blooop/archive", 1),
+            MapId::new("blooop/wayfinder", 1),
             Map {
-                title: "Map: archive".to_string(),
+                title: "Map: the archive".to_string(),
                 last_activity: Activity::parse("2026-08-06T12:00:00Z"),
                 tickets: vec![ticket(
-                    "blooop/archive",
+                    "blooop/wayfinder",
                     88,
                     "Shipped last week",
                     false,
@@ -1247,7 +1315,7 @@ mod tests {
                 )],
             },
         );
-        let mut app = App::new(clusters);
+        let mut app = app_on("blooop/wayfinder", clusters);
         // The forest, because that is the screen a finished map appears on at
         // all — leverage drops it as idle.
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -1256,7 +1324,7 @@ mod tests {
             .find("▌ wayfinder · Map: the selection view")
             .expect("the live cluster");
         let finished = screen
-            .find("▌ archive · Map: archive")
+            .find("▌ wayfinder · Map: the archive")
             .expect("the finished cluster");
         assert!(
             live < finished,
@@ -1300,11 +1368,15 @@ mod tests {
         assert!(lines[2].contains("5/5"), "{screen}");
         // The body follows, still opening on its own blank spacer line — which
         // now reads as the gap between the chrome and the first cluster.
+        // The project row leads the body, with the spacer that separates it
+        // from the first cluster — so the cluster header is two lines further
+        // down than it was when the body opened straight onto it.
+        assert!(lines[4].contains("▌ blooop/wayfinder"), "{screen}");
         let header = lines
             .iter()
             .position(|l| l.contains("▌ wayfinder · Map: wf"))
             .expect("cluster header on screen");
-        assert_eq!(header, 4, "{screen}");
+        assert_eq!(header, 6, "{screen}");
         assert!(
             lines[lines.len() - 2].contains("enter launch"),
             "hints stay on the last line: {screen}"
@@ -1428,7 +1500,7 @@ mod tests {
         ));
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), map);
-        let mut app = App::new(clusters);
+        let mut app = app_on("blooop/wayfinder", clusters);
         type_str(&mut app, "choose");
         let screen = render(&app);
         assert!(screen.contains("▾ ● 1 of 2 done"), "{screen}");
@@ -1482,9 +1554,11 @@ mod tests {
     /// The fixture map plus Build 4 launch inputs: two checkouts of the repo,
     /// so `enter` opens the which-checkout picker.
     fn launchable_app() -> App {
-        let checkout = |path: &str| crate::projects::Checkout {
-            path: std::path::PathBuf::from(path),
-            repo: "blooop/wayfinder".to_string(),
+        let checkout = |path: &str| {
+            crate::projects::Checkout::new(
+                std::path::PathBuf::from(path),
+                "blooop/wayfinder".to_string(),
+            )
         };
         fixture_app().with_checkouts(vec![
             checkout("/data/k1/wayfinder"),
@@ -1493,11 +1567,21 @@ mod tests {
     }
 
     #[test]
-    fn the_hint_line_advertises_the_one_launch_key_and_no_afk() {
+    fn the_hint_line_is_the_levels_and_advertises_no_afk() {
         let screen = render(&fixture_app());
-        assert!(screen.contains("enter launch"));
+        assert!(screen.contains("enter launch"), "{screen}");
+        assert!(screen.contains("← back"), "{screen}");
         assert!(!screen.contains("ctrl-a"), "{screen}");
         assert!(!screen.contains("afk"), "{screen}");
+
+        // On the list there is nothing to launch, nothing to descend into and
+        // nowhere further back — so the line says none of those.
+        let mut app = fixture_app();
+        app.level = crate::app::Level::Projects;
+        let screen = render(&app);
+        assert!(screen.contains("enter open"), "{screen}");
+        assert!(!screen.contains("← back"), "{screen}");
+        assert!(!screen.contains("tab structure"), "{screen}");
     }
 
     #[test]
@@ -1510,6 +1594,7 @@ mod tests {
     #[test]
     fn the_checkout_picker_floats_over_the_list_with_one_row_per_tree() {
         let mut app = launchable_app();
+        down(&mut app, 2); // past the project row and the cluster header, onto #6
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // stage
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // resolve
         let screen = render(&app);
@@ -1523,14 +1608,15 @@ mod tests {
     }
 
     #[test]
-    fn a_header_picker_draws_the_creation_rows_with_their_own_skills() {
-        // #114: on the repo-level stop the list carries both questions, so
-        // every row still has to name the skill it execs — including the rows
-        // that launch nothing on this node.
+    fn a_project_picker_draws_the_creation_rows_with_their_own_skills() {
+        // Creation is an act on a repo, so the rows live on the one stop that
+        // is a repo — and every row still names the skill it execs, including
+        // the ones that launch no node.
         let mut app = fixture_app();
-        while !matches!(app.cursor_stop(), Some(crate::view::Stop::Map(_))) {
-            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        }
+        assert!(
+            matches!(app.cursor_stop(), Some(crate::view::Stop::Project(_))),
+            "the project row is where an untouched cursor already is"
+        );
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let screen = render(&app);
         assert!(screen.contains("new task"), "{screen}");
@@ -1538,20 +1624,11 @@ mod tests {
         assert!(screen.contains("one tracked ticket"), "{screen}");
         assert!(screen.contains("new map"), "{screen}");
         assert!(screen.contains("new map, auto"), "{screen}");
-        // The field is named `steer` while a launch row is picked…
-        assert!(screen.contains("steer"), "{screen}");
-        // …and renames itself as the pick moves onto the creation rows, which
-        // is the only thing telling you the text means something else there.
-        for _ in 0..3 {
-            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        }
-        let screen = render(&app);
-        assert!(screen.contains("▶ new task"), "{screen}");
-        assert!(screen.contains("task  "), "{screen}");
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        let screen = render(&app);
-        assert!(screen.contains("▶ new map"), "{screen}");
-        assert!(screen.contains("seed  "), "{screen}");
+        // The field is named for the row it fills: `task` on the first one,
+        // which is the only thing telling you the text is not steering.
+        assert!(screen.contains("task"), "{screen}");
+        // Nothing to launch here, so no launch row names a mode.
+        assert!(!screen.contains("interactive"), "{screen}");
     }
 
     #[test]
@@ -1560,6 +1637,7 @@ mod tests {
         // its picker is the three modes and nothing else.
         let app = {
             let mut app = fixture_app();
+            down(&mut app, 2); // past the project row and the cluster header
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
             app
         };
@@ -1575,6 +1653,7 @@ mod tests {
 
         // Enter on #6 (a task at ready): the picker floats over the list,
         // titled with the node it launches.
+        down(&mut app, 2); // past the project row and the cluster header
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let screen = render(&app);
         // The repo leads the title (#114): it is the one fact every row shares
@@ -1647,10 +1726,16 @@ mod tests {
     fn the_first_frame_says_it_is_loading_rather_than_that_there_is_nothing() {
         // The whole point of #27: this screen is drawn before any network call,
         // so its empty list must not read as "no tickets" or "no projects".
-        let screen = render(&App::empty());
+        let mut app = App::empty();
+        app.enter("blooop/wayfinder");
+        let screen = render(&app);
         assert!(screen.contains("searching for maps…"), "{screen}");
-        assert!(screen.contains("wf · loading…"), "{screen}");
-        assert!(!screen.contains("no projects"), "{screen}");
+        // The screen is this project's from the first frame — the level came
+        // from a local `git` call, not from the fetch — and its row says the
+        // maps are still coming rather than that there are none.
+        assert!(screen.contains("wf · blooop/wayfinder"), "{screen}");
+        assert!(screen.contains("▌ blooop/wayfinder · loading…"), "{screen}");
+        assert!(!screen.contains("no map"), "{screen}");
     }
 
     #[test]
@@ -1660,7 +1745,16 @@ mod tests {
         // checkout" there sends the user to fix the one thing that is not
         // broken, so the failure has to win the heading — and it names the
         // *map*, because with several on one repo the repo alone is ambiguous.
-        let mut app = App::empty();
+        let mut app = App::empty().with_checkouts(vec![
+            crate::projects::Checkout::new(
+                std::path::PathBuf::from("/data/proj/wayfinder"),
+                "blooop/wayfinder".to_string(),
+            ),
+            crate::projects::Checkout::new(
+                std::path::PathBuf::from("/data/proj/dotfiles"),
+                "blooop/dotfiles".to_string(),
+            ),
+        ]);
         app.startup = Startup::loaded();
         app.failed.insert(MapId::new("blooop/wayfinder", 35));
         let screen = render(&app);
@@ -1777,30 +1871,72 @@ mod tests {
                 )],
             },
         );
-        let mut app = App::new(clusters);
+        let mut app = app_on("blooop/wayfinder", clusters);
         for _ in 0..40 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         assert_eq!(app.cursor_ticket().unwrap().number, 50);
         let screen = render(&app);
         assert!(screen.contains("▶ ○ #50 Build: clusters"), "{screen}");
-        // And with the cursor back at the top — the first cluster's header,
-        // since #96 — the top is what shows.
+        // And with the cursor back at the top — the project's own row, which
+        // is the first stop of its screen — the top is what shows.
         for _ in 0..40 {
             app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         }
         let screen = render(&app);
-        assert!(screen.contains("▶ ▌ wayfinder · Map: wf"), "{screen}");
+        assert!(screen.contains("▶ ▌ blooop/wayfinder"), "{screen}");
         assert!(screen.contains("○ #1 Open 1"), "{screen}");
     }
 
     #[test]
-    fn focus_mode_names_the_scope_in_the_title() {
-        let mut app = fixture_app();
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    fn the_project_list_draws_a_row_per_project_with_what_is_inside_it() {
+        // The top-level screen: full slugs (two forks of one repo have the same
+        // short name and sit next to each other here), most recently used
+        // first, each saying how much is inside it in the same glyph vocabulary
+        // the rows below use.
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
+        let stamped = |path: &str, repo: &str, at: u64| crate::projects::Checkout {
+            path: std::path::PathBuf::from(path),
+            repo: repo.to_string(),
+            used: Some(at),
+        };
+        let mut app = App::new(clusters).with_checkouts(vec![
+            stamped("/data/proj/wayfinder", "blooop/wayfinder", 200),
+            stamped("/data/proj/newthing", "blooop/newthing", 100),
+        ]);
+        app.startup = Startup::loaded();
         let screen = render(&app);
-        assert!(screen.contains("wf · blooop/wayfinder — focused"));
-        assert!(screen.contains("ctrl-g all projects"));
-        assert!(screen.contains("▶ ○ #6 Re-entry breadcrumbs"));
+        assert!(screen.contains("wf · 2 projects"), "{screen}");
+        assert!(
+            !screen.contains("← all projects"),
+            "nowhere further out to go"
+        );
+
+        let lines: Vec<&str> = screen.lines().collect();
+        let wayfinder = lines
+            .iter()
+            .position(|l| l.contains("▌ blooop/wayfinder · 1 map"))
+            .expect("the mapped project");
+        let newthing = lines
+            .iter()
+            .position(|l| l.contains("▌ blooop/newthing · no map — enter to start one"))
+            .expect("the map-less project — a row here like any other");
+        assert!(wayfinder < newthing, "most recently used first: {screen}");
+        // The counts are the map's, in the glyphs the rows use.
+        assert!(lines[wayfinder].contains("○1"), "{screen}");
+        // And no ticket got onto this screen.
+        assert!(!screen.contains("#6 Re-entry breadcrumbs"), "{screen}");
+    }
+
+    #[test]
+    fn a_project_screen_names_its_project_and_the_way_back() {
+        let screen = render(&fixture_app());
+        assert!(screen.contains("wf · blooop/wayfinder"), "{screen}");
+        // The way back is named on the screen it applies to, and it is the key
+        // that does it — the chords that used to focus and widen are gone.
+        assert!(screen.contains("← all projects"), "{screen}");
+        assert!(!screen.contains("ctrl-f"), "{screen}");
+        assert!(!screen.contains("ctrl-g"), "{screen}");
     }
 }

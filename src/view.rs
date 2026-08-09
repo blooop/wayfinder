@@ -120,10 +120,59 @@ pub enum Stop {
     Map(MapId),
     Ticket(Row),
     Group(GroupId),
-    /// A focused repo with no open map, by full slug (#114). Nothing to
-    /// launch — this is the door its *first* map is charted from, and the one
-    /// stop that names a repo rather than something in a map.
+    /// A whole project, by full slug — a row of the project list, and the row
+    /// the project screen opens on.
+    ///
+    /// The one stop that names a repo rather than something in a map, which is
+    /// why creation lives here: starting a map or a task is an act on a repo,
+    /// and this is the only stop that *is* one. What `enter` does to it
+    /// depends on which screen drew it — enter the project, or create in it —
+    /// and that is the whole of the two-level navigation.
     Project(String),
+}
+
+/// One project, as a row draws it: the slug, how much of it has arrived, and
+/// what stages its tickets are in.
+///
+/// `maps` and `rollup` are the *loaded* picture, not the true one — they count
+/// the clusters in hand this frame — which is what `loaded` is for. A repo with
+/// no clusters means "no map yet" only once the search has answered; before
+/// that it means "still looking", and the two are the same zero. The row is
+/// drawn either way, because it is a place to stand rather than a report: what
+/// `enter` does to it does not depend on whether the fetch has landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRow {
+    /// Full slug, `owner/name`.
+    pub repo: String,
+    /// How many of this repo's open maps are on hand.
+    pub maps: usize,
+    /// Stage counts across them, in display order — empty when none are.
+    pub rollup: Vec<(RowGlyph, usize)>,
+    /// Whether the map search has answered, so `maps: 0` can be read as "no
+    /// map" rather than "not yet".
+    pub loaded: bool,
+    /// Where a live query landed in the slug, in char indices — what the row
+    /// underlines. Empty on the structured screen, which has no query.
+    pub lit: Vec<usize>,
+}
+
+impl ProjectRow {
+    /// The row for `repo`, tallied from whichever of its maps have arrived.
+    ///
+    /// Takes every cluster rather than the repo's, so the caller cannot hand it
+    /// a filtered set and get a rollup that quietly means something narrower
+    /// than the row says.
+    #[must_use]
+    pub fn new(repo: &str, clusters: &BTreeMap<MapId, Map>, loaded: bool) -> ProjectRow {
+        let mine = || clusters.iter().filter(|(id, _)| id.repo == repo);
+        ProjectRow {
+            repo: repo.to_string(),
+            maps: mine().count(),
+            rollup: RowGlyph::tally(mine().flat_map(|(_, map)| &map.tickets)),
+            loaded,
+            lit: Vec::new(),
+        }
+    }
 }
 
 /// A stop plus the depth it sits at — everything navigation needs.
@@ -140,9 +189,9 @@ pub struct StopAt {
 pub enum Item {
     /// A cluster header — the map this and the following lines belong to.
     Header(MapId),
-    /// The slim header of a focused repo with no open map (#114): no stage
-    /// counts, because there are no stages — just somewhere to stand.
-    MaplessHeader(String),
+    /// A project row: the body of the project list, and the first line of a
+    /// project's own screen.
+    Project(ProjectRow),
     /// A ticket row.
     Ticket {
         row: Row,
@@ -193,8 +242,8 @@ impl Item {
                 stop: Stop::Map(id.clone()),
                 depth: 0,
             }),
-            Item::MaplessHeader(repo) => Some(StopAt {
-                stop: Stop::Project(repo.clone()),
+            Item::Project(project) => Some(StopAt {
+                stop: Stop::Project(project.repo.clone()),
                 depth: 0,
             }),
             // Nothing to land on. A sifted group leads this arm because it is
@@ -288,18 +337,76 @@ impl Plan {
     }
 }
 
+/// Plan the **project list**: one row per registered repo, in the order given
+/// (most recently used first), sifted by a live query.
+///
+/// The whole top level of the screen, and the only plan that needs no clusters
+/// to be meaningful — `repos` comes from the projects cache, which is read
+/// before the first frame, so this body is drawn without a single network call.
+/// The clusters, when they arrive, only fill in each row's counts.
+///
+/// A query here matches the **slug**, through the same pattern and tightness
+/// rule a ticket row goes through, and rows that miss leave the body. There are
+/// no context rows and nothing to elide: the list is flat, so a match either
+/// keeps its row or is not a match.
+///
+/// The *owner* half is matched here and deliberately not in a ticket's haystack
+/// (see [`filter`]'s `haystack`), and the difference is the screen rather than
+/// an oversight: there, an owner shared by two unrelated repos would drag one
+/// repo's tickets into the other's sift; here the rows **are** repos, the owner
+/// is drawn on every one of them, and narrowing to an org is a thing to want.
+/// Matching what is on screen is the rule both screens are keeping.
+pub fn projects(
+    repos: &[String],
+    clusters: &BTreeMap<MapId, Map>,
+    loaded: bool,
+    query: &str,
+) -> Plan {
+    let mut matcher = filter::Query::new(query);
+    // Best-first under a query, most-recently-used order without one — the same
+    // rule the clusters follow, where a live query is the query's to order and
+    // silence leaves the caller's order standing. `sort_by_key` is stable, so
+    // equally-scored projects keep their MRU order rather than shuffling.
+    let mut scored: Vec<(u32, ProjectRow)> = repos
+        .iter()
+        .filter_map(|repo| {
+            let mut row = ProjectRow::new(repo, clusters, loaded);
+            let Some(matcher) = matcher.as_mut() else {
+                return Some((0, row));
+            };
+            let (score, lit) = matcher.text(repo)?;
+            row.lit = lit;
+            Some((score, row))
+        })
+        .collect();
+    scored.sort_by_key(|(score, _)| Reverse(*score));
+    Plan {
+        items: scored
+            .into_iter()
+            .map(|(_, row)| Item::Project(row))
+            .collect(),
+        idle_hidden: 0,
+    }
+}
+
 /// Plan the body for the clusters in scope, in their given (render) order.
 ///
-/// `door` is the map-less repo whose empty-state header closes the body, if
-/// this screen is showing one (#114). It is planned *here*, with everything
-/// else, rather than appended by the caller: on-screen order is this module's
-/// single answer, and a row the caller pushes afterwards is a row the rollup
-/// pass — and every other walk below — never sees.
+/// `project` is the row the screen **opens on** — the repo whose screen this
+/// is. It is planned *here*, with everything else, rather than pushed on by the
+/// caller: on-screen order is this module's single answer, and a row the caller
+/// prepends afterwards is a row the rollup pass — and every other walk below —
+/// never sees, and one the cursor would find at a position the plan did not put
+/// it at.
+///
+/// It leads rather than trails because it is where the cursor starts. A project
+/// screen's first stop is the project itself, so `enter` on a freshly opened
+/// screen starts something in this repo, and reaching a ticket is one `↓` down
+/// into the maps below.
 pub fn plan(
     clusters: &[(&MapId, &Map)],
     screen: Screen<'_>,
     expanded: &Expanded,
-    door: Option<&str>,
+    project: Option<ProjectRow>,
 ) -> Plan {
     let sieve = Sieve::new(clusters, screen);
     // Under a query the cluster order is the query's to decide: the project
@@ -324,8 +431,17 @@ pub fn plan(
     if !sieve.sifting() {
         attach_rollups(&mut plan.items, clusters);
     }
-    if let Some(repo) = door {
-        plan.items.push(Item::MaplessHeader(repo.to_string()));
+    // Prepended after the rollup pass, which walks the cluster lines and would
+    // have to learn to step over this one otherwise. A spacer follows it for
+    // the same reason clusters have one between them: the row is a level above
+    // what comes next, not the first line of it.
+    if let Some(project) = project {
+        let lead = if plan.items.is_empty() {
+            vec![Item::Project(project)]
+        } else {
+            vec![Item::Project(project), Item::Blank]
+        };
+        plan.items.splice(0..0, lead);
     }
     plan
 }
@@ -574,7 +690,7 @@ fn attach_rollups(items: &mut [Item], clusters: &[(&MapId, &Map)]) {
             // `Item::Context` cannot appear here: rollups are attached only to
             // the unsifted screens, and only a sift produces context rows.
             Item::Header(_)
-            | Item::MaplessHeader(_)
+            | Item::Project(_)
             | Item::Group { .. }
             | Item::Context { .. }
             | Item::Blank => {
@@ -975,8 +1091,8 @@ mod tests {
     use super::*;
     use crate::model::{classify, Checks, PrLink, PrStatus, Review, Stage, TicketType};
 
-    /// The body without an empty-state door — the case every test below but
-    /// the door's own is about. Shadows [`super::plan`] so those tests read as
+    /// The body without a project row — the case every test below but the
+    /// project row's own is about. Shadows [`super::plan`] so those tests read as
     /// what they are testing rather than trailing a `None` each.
     fn plan(clusters: &[(&MapId, &Map)], screen: Screen<'_>, expanded: &Expanded) -> Plan {
         super::plan(clusters, screen, expanded, None)
@@ -1711,7 +1827,7 @@ mod tests {
             .iter()
             .map(|item| match item {
                 Item::Header(id) => format!("▌ {}", id.short_repo()),
-                Item::MaplessHeader(repo) => format!("▌ {repo} no map"),
+                Item::Project(p) => format!("▌ {} · {} map(s)", p.repo, p.maps),
                 Item::Ticket { row, prefix, .. } => format!("{prefix}#{}", number(row)),
                 Item::Context { row, prefix } => format!("{prefix}#{} dim", number(row)),
                 Item::Group {
