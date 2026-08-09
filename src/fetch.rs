@@ -66,16 +66,19 @@ query($owner: String!, $name: String!, $number: Int!) {
   }
 }";
 
+/// The envelope every `gh api graphql` answer arrives in. Generic over the
+/// selection because reap batches its own query through the same shape (#129),
+/// and "errors instead of data" must mean the same thing to both readers.
 #[derive(Deserialize)]
-struct GraphQlResponse {
-    data: Option<ResponseData>,
+pub(crate) struct GraphQlResponse<T> {
+    pub(crate) data: Option<T>,
     #[serde(default)]
-    errors: Vec<GraphQlError>,
+    pub(crate) errors: Vec<GraphQlError>,
 }
 
 #[derive(Deserialize)]
-struct GraphQlError {
-    message: String,
+pub(crate) struct GraphQlError {
+    pub(crate) message: String,
 }
 
 #[derive(Deserialize)]
@@ -103,8 +106,8 @@ struct MapIssue {
 }
 
 #[derive(Deserialize)]
-struct Nodes<T> {
-    nodes: Vec<T>,
+pub(crate) struct Nodes<T> {
+    pub(crate) nodes: Vec<T>,
 }
 
 impl<T> Default for Nodes<T> {
@@ -135,7 +138,7 @@ struct Label {
 }
 
 #[derive(Deserialize)]
-struct Assignee {
+pub(crate) struct Assignee {
     #[allow(dead_code)]
     login: String,
 }
@@ -147,8 +150,8 @@ struct Blocker {
 }
 
 #[derive(Deserialize)]
-struct PrNode {
-    number: u64,
+pub(crate) struct PrNode {
+    pub(crate) number: u64,
     state: String,
     #[serde(rename = "isDraft")]
     is_draft: bool,
@@ -177,7 +180,7 @@ struct RepoRef {
 /// wrong one. The inner strings are open GraphQL enums too: an unknown check
 /// rollup or review decision reads as "in flight", the only claim that stays
 /// true whatever the new value means.
-fn parse_pr(pr: &PrNode) -> Option<PrLink> {
+pub(crate) fn parse_pr(pr: &PrNode) -> Option<PrLink> {
     let status = match (pr.state.as_str(), pr.is_draft) {
         ("MERGED", _) => PrStatus::Merged,
         ("CLOSED", _) => PrStatus::Closed,
@@ -205,7 +208,7 @@ fn parse_pr(pr: &PrNode) -> Option<PrLink> {
     })
 }
 
-fn is_open(state: &str) -> bool {
+pub(crate) fn is_open(state: &str) -> bool {
     state == "OPEN"
 }
 
@@ -258,7 +261,7 @@ pub async fn fetch_map(id: &MapId) -> Result<Map> {
 /// network. Every raw tracker string a ticket is derived from (state,
 /// assignees, blocker states, labels) is interpreted exactly here.
 fn parse_map(body: &[u8], id: &MapId) -> Result<Map> {
-    let resp: GraphQlResponse =
+    let resp: GraphQlResponse<ResponseData> =
         serde_json::from_slice(body).context("unparseable GraphQL response from gh")?;
     if let Some(err) = resp.errors.first() {
         bail!("GraphQL error: {}", err.message);

@@ -26,6 +26,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
 
+use crate::fetch::{is_open, parse_pr, Assignee, GraphQlResponse, Nodes, PrNode};
 use crate::model::PrStatus;
 
 /// The branch prefix `wf` mints its workspaces under (#106): the full branch is
@@ -394,64 +395,157 @@ fn parse_workspaces(body: &[u8]) -> Result<Vec<Workspace>> {
     serde_json::from_slice(body).context("unparseable workspace listing from `dl --ls --json`")
 }
 
-/// Which of `nodes` the tracker says are closed.
+/// What the tracker says about each of `nodes`.
 ///
-/// One `gh` search per repo rather than one call per ticket: the numbers are
-/// asked about together, so ten workspaces of one repo cost one round trip.
+/// **One `gh api graphql` call per repo**, and none per workspace: every wanted
+/// number of a repo is aliased into the same query, so ten workspaces of one
+/// repo cost one round trip. (The per-ticket REST loop this replaced cost one
+/// each, which is what the old version of this comment claimed it did not.)
+///
+/// The selection is the reap-relevant subset of the map query's own — issue
+/// state, `assignees`, and the linked-PR rollup — and the PR nodes are read
+/// back through [`fetch`](crate::fetch)'s badge parse rather than re-read here,
+/// so "done" means one thing across the screen and the reaper.
 ///
 /// # Errors
 ///
-/// A `gh` that is missing, unauthenticated or refused. Never partial: a repo
-/// whose state could not be read makes the whole call fail, because the
-/// alternative is treating "could not ask" as "not closed" for some workspaces
-/// and deleting the rest — a half-answered question is the one shape this must
-/// not act on.
-pub async fn finished_nodes(nodes: &BTreeSet<Node>) -> Result<BTreeSet<Node>> {
-    let mut finished = BTreeSet::new();
-    let mut repos: BTreeSet<&str> = BTreeSet::new();
-    for node in nodes {
-        repos.insert(node.repo.as_str());
-    }
+/// A `gh` that is missing, unauthenticated or refused, and any node the batch
+/// did not answer for. Never partial: an unanswered repo or issue fails the
+/// whole call, because the alternative is treating "could not ask" as a fact
+/// about the node — and both directions of that are wrong, one deleting a
+/// workspace on no evidence and the other warning about one.
+pub async fn node_facts(nodes: &BTreeSet<Node>) -> Result<BTreeMap<Node, NodeFact>> {
+    let mut facts = BTreeMap::new();
+    let repos: BTreeSet<&str> = nodes.iter().map(|n| n.repo.as_str()).collect();
     for repo in repos {
-        let wanted: Vec<u64> = nodes
+        let numbers: Vec<u64> = nodes
             .iter()
             .filter(|n| n.repo == repo)
             .map(|n| n.number)
             .collect();
-        for number in wanted {
-            if issue_is_closed(repo, number).await? {
-                finished.insert(Node {
-                    repo: repo.to_string(),
-                    number,
-                });
-            }
+        let (owner, name) = repo
+            .split_once('/')
+            .with_context(|| format!("malformed repo slug {repo:?}"))?;
+        let output = Command::new("gh")
+            .args([
+                "api",
+                "graphql",
+                "-F",
+                &format!("owner={owner}"),
+                "-F",
+                &format!("name={name}"),
+                "-f",
+                &format!("query={}", node_facts_query(&numbers)),
+            ])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
+        if !output.status.success() {
+            bail!(
+                "could not read {repo}'s tickets: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
+        facts.extend(parse_node_facts(&output.stdout, repo, &numbers)?);
     }
-    Ok(finished)
+    Ok(facts)
 }
 
-/// Whether one issue is closed. `gh api` rather than a search, because search
-/// indexes lag and a stale "still open" only ever costs a workspace that stays.
-async fn issue_is_closed(repo: &str, number: u64) -> Result<bool> {
-    let output = Command::new("gh")
-        .args([
-            "api",
-            &format!("repos/{repo}/issues/{number}"),
-            "--jq",
-            ".state",
-        ])
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .context("failed to run `gh` — is the GitHub CLI installed and on PATH?")?;
-    if !output.status.success() {
-        bail!(
-            "could not read {repo}#{number}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+/// The GraphQL alias one node's answer comes back under. GraphQL has no
+/// variable field aliases, so the numbers are written into the query text —
+/// safe by type, since they are `u64` and nothing else can arrive here.
+fn alias(number: u64) -> String {
+    format!("i{number}")
+}
+
+/// One repo's batch: every wanted issue in one query.
+fn node_facts_query(numbers: &[u64]) -> String {
+    let mut query = String::from("query($owner: String!, $name: String!) {\n  repository(owner: $owner, name: $name) {\n");
+    for &number in numbers {
+        query.push_str(&format!(
+            "    {}: issue(number: {number}) {{\n      \
+               state\n      \
+               assignees(first: 5) {{ nodes {{ login }} }}\n      \
+               closedByPullRequestsReferences(first: 5, includeClosedPrs: true) {{\n        \
+                 nodes {{\n          \
+                   number state isDraft reviewDecision\n          \
+                   statusCheckRollup {{ state }}\n          \
+                   repository {{ nameWithOwner }}\n        \
+                 }}\n      \
+               }}\n    \
+             }}\n",
+            alias(number)
+        ));
+    }
+    query.push_str("  }\n}");
+    query
+}
+
+#[derive(Deserialize)]
+struct BatchData {
+    /// Aliased issues, keyed by [`alias`]. A node the query asked about and
+    /// this map has no live entry for is the never-partial case.
+    repository: Option<BTreeMap<String, Option<IssueFacts>>>,
+}
+
+#[derive(Deserialize)]
+struct IssueFacts {
+    state: String,
+    assignees: Nodes<Assignee>,
+    /// Defaulted for the same reason the map query defaults it: a GitHub
+    /// edition without the field reads as "no linked PRs" rather than failing.
+    #[serde(rename = "closedByPullRequestsReferences", default)]
+    closed_by_prs: Nodes<PrNode>,
+}
+
+/// The parse boundary for one repo's batch, kept apart from the process call so
+/// it is testable without `gh`.
+fn parse_node_facts(
+    body: &[u8],
+    repo: &str,
+    numbers: &[u64],
+) -> Result<BTreeMap<Node, NodeFact>> {
+    let resp: GraphQlResponse<BatchData> =
+        serde_json::from_slice(body).context("unparseable GraphQL response from gh")?;
+    if let Some(err) = resp.errors.first() {
+        bail!("GraphQL error: {}", err.message);
+    }
+    let answered = resp
+        .data
+        .and_then(|d| d.repository)
+        .with_context(|| format!("the tracker did not answer for {repo}"))?;
+    let mut facts = BTreeMap::new();
+    for &number in numbers {
+        let issue = answered
+            .get(&alias(number))
+            .and_then(Option::as_ref)
+            .with_context(|| format!("the tracker did not answer for {repo}#{number}"))?;
+        // The badge reading is fetch's, projected rather than repeated: an
+        // unreadable state yields no badge there and an in-flight PR here.
+        let prs: Vec<PrOutcome> = issue
+            .closed_by_prs
+            .nodes
+            .iter()
+            .map(|pr| {
+                let link = parse_pr(pr);
+                PrOutcome::project(pr.number, link.as_ref().map(|l| &l.status))
+            })
+            .collect();
+        facts.insert(
+            Node {
+                repo: repo.to_string(),
+                number,
+            },
+            node_fact(
+                is_open(&issue.state),
+                !issue.assignees.nodes.is_empty(),
+                &prs,
+            ),
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim() == "closed")
+    Ok(facts)
 }
 
 /// Hand one finished workspace back to `dl`.
@@ -1144,6 +1238,101 @@ mod tests {
                 reason: "still running — stop it first".to_string()
             }]
         );
+    }
+
+    /// One repo's batch, shaped exactly like the live one: five aliased
+    /// issues covering every arm the fact derivation can land on.
+    const BATCH_RESPONSE: &str = r#"{"data": {"repository": {
+        "i80": {"state": "OPEN", "assignees": {"nodes": []},
+                "closedByPullRequestsReferences": {"nodes": [
+                  {"number": 97, "state": "MERGED", "isDraft": false,
+                   "reviewDecision": null, "statusCheckRollup": {"state": "SUCCESS"},
+                   "repository": {"nameWithOwner": "blooop/devlaunch"}}]}},
+        "i81": {"state": "OPEN", "assignees": {"nodes": [{"login": "blooop"}]},
+                "closedByPullRequestsReferences": {"nodes": []}},
+        "i82": {"state": "OPEN", "assignees": {"nodes": []},
+                "closedByPullRequestsReferences": {"nodes": []}},
+        "i83": {"state": "CLOSED", "assignees": {"nodes": []},
+                "closedByPullRequestsReferences": {"nodes": []}},
+        "i84": {"state": "OPEN", "assignees": {"nodes": []},
+                "closedByPullRequestsReferences": {"nodes": [
+                  {"number": 44, "state": "SOMETHING_NEW", "isDraft": false,
+                   "reviewDecision": null, "statusCheckRollup": null,
+                   "repository": {"nameWithOwner": "blooop/devlaunch"}}]}}
+    }}}"#;
+
+    #[test]
+    fn one_batch_answers_every_node_of_a_repo() {
+        let facts = parse_node_facts(
+            BATCH_RESPONSE.as_bytes(),
+            "blooop/devlaunch",
+            &[80, 81, 82, 83, 84],
+        )
+        .expect("the batch parses");
+        assert_eq!(
+            facts,
+            BTreeMap::from([
+                (
+                    node("blooop/devlaunch", 80),
+                    NodeFact::DoneByMerge { pr: 97 }
+                ),
+                (node("blooop/devlaunch", 81), NodeFact::Claimed),
+                (node("blooop/devlaunch", 82), NodeFact::Unstarted),
+                (node("blooop/devlaunch", 83), NodeFact::Closed),
+                // The unknown PR state travels the whole way: it reached the
+                // fact as a PR in flight rather than being dropped on the floor
+                // and leaving #84 looking like a node nothing came of.
+                (node("blooop/devlaunch", 84), NodeFact::InFlight { pr: 44 }),
+            ])
+        );
+    }
+
+    #[test]
+    fn assignees_reach_the_reap_fact_from_the_same_batch() {
+        // The one bit separating "nobody took this up" from "someone is on it
+        // and has not opened a PR yet" — and without it the warning would fire
+        // on every grilling ticket and every pre-PR build session. It rides in
+        // on a call already being made: zero extra round trips.
+        let facts =
+            parse_node_facts(BATCH_RESPONSE.as_bytes(), "blooop/devlaunch", &[81, 82]).expect("parse");
+        assert_eq!(facts[&node("blooop/devlaunch", 81)], NodeFact::Claimed);
+        assert_eq!(facts[&node("blooop/devlaunch", 82)], NodeFact::Unstarted);
+    }
+
+    #[test]
+    fn a_node_the_batch_did_not_answer_for_is_an_error_not_unstarted() {
+        // The one sentinel this design could grow: a missing answer quietly
+        // becoming "nothing has come of it". Half an answer is the one shape
+        // reap must not act on, so the whole call fails instead.
+        let missing = parse_node_facts(BATCH_RESPONSE.as_bytes(), "blooop/devlaunch", &[80, 99])
+            .expect_err("an unanswered node fails the batch");
+        assert!(missing.to_string().contains("99"), "{missing}");
+        for body in [
+            // The alias came back null: the number names no issue there.
+            r#"{"data": {"repository": {"i80": null}}}"#,
+            // The repo itself came back null.
+            r#"{"data": {"repository": null}}"#,
+            // An error instead of data — never read as "nothing is closed".
+            r#"{"errors": [{"message": "Could not resolve to a Repository"}]}"#,
+            "not json",
+        ] {
+            assert!(
+                parse_node_facts(body.as_bytes(), "blooop/devlaunch", &[80]).is_err(),
+                "{body} parsed as an answer"
+            );
+        }
+    }
+
+    #[test]
+    fn the_batch_asks_one_question_per_node_and_asks_it_about_the_claim() {
+        // The wire contract: every wanted node aliased into the same round
+        // trip, and the same field subset the map query already reads — the
+        // claim included, which is what makes the split free.
+        let query = node_facts_query(&[80, 81]);
+        assert!(query.contains("i80: issue(number: 80)"), "{query}");
+        assert!(query.contains("i81: issue(number: 81)"), "{query}");
+        assert!(query.contains("assignees(first: 5)"), "{query}");
+        assert!(query.contains("includeClosedPrs: true"), "{query}");
     }
 
     #[test]
