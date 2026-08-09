@@ -72,7 +72,18 @@ Everything after `steer:` is still the human's text, so a steer that happens to 
 }
 ```
 
-The map carries its own repo because a ticket can sit on a map in another repo. `ticket_type` is one of `build` · `research` · `task` · `grilling` · `prototype` · `untyped`; `stage` one of `ready` · `building` · `in_review` · `needs_attention` — never `done`, because a finished node is not launchable. A PR's `status` is `draft`, `merged`, `closed`, or `open` with its `checks` (`absent` · `pending` · `passing` · `failing`) and `review` (`not_required` · `required` · `approved` · `changes_requested`).
+The map carries its own repo because a ticket can sit on a map in another repo.
+
+Every enumerated field, with its whole vocabulary — one line each, and each line is the complete list:
+
+- `aim` — `map` · `ticket`
+- `ticket_type` — `build` · `research` · `task` · `grilling` · `prototype` · `untyped`
+- `stage` — `ready` · `building` · `in_review` · `needs_attention`
+- `status` — `draft` · `open` · `merged` · `closed`
+- `checks` — `absent` · `pending` · `passing` · `failing`
+- `review` — `not_required` · `required` · `approved` · `changes_requested`
+
+A `stage` is never `done`: a finished node is not launchable, so a block cannot claim one. `checks` and `review` exist only inside an `open` status — they are questions about something still in flight.
 
 **What it deliberately does not carry**, and why the omissions are the contract rather than an oversight:
 
