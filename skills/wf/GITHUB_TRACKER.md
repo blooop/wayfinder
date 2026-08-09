@@ -89,16 +89,26 @@ An open, unassigned ticket is unclaimed. Claim **before any work**.
 
 ## Frontier query
 
-Open, unblocked, unclaimed children of the map:
+Open, unblocked, unclaimed children of the map — one round trip, however many children the map has. This is the same single-hop GraphQL query the `wf` binary issues to render a map: every child arrives with its `blockedBy` edges attached, so there is nothing left to fetch per child. (GraphQL spells enum values in caps: `OPEN`, not `open`.)
 
 ```bash
-gh api "repos/$REPO/issues/MAP_NUMBER/sub_issues" --paginate \
-  --jq '.[] | select(.state == "open" and (.assignees | length == 0)) | .number' |
-while read -r n; do
-  open_blockers=$(gh api "repos/$REPO/issues/$n/dependencies/blocked_by" \
-    --jq '[.[] | select(.state == "open")] | length')
-  [ "$open_blockers" -eq 0 ] && echo "$n"
-done
+gh api graphql -F owner="${REPO%/*}" -F name="${REPO#*/}" -F number=MAP_NUMBER -f query='
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      subIssues(first: 100) {
+        nodes {
+          number state
+          assignees(first: 5) { nodes { login } }
+          blockedBy(first: 50) { nodes { number state } }
+        }
+      }
+    }
+  }
+}' --jq '.data.repository.issue.subIssues.nodes[]
+  | select(.state == "OPEN" and (.assignees.nodes | length == 0)
+      and ([.blockedBy.nodes[] | select(.state == "OPEN")] | length == 0))
+  | .number'
 ```
 
 ## Journal on a ticket (breadcrumbs and handoff)
