@@ -145,6 +145,14 @@ pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
         "the probe child `{test}` failed:\n{stdout}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // A name that matches nothing leaves a child that ran no tests, exited 0
+    // and recorded no argv — and every assertion about what the probe did *not*
+    // do would then pass vacuously. This is what makes those assertions mean
+    // something: the probe ran.
+    assert!(
+        stdout.contains("test result: ok. 1 passed"),
+        "the probe child `{test}` ran no test — is that name still right?\n{stdout}"
+    );
     let argv = std::fs::read_to_string(&log)
         .expect("the log")
         .lines()
