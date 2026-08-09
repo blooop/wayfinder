@@ -15,7 +15,9 @@ Adapted from aihero.dev's `/code-review` (see `research/aihero-spine.md` in bloo
 
 ## Invocation
 
-`wf-review <pr>` — a PR number or URL (or a ticket number whose linked open PR is unambiguous). Resolve the repo explicitly and pass `--repo` on every `gh` call.
+`wf-review <pr> [ctx: <json>] [steer: <text>]` — a PR number or URL (or a ticket number whose linked open PR is unambiguous). Resolve the repo explicitly and pass `--repo` on every `gh` call.
+
+A launch from `wf` adds a `ctx: <json>` block after the number, and it carries the ticket's **linked PRs** — which is precisely the lookup this skill otherwise opens with when it is handed a bare ticket number. It is an **accelerator, never a precondition**: with no block, or one you cannot read, resolve the PR the way a hand-typed invocation does. See **The launch context** in [GITHUB_TRACKER.md](../wf/GITHUB_TRACKER.md).
 
 ## Inputs — deterministic, never asked
 

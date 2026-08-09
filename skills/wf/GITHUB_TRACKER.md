@@ -41,6 +41,47 @@ If `origin` is the **parent** — you cloned upstream and added your fork as a s
 gh api "repos/$REPO/issues/NUMBER" --jq .id
 ```
 
+## The launch context (`ctx:`)
+
+A launch line may carry `ctx: <json>` — a snapshot of what `wf` knew at exec time. It is an accelerator, never a precondition: use it to skip discovery reads (which map, which PR, what type and stage); never let it substitute for a live read before any write — claiming, commenting, closing, gating. If it is absent, does not parse, has a `v` you don't recognise, or names a repo or ticket other than the one your arguments and pinned `$REPO` name, ignore it entirely and discover via the commands below, as a hand-invoked session always does.
+
+It sits between the skill's own arguments and any `steer:` suffix, on one line:
+
+```
+<sigil><skill> <args> ctx: {"v":1,…} steer: <text>
+```
+
+Everything after `steer:` is still the human's text, so a steer that happens to contain the letters `ctx:` is steering text and nothing else.
+
+**What it carries** (schema `v: 1`; a ticket aim shown — a whole-map launch reads `"aim": "map"` and names no ticket):
+
+```json
+{
+  "v": 1,
+  "repo": "owner/name",
+  "map": { "repo": "owner/name", "number": 121, "title": "the map's title" },
+  "aim": {
+    "ticket": {
+      "number": 124,
+      "title": "the ticket's title",
+      "ticket_type": "build",
+      "stage": "in_review",
+      "prs": [{ "repo": "owner/name", "number": 130, "status": { "open": { "checks": "passing", "review": "required" } } }]
+    }
+  }
+}
+```
+
+The map carries its own repo because a ticket can sit on a map in another repo. `ticket_type` is one of `build` · `research` · `task` · `grilling` · `prototype` · `untyped`; `stage` one of `ready` · `building` · `in_review` · `needs_attention` — never `done`, because a finished node is not launchable. A PR's `status` is `draft`, `merged`, `closed`, or `open` with its `checks` (`absent` · `pending` · `passing` · `failing`) and `review` (`not_required` · `required` · `approved` · `changes_requested`).
+
+**What it deliberately does not carry**, and why the omissions are the contract rather than an oversight:
+
+- **No assignee and no ticket status.** The one fact whose staleness is dangerous — is this ticket still mine to take — is not in the schema at all, so everything present *is* safe to orient from. Claim-first is unchanged: `gh issue edit <n> --repo "$REPO" --add-assignee @me` is still the first thing a session does, and a ticket taken or closed between the pick and the launch fails there, before any work.
+- **No blockers.** The picker refuses a blocked node before staging, so a launched ticket has none open.
+- **No bodies and no comments** — of the ticket, of the map, of anything. `wf` never fetches them, so the reads that need them are unchanged.
+
+**Precedence: your arguments beat the block, and the tracker beats both.** The ticket number in your invocation is the assignment; a block naming a different number or repo is discarded whole, never merged field by field.
+
 ## Labels (once per repo, idempotent)
 
 ```bash
