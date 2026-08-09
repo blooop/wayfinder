@@ -49,7 +49,7 @@ use crate::projects::{Checkout, Resume, Session};
 /// command-line permission switch. Keeping that translation here means the
 /// picker cannot display one agent while the exec path silently starts the
 /// other.
-/// It is also the one half of a [`Resume`](crate::projects::Resume) that
+/// It is also the one half of a [`Resume`] that
 /// cannot be re-derived, so it goes to disk with one — spelt in lower case,
 /// which is what a human editing that cache would write.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
