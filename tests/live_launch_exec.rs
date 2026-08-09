@@ -8,7 +8,7 @@
 //! actually be wrong is what happens between the keypress and the agent's first
 //! frame, and that only happens once, in `main`.
 //!
-//! It pins down four claims, in the order they can fail:
+//! It pins down six claims, in the order they can fail:
 //!
 //! 0. **The container carries the agent, in a workspace of the ticket's
 //!    own.** This repo has a `.devcontainer/devcontainer.json`, so its
@@ -39,6 +39,16 @@
 //!    the shim reports its own termios, and an agent handed a still-raw tty
 //!    fails here instead of in daily use (the #30 failure mode, now guarded
 //!    from the other side).
+//!
+//! 4. **The launch leaves a way back into itself** (#35). The record has to
+//!    reach disk *before* the exec, because after it there is no `wf` left to
+//!    write anything — so a run that reached the agent and recorded nothing
+//!    would silently lose the conversation it had just started.
+//! 5. **And coming back rejoins it.** A second `wf`, against the cache the
+//!    first one left, opens its picker on a `resume` row and the same
+//!    `enter enter` returns to that conversation instead of starting another.
+//!    This is the one seam no unit test can reach: `resume_launch` is checked
+//!    exhaustively in the library, but only against a record a test handed it.
 //!
 //! Needs network, an authenticated `gh`, and a `blooop/wayfinder` checkout with
 //! at least one ticket on its map — i.e. this repo.
@@ -73,8 +83,11 @@ const COOKED: [&str; 4] = ["echo", "icanon", "isig", "opost"];
 struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new() -> Scratch {
-        let root = std::env::temp_dir().join(format!("wf-it-exec-{}", std::process::id()));
+    /// `name` keeps two tests in this binary from sharing a root: they run as
+    /// threads of one process, so the pid alone is not unique between them and
+    /// the `remove_dir_all` below would delete the other's shims mid-run.
+    fn new(name: &str) -> Scratch {
+        let root = std::env::temp_dir().join(format!("wf-it-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("bin")).expect("scratch bin");
         std::fs::create_dir_all(root.join("cache")).expect("scratch cache");
@@ -256,7 +269,7 @@ fn flags(stty: &str) -> Vec<&str> {
 #[allow(clippy::too_many_lines)]
 #[test]
 fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
-    let scratch = Scratch::new();
+    let scratch = Scratch::new("exec");
     scratch.write_shims();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
 
@@ -311,14 +324,35 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     drop(slave);
     let seen = spawn_reader(master);
 
-    // `▶` marks the cursor on a *ticket row*, so it cannot be drawn until a map
-    // has actually landed — group headers and the empty-list screen have none.
+    // A *cluster header* cannot be drawn until a map has landed. Waiting on
+    // `▶` alone would not do it any more: since #135 the cursor starts on the
+    // project row, which is drawn from the local cache on the very first frame
+    // and so says nothing about the fetch. The needle is one contiguous write
+    // — ratatui emits diffs, so `" #"` before a ticket number is split by the
+    // cursor-positioning escape between them and never appears in the stream.
     // Generous, because a cold cache pays for the map search before the fetch.
-    wait_for(&seen, "▶", Duration::from_secs(60), "the map to load");
+    wait_for(
+        &seen,
+        "▌ wayfinder · ",
+        Duration::from_secs(60),
+        "the map to load",
+    );
+
+    // Down onto a *ticket*. `wf` opens standing on the project row (#135) —
+    // where `enter` means "start something new in this repo" — and this test
+    // is about launching an agent on a node the tracker already knows. `→`
+    // steps forward one stop at a time, so two of them go project → cluster
+    // header → its first ticket.
+    for _ in 0..2 {
+        keys.write_all(b"\x1b[C").expect("send right");
+    }
+    keys.flush().expect("flush the descent");
 
     // First enter stages the launch: the picker opens over the list, titled
     // with the node and cursored on the interactive row. The second enter
-    // takes that row — today's default.
+    // takes that row — today's default. (Nothing has been launched on this
+    // node from this cache before, so there is no resume row above it: the
+    // cache is the test's own, and this run is the first.)
     keys.write_all(b"\r").expect("send enter");
     keys.flush().expect("flush enter");
     wait_for(
@@ -443,6 +477,36 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
          {workspace:?} vs {prompt:?}"
     );
 
+    // Claim 5: the launch left a way back into itself (#35). The record has to
+    // be on disk *before* the exec — after it there is no `wf` left to write
+    // anything — so a run that reached the agent and recorded nothing would
+    // lose the conversation it just started. It names the same node as the
+    // workspace and the prompt, in the tree the agent was exec'd into.
+    let cache_file = scratch.cache().join("wf").join("projects.json");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cache_file).expect("the projects cache"))
+            .expect("the cache is JSON");
+    let sessions = written["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the launch recorded no session: {written}"));
+    let session = sessions
+        .iter()
+        .find(|s| s["repo"] == "blooop/wayfinder")
+        .unwrap_or_else(|| panic!("no session for the launched repo: {written}"));
+    assert_eq!(
+        session["number"].as_u64().map(|n| n.to_string()).as_deref(),
+        Some(workspace_ticket),
+        "the recorded node must be the one that launched: {session}"
+    );
+    assert_eq!(session["agent"], "claude");
+    assert_eq!(
+        Path::new(session["checkout"].as_str().expect("a checkout path"))
+            .canonicalize()
+            .ok(),
+        repo.canonicalize().ok(),
+        "the resume must point at the tree the agent actually ran in"
+    );
+
     // Claim 3a: the tty itself came back. `wf` runs raw the whole time it is
     // up, so an agent that finds a raw tty here is one that would have found a
     // dead keyboard in daily use.
@@ -494,5 +558,136 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
         std::fs::read_to_string(&copied_prompt).ok(),
         std::fs::read_to_string(repo.join("skills/wf-tdd/SKILL.md")).ok(),
         "the launch must refresh the prompt it is about to exec"
+    );
+}
+
+/// Spawn `wf` under a fresh pty in `scratch`, returning the child, a handle to
+/// write keys into it, and the accumulating output.
+///
+/// Extracted for the round trip below, which needs two runs sharing one cache —
+/// the first to leave a conversation behind, the second to find it. The test
+/// above keeps its own inline copy: it asserts on the pid of the process it
+/// spawned, and threading that through a helper would put the thing being
+/// proved behind an abstraction.
+fn spawn_wf(
+    scratch: &Scratch,
+    cwd: &Path,
+) -> (std::process::Child, std::fs::File, Arc<Mutex<Vec<u8>>>) {
+    let (master, slave) = openpty_sized(40, 120);
+    let path = format!(
+        "{}:{}",
+        scratch.bin().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let child = unsafe {
+        Command::new(env!("CARGO_BIN_EXE_wf"))
+            .current_dir(cwd)
+            .env("PATH", &path)
+            .env("XDG_CACHE_HOME", scratch.cache())
+            .env("CLAUDE_CONFIG_DIR", scratch.claude())
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave.try_clone().expect("dup slave")))
+            .stdout(Stdio::from(slave.try_clone().expect("dup slave")))
+            .stderr(Stdio::from(slave.try_clone().expect("dup slave")))
+            .pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .spawn()
+            .expect("spawn wf under a pty")
+    };
+    let keys = std::fs::File::from(master.try_clone().expect("dup master"));
+    drop(slave);
+    (child, keys, spawn_reader(master))
+}
+
+/// Walk from the project row down to the first cluster's first ticket, stage
+/// it, and take the picker's leading row. The same keys both times, so the two
+/// runs land on the same node — which is what makes the second one a *return*
+/// to the first rather than a fresh launch somewhere else.
+fn launch_the_first_ticket(keys: &mut std::fs::File, seen: &Arc<Mutex<Vec<u8>>>, leading: &str) {
+    wait_for(
+        seen,
+        "▌ wayfinder · ",
+        Duration::from_secs(60),
+        "the map to load",
+    );
+    for _ in 0..2 {
+        keys.write_all(b"\x1b[C").expect("send right");
+    }
+    keys.flush().expect("flush the descent");
+    keys.write_all(b"\r").expect("send enter");
+    keys.flush().expect("flush enter");
+    wait_for(seen, leading, Duration::from_secs(10), "the launch picker");
+    keys.write_all(b"\r").expect("send the second enter");
+    keys.flush().expect("flush the second enter");
+}
+
+/// The round trip (#35): launch a node, come back, and rejoin the very
+/// conversation that launch started.
+///
+/// The one seam no unit test can reach. `launch::resume_launch` is checked
+/// exhaustively in the library, but what it is checked *against* is a `Resume`
+/// the test handed it. Here the record is written by one real `wf` on its way
+/// out of the process and read by a second real `wf` on its way up — through an
+/// actual file, an actual serde round trip, and the cache-loading path in
+/// `main` — so a resume that is offered but points nowhere, or is not offered
+/// at all, fails here and nowhere else.
+///
+/// Both runs press the same keys. The second one presses them against a screen
+/// that now has a resume row leading its picker, so the same `enter enter` that
+/// *started* the work is the one that returns to it — which is the claim the
+/// whole feature is for.
+#[test]
+fn coming_back_to_a_node_rejoins_the_conversation_the_first_launch_started() {
+    let scratch = Scratch::new("resume");
+    scratch.write_shims();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // Run one: an ordinary launch, which leaves the record behind.
+    let (mut child, mut keys, seen) = spawn_wf(&scratch, repo);
+    launch_the_first_ticket(&mut keys, &seen, "▶ interactive");
+    wait_for(&seen, RAN, Duration::from_secs(30), "the agent to run");
+    assert!(child.wait().expect("wait").success());
+    let first = std::fs::read_to_string(scratch.report()).expect("the first run's report");
+    let launched = field(&first, "argv=").to_string();
+    assert!(
+        launched.contains("/wf"),
+        "the first run must be a fresh skill launch: {launched}"
+    );
+
+    // Run two: the same keys, against a cache that now knows about that node.
+    // The picker leads with `resume`, so the second enter takes it.
+    let (mut child, mut keys, seen) = spawn_wf(&scratch, repo);
+    launch_the_first_ticket(&mut keys, &seen, "▶ resume");
+    wait_for(&seen, RAN, Duration::from_secs(30), "the agent to run");
+    assert!(child.wait().expect("wait").success());
+
+    let second = std::fs::read_to_string(scratch.report()).expect("the second run's report");
+    let resumed = field(&second, "argv=");
+    // The agent's own way back, and *only* that: no skill, and no `ctx:` block
+    // — the conversation being rejoined worked all of that out already.
+    assert_eq!(
+        resumed, "--continue --dangerously-skip-permissions",
+        "the second run must rejoin rather than start again"
+    );
+
+    // And it went back into the same container the first launch ran in, which
+    // is what makes it the same conversation: both agents key their history by
+    // cwd, and that cwd is inside this workspace.
+    let dl = std::fs::read_to_string(scratch.dl_report()).expect("the dl shim's report");
+    let workspace = field(&dl, "argv=")
+        .split(' ')
+        .next()
+        .expect("a workspace")
+        .to_string();
+    assert!(
+        workspace.starts_with("blooop/wayfinder@wayfinder/wayfinder-"),
+        "the resume must re-enter the node's own workspace, got {workspace:?}"
     );
 }

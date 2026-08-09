@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use crate::launch::{Agent, Isolation};
 use crate::model::MapSet;
 
 /// One touched checkout: where it lives, and which repo its `origin` points at.
@@ -60,6 +61,96 @@ impl Checkout {
             path,
             repo,
             used: Some(now_secs()),
+        }
+    }
+}
+
+/// A conversation a previous launch left behind on this machine, and the way
+/// back into it (#35).
+///
+/// Deliberately small, because resuming needs almost nothing. Neither agent
+/// resumes by session id: `claude --continue` continues "the most recent
+/// conversation in the current directory", and `codex resume --last` filters
+/// by cwd unless told otherwise. `wf` already gives every node a cwd of its
+/// own — that is what the per-node workspace *is* — so the way back to a
+/// conversation is simply to exec in the same place. Which leaves three facts
+/// worth keeping and no fourth — the three that between them say *where the
+/// conversation is*: which tree, whether it ran in that tree or in the node's
+/// container, and which CLI ran there.
+///
+/// The agent is here because it cannot be re-derived at all: a Claude
+/// conversation is not rejoinable by Codex, and a resume that guessed would
+/// open an empty session in the right directory and call it a rejoin. The
+/// workspace name is *not* here for the opposite reason — it is a pure
+/// function of the node, so a copy could only ever disagree with a fresh
+/// derivation.
+///
+/// What this does **not** claim is that a conversation exists. It says `wf`
+/// launched an agent here, which is the strongest thing `wf` can know without
+/// reading the agent's own store — a container's store, for an isolated
+/// launch, at a path devpod chose. A launch that died before its agent wrote
+/// anything leaves a resume row that lands on the agent's own "no conversation
+/// found", and that is the honest failure: the row promises what `wf` did, not
+/// what the agent managed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resume {
+    /// Which CLI ran, and therefore which one can rejoin it.
+    pub agent: Agent,
+    /// The tree the launch exec'd in — the checkout on the host, and the
+    /// tree whose devcontainer an isolated launch's container was built from.
+    pub checkout: PathBuf,
+    /// Whether the agent ran on the host or inside the node's container.
+    ///
+    /// Recorded rather than re-detected, unlike everything else here, because
+    /// it is a fact about **where the conversation is** and not about the
+    /// tree's current shape. An isolated launch's history lives at a cwd
+    /// inside `dl`'s own clone; re-detecting from a checkout that has since
+    /// lost its `.devcontainer/` would answer Host and silently resume the
+    /// checkout's own, different conversation. A `dl` that has gone missing
+    /// makes the exec fail loudly instead, which is the better of the two.
+    pub isolation: Isolation,
+    /// When it was launched, seconds since the Unix epoch — what the picker
+    /// row reads back as "20m ago".
+    pub at: u64,
+}
+
+/// A [`Resume`], keyed to the node whose conversation it is.
+///
+/// Flattened on the wire, so a session reads as one object rather than a node
+/// with a nested record — and so the file stays legible to the human who
+/// deletes it, this being a cache and not truth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    /// The node's repo, full slug — matched whole, since a fork and its
+    /// upstream share a short name (#15).
+    pub repo: String,
+    /// The ticket or map number the launch was aimed at.
+    pub number: u64,
+    #[serde(flatten)]
+    pub resume: Resume,
+}
+
+impl Session {
+    /// A session recorded now. The only constructor, for the same reason
+    /// [`Checkout::new`] is: a record that forgot to stamp itself would read
+    /// as a resume from the epoch.
+    #[must_use]
+    pub fn new(
+        repo: String,
+        number: u64,
+        agent: Agent,
+        checkout: PathBuf,
+        isolation: Isolation,
+    ) -> Self {
+        Self {
+            repo,
+            number,
+            resume: Resume {
+                agent,
+                checkout,
+                isolation,
+                at: now_secs(),
+            },
         }
     }
 }
@@ -125,6 +216,16 @@ pub struct ProjectsCache {
     /// and only the head start is lost — once.
     #[serde(default)]
     pub open_maps: MapSet,
+    /// The conversations previous launches left on this machine (#35), at most
+    /// one per node.
+    ///
+    /// Here rather than in a file of its own because it is the same *kind* of
+    /// thing the rest of this cache is: a per-machine fact `wf` accumulates by
+    /// being used, cheap to lose, rebuilt by the next launch. It also lands
+    /// where the write already happens — the handover already loads this cache
+    /// to stamp the checkout it is about to exec in.
+    #[serde(default)]
+    pub sessions: Vec<Session>,
 }
 
 impl ProjectsCache {
@@ -192,6 +293,36 @@ impl ProjectsCache {
         }
     }
 
+    /// Record that an agent was launched on a node, here — the fact a later
+    /// resume is offered on.
+    ///
+    /// **Upserts by node**, so a node has at most one resume. Both agents
+    /// resume by cwd, so one node in one tree has exactly one conversation to
+    /// come back to; keeping the older record would offer a second door to the
+    /// same place, and — once the launch moved to another checkout — a door
+    /// into the wrong one. The newest launch is the one the human means.
+    pub fn record_session(&mut self, session: Session) {
+        self.sessions
+            .retain(|s| !(s.repo == session.repo && s.number == session.number));
+        self.sessions.push(session);
+    }
+
+    /// The conversation a previous launch of this node left, if there is one
+    /// to rejoin.
+    pub fn resume(&self, repo: &str, number: u64) -> Option<&Resume> {
+        self.sessions
+            .iter()
+            .find(|s| s.repo == repo && s.number == number)
+            .map(|s| &s.resume)
+    }
+
+    /// Drop resumes into trees that are gone. Called by
+    /// [`prune_missing`](Self::prune_missing), because a resume's whole content
+    /// is a place to exec in.
+    fn forget_unreachable_sessions(&mut self) {
+        self.sessions.retain(|s| s.resume.checkout.is_dir());
+    }
+
     /// The head start (#28): every open map the last search found, for repos
     /// still in the cache. Read before the first frame, so the loaders start
     /// fetching at `t≈0` instead of after the ~2.5 s search.
@@ -230,9 +361,10 @@ impl ProjectsCache {
     /// before the first frame. `is_dir()` is also the deliberately lenient
     /// test — a checkout on an unmounted volume comes back when it mounts.
     pub fn prune_missing(&mut self) -> bool {
-        let before = self.checkouts.len();
+        let before = (self.checkouts.len(), self.sessions.len());
         self.checkouts.retain(|c| c.path.is_dir());
-        let removed = self.checkouts.len() != before;
+        self.forget_unreachable_sessions();
+        let removed = (self.checkouts.len(), self.sessions.len()) != before;
         if removed {
             self.forget_unknown_maps();
         }
@@ -552,6 +684,131 @@ mod tests {
             paths,
             vec![p("/data/k1/kinisi_ros"), p("/data/k2/kinisi_ros")]
         );
+    }
+
+    #[test]
+    fn a_launch_leaves_a_resume_the_node_can_be_rejoined_by() {
+        // The one fact resuming needs, and one `wf` creates rather than
+        // discovers: an agent ran on this node, in this tree, on this machine.
+        let mut cache = ProjectsCache::default();
+        cache.record_session(Session::new(
+            "blooop/wayfinder".to_string(),
+            117,
+            Agent::Claude,
+            p("/data/proj/wayfinder"),
+            Isolation::Host,
+        ));
+        let resume = cache
+            .resume("blooop/wayfinder", 117)
+            .expect("the node it was recorded for finds it");
+        assert_eq!(resume.agent, Agent::Claude);
+        assert_eq!(resume.checkout, p("/data/proj/wayfinder"));
+        // Every other node is untouched: a resume belongs to one node, and
+        // offering a neighbour's conversation would rejoin the wrong work.
+        assert_eq!(cache.resume("blooop/wayfinder", 118), None);
+        assert_eq!(cache.resume("blooop/devlaunch", 117), None);
+    }
+
+    #[test]
+    fn relaunching_a_node_replaces_its_resume_rather_than_stacking_them() {
+        // Both agents resume by *cwd* (`claude -c`, `codex resume --last`), so
+        // one node in one tree has exactly one conversation to come back to.
+        // Keeping the older record would offer a second door to the same
+        // place — and, when the tree changed, the wrong place.
+        let mut cache = ProjectsCache::default();
+        let node = || ("blooop/wayfinder".to_string(), 117);
+        cache.record_session(Session::new(
+            node().0,
+            node().1,
+            Agent::Claude,
+            p("/data/k1/wayfinder"),
+            Isolation::Host,
+        ));
+        cache.record_session(Session::new(
+            node().0,
+            node().1,
+            Agent::Codex,
+            p("/data/k2/wayfinder"),
+            Isolation::Host,
+        ));
+        assert_eq!(cache.sessions.len(), 1);
+        let resume = cache.resume("blooop/wayfinder", 117).expect("the newer");
+        assert_eq!(resume.agent, Agent::Codex);
+        assert_eq!(resume.checkout, p("/data/k2/wayfinder"));
+    }
+
+    #[test]
+    fn a_resume_whose_checkout_is_gone_is_pruned_with_it() {
+        // The resume names a tree to exec in. Once that tree is deleted the
+        // conversation is unreachable, so the row must stop being offered —
+        // the same rule the checkout it points at already obeys.
+        let root = std::env::temp_dir().join(format!("wf-test-resume-{}", std::process::id()));
+        let live = root.join("live");
+        let gone = root.join("gone");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&gone).unwrap();
+
+        let mut cache = ProjectsCache::default();
+        cache.register(live.clone(), "blooop/wayfinder".to_string());
+        cache.register(gone.clone(), "blooop/wayfinder".to_string());
+        cache.record_session(Session::new(
+            "blooop/wayfinder".to_string(),
+            117,
+            Agent::Claude,
+            live.clone(),
+            Isolation::Devlaunch,
+        ));
+        cache.record_session(Session::new(
+            "blooop/wayfinder".to_string(),
+            121,
+            Agent::Claude,
+            gone.clone(),
+            Isolation::Host,
+        ));
+
+        std::fs::remove_dir_all(&gone).unwrap();
+        assert!(cache.prune_missing());
+        assert!(cache.resume("blooop/wayfinder", 117).is_some());
+        assert_eq!(
+            cache.resume("blooop/wayfinder", 121),
+            None,
+            "a resume into a deleted tree must stop being offered"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_cache_file_written_before_resume_existed_still_loads() {
+        // The fourth shape change, and the same rule as the other three: the
+        // checkouts survive, and the only thing missing is a resume nobody
+        // could have recorded yet.
+        let cache: ProjectsCache = serde_json::from_str(
+            r#"{"checkouts":[{"path":"/data/proj/wayfinder","repo":"blooop/wayfinder"}]}"#,
+        )
+        .expect("a cache file without sessions parses");
+        assert!(cache.sessions.is_empty());
+        assert_eq!(cache.resume("blooop/wayfinder", 117), None);
+    }
+
+    #[test]
+    fn a_resume_round_trips_through_disk_with_the_agent_that_ran() {
+        // Which agent ran is the half that cannot be re-derived: a Claude
+        // conversation cannot be rejoined by Codex, so if this field does not
+        // survive the write, resume comes back offering the wrong CLI.
+        let dir = std::env::temp_dir().join(format!("wf-test-sessions-{}", std::process::id()));
+        let file = dir.join("projects.json");
+        let mut cache = ProjectsCache::default();
+        cache.register(p("/data/proj/wayfinder"), "blooop/wayfinder".to_string());
+        cache.record_session(Session::new(
+            "blooop/wayfinder".to_string(),
+            117,
+            Agent::Codex,
+            p("/data/proj/wayfinder"),
+            Isolation::Host,
+        ));
+        cache.save(&file).expect("save");
+        assert_eq!(ProjectsCache::load_or_default(&file), cache);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
