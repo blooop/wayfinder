@@ -716,7 +716,7 @@ pub struct Staged {
     pub at: StagedAt,
 }
 
-/// What the picker was opened on (#114). A map-less repo is not a node with a
+/// What the picker was opened on (#114). A project is not a node with a
 /// missing issue number — it has no aim, no map and nothing to launch, because
 /// nothing has been filed in it yet — so the two are arms of one sum rather
 /// than a node struct with optional fields. Which rows the picker offers falls
@@ -733,8 +733,8 @@ pub enum StagedAt {
         /// when the cursor was on the cluster header.
         map: MapRef,
     },
-    /// A registered checkout whose repo has no open map: the empty-state door
-    /// this repo's *first* map is charted from.
+    /// A whole project: the repo-level stop every project screen opens on,
+    /// and the only stop creation hangs off.
     Project,
 }
 
@@ -771,8 +771,8 @@ impl Staged {
         }
     }
 
-    /// Stage the empty-state door: a registered repo with no open map (#114).
-    /// There is no node, so the picker offers creation alone.
+    /// Stage a project — the repo-level stop. There is no node, so the picker
+    /// offers creation alone.
     pub fn project(repo: &str) -> Staged {
         Staged {
             repo: repo.to_string(),
@@ -781,7 +781,7 @@ impl Staged {
     }
 
     /// How the staged stop reads to the human: the ticket's title, the map's,
-    /// or the map-less door's own words.
+    /// or nothing at all for a project, which the repo already names.
     ///
     /// Derived rather than stored (#124). The title the picker draws and the
     /// title the launch hands the agent are one fact, and a second copy beside
@@ -795,12 +795,16 @@ impl Staged {
             StagedAt::Node {
                 aim: Aim::Map, map, ..
             } => &map.title,
-            StagedAt::Project => "no map",
+            // The repo already leads the picker's title, and a project stop
+            // adds nothing to it: what is being named is the repo itself. It
+            // read `no map` while this stop existed only as the map-less door;
+            // it is now every project's row, and most of them have maps.
+            StagedAt::Project => "",
         }
     }
 
     /// Which skill launching this node in `mode` would run — `None` for the
-    /// map-less door, which has no node to launch and therefore no route.
+    /// project stop, which has no node to launch and therefore no route.
     pub fn route(&self, mode: Mode) -> Option<Route> {
         match &self.at {
             StagedAt::Node { aim, .. } => Some(route(aim, mode)),
@@ -811,52 +815,50 @@ impl Staged {
     /// The row the picker opens on: the first row this stop offers. On a node
     /// that is the default mode's launch row — creation is never the default,
     /// because `enter` on a node still means "launch this node" first. On the
-    /// map-less door there is no node to launch, so the first creation row
-    /// leads.
+    /// project row there is no node to launch, so the first creation row
+    /// leads — and since that row is where an untouched cursor sits, it is
+    /// what `enter` type `enter` runs.
     ///
     /// # Panics
     ///
     /// Never: [`Staged::candidates`] is never empty. Every stop offers rows —
-    /// its launch rows, or, on the map-less door, its creation rows.
+    /// its launch rows, or, on a project row, its creation rows.
     pub fn default_candidate(&self) -> Candidate {
         *self.candidates().first().expect("every stop offers rows")
     }
 
     /// The picker's rows for this stop, in on-screen order — the one
     /// constructor of [`Candidate`], which is what makes an inconsistent row
-    /// unbuildable (#114). Every *node* launches; only the repo-level node —
-    /// the cluster header, [`Aim::Map`] — adds the creation rows, because
-    /// creation is a repo-level act and a ticket picker carrying it would
-    /// merge concerns the stop grammar keeps apart. The map-less door has no
-    /// node, so it offers the creation rows alone.
+    /// unbuildable (#114).
+    ///
+    /// A **node launches, a project creates**, and neither does the other's
+    /// job. Creation used to ride along on the cluster header's picker, on the
+    /// grounds that a header was the only repo-level stop there was; a project
+    /// row is a *better* one, and having both would put "new map" on every
+    /// header of a repo that has three maps open — three doors to one act,
+    /// none of them the repo. So the header's picker is the three modes again,
+    /// exactly like a ticket's, and the only difference between them is what
+    /// they aim at.
     pub fn candidates(&self) -> Vec<Candidate> {
-        let launches = |aim: &Aim| {
-            Mode::all()
+        match &self.at {
+            StagedAt::Node { aim, .. } => Mode::all()
                 .into_iter()
                 .map(|mode| Candidate::Launch {
                     mode,
                     route: route(aim, mode),
                 })
-                .collect::<Vec<_>>()
-        };
-        let creations = || CreationKind::all().into_iter().map(Candidate::Create);
-        match &self.at {
-            StagedAt::Node {
-                aim: aim @ Aim::Ticket { .. },
-                ..
-            } => launches(aim),
-            StagedAt::Node {
-                aim: aim @ Aim::Map,
-                ..
-            } => launches(aim).into_iter().chain(creations()).collect(),
-            // Nothing has been filed in this repo yet, so there is nothing to
+                .collect(),
+            // A project names nothing that exists yet, so there is nothing to
             // launch — only the three ways to start something.
-            StagedAt::Project => creations().collect(),
+            StagedAt::Project => CreationKind::all()
+                .into_iter()
+                .map(Candidate::Create)
+                .collect(),
         }
     }
 
     /// How the staged stop reads: `#<n>` for a node — the ticket's number or
-    /// the map's — and `+new` for the map-less door, which has no number to
+    /// the map's — and `+new` for a project, which has no number to
     /// name until a skill files one.
     pub fn key(&self) -> String {
         match &self.at {
@@ -878,7 +880,7 @@ impl Staged {
     /// two `None` cases are the ones where staging does not determine a
     /// workspace:
     ///
-    /// - **The map-less door** ([`StagedAt::Project`]) offers creation rows
+    /// - **A project row** ([`StagedAt::Project`]) offers creation rows
     ///   alone. There is no node, so there is nothing a launch would attach
     ///   to.
     /// - A **creation** picked on a map's picker resolves to the repo's bare
@@ -1427,7 +1429,7 @@ fn enabled_from(value: Option<&str>) -> bool {
 ///
 /// `None` unless there is exactly one thing to warm. Two ways to get nothing:
 /// the stop names no launchable workspace ([`Staged::node_workspace`] — the
-/// map-less door), or no candidate checkout would launch isolated, which is a
+/// project row), or no candidate checkout would launch isolated, which is a
 /// host launch with no container in it.
 ///
 /// Any *one* isolated candidate is enough — the workspace name is the node's,
@@ -1540,7 +1542,7 @@ pub enum Targets {
 pub fn plan(checkouts: &[Checkout], staged: &Staged, route: Route, mode: &LaunchMode) -> Targets {
     let StagedAt::Node { aim, map } = &staged.at else {
         // Unreachable from the picker: [`Staged::candidates`] offers no launch
-        // row on the map-less door, so nothing there can ask for a node
+        // row on a project stop, so nothing there can ask for a node
         // launch. Refusing rather than inventing a node — there is no aim and
         // no map issue to invent one from — keeps this total.
         return Targets::Unregistered;
@@ -1640,10 +1642,7 @@ mod tests {
     }
 
     fn checkout(path: &str, repo: &str) -> Checkout {
-        Checkout {
-            path: PathBuf::from(path),
-            repo: repo.to_string(),
-        }
+        Checkout::new(PathBuf::from(path), repo.to_string())
     }
 
     /// What the picker composes with the default mode row selected, steered by
@@ -1865,15 +1864,16 @@ mod tests {
         );
     }
     #[test]
-    fn a_header_picker_adds_the_creation_rows_after_the_launch_rows() {
-        // The repo-level stop is where creation lives: the same three launch
-        // rows, then the three ways to start something new in this repo. Each
-        // candidate is complete — it carries its own resolved route, the
-        // `Targets::Many` move — so a row and its launch cannot disagree.
-        let staged = Staged::map(&map_ref(59));
-        let candidates = staged.candidates();
+    fn a_node_launches_and_a_project_creates_and_neither_does_the_others_job() {
+        // The two kinds of stop, and the whole of what tells their pickers
+        // apart. A cluster header is a *map* — a node — so it walks the three
+        // modes exactly as a ticket does; creation belongs to the project row,
+        // which has no node and therefore no launch row. Each candidate is
+        // complete, carrying its own resolved route (the `Targets::Many`
+        // move), so a row and its launch cannot disagree.
+        let header = Staged::map(&map_ref(59)).candidates();
         assert_eq!(
-            candidates,
+            header,
             vec![
                 Candidate::Launch {
                     mode: Mode::Interactive,
@@ -1887,18 +1887,23 @@ mod tests {
                     mode: Mode::Plain,
                     route: Route::Plain
                 },
+            ],
+            "a map's picker carries no creation rows"
+        );
+
+        let project = Staged::project("blooop/wayfinder").candidates();
+        assert_eq!(
+            project,
+            vec![
                 Candidate::Create(CreationKind::Task),
                 Candidate::Create(CreationKind::Map),
                 Candidate::Create(CreationKind::MapAuto),
             ]
         );
-        // Every row names the skill it execs — including the creation rows,
-        // whose routes are theirs rather than the staged node's.
-        let routes: Vec<Route> = candidates.iter().map(|c| c.route()).collect();
-        assert_eq!(
-            routes[3..],
-            [Route::One, Route::Wayfinder, Route::WayfinderAuto]
-        );
+        // Every row names the skill it execs — the creation rows' routes are
+        // their own rather than any node's.
+        let routes: Vec<Route> = project.iter().map(|c| c.route()).collect();
+        assert_eq!(routes, [Route::One, Route::Wayfinder, Route::WayfinderAuto]);
     }
 
     #[test]

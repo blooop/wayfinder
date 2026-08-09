@@ -157,22 +157,81 @@ package into a throwaway environment to run `wf --version`. Pushing a
 attaches the package to a GitHub release and — if the repository has a
 `PIXI_TOKEN` secret — publishes it to prefix.dev/blooop.
 
+## Two levels: projects, then one project
+
+`wf` has exactly two screens, and which one it opens on is decided by where you
+ran it.
+
+**Inside a checkout** it opens on **that project**: its own row first, then its
+maps as clusters beneath.
+
+```
+▶ ▌ blooop/wayfinder · 2 maps  ○4  ◐2  ◍1
+
+  ▌ wayfinder · the general dev-process tree  ○2  ◐1
+    ○ #134 The manager hands pointers, never readings [build]
+    ○ #133 The ctx handoff's guards don't yet guard   [build]
+```
+
+**Outside one** it opens on the **project list** — every registered repo, most
+recently used first — and `enter` (or `→`) on a row goes to exactly the screen
+above. One project view, two doors into it.
+
+```
+▶ ▌ blooop/wayfinder · 2 maps  ○4  ◐2  ◍1
+  ▌ blooop/devlaunch · 1 map   ○2  ●7
+  ▌ blooop/bencher   · no map — enter to start one
+```
+
+`←` is the way back out, from anywhere: it closes a group, climbs to the parent,
+steps back a stop, and from the project's own row leaves for the list. Held
+down it walks you from a ticket to the top level. `esc` is deliberately not
+this — it still clears the query and quits, so leaving `wf` never depends on how
+deep you are.
+
+This is what retired `ctrl-f` (focus) and `ctrl-g` (widen): focusing a project
+is entering it, widening is `←` out of it, and both chords named a move the
+arrows already make. They are unbound, not merely undocumented.
+
+There is no screen that pours every project's tickets into one tree. That was
+the old widened scope, and the trade is deliberate: the query means projects at
+the top level and tickets inside one, instead of a single field matching both.
+The cost is that a ticket in a project you have not thought of is not findable
+by typing its title.
+
+**The project list needs no network.** It is the projects cache, ordered by a
+local timestamp, so it is on screen and answering keys before the first `gh`
+call — which is also what lets `enter`, type, `enter` file a task in a fresh
+checkout before the map search has returned. The counts on each row fill in as
+the maps land; a row reads `loading…` until the search has answered and `no
+map — enter to start one` once it has.
+
 ## Discovery
 
 Projects accrete: running `wf` inside a git checkout with a GitHub `origin`
-registers that checkout and opens focused on it (`ctrl-g` widens to every
-known project, `ctrl-f` re-focuses the row's project). Run outside a checkout
-to open on all of them.
+registers that checkout.
 
 The registry is a per-machine cache at `~/.cache/wf/projects.json`
-(`$XDG_CACHE_HOME` respected) holding `{path, repo}` per checkout, plus every
-open map that the last search found. Deleting it is safe — projects re-accrete
-as you open them, and the maps are re-found on the next start.
+(`$XDG_CACHE_HOME` respected) holding `{path, repo, used}` per checkout, plus
+every open map that the last search found. Deleting it is safe — projects
+re-accrete as you open them, and the maps are re-found on the next start.
 
-Only repos with an open `wayfinder:map`-labelled issue show tickets; other
-checkouts stay cached but hidden — except the one you are *focused* on, which
-renders a slim `no map` header so its first map has somewhere to be started from
-(see [Launching](#launching)).
+`used` is what orders the project list: a local stamp, written when you open
+`wf` in a checkout and when you launch an agent from one. A *local* stamp, and
+not the tracker's activity, because the list is drawn before any fetch — and
+because "which project did the world touch last" and "which one did **you**"
+are different questions, and a launcher is answering the second. Entries written
+before this existed carry no stamp and sort last, once, until you next open
+them.
+
+A repo with several checkouts (the `~/k1/kinisi_ros`, `~/k2/kinisi_ros`
+pattern) is **one** project: they are two places it can run, and they share its
+maps, so the project's stamp is the newest of theirs.
+
+Every registered repo is a row on the project list, mapped or not. A repo with
+no open `wayfinder:map` simply has no clusters on its screen — its own row is
+still there, and is where its first map gets charted (see
+[Launching](#launching)).
 
 **Every open map renders as its own cluster** — a `▌ repo · map title` header
 carrying the map's **stage** counts, in the same glyph vocabulary the rows
@@ -295,9 +354,8 @@ quiet once everything is in.
 Which repos have maps takes one `wayfinder:map` label search, and it used to be
 the only genuinely serial step: nothing could load until it returned, which was
 ~2.5 s of a ~3 s start. So the map numbers are cached, and a warm start begins
-fetching the maps themselves immediately — real tickets in ~0.6 s, and the cwd
-focus applied on the *first* frame rather than a couple of seconds in. Every map
-is fetched concurrently, so N projects cost one round trip rather than N.
+fetching the maps themselves immediately — real tickets in ~0.6 s. Every map is
+fetched concurrently, so N projects cost one round trip rather than N.
 
 The cache is a head start, never a skip: the search still runs on every start,
 and its answer is what adds a repo mapped since last time, drops one whose map
@@ -305,8 +363,9 @@ was closed, and corrects a number that moved. A cached number is never taken at
 its word either — a map fetch checks the issue is still an open `wayfinder:map`
 and refuses it otherwise, so a stale number renders *nothing* for a moment
 rather than the wrong issue as that project's map. A search that fails is
-retried rather than fatal, and the cwd focus yields to a scope you have already
-chosen yourself with `ctrl-f`/`ctrl-g`.
+retried rather than fatal. Which project's screen is up is not the search's
+business either way: it comes from the local `git` call that registers the
+checkout, before the first frame, and nothing arriving later moves it.
 
 Each map is fetched exactly once. Nothing polls: `wf` is on screen for seconds
 and restarts warm in ~0.6 s, so there is nothing worth keeping fresh. `ctrl-r`
@@ -363,22 +422,28 @@ count line instead.
 **The cursor lands on cluster headers too**, so a whole map is a thing you can
 launch: `enter` on one runs the wayfinder skill on the map itself rather than on
 any one ticket — interactively to chart it with you, or under auto to have the
-agent take the map from open questions to merged work on its own judgement. The
-default cursor position still skips headers and lands on the first row, so
-opening `wf` and pressing `enter` picks a ticket exactly as it always did;
-headers are one `↑` away.
+agent take the map from open questions to merged work on its own judgement.
 
-**Starting something new is more rows in the same picker.** Creation is an act on
-a *repo*, so it lives where the stop is repo-level — the cluster header — and is
-reached by the same `enter` as everything else. No new keys:
+**The cursor opens on the project's own row**, not on a ticket. This
+consciously overrides the older rule that opening `wf` and pressing `enter`
+picked the top ticket: with creation on the project row, the default became
+`enter`, type what you want to do, `enter` — the thing you most often open `wf`
+in a repo to do, with no navigation at all. Picking the top ticket is one `↓`
+first. Two things make the trade a good one: an empty `task` field refuses, so
+the default cannot misfire; and the project row is known before any fetch, so
+unlike the top ticket it never moves under you as maps stream in — which is what
+#88 and #89 were both about.
+
+**Starting something new lives on the project row.** Creation is an act on a
+*repo*, so it lives on the one stop that is a repo — and it is where the cursor
+already is when the screen opens, so `enter`, type, `enter` is the whole of
+filing a task in the project you are standing in. No new keys, and no
+navigation:
 
 ```
-┌ launch blooop/wayfinder · #59 Map: the dev-process tree ────────────────┐
+┌ launch Claude · blooop/wayfinder · +new ────────────────────────────────┐
 │                                                                         │
-│  ▶ interactive   /wf       you are in the loop; it grills you           │
-│    auto          /wf-auto  the agent decides alone and drives it to done│
-│    plain         claude    no skill; a bare session on the node's branch│
-│    new task      /wf-one   one tracked ticket, built and reviewed       │
+│  ▶ new task      /wf-one   one tracked ticket, built and reviewed       │
 │    new map       /wf       chart a new map in this repo, with you       │
 │    new map, auto /wf-auto  chart a new map in this repo, alone          │
 │                                                                         │
@@ -388,27 +453,33 @@ reached by the same `enter` as everything else. No new keys:
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-The repo comes free from wherever the cursor was standing, which is why the title
-names it. **Ticket pickers are unchanged** — they list the three modes and
-nothing else, so `enter` on a ticket never offers to start something instead.
+There is nothing to launch on a project — it names nothing that exists yet — so
+there are no launch rows, and `enter` with an empty `task` field refuses on the
+count line rather than filing something blank. Which is why the creating default
+is safe: `enter enter` on a fresh screen does nothing at all.
+
+**A node launches and a project creates, and neither does the other's job.** A
+cluster header is a *map*, so its picker is the three modes and wraps, exactly
+like a ticket's — the only difference between the two is what they aim at. The
+creation rows used to ride along on the header, on the grounds that a header was
+the only repo-level stop there was; a project row is a better one, and having
+both would put `new map` on every header of a repo with three maps open — three
+doors to one act, none of them the repo.
 
 The text field keeps one keyboard behaviour and takes its meaning from the row,
 which is what the name beside it says: `steer` on a launch row, `task` on **new
-task** — where the text *is* the ticket, so `enter` with nothing typed refuses on
-the count line — and `seed` on the two **new map** rows, where it is an optional
-loose idea the charting session will grill you about anyway.
+task** — where the text *is* the ticket — and `seed` on the two **new map** rows,
+where it is an optional loose idea the charting session will grill you about
+anyway.
 
 Adding a ticket to an existing map needs no row of its own: `enter` on its
 header, type `add a ticket for X`, launch — that is `/wf <map> steer: …`, and the
 charting session files it.
 
-**A repo with no map has a door too.** Run `wf` inside a registered checkout
-whose repo has no open `wayfinder:map` and the screen used to be empty; now it
-renders that repo as one slim header, and `enter` on it opens the creation rows
-alone — nothing to launch, so no launch rows. That is where a repo's *first* map
-gets charted. It appears only on the focused empty state and only once the load
-has landed, so a still-fetching repo never flashes a creation row under `enter`,
-and the widened screen stays free of one row per project.
+**A repo with no map needs no special case.** Its screen is its project row and
+nothing else, and that row is where its *first* map gets charted. That row is
+also there before the search has answered — it is a place to stand, not a report
+on what was found — which is what makes the create path work on the first frame.
 
 **Which skill runs is a fact about what you picked and who decides:**
 
@@ -420,9 +491,9 @@ and the widened screen stays free of one row per project.
 | research · prototype · grilling · task | any unfinished stage | interactive | `<sigil>wf <map> <n>` |
 | anything | any unfinished stage | auto | `<sigil>wf-auto <map> [<n>]` |
 | anything | any unfinished stage | plain | the selected agent, with no skill; anything typed is the whole prompt |
-| a cluster header, or a map-less repo | — | new task | `<sigil>wf-one <task>` |
-| a cluster header, or a map-less repo | — | new map | `<sigil>wf [<seed>]` |
-| a cluster header, or a map-less repo | — | new map, auto | `<sigil>wf-auto [<seed>]` |
+| a project row | — | new task | `<sigil>wf-one <task>` |
+| a project row | — | new map | `<sigil>wf [<seed>]` |
+| a project row | — | new map, auto | `<sigil>wf-auto [<seed>]` |
 | a ticket | done | — | nothing — not launchable |
 
 A creation has no issue number until the skill files one, so it has no per-node
@@ -471,25 +542,23 @@ an empty one.
 
 | key | what it does |
 | --- | --- |
-| *type anything* | fuzzy-filter: the tree is pruned to the matches, best-first, with the rows that place them dimmed; clearing restores it |
+| *type anything* | fuzzy-filter, best-first: the project list narrows to matching slugs; a project's screen prunes the tree to the matching tickets, with the rows that place them dimmed. Clearing restores it |
 | `tab` | toggle the leverage view ⇄ the structure forest |
 | `↑`/`↓`, `ctrl-j`/`ctrl-k` | move between siblings at the cursor's depth — on the default screen, the tickets you can take, plus each cluster's header above them |
-| `→` | reveal: open a `▸ done`/`▸ blocked` group, else step forward one stop — which *is* descending, since a subtree's first row follows its parent |
-| `←` | close: shut an open group, else back out to the parent, else one stop back — which, from a cluster's first row, is that cluster's header |
-| `enter` | open the launch picker on the cursor's ticket, or on its map when the cursor is on a cluster header; a second `enter` runs the agent here and exits — on a group line it folds instead, since there is no agent to run |
+| `→` | reveal: enter the project on the project list, else open a `▸ done`/`▸ blocked` group, else step forward one stop — which *is* descending, since a subtree's first row follows its parent |
+| `←` | close: from a project's own row, back out to the project list; else shut an open group, back out to the parent, or step one stop back — which, from a cluster's first row, is that cluster's header |
+| `enter` | on the project list: enter that project. On a project's screen: open the launch picker — the creation rows on the project's own row, the launch modes on a ticket or a cluster header — and a second `enter` runs the agent here and exits. On a group line it folds instead, since there is no agent to run |
 | `←`/`→`, `↑`/`↓` or `tab`, *type*, then `enter`* | in the launch picker: pick Claude/Codex, pick the row, fill its field (a steering prompt, a task, or a map seed), launch — `esc` backs out with the query and cursor intact |
-| `ctrl-f` | focus the cursor row's project — only its clusters stay on screen |
-| `ctrl-g` | widen back to every project |
-| `ctrl-r` | refetch every map in place, keeping your query, scope and cursor |
+| `ctrl-r` | refetch every map in place, keeping your query, level and cursor |
 | `esc` | clear the query; on an empty query, quit |
 | `q` | quit — on an empty query only, since mid-query it types |
 | `ctrl-c` | quit from anywhere, including the which-checkout picker |
 | `↑`/`↓` or `j`/`k`, `enter`, `esc`/`q` | in the which-checkout picker: pick which tree the agent runs in, or cancel |
 
 `ctrl-r` is the only thing that updates the list in place. Quitting and running
-`wf` again is nearly as fast (~0.6 s warm) but throws away the query, the scope
-and where the cursor was, which is the whole reason the key still exists now
-that nothing polls.
+`wf` again is nearly as fast (~0.6 s warm) but throws away the query, the
+project you had entered and where the cursor was, which is the whole reason the
+key still exists now that nothing polls.
 
 That picker is the one prompt left, and only a repo with several registered
 checkouts (the `~/k1/kinisi_ros`, `~/k2/kinisi_ros` pattern) ever sees it: the
@@ -551,17 +620,16 @@ while you are working a map and a bad one while you are browsing it.
 Two things to be clear about, because the cleanup is not automatic:
 
 - **An abandoned stage leaves its workspace behind.** Back out of the launch
-  picker, pick a host checkout at the which-checkout prompt, or pick a
-  *creation* row on a map (a creation runs in the repo's bare workspace, not
-  the node's), and the branch, the clone and the container stay. `wf reap`
-  will *not* collect them while the ticket is open — it only removes
-  workspaces whose tickets are **closed** — so until then they are yours to
-  remove with `dl <workspace> rm`.
+  picker, or pick a host checkout at the which-checkout prompt, and the branch,
+  the clone and the container stay. `wf reap` will *not* collect them while the
+  ticket is open — it only removes workspaces whose tickets are **closed** — so
+  until then they are yours to remove with `dl <workspace> rm`.
 
-  Only a **node** is ever warmed. The map-less door offers creation rows
-  alone, so staging it warms nothing: there is no node for a launch to attach
-  to, and a keystroke should not pre-build a repo's default workspace on the
-  chance you file something.
+  Only a **node** is ever warmed, which is now exactly the stops that have one:
+  a ticket or a cluster header. Staging a **project** row warms nothing — its
+  rows all create, so there is no node for a launch to attach to, and a
+  keystroke should not pre-build a repo's default workspace on the chance you
+  file something.
 - **It does reach the network, but it never publishes.** Fetching the repo and
   pulling the image are the point of doing it early. What it does not do is
   write anything to GitHub: `dl` creates the work branch locally and never
