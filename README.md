@@ -604,16 +604,43 @@ an agent exiting. `dl <ws> stop`, `dl <ws> rm` and `dl --ls` are yours to run.
 ### `wf reap` — clearing away finished tickets
 
 A workspace per ticket means workspaces accumulate as fast as tickets are
-worked. `wf reap` removes the ones whose tickets are **closed**:
+worked. `wf reap` removes the ones whose **work is over**:
 
 ```
 $ wf reap
   keep  devlaunch-wayfinder-devlaunch-131-a  (devlaunch#131 is still open)
   keep  wayfinder-wayfinder-wayfinder-42-b   (still running — stop it first)
+  warn  devlaunch-wayfinder-devlaunch-118-d  (devlaunch#118's PR #120 closed unmerged — superseded? reap by hand if so)
+  warn  wayfinder-wayfinder-wayfinder-96-e   (wayfinder#96 unclaimed and no PR — an abandoned stage? reap by hand if so)
   reap  devlaunch-wayfinder-devlaunch-127-c  (devlaunch#127 is closed)
+  reap  devlaunch-wayfinder-devlaunch-80-f   (devlaunch#80 open but its PR #97 merged)
 
-delete 1 workspace(s)? [y/N]
+delete 2 workspace(s)? [y/N]
 ```
+
+"Over" is not a judgement `wf` invents for the occasion — it is exactly what
+the stage lattice already calls Done, read off the same fields
+as the `⇄` badge on the screen: a **closed** ticket, or an **open** one whose
+PR merged with nothing still in flight. The second case is the one that earns
+this its keep, since a ticket often outlives the branch that finished it. And
+because the guards run first, an un-`-f`'d reap only ever deletes a checkout
+whose every byte exists on the remote: being wrong costs a re-clone, never
+work.
+
+`warn` rows are the other end of that lattice, and they are **never deleted** —
+no flag makes them so. `wf` prints them because it suspects dead weight on
+evidence too weak to act on:
+
+- every linked PR **closed unmerged** — a human's "not this way", which is not
+  the same as "this branch is disposable";
+- **nobody claimed it and nothing came of it** — no PR, no assignee. An open,
+  unassigned ticket is unclaimed by `wf`'s own convention, and that one bit is
+  what keeps this from firing on every ticket someone is mid-way through.
+
+A stale claim therefore keeps a workspace: an agent that died leaves its ticket
+assigned, and reap does not overrule a person's stated intent. `wf` says only
+what it observed — it does not know whether anyone ever entered a container,
+and does not claim to.
 
 This is the same division of labour the launch draws: **`dl` owns the
 containers, `wf` owns the tickets.** `dl` deliberately does not decide what is
@@ -625,8 +652,12 @@ decides. Needs `dl` **0.0.21 or newer** for the JSON listing.
 
 Kept, always: workspaces `dl` did not create (they are not `wf`'s, whatever
 their branch looks like), branches that are not `wayfinder/<repo>-<n>` for that
-repo, tickets still open, and anything **running** — a ticket closing is no
+repo, tickets with an open or draft PR (in review is where review fixes happen),
+tickets someone has claimed, and anything **running** — a ticket closing is no
 evidence that the session in the container ended.
+
+One `gh api graphql` call per repo answers all of this, however many workspaces
+that repo has.
 
 Kept by default but waivable: a workspace whose clone holds uncommitted or
 unpushed work. `-f` reaps those too, and the plan says what it is discarding:
@@ -640,6 +671,7 @@ unpushed work. `-f` reaps those too, and the plan says what it is discarding:
 *every* workspace it builds, so without it those are unreapable forever. It
 waives the unsaved-work guard only — a running container is still kept, because
 that is a session in progress rather than bytes on disk. `-y` skips the prompt.
+Neither flag can turn a `warn` row into a deletion.
 
 Your host `~/.claude` is bind-mounted in, which is how the Claude agent arrives
 already logged in — and is the reason `wf skills install` keeps the prompts

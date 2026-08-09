@@ -78,10 +78,14 @@ ctrl-g narrow and widen the scope, ctrl-r refetches, esc quits.
 
 wf skills          report which prompt each route would actually run
 wf skills install  link this build's skills into ~/.claude/skills and ~/.codex/skills
-wf reap            remove the workspaces whose tickets are closed (-y to skip
-                   the prompt). Keeps anything running or holding work that is
-                   not pushed anywhere; -f reaps the unpushed ones too, naming
-                   what it discards. Needs dl 0.0.21 or newer.
+wf reap            remove the workspaces whose work is over — a closed ticket,
+                   or an open one whose PR merged with nothing still in flight
+                   (-y to skip the prompt). Warns about the ones it suspects
+                   but will not delete: a ticket whose PRs all closed unmerged,
+                   or one nobody claimed that nothing came of. Keeps anything
+                   running or holding work that is not pushed anywhere; -f
+                   reaps the unpushed ones too, naming what it discards.
+                   Needs dl 0.0.21 or newer.
 
 The skills wf execs ship in this package, so they update with it. `install`
 links both agents' skills directories at copies kept beside them; every launch
@@ -224,11 +228,11 @@ fn run_skills(install: bool) -> Result<()> {
     Ok(())
 }
 
-/// `wf reap`: remove the workspaces whose tickets are closed.
+/// `wf reap`: remove the workspaces whose nodes the tracker calls finished.
 ///
 /// The division of labour is the one the launch already draws — `dl` owns the
 /// containers, `wf` owns the tickets — so this asks `dl` what exists, asks the
-/// tracker which of those nodes are closed, prints the plan, and hands the
+/// tracker what has become of those nodes, prints the plan, and hands the
 /// finished ones back to `dl`. No terminal is taken: this is a stream command
 /// like `wf skills`, not a second TUI.
 ///
@@ -236,6 +240,12 @@ fn run_skills(install: bool) -> Result<()> {
 /// because a workspace someone expected to go and that stayed is the thing they
 /// most need told about, and a reason they disagree with ("still running" when
 /// they thought they had stopped it) is only actionable while no is an answer.
+///
+/// `warn` rows are the same argument pointed the other way: workspaces `wf`
+/// suspects are dead weight on evidence too weak to act on — a superseded
+/// ticket, or a node nothing has come of. They are printed and never counted
+/// into the prompt, because the only safe thing to do with a suspicion is say
+/// it out loud.
 async fn run_reap(yes: bool, insist: bool) -> Result<()> {
     use std::collections::BTreeSet;
     use std::fmt::Write;
@@ -247,18 +257,28 @@ async fn run_reap(yes: bool, insist: bool) -> Result<()> {
         emit("no wayfinder workspaces on this machine — nothing to reap\n");
         return Ok(());
     }
-    let finished = reap::finished_nodes(&nodes).await?;
-    let verdicts = reap::plan(&workspaces, &finished, insist);
+    let known = reap::node_facts(&nodes).await?;
+    let verdicts = reap::plan(&workspaces, &known, insist);
 
-    let (doomed, kept): (Vec<_>, Vec<_>) = verdicts
-        .iter()
-        .partition(|v| matches!(v, reap::Verdict::Reap { .. }));
+    // The deletion set is asked for rather than re-derived here: `reap::doomed`
+    // is the one definition of what goes, so a warning row cannot become a
+    // deletion by way of a partition written twice.
+    let doomed = reap::doomed(&verdicts);
+    // Grouped rather than in listing order, and in this order: what stays,
+    // then what `wf` is uneasy about, then — last, immediately above the
+    // prompt — what the y/N is actually about.
     let mut out = String::new();
-    for verdict in &kept {
-        let _ = writeln!(out, "  keep  {}  ({})", verdict.id(), verdict.reason());
-    }
-    for verdict in &doomed {
-        let _ = writeln!(out, "  reap  {}  ({})", verdict.id(), verdict.reason());
+    for label in ["keep", "warn", "reap"] {
+        for verdict in &verdicts {
+            let row = match verdict {
+                reap::Verdict::Keep { .. } => "keep",
+                reap::Verdict::Warn { .. } => "warn",
+                reap::Verdict::Reap { .. } => "reap",
+            };
+            if row == label {
+                let _ = writeln!(out, "  {label}  {}  ({})", verdict.id(), verdict.reason());
+            }
+        }
     }
     emit(&out);
     if doomed.is_empty() {

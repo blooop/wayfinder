@@ -14,10 +14,20 @@
 //! and knows which tickets are closed — decides.
 //!
 //! Which makes this module's job small and its shape strict: match workspaces
-//! to nodes by the branch `wf` itself minted, ask the tracker which of those
-//! nodes are closed, and hand the finished ones back to `dl`. Everything a
+//! to nodes by the branch `wf` itself minted, ask the tracker what has become
+//! of those nodes, and hand the finished ones back to `dl`. Everything a
 //! workspace holds that says "not yet" — unsaved work, a running container — is
 //! `dl`'s fact, read here rather than argued with.
+//!
+//! "Finished" is not `wf`'s own invention either. It is exactly what the stage
+//! lattice already calls Done — a closed ticket, or an open one whose PR merged
+//! with nothing still in flight — read off the same fields, through the same
+//! per-PR interpretation, as the badge on the screen. Reap claims that end of
+//! the lattice and only warns at the other: a ticket every PR of which closed
+//! unmerged, and a ticket nobody claimed that nothing came of, are named and
+//! left alone. A suspicion is worth printing and never worth acting on, which
+//! is why [`Verdict::Warn`] exists and why [`doomed`] is the single place that
+//! decides what actually goes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
@@ -112,10 +122,10 @@ pub fn doomed(verdicts: &[Verdict]) -> Vec<&Verdict> {
 /// review and draftness are all the same answer here.
 ///
 /// Every arm carries its number, since that number is the whole content of the
-/// row the human is about to approve.
+/// row the human is about to approve. `InFlight` covers open, draft — and
+/// unreadable; see [`PrOutcome::project`] for why that third one belongs there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrOutcome {
-    /// Open, draft — or unreadable. See [`PrOutcome::project`].
     InFlight { pr: u64 },
     Merged { pr: u64 },
     ClosedUnmerged { pr: u64 },
@@ -460,24 +470,33 @@ fn alias(number: u64) -> String {
     format!("i{number}")
 }
 
+/// What one node's answer has to carry: the reap-relevant subset of the map
+/// query's own sub-issue selection, field for field. `assignees` costs nothing
+/// extra here — it is already selected there, and `classify` already reads it
+/// as the claim, which is what makes the claimed/unstarted split free.
+const NODE_FACT_SELECTION: &str = "\
+      state
+      assignees(first: 5) { nodes { login } }
+      closedByPullRequestsReferences(first: 5, includeClosedPrs: true) {
+        nodes {
+          number state isDraft reviewDecision
+          statusCheckRollup { state }
+          repository { nameWithOwner }
+        }
+      }";
+
 /// One repo's batch: every wanted issue in one query.
 fn node_facts_query(numbers: &[u64]) -> String {
-    let mut query = String::from("query($owner: String!, $name: String!) {\n  repository(owner: $owner, name: $name) {\n");
+    use std::fmt::Write;
+    let mut query = String::from(
+        "query($owner: String!, $name: String!) {\n  repository(owner: $owner, name: $name) {\n",
+    );
     for &number in numbers {
-        query.push_str(&format!(
-            "    {}: issue(number: {number}) {{\n      \
-               state\n      \
-               assignees(first: 5) {{ nodes {{ login }} }}\n      \
-               closedByPullRequestsReferences(first: 5, includeClosedPrs: true) {{\n        \
-                 nodes {{\n          \
-                   number state isDraft reviewDecision\n          \
-                   statusCheckRollup {{ state }}\n          \
-                   repository {{ nameWithOwner }}\n        \
-                 }}\n      \
-               }}\n    \
-             }}\n",
+        let _ = write!(
+            query,
+            "    {}: issue(number: {number}) {{\n{NODE_FACT_SELECTION}\n    }}\n",
             alias(number)
-        ));
+        );
     }
     query.push_str("  }\n}");
     query
@@ -502,11 +521,7 @@ struct IssueFacts {
 
 /// The parse boundary for one repo's batch, kept apart from the process call so
 /// it is testable without `gh`.
-fn parse_node_facts(
-    body: &[u8],
-    repo: &str,
-    numbers: &[u64],
-) -> Result<BTreeMap<Node, NodeFact>> {
+fn parse_node_facts(body: &[u8], repo: &str, numbers: &[u64]) -> Result<BTreeMap<Node, NodeFact>> {
     let resp: GraphQlResponse<BatchData> =
         serde_json::from_slice(body).context("unparseable GraphQL response from gh")?;
     if let Some(err) = resp.errors.first() {
@@ -693,7 +708,11 @@ mod tests {
             ),
         ];
         for (name, prs, claimed, unclaimed) in cases {
-            assert_eq!(node_fact(true, true, &prs), claimed, "open, assigned, {name}");
+            assert_eq!(
+                node_fact(true, true, &prs),
+                claimed,
+                "open, assigned, {name}"
+            );
             assert_eq!(
                 node_fact(true, false, &prs),
                 unclaimed,
@@ -817,10 +836,7 @@ mod tests {
         ];
         let known = facts([
             (node("blooop/devlaunch", 80), NodeFact::Closed),
-            (
-                node("blooop/devlaunch", 81),
-                NodeFact::InFlight { pr: 91 },
-            ),
+            (node("blooop/devlaunch", 81), NodeFact::InFlight { pr: 91 }),
         ]);
         let verdicts = plan(&listing, &known, false);
         assert_eq!(
@@ -967,9 +983,9 @@ mod tests {
             let quiet = plan(std::slice::from_ref(&ws), &known, false);
             assert!(!quiet[0].reason().contains("discarding"));
             let loud = plan(std::slice::from_ref(&ws), &known, true);
-            assert!(loud[0].reason().ends_with(
-                "reap by hand if so, discarding 1 uncommitted change(s) (pixi.lock)"
-            ));
+            assert!(loud[0]
+                .reason()
+                .ends_with("reap by hand if so, discarding 1 uncommitted change(s) (pixi.lock)"));
         }
     }
 
@@ -1168,10 +1184,7 @@ mod tests {
             workspace("mine", "blooop/devlaunch", "wayfinder/devlaunch-81"),
             workspace("plain", "blooop/devlaunch", "main"),
         ];
-        let known = facts([(
-            node("blooop/devlaunch", 81),
-            NodeFact::InFlight { pr: 91 },
-        )]);
+        let known = facts([(node("blooop/devlaunch", 81), NodeFact::InFlight { pr: 91 })]);
         let verdicts = plan(&listing, &known, false);
         assert_eq!(verdicts.len(), 1);
         assert_eq!(verdicts[0].id(), "mine");
@@ -1293,8 +1306,8 @@ mod tests {
         // and has not opened a PR yet" — and without it the warning would fire
         // on every grilling ticket and every pre-PR build session. It rides in
         // on a call already being made: zero extra round trips.
-        let facts =
-            parse_node_facts(BATCH_RESPONSE.as_bytes(), "blooop/devlaunch", &[81, 82]).expect("parse");
+        let facts = parse_node_facts(BATCH_RESPONSE.as_bytes(), "blooop/devlaunch", &[81, 82])
+            .expect("parse");
         assert_eq!(facts[&node("blooop/devlaunch", 81)], NodeFact::Claimed);
         assert_eq!(facts[&node("blooop/devlaunch", 82)], NodeFact::Unstarted);
     }
