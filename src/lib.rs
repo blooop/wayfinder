@@ -20,6 +20,23 @@
 //!   invocation in the chosen checkout. Unattended work is not a feature — it
 //!   is another terminal session you start and switch away from.
 
+/// Write a whole report to stdout, tolerating a reader that has gone away.
+///
+/// `println!` panics on a closed pipe: Rust ignores `SIGPIPE`, so the write
+/// returns `EPIPE` and the macro unwraps it. `wf skills | head` is an ordinary
+/// thing to type and a panic is an absurd answer to it — the reader stopped
+/// listening, which is not this program's problem to report. One write of one
+/// string rather than a line at a time, so there is a single place for that to
+/// be true.
+///
+/// Here rather than in the binary because [`reap::run`] emits from inside the
+/// library and `wf skills` emits from outside it, and a second copy of this is
+/// a second place for the `EPIPE` reasoning to be got wrong.
+pub fn emit(text: &str) {
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(text.as_bytes());
+}
+
 pub mod app;
 pub mod fetch;
 pub mod filter;

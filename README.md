@@ -386,10 +386,18 @@ count line when it arrives:
 
 It is the same reading `wf reap` prints, taken by the same code — a `dl --ls
 --json` and one batched tracker query, neither of them on the way to a frame.
-The picker draws at exactly the speed it did without it. Nothing is deleted, and
-nothing can be: this names workspaces and a command, and you type the command.
-It names them rather than only counting them, because "2 reclaimable" is not
-something you can agree or disagree with.
+The picker draws at exactly the speed it did without it. Nothing is deleted:
+this names workspaces and a command, and you type the command. It names them
+rather than only counting them, because "2 reclaimable" is not something you can
+agree or disagree with.
+
+The picker *cannot* delete them, and that is a property of the build rather than
+a promise. The function that removes a workspace is private to the library
+module that owns `wf reap`; the picker lives in the binary, so a line anywhere
+in it — or in any helper, alias or submodule it calls — that tries to reach that
+function does not compile. Shelling out to `dl` instead is caught by a test that
+drives the real event loop with a recording `dl` on `PATH` and reads back every
+argv it ran.
 
 A `dl` workspace id is around forty characters and this segment shares one line
 with the load state and the match count, so the line is **budgeted** rather than

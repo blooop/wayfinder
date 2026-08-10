@@ -19,6 +19,12 @@
 //! keeps the environment surgery out of the parent — where it would race every
 //! other test in the binary — and costs one process spawn.
 //!
+//! The child also gets a scratch `HOME` laid out as a machine with the
+//! fixture's workspaces on it, and the whole tree is compared before and
+//! after. That is the other half of the same idea, for the destruction that
+//! runs no command: `std::fs::remove_dir_all` leaves no argv, but it does
+//! leave a hole.
+//!
 //! [`note`] is what makes the log a timeline the probe body can put its own
 //! marks on, so an *ordering* — this frame was painted before that subprocess
 //! ran — is as observable as the argv itself.
@@ -53,6 +59,16 @@ const LOG: &str = "WF_PROBE_LOG";
 /// [`Recording::printed`] keeps only the marked part.
 pub const MARK: &str = "PROBE|";
 
+/// The workspace ids [`record`] lays a scratch home out for — the three
+/// [`DL_LISTING`] names, so every workspace the code under test can *see* is
+/// also a directory it can be caught destroying.
+const LAID_OUT: [&str; 3] = ["wf-129-closed", "wf-138-unstarted", "wf-137-open"];
+
+/// What each of those directories holds. The name is the point: this stands in
+/// for the one thing `dl`'s own guard exists to protect — a clone holding work
+/// that exists nowhere else.
+const PRECIOUS: &str = "work that exists nowhere else\n";
+
 /// What a probe run saw.
 #[derive(Debug)]
 pub struct Recording {
@@ -62,6 +78,10 @@ pub struct Recording {
     pub argv: Vec<String>,
     /// Everything the child printed.
     pub stdout: String,
+    /// Every path under the child's scratch `HOME` that was not the same
+    /// afterwards as before — removed, added or rewritten. Empty is the
+    /// expected reading; see [`Recording::destroyed_nothing`].
+    disturbed: Vec<String>,
 }
 
 impl Recording {
@@ -86,13 +106,24 @@ impl Recording {
         );
     }
 
-    /// Fail if anything recorded could have destroyed a workspace.
+    /// Fail if the run destroyed anything, by either of the two means it has.
     ///
-    /// Deliberately not a list of function names — the point of watching argv
-    /// rather than source text is that it does not matter *how* the deletion
-    /// was spelt in Rust. `dl <ws> rm` is the only thing that removes a
-    /// workspace, `--force` the only waiver, and both are visible here however
-    /// they were reached.
+    /// **Out of process.** Deliberately not a list of function names — the
+    /// point of watching argv rather than source text is that it does not
+    /// matter *how* the deletion was spelt in Rust. `dl <ws> rm` is the only
+    /// thing that removes a workspace, `--force` the only waiver, and both are
+    /// visible here however they were reached.
+    ///
+    /// **In process.** A `std::fs::remove_dir_all` runs no command and leaves
+    /// no argv, so the child is given a scratch `HOME` laid out as a machine
+    /// with the fixture's workspaces on it, and the whole tree is compared
+    /// before and after. Any path under it that was removed, added or
+    /// rewritten fails here, whatever module or alias or submodule did it.
+    ///
+    /// What that does **not** reach is a path outside the scratch home: a
+    /// `remove_dir_all("/etc")` is caught by nothing here, as it would be in
+    /// any code in any file. The claim is about the thing a deletion on this
+    /// path would actually be aimed at — the workspaces the reading names.
     pub fn destroyed_nothing(&self) {
         for line in &self.argv {
             for forbidden in ["<rm>", "<--force>", "<remove>", "<delete>"] {
@@ -102,6 +133,11 @@ impl Recording {
                 );
             }
         }
+        assert!(
+            self.disturbed.is_empty(),
+            "this path must leave the machine as it found it, and it changed: {:?}",
+            self.disturbed
+        );
     }
 }
 
@@ -124,6 +160,8 @@ pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
     std::fs::write(&log, "").expect("the log");
     shim(&dir, "dl");
     shim(&dir, "gh");
+    let home = lay_out_a_home(&dir);
+    let before = tree(&home);
 
     let exe = std::env::current_exe().expect("this test binary");
     let path = format!(
@@ -140,6 +178,7 @@ pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
             "--test-threads=1",
         ])
         .env("PATH", path)
+        .env("HOME", &home)
         .env(LOG, &log)
         .output()
         .expect("the probe child");
@@ -152,10 +191,11 @@ pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect();
-    // Read the log *before* asserting anything, so that the scratch directory
-    // is swept on the way out of a failing run too — a probe that leaked a
-    // directory per failure would fill `/tmp` on exactly the day someone is
-    // running it in a loop.
+    let disturbed = differences(&before, &tree(&home));
+    // Read the log and the home *before* asserting anything, so that the
+    // scratch directory is swept on the way out of a failing run too — a probe
+    // that leaked a directory per failure would fill `/tmp` on exactly the day
+    // someone is running it in a loop.
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         out.status.success(),
@@ -169,7 +209,95 @@ pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
         stdout.contains("test result: ok. 1 passed"),
         "the probe child `{test}` ran no test — is that name still right?\n{stdout}"
     );
-    Recording { argv, stdout }
+    Recording {
+        argv,
+        stdout,
+        disturbed,
+    }
+}
+
+/// A scratch `HOME` for the child: a machine with the fixture's workspaces on
+/// it, each holding a file worth keeping.
+///
+/// The layout stands in for `dl`'s rather than reproducing it — what matters is
+/// that a directory named for every workspace the code under test can see is
+/// *there*, so an in-process deletion aimed at one has something to hit and
+/// [`Recording::destroyed_nothing`] has something to miss.
+fn lay_out_a_home(dir: &Path) -> PathBuf {
+    let home = dir.join("home");
+    for id in LAID_OUT {
+        let workspace = home.join("workspaces").join(id);
+        std::fs::create_dir_all(&workspace).expect("the scratch home");
+        std::fs::write(workspace.join("PRECIOUS.txt"), PRECIOUS).expect("the scratch home");
+    }
+    home
+}
+
+/// The directory the probe child may write its own scratch state into — the
+/// one holding the log, which is [`record`]'s and is swept with it.
+///
+/// A probe that needs a path to hand the code under test (a projects cache, a
+/// checkout) uses this rather than `HOME`, because `HOME` is the thing being
+/// watched for changes and a legitimate write there would read as destruction.
+///
+/// # Panics
+///
+/// Outside a probe child, where there is no such directory. Guard with
+/// [`is_child`].
+pub fn child_scratch() -> PathBuf {
+    let log = std::env::var_os(LOG).expect("a probe child has a log");
+    PathBuf::from(log)
+        .parent()
+        .expect("the log lives in the scratch directory")
+        .to_path_buf()
+}
+
+/// Every file under `root`, by path relative to it, with its contents.
+///
+/// Contents and not merely names: a workspace whose files were emptied in place
+/// is as destroyed as one that was removed, and `rename` shows up as both a
+/// disappearance and an appearance.
+fn tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(root: &Path, at: &Path, into: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, into);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                into.push((name, bytes));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(root, root, &mut found);
+    found.sort();
+    found
+}
+
+/// What changed between two [`tree`] readings, as one line per path.
+fn differences(before: &[(String, Vec<u8>)], after: &[(String, Vec<u8>)]) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (path, bytes) in before {
+        match after.iter().find(|(name, _)| name == path) {
+            None => changed.push(format!("{path} was removed")),
+            Some((_, now)) if now != bytes => changed.push(format!("{path} was rewritten")),
+            Some(_) => {}
+        }
+    }
+    for (path, _) in after {
+        if !before.iter().any(|(name, _)| name == path) {
+            changed.push(format!("{path} appeared"));
+        }
+    }
+    changed
 }
 
 /// Write a marked line into the recording log from inside a probe body.
@@ -201,6 +329,10 @@ pub fn note(what: &str) {
 /// Here rather than beside either probe that uses it: the reading's own probe
 /// and the picker's drive the same two reads, and a fixture written twice is a
 /// fixture that can disagree with itself about what the machine looks like.
+///
+/// The three ids are also [`LAID_OUT`] as directories in the child's scratch
+/// home, so what the code under test can see is exactly what it can be caught
+/// destroying.
 pub const DL_LISTING: &str = r#"[
   {"id":"wf-129-closed","devlaunch":true,"repo":"blooop/wayfinder",
    "branch":"wayfinder/wayfinder-129","state":"Stopped"},

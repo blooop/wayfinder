@@ -16,15 +16,22 @@
 //!    the terminal is restored, and this process is replaced by the agent
 //!    ([`wf::launch::Launch::exec`]).
 //!
-//! This file is argv and the commands that answer on a stream — `--version`,
-//! `wf skills`, `wf reap`. The picker itself is [`picker`], a module of its
-//! own, because `wf reap` deletes workspaces for a living and the picker must
-//! be provably unable to: that is one grep over one file only if the two do not
-//! share one (#137).
+//! This file is argv and nothing else: it decides what was asked for and hands
+//! it to whoever answers. `wf skills` is [`run_skills`] here because linking a
+//! directory is a few lines; `wf reap` is [`wf::reap::run`] in the *library*,
+//! because reaping deletes workspaces and the deletion it calls
+//! ([`wf::reap`]'s private `remove`) is not something this crate may name. The
+//! picker is [`picker`], a module of its own.
+//!
+//! That arrangement is #137's separation, and it is a fact about visibility
+//! rather than a claim anyone has to check: the picker cannot call the deletion
+//! because the deletion is private to a module in another crate. No alias,
+//! helper or submodule of this binary changes that — the edit does not compile.
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use tokio::signal::unix::{signal, SignalKind};
 
+use wf::emit;
 use wf::launch::Agent;
 use wf::reap;
 use wf::skills;
@@ -228,110 +235,6 @@ fn run_skills(install: bool) -> Result<()> {
     Ok(())
 }
 
-/// `wf reap`: remove the workspaces whose nodes the tracker calls finished.
-///
-/// The division of labour is the one the launch already draws — `dl` owns the
-/// containers, `wf` owns the tickets — so this asks `dl` what exists, asks the
-/// tracker what has become of those nodes, prints the plan, and hands the
-/// finished ones back to `dl`. No terminal is taken: this is a stream command
-/// like `wf skills`, not a second TUI.
-///
-/// The plan is printed **before** the prompt and includes what is being kept,
-/// because a workspace someone expected to go and that stayed is the thing they
-/// most need told about, and a reason they disagree with ("still running" when
-/// they thought they had stopped it) is only actionable while no is an answer.
-///
-/// `warn` rows are the same argument pointed the other way: workspaces `wf`
-/// suspects are dead weight on evidence too weak to act on — a superseded
-/// ticket, or a node nothing has come of. They are printed and never counted
-/// into the prompt, because the only safe thing to do with a suspicion is say
-/// it out loud.
-async fn run_reap(yes: bool, insist: bool) -> Result<()> {
-    use std::collections::BTreeSet;
-    use std::fmt::Write;
-    use std::io::Write as _;
-
-    let workspaces = reap::workspaces().await?;
-    let nodes: BTreeSet<reap::Node> = workspaces.iter().filter_map(reap::node_of).collect();
-    if nodes.is_empty() {
-        emit("no wayfinder workspaces on this machine — nothing to reap\n");
-        return Ok(());
-    }
-    let known = reap::node_facts(&nodes).await?;
-    let verdicts = reap::plan(&workspaces, &known, insist);
-
-    // The deletion set is asked for rather than re-derived here: `reap::doomed`
-    // is the one definition of what goes, so a warning row cannot become a
-    // deletion by way of a partition written twice.
-    let doomed = reap::doomed(&verdicts);
-    // Grouped rather than in listing order, and in this order: what stays,
-    // then what `wf` is uneasy about, then — last, immediately above the
-    // prompt — what the y/N is actually about.
-    let mut out = String::new();
-    for label in ["keep", "warn", "reap"] {
-        for verdict in &verdicts {
-            let row = match verdict {
-                reap::Verdict::Keep { .. } => "keep",
-                reap::Verdict::Warn { .. } => "warn",
-                reap::Verdict::Reap { .. } => "reap",
-            };
-            if row == label {
-                let _ = writeln!(out, "  {label}  {}  ({})", verdict.id(), verdict.reason());
-            }
-        }
-    }
-    emit(&out);
-    if doomed.is_empty() {
-        emit("nothing to reap\n");
-        return Ok(());
-    }
-
-    if !yes {
-        emit(&format!("\ndelete {} workspace(s)? [y/N] ", doomed.len()));
-        let _ = std::io::stdout().flush();
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
-            .context("cannot read the answer")?;
-        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            emit("aborted\n");
-            return Ok(());
-        }
-    }
-
-    // One at a time, reporting each: `dl <ws> rm` tears down a container, and a
-    // failure part-way through leaves a set the next run has to be able to make
-    // sense of. Failures are collected rather than propagated at the first one,
-    // so a single wedged workspace does not strand the rest.
-    let mut failed = Vec::new();
-    for verdict in &doomed {
-        match reap::remove(verdict.id(), insist).await {
-            Ok(()) => emit(&format!("removed {}\n", verdict.id())),
-            Err(e) => {
-                emit(&format!("could not remove {}: {e}\n", verdict.id()));
-                failed.push(verdict.id().to_string());
-            }
-        }
-    }
-    if !failed.is_empty() {
-        bail!("{} workspace(s) could not be removed", failed.len());
-    }
-    Ok(())
-}
-
-/// Write a whole report to stdout, tolerating a reader that has gone away.
-///
-/// `println!` panics on a closed pipe: Rust ignores `SIGPIPE`, so the write
-/// returns `EPIPE` and the macro unwraps it. `wf skills | head` is an ordinary
-/// thing to type and a panic is an absurd answer to it — the reader stopped
-/// listening, which is not this program's problem to report. One write of one
-/// string rather than a line at a time, so there is a single place for that to
-/// be true.
-fn emit(text: &str) {
-    use std::io::Write;
-    let _ = std::io::stdout().write_all(text.as_bytes());
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     match parse_args(std::env::args().skip(1)) {
@@ -348,7 +251,12 @@ async fn main() -> Result<()> {
         // whatever script installs the tool.
         Invocation::SkillsReport => run_skills(false),
         Invocation::SkillsInstall => run_skills(true),
-        Invocation::Reap { yes, insist } => run_reap(yes, insist).await,
+        // The one thing in this binary that deletes anything, and it is a
+        // *call into the library* — `reap::remove` is private there, so this
+        // whole crate, the picker included, has no way to spell a deletion
+        // except by choosing this arm. Pinned by
+        // `the_binary_reaches_the_deletion_at_exactly_one_place`.
+        Invocation::Reap { yes, insist } => reap::run(yes, insist).await,
         // And the one shape that opens the TUI, which is the whole of what this
         // arm may do. Everything the picker touches lives in a module that
         // cannot name a deletion — see [`picker`] — and this line is what keeps
@@ -413,15 +321,35 @@ mod tests {
     }
 
     #[test]
-    fn the_tui_invocation_is_nothing_but_the_picker() {
-        // The composition site, structurally. `wf reap` lives in this file and
-        // deletes workspaces for a living, so this file can never carry the
-        // denylist [`picker`] does — and the picker path through it is exactly
-        // one expression long, which is a thing a grep *can* pin. Anything else
-        // wired into this arm, before or after or instead, fails here; anything
-        // wired inside the picker fails
-        // `picker::tests::no_deletion_is_reachable_from_the_picker`.
+    fn the_binary_reaches_the_deletion_at_exactly_one_place() {
+        // What is left for a grep to say once the deletion is out of reach.
+        //
+        // `reap::remove` is private to the library's `reap` module, so nothing
+        // in this crate can call it — that half needs no test, it is a compile
+        // error. What this crate *can* still name is `reap::run`, the whole
+        // `wf reap` command, prompt and plan and all. A previous round's
+        // escape was a prologue in `main` before the match; the same edit
+        // spelt with `reap::run(true, true)` would delete unattended too. So
+        // the claim here is a count, not a `contains`: this file reaches into
+        // `reap` exactly once, and that once is the arm `parse_args` produced
+        // for the words `wf reap`.
+        //
+        // Nothing weaker would do. `contains` says an arm exists and says
+        // nothing about the rest of the file, which is precisely how the
+        // prologue got in.
         let code = probe::code_only(include_str!("main.rs"));
+        assert_eq!(
+            code.matches("reap::").count(),
+            1,
+            "this file may reach into `reap` once, for the `wf reap` argv and \
+             nothing else"
+        );
+        assert!(
+            code.contains("Invocation::Reap { yes, insist } => reap::run(yes, insist).await,"),
+            "and that once is the arm the `reap` argv produced"
+        );
+        // The other half of the same claim, at the other arm: opening the TUI
+        // is the whole of what `wf` with no arguments does.
         assert!(
             code.contains("Invocation::Tui => picker::run_picker().await,"),
             "opening the TUI must be the whole of what that arm does"

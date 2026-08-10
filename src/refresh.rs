@@ -533,6 +533,10 @@ mod tests {
         // `std::fs::remove_dir_all` inside the spawned task passed both this
         // and the argv probe, because a directory removed in-process runs no
         // command for a shim to write down.
+        //
+        // `unsafe` used to be on this list and is not, for the reason its
+        // sibling gives: `unsafe_code = "deny"` in `Cargo.toml` already covers
+        // every target in the crate.
         let code = crate::probe::code_only(include_str!("refresh.rs"));
         for forbidden in [
             "reap::",
@@ -542,7 +546,6 @@ mod tests {
             "Command",
             "process::",
             "fs::",
-            "unsafe",
         ] {
             assert!(
                 !code.contains(forbidden),

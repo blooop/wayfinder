@@ -16,8 +16,10 @@
 //!
 //! **Nothing here can delete.** `plan` is asked with `insist` false, so a
 //! workspace holding work that exists nowhere else is not surfaced at all; and
-//! the whole module reads facts and returns a sentence. It spawns no process of
-//! its own, and never reaches `reap`'s deletion side. The reading is the
+//! the whole module reads facts and returns a sentence. It cannot reach
+//! `reap`'s deletion side even by trying: the function that removes a workspace
+//! is private to `reap`'s own module, so `reap::remove(id, true).await` written
+//! anywhere in this file is `E0603`, not a test failure. The reading is the
 //! product; the waiver, the prompt and the deletion all stay with the human
 //! typing `wf reap`.
 //!
@@ -158,6 +160,18 @@ impl Reclaimable {
     /// the same reason a name below `READABLE` characters is dropped. So the
     /// aside is dropped before the pointer, and only a width too narrow for
     /// even `· N reclaimable` clips anything at all.
+    ///
+    /// **The cost of that order, named rather than hidden.** The aside is
+    /// treated as fixed while the names are being budgeted, so it is only ever
+    /// dropped *after* naming has already been given up. With one warning that
+    /// costs 22 characters, and below about 78 columns the segment is the bare
+    /// count — while spending those 22 characters on a name instead would have
+    /// left room for an abbreviated one and a `+N more`. Both readings are
+    /// defensible and this one is deliberate: `(+N to check by hand)` is the
+    /// whole of #128's posture on the screen, and a reader who cannot see it
+    /// has no way to know those rows were considered at all, whereas a reader
+    /// who cannot see a name still has `wf reap`, which prints every name.
+    /// A future that disagrees should change the order here, not the budget.
     pub fn hint(&self, width: usize) -> String {
         let head = format!("· {} reclaimable", self.ids.len());
         let aside = match self.warned {
@@ -764,6 +778,10 @@ mod tests {
         // watched at run time and the means of destruction that leave no argv
         // are pinned here — this module reads two functions and formats a
         // sentence, and has no business naming any of these.
+        //
+        // `unsafe` used to be on this list and is not: `unsafe_code = "deny"`
+        // in `Cargo.toml` covers every target in the crate, so a copy here was
+        // a second, weaker statement of a rule the compiler already enforces.
         let code = crate::probe::code_only(include_str!("reclaim.rs"));
         for forbidden in [
             "remove",
@@ -772,7 +790,6 @@ mod tests {
             "Command",
             "process::",
             "fs::",
-            "unsafe",
         ] {
             assert!(
                 !code.contains(forbidden),
