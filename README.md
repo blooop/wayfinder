@@ -402,14 +402,16 @@ That one is settled by the compiler and needs no test.
 
 `wf reap` as a whole *command* is another matter: it has to be public for `main`
 to dispatch it, and `reap::run(true, true)` is a forced reap. So the picker file
-may not write the word `reap` at all, and `main.rs` carries the list of every
-line in itself that does — a word, not a path, so an alias or a `crate::` route
-has to appear in it too. Those are greps over the source text of two files.
-They catch a cleanup wired in by accident, which is the mistake anyone is
-actually likely to make; they do not stop someone who means to get around them,
-and several review rounds of this feature were spent proving exactly that. A
-grep over two files cannot see the same call written in a third, or a second
-name for the module exported from the library.
+may not write the word `reap` at all — nor `Command`, `process::`,
+`tokio::spawn` or `fs::` — and `main.rs` carries the list of every line of code
+in itself that writes `reap`, and may not write `Command` either. A word, not a
+path, so an alias or a `crate::` route has to appear in that list too. Those are
+greps over the source text of two files. They catch a cleanup wired in by
+accident, which is the mistake anyone is actually likely to make; they do not
+stop someone who means to get around them, and several review rounds of this
+feature were spent proving exactly that. A grep over two files cannot see the
+same call written in a third, or a second name for the module exported from the
+library.
 
 Everything else is watched rather than proven. A test drives the real event loop
 against a recording `dl` and `gh`, through every arm the loop has — quit,
@@ -418,12 +420,19 @@ argv the run made, plus a scratch `HOME` laid out the way this machine is
 (`~/.cache/devlaunch/repos/<owner>/<repo>/<id>` for the clone,
 `~/.devpod/contexts/<ctx>/workspaces/<id>` for the record), compared before and
 after. That catches a workspace deleted by running `dl` and one deleted
-in-process, whatever file the call was written in — for the length of the
-session, plus 400 ms after the reading lands, after every key, and after the
-session returns. It does not catch a deletion deferred past that window (a
-spawned task that sleeps a second and a half is green; the same one with the
-window at three seconds is caught), or an `std::fs` call aimed somewhere else;
-nothing in any Rust file catches those.
+in-process, whatever file the call was written in, inside three stated bounds.
+It starts at the loop's composition — the function that spawns the reading and
+runs the loop — so what `wf` does above and below that call is outside it; the
+tokens above are what cover that part of the picker file. It runs for the length
+of that call plus 400 ms after the reading lands, after every key and after it
+returns, so a deletion deferred past the window is not seen (a spawned task that
+sleeps a second and a half is green; the same one with the window at three
+seconds is caught). And it sees only what the child's fixtures reach: a deletion
+in the one fold arm a failed map search would take is green, because the `gh`
+shim succeeds. An `std::fs` call aimed outside that scratch `HOME` is caught by
+nothing — a `remove_dir_all` pointed at a directory elsewhere on the disk passes
+the whole suite, and really does destroy it. Nothing in any Rust file catches
+that.
 
 The picker does delete one thing, and it is not a workspace: the launch path
 brings the installed skill copies back in step with the bundle, which removes

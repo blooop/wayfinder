@@ -33,19 +33,38 @@
 //!    `dl <ws> rm` reached from anywhere the loop can reach — a helper in
 //!    `app.rs`, a task spawned in a fold arm, a function named nothing anyone
 //!    thought to forbid — is written down as argv. It does not care what file
-//!    the route was spelt in. It cares about *which arm* and about *when*: all
-//!    four [`Outcome`] arms are driven, the launch one included, and the
-//!    recording runs from the composition site to a stated window past the
-//!    ending (`WATCH`, in the tests below). A cleanup deferred longer than that
-//!    is not seen. The bound is stated rather than silent because it cannot be
-//!    removed — a probe can always be outwaited.
+//!    the route was spelt in. It cares about *where*, about *which arm*, and
+//!    about *when*, and each of those three is a bound on the claim rather than
+//!    a detail of the test:
+//!
+//!    - **where**: the recording starts at [`session`], not at [`run_picker`].
+//!      `run_picker` composes the registration, the terminal, the `session`
+//!      call and the handover, and no test in this repository executes it, so
+//!      everything it does above and below that call is outside the recording.
+//!      What covers that part of this file is the denylist in (1), widened to
+//!      `fs::` for exactly this reason after a reviewer deleted a workspace
+//!      from `run_picker` with the whole selection green;
+//!    - **which arm**: all four [`Outcome`] arms are driven, the launch one
+//!      included, and so is [`fold`] — but only through the events the child's
+//!      fixtures actually produce. Its `Discovered`, `Fetched` and
+//!      `Reclaimable` arms are entered; `SearchFailed` is not, because the `gh`
+//!      shim answers the map search successfully, and a `dl <ws> rm` planted in
+//!      that one arm is green. What stands against it there is the denylist in
+//!      (1) — it has to be spelt in another file to get past that; the
+//!      recording does not reach it;
+//!    - **when**: to a stated window past the ending (`WATCH`, in the tests
+//!      below). A cleanup deferred longer than that is not seen. The bound is
+//!      stated rather than silent because it cannot be removed — a probe can
+//!      always be outwaited.
 //! 3. **Destruction that runs no command is watched where it would land.** The
 //!    same run gives the child a scratch `HOME` laid out the way this machine
 //!    is — `~/.cache/devlaunch/repos/<owner>/<repo>/<id>` for the clone,
 //!    `~/.devpod/contexts/<ctx>/workspaces/<id>` for the record — and compares
 //!    the tree before and after. An `fs::remove_dir_all` aimed at a workspace
-//!    fails it. An `fs` call aimed somewhere else is caught by nothing — as it
-//!    would be in any file of any crate, and this file claims no better.
+//!    fails it *if it runs inside `session`* — the same three bounds as (2)
+//!    apply, and the `run_picker` escape above was one of them being real. An
+//!    `fs` call aimed somewhere else is caught by nothing — as it would be in
+//!    any file of any crate, and this file claims no better.
 //!
 //! None of that says the picker deletes nothing at all. [`run_picker`] calls
 //! [`refresh_skills`] on the way into the agent, and a copy that has fallen
@@ -918,23 +937,36 @@ mod tests {
         // [`Picker::tick`] and [`fold`], neither of which is async, and a task
         // that outlives the loop outlives the probe with it.
         //
+        // `fs::` is here because the probe drives [`session`], and
+        // [`run_picker`] is the function *above* it — composed of a
+        // registration, a terminal, the `session` call and the handover, and
+        // executed by no test in this repository. A reviewer planted
+        // `std::fs::remove_dir_all` in `run_picker` aimed at the real layout
+        // (`~/.cache/devlaunch/repos/<owner>/<repo>/<id>` and
+        // `~/.devpod/contexts/default/workspaces/<id>`); it named none of the
+        // four tokens above, the whole selection was green, and driven under a
+        // pty it destroyed a workspace while the picker drew normally. So the
+        // token is what covers the part of this file the run does not reach.
+        // Adding it cost nothing: `fs::` appears nowhere in this file's code.
+        //
         // It is *not* a claim that nothing on the picker's path can delete, and
         // a grep over one file could never be one. The same call spelt in
         // `app.rs` or in a submodule of this module names none of these and
         // compiles; what stands against it there is the recorded argv and the
-        // scratch home the run above compares — and outside that home, or after
-        // that run, nothing does, which is true of any code in any file.
+        // scratch home the run above compares — and outside that home, outside
+        // [`session`], or after that run, nothing does, which is true of any
+        // code in any file.
         //
-        // Which is also why this list is shorter than the ones
-        // [`wf::reclaim`] and [`wf::refresh`] carry, rather than having drifted
-        // from them. Those are leaf modules that read and format, so `fs::` and
-        // `remove` cost them nothing and close the only spelling they have. This
-        // file is a *composition site*: it is reached by a probe that watches the
-        // filesystem directly, and banning `fs::` here would read as "the picker
-        // cannot touch a file" while a submodule of it still could. The
-        // behavioural guard is the honest one for that, so it is the one used.
-        let code = probe::code_only(include_str!("picker.rs"));
-        for forbidden in ["reap", "Command", "process::", "tokio::spawn"] {
+        // The list is still one short of the ones [`wf::reclaim`] and
+        // [`wf::refresh`] carry. Those two also forbid `remove`, and this file
+        // cannot: `app.failed.remove(&id)` is `App`'s own bookkeeping, one
+        // occurrence, and renaming a `HashMap` method to satisfy a grep is the
+        // distortion a previous round was asked to undo. `"rm"` and `--force`
+        // are absent from this file's code and could be added at no cost; they
+        // are the argv of the subprocess `Command` and `process::` already
+        // forbid spelling, and the recorded run reads argv directly.
+        let code = probe::code_only("picker.rs", include_str!("picker.rs"));
+        for forbidden in ["reap", "Command", "process::", "tokio::spawn", "fs::"] {
             assert!(
                 !code.contains(forbidden),
                 "the picker draws a screen and drains a channel: it names {forbidden:?}"

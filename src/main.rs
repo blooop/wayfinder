@@ -360,6 +360,43 @@ mod tests {
             .collect()
     }
 
+    /// `code` with the `USAGE` literal cut out — from its `const` line to the
+    /// line that closes the string.
+    ///
+    /// `USAGE` is help text. It writes `wf reap` because that is the command it
+    /// documents, and it calls nothing. Leaving it in [`lines_naming`]'s input
+    /// put two of its hand-wrapped lines into the list below, which turned that
+    /// list into a pin on the wrapping: rewording the `wf reap` paragraph — no
+    /// capability changed, the same code, the same seven sites — failed the
+    /// guard, and failed it with a message saying the file wrote `reap`
+    /// somewhere new, which was not true. Cutting the literal out leaves the
+    /// list five lines of code, which is what the guard is about.
+    ///
+    /// # Panics
+    ///
+    /// If `USAGE` is not found, or its literal is not closed by a line ending
+    /// `";` — the same fail-closed posture as [`probe::code_only`]: a shape
+    /// this cannot locate is refused rather than skipped.
+    fn without_usage(code: &str) -> String {
+        let lines: Vec<&str> = code.lines().collect();
+        let opens = lines
+            .iter()
+            .position(|line| line.starts_with("const USAGE: &str = \""))
+            .expect("main.rs defines USAGE at column 0");
+        let closes = opens
+            + lines[opens..]
+                .iter()
+                .position(|line| line.trim_end().ends_with("\";"))
+                .expect("the USAGE literal is closed by a line ending `\";`");
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| !(opens..=closes).contains(at))
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn the_binary_writes_reap_only_where_it_is_listed_here() {
         // What is left for a grep to say once the deletion itself is out of
@@ -373,15 +410,19 @@ mod tests {
         // that as a prologue before the match, and `wf --version` reaped a
         // workspace and exited 0.
         //
-        // So this is the whole list of lines in this file that write the word
-        // `reap`, and it is compared as a list rather than as a count. Two of
-        // them are code — the import and the arm — and the rest are the help
-        // text, which is prose in a string and calls nothing. Any new line that
-        // writes the word fails here, whatever it writes around it: an alias
-        // (`use wf::reap as tidy;`, `use crate::reap as tidy;`), a path through
-        // the crate root, a call split over two lines. The module cannot be
-        // reached without its name being written somewhere, and every somewhere
-        // is below.
+        // So this is the whole list of lines of *code* in this file that write
+        // the word `reap`, compared as a list rather than as a count. All five
+        // are code: the import, the two parse arms — one of which calls
+        // `parse_reap` — the rejection message, and the dispatch arm that calls
+        // `reap::run`. The help text is cut out first (see `without_usage`),
+        // because it is prose and pinning its line wrapping here made the guard
+        // fail on rewraps and say something untrue when it did.
+        //
+        // Any new line that writes the word fails here, whatever it writes
+        // around it: an alias (`use wf::reap as tidy;`, `use crate::reap as
+        // tidy;`), a path through the crate root, a call split over two lines.
+        // The module cannot be reached without its name being written
+        // somewhere, and every somewhere is below.
         //
         // What this does **not** reach: a third file calling `wf::reap::run`,
         // and a re-export that gives the module a second name in the library.
@@ -389,28 +430,49 @@ mod tests {
         // either. What it is good for is the accident — a maintainer wiring a
         // cleanup in without noticing — and that is the claim the module doc
         // makes for it too.
-        //
-        // If you changed the usage text, update the prose lines below; the two
-        // code lines are the ones that matter.
-        let code = probe::code_only(include_str!("main.rs"));
+        let code = probe::code_only("main.rs", include_str!("main.rs"));
         assert_eq!(
-            lines_naming(&code, "reap"),
+            lines_naming(&without_usage(&code), "reap"),
             [
                 "use wf::reap;",
-                "wf reap [-y] [-f]",
-                "wf reap            remove the workspaces whose work is over — a closed ticket,",
-                "\"reap\" => Invocation::Reap {",
+                "\"reap\" => Invocation::Reap {", // }
                 "[first, rest @ ..] if first == \"reap\" => parse_reap(rest),",
                 "\"wf: unknown reap argument {other:?} (expected `-y` or `-f`)\\n{USAGE}\"",
                 "Invocation::Reap { yes, insist } => reap::run(yes, insist).await,",
             ],
-            "this file writes `reap` somewhere new"
+            "the lines of code in this file that write `reap` are no longer the five \
+             listed here. A line that is not in the list is a way this binary reaches \
+             `wf::reap::run`, which is a forced deletion when it is called with both \
+             flags; a listed line that is gone means the list is stale. Read the diff \
+             and decide which before editing the list"
         );
+        // The dangling opening brace in the second entry is real: the arm it
+        // quotes opens a struct literal and rustfmt wraps the line there. The
+        // trailing comment that closes it is not decoration —
+        // `probe::code_only` counts braces as text to find where this module
+        // ends, so a string that opens one and never closes it fails this
+        // file's own guard. That is the fail-closed cost described in that
+        // function's doc, paid here, in the one place this file pays it.
+
         // The other half of the same claim, at the other arm: opening the TUI
         // is the whole of what `wf` with no arguments does.
         assert!(
             code.contains("Invocation::Tui => picker::run_picker().await,"),
             "opening the TUI must be the whole of what that arm does"
+        );
+
+        // And the deletion that does not go through `reap` at all. `main` is
+        // argv and dispatch; it starts no subprocess of its own. A prologue
+        // reading `Command::new("dl").args([id, "rm", "--force"]).output()` is
+        // the most ordinary shape an accidental cleanup takes, it runs on every
+        // invocation including `wf --version`, and until this line nothing in
+        // this file looked for it. `process::` and `tokio::spawn` are *not*
+        // added beside it: this file genuinely uses both, for the signal
+        // handler and the exit code.
+        assert!(
+            !code.contains("Command"),
+            "this file dispatches; it does not run anything itself, and a \
+             subprocess started here runs on every `wf` invocation"
         );
     }
 

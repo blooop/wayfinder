@@ -786,7 +786,7 @@ mod tests {
         // `unsafe` used to be on this list and is not: `unsafe_code = "deny"`
         // in `Cargo.toml` covers every target in the crate, so a copy here was
         // a second, weaker statement of a rule the compiler already enforces.
-        let code = crate::probe::code_only(include_str!("reclaim.rs"));
+        let code = crate::probe::code_only("reclaim.rs", include_str!("reclaim.rs"));
         for forbidden in [
             "remove",
             "\"rm\"",

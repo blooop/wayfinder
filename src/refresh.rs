@@ -546,7 +546,7 @@ mod tests {
         // reached without its name being written, so `use crate::reap as tidy;`
         // is caught here too. It costs nothing — nothing in this file's code
         // says the word.
-        let code = crate::probe::code_only(include_str!("refresh.rs"));
+        let code = crate::probe::code_only("refresh.rs", include_str!("refresh.rs"));
         for forbidden in [
             "reap",
             "remove",

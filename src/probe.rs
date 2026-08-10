@@ -525,9 +525,10 @@ fn executable(_path: &Path) {
 /// stripped — what the code can *do*, rather than what the prose beside it says
 /// it does.
 ///
-/// Called as `code_only(include_str!("reclaim.rs"))`: the `include_str!` has to
-/// stay at the call site, because its path is resolved against the file it is
-/// written in.
+/// Called as `code_only("reclaim.rs", include_str!("reclaim.rs"))`: the
+/// `include_str!` has to stay at the call site, because its path is resolved
+/// against the file it is written in, and the name is written beside it so a
+/// panic from here names the file at fault rather than this one.
 ///
 /// # What is dropped, and why that is safe
 ///
@@ -537,13 +538,18 @@ fn executable(_path: &Path) {
 /// each guard fail on itself.
 ///
 /// Dropping it is only safe if the part dropped is exactly a `#[cfg(test)]`
-/// module and nothing else, so that is checked here rather than assumed. An
-/// earlier version took the lines *before* the first `mod tests {` and threw
-/// the rest away unexamined, which had two holes, both demonstrated: a helper
-/// written below the test module was invisible to all four guards (only
-/// clippy's `items_after_test_module` saw it), and a raw string containing a
-/// line reading `mod tests {` cut the file short wherever its author liked —
-/// which silenced that lint too, and made every guard green for a deletion.
+/// module and nothing else, so that is checked here rather than assumed. Two
+/// earlier versions of this check were each defeated by a reviewer, and both
+/// are worth recording because the second looked like the fix for the first.
+/// The first took the lines *before* the first `mod tests {` and threw the rest
+/// away unexamined: a helper written below the test module was invisible to all
+/// four guards (only clippy's `items_after_test_module` saw it), and a raw
+/// string containing a line reading `mod tests {` cut the file short wherever
+/// its author liked — which silenced that lint too. The second read the tail,
+/// but only at column 0: it skipped every line starting with a space or a tab,
+/// so indenting each item below a raw-string decoy by one space dropped the
+/// whole tail out of all four guards again, and only `cargo fmt --check`
+/// objected.
 ///
 /// So the whole file is read, and three things are asserted about it:
 ///
@@ -551,11 +557,59 @@ fn executable(_path: &Path) {
 ///    including inside a string, is the decoy above;
 /// 2. it is preceded by `#[cfg(test)]` — so what is dropped is compiled out of
 ///    every release, not merely named `tests`;
-/// 3. it is the file's last item — the only thing at column 0 below it is its
-///    own closing brace, on the last non-blank line.
+/// 3. counting braces from that line, the depth reaches zero only on the file's
+///    last non-blank line. Depth rather than indentation: an item written below
+///    the module closes the module's brace above the end of the file, wherever
+///    the item itself is indented to.
 ///
 /// What remains uncovered is the *inside* of that module, which cannot run in a
-/// shipped binary. Everything else in the file is returned and read.
+/// shipped binary. The lines above it are returned; the lines below it are what
+/// (3) is about, and it is (3) that makes returning only the prefix safe.
+///
+/// # The braces are counted as text, and the four files pay for that
+///
+/// Nothing here parses Rust. A `{` or `}` inside a string, a char literal or a
+/// comment counts exactly like one in code. That makes this check **fail
+/// closed**, and that is the intended trade: an edit it cannot account for is
+/// rejected rather than waved through.
+///
+/// The cost is real, and these three were run against `picker.rs` — each is an
+/// ordinary, security-neutral edit that now fails the guard over whichever file
+/// it is made in, with the whole rest of the selection green:
+///
+/// - `#[allow(clippy::too_many_lines)]` written between the `#[cfg(test)]` and
+///   the `mod tests {` — the announcement is no longer the line above;
+/// - `#[cfg(all(test, unix))]` in place of `#[cfg(test)]` — likewise;
+/// - a second `#[cfg(test)] mod` written *below* the test module — the braces
+///   close before the end of the file, which is the whole point of (3).
+///
+/// Two that read like the same class and are **not** rejected, checked rather
+/// than assumed: a trailing `} // end` on the closing brace passes, because
+/// what is counted is the brace and not the shape of the line; and a second
+/// `#[cfg(test)] mod` written *above* the test module passes, because it is
+/// above, which means the denylists read it like any other code. A file with no
+/// `mod tests {` line at all fails the first assertion by construction — zero
+/// is not one — and that is a shape this repository does not have, so it is
+/// stated from the code rather than from a run.
+///
+/// So `main.rs`, `picker.rs`, `reclaim.rs` and `refresh.rs` are held to one
+/// test-module convention — a single `#[cfg(test)] mod tests {` at column 0,
+/// last in the file — and a maintainer who departs from it gets a security
+/// guard failing on an edit that has nothing to do with security. That is
+/// deliberate: the alternative is a check that can be argued out of reading
+/// part of the file, and that is how both previous versions were defeated. The
+/// panic names the file at fault so the message points at the edit rather than
+/// at this function.
+///
+/// What a textual count does not reach, measured rather than reasoned: a tail
+/// whose braces are *balanced* by braces written inside string literals — one
+/// stray `{` in a literal inside the module and one stray `}` in a literal
+/// inside the item below it — leaves the depth at zero only on the last line,
+/// and all four guards pass, `cargo fmt --check` included. What refuses that
+/// edit is clippy's `items_after_test_module`, which CI runs under
+/// `-D warnings`; an item below a test module is exactly what that lint is for.
+/// So the honest statement is that this function catches the tail written at
+/// any indentation, and clippy catches the tail that hand-balances its braces.
 ///
 /// The module is found by its `mod tests {` line rather than by the
 /// `#[cfg(test)]` above it, and that is not a detail. `main.rs` declares
@@ -566,7 +620,7 @@ fn executable(_path: &Path) {
 /// # Panics
 ///
 /// If any of the three does not hold, which fails the guard that called it.
-pub fn code_only(source: &str) -> String {
+pub fn code_only(file: &str, source: &str) -> String {
     let lines: Vec<&str> = source.lines().collect();
     let opens: Vec<usize> = lines
         .iter()
@@ -577,9 +631,9 @@ pub fn code_only(source: &str) -> String {
     assert_eq!(
         opens.len(),
         1,
-        "a file guarded by its source text must open exactly one test module at \
-         column 0, and this one has {} such lines (a second is how a raw string \
-         hides the rest of the file from every guard): {:?}",
+        "{file}: a file guarded by its source text must open exactly one test \
+         module at column 0, and this one has {} such lines (a second is how a \
+         raw string hides the rest of the file from every guard): {:?}",
         opens.len(),
         opens.iter().map(|at| at + 1).collect::<Vec<_>>()
     );
@@ -587,7 +641,7 @@ pub fn code_only(source: &str) -> String {
     assert_eq!(
         opens.checked_sub(1).map(|above| lines[above].trim()),
         Some("#[cfg(test)]"),
-        "what is dropped must be announced `#[cfg(test)]`: line {} is {:?}",
+        "{file}: what is dropped must be announced `#[cfg(test)]`: line {} is {:?}",
         opens,
         opens.checked_sub(1).map(|above| lines[above])
     );
@@ -595,17 +649,29 @@ pub fn code_only(source: &str) -> String {
         .iter()
         .rposition(|line| !line.trim().is_empty())
         .expect("a source file has a line");
-    for (at, line) in lines.iter().enumerate().skip(opens + 1) {
-        if line.trim().is_empty() || line.starts_with([' ', '\t']) {
-            continue;
-        }
+    // Brace depth, not column. The version this replaced skipped every line
+    // starting with a space or a tab, so one space of indentation on each item
+    // below a decoy hid the whole tail from all four guards.
+    let mut depth = 0usize;
+    for (at, line) in lines.iter().enumerate().skip(opens) {
+        depth = (depth + line.matches('{').count()).saturating_sub(line.matches('}').count());
         assert!(
-            at == last && *line == "}",
-            "the test module must be this file's last item, and line {} is {line:?} \
-             — an item below it is read by no guard here",
-            at + 1
+            depth > 0 || at == last,
+            "{file}: the test module must be this file's last item, and its braces \
+             close at line {} of {} — whatever is written below that line is read \
+             by no guard here, at any indentation",
+            at + 1,
+            last + 1
         );
     }
+    assert_eq!(
+        depth,
+        0,
+        "{file}: the test module's braces are still {depth} deep at line {}, the \
+         file's last — the guards below read only what is above the module, so \
+         this file's shape has to be checkable",
+        last + 1
+    );
     lines[..opens]
         .iter()
         .filter(|line| !line.trim_start().starts_with("//"))
