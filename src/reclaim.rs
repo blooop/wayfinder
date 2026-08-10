@@ -274,6 +274,7 @@ pub async fn survey_live() -> Option<Reclaimable> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reap::Unsaved;
     use anyhow::anyhow;
 
     fn workspace(id: &str, repo: &str, number: u64) -> Workspace {
@@ -336,7 +337,7 @@ mod tests {
             for unsaved in [None, Some("1 uncommitted change(s) (pixi.lock)")] {
                 for state in ["Stopped", "Running"] {
                     let mut ws = workspace("solo", "blooop/devlaunch", 80);
-                    ws.unsaved = unsaved.map(str::to_string);
+                    ws.unsaved = unsaved.map(|u| Unsaved::WouldLose(u.to_string()));
                     ws.state = Some(state.to_string());
                     let known = facts([(node("blooop/devlaunch", 80), fact.clone())]);
                     let listed = std::slice::from_ref(&ws);
@@ -372,7 +373,7 @@ mod tests {
         for fact in [NodeFact::Superseded { pr: 97 }, NodeFact::Unstarted] {
             for unsaved in [None, Some("1 uncommitted change(s) (pixi.lock)")] {
                 let mut ws = workspace("warned", "blooop/devlaunch", 80);
-                ws.unsaved = unsaved.map(str::to_string);
+                ws.unsaved = unsaved.map(|u| Unsaved::WouldLose(u.to_string()));
                 let known = facts([(node("blooop/devlaunch", 80), fact.clone())]);
                 assert_eq!(
                     reading(std::slice::from_ref(&ws), &known),
@@ -402,7 +403,9 @@ mod tests {
             workspace("in-flight", "blooop/devlaunch", 98),
             {
                 let mut dirty = workspace("dirty", "blooop/devlaunch", 99);
-                dirty.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+                dirty.unsaved = Some(Unsaved::WouldLose(
+                    "1 uncommitted change(s) (pixi.lock)".to_string(),
+                ));
                 dirty
             },
         ];
@@ -443,7 +446,9 @@ mod tests {
         // hint must inherit that keep rather than quietly count it — otherwise
         // the picker is advertising a reap that would throw work away.
         let mut ws = workspace("dirty", "blooop/devlaunch", 80);
-        ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+        ws.unsaved = Some(Unsaved::WouldLose(
+            "1 uncommitted change(s) (pixi.lock)".to_string(),
+        ));
         let known = facts([(node("blooop/devlaunch", 80), NodeFact::Closed)]);
         assert_eq!(reading(std::slice::from_ref(&ws), &known), None);
         // And the same node with a clean clone *is* surfaced, so the assertion

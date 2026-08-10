@@ -430,11 +430,46 @@ pub fn note(what: &str) {
 /// destroying.
 pub const DL_LISTING: &str = r#"[
   {"id":"wf-129-closed","devlaunch":true,"repo":"blooop/wayfinder",
-   "branch":"wayfinder/wayfinder-129","state":"Stopped"},
+   "branch":"wayfinder/wayfinder-129","state":"Stopped",
+   "unsaved":{"nothingToLose":true}},
   {"id":"wf-138-unstarted","devlaunch":true,"repo":"blooop/wayfinder",
-   "branch":"wayfinder/wayfinder-138","state":"Stopped"},
+   "branch":"wayfinder/wayfinder-138","state":"Stopped",
+   "unsaved":{"nothingToLose":true}},
   {"id":"wf-137-open","devlaunch":true,"repo":"blooop/wayfinder",
-   "branch":"wayfinder/wayfinder-137","state":"Running"}
+   "branch":"wayfinder/wayfinder-137","state":"Running",
+   "unsaved":{"nothingToLose":true}}
+]"#;
+
+/// Every shape `dl` has ever emitted for `unsaved`, in one listing.
+///
+/// The top three rows are devlaunch **0.0.24 and newer**: an object with
+/// exactly one key. The bottom two are **0.0.23 and older**, whose field was a
+/// bare sentence or `null` — still on real machines, because `wf` pins no `dl`
+/// version. The last row is a workspace `dl` did not create, where the field is
+/// absent altogether.
+///
+/// This is a transcription of `dl`'s own documented output rather than
+/// something `wf` finds convenient to parse: the object arms and their spelling
+/// come from devlaunch's `--ls --json` table, and the whole reason this fixture
+/// exists is that the two repos had no executed agreement about this field at
+/// all — only prose on each side, which is how the string→object change was
+/// able to land unnoticed.
+pub const DL_LISTING_UNSAVED: &str = r#"[
+  {"id":"wf-1-clean","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-1","state":"Stopped",
+   "unsaved":{"nothingToLose":true}},
+  {"id":"wf-2-dirty","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-2","state":"Stopped",
+   "unsaved":{"wouldLose":"2 uncommitted change(s) (pixi.lock, notes.md) and 1 unpushed commit(s)"}},
+  {"id":"wf-3-unreadable","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-3","state":"Stopped",
+   "unsaved":{"couldNotTell":"fatal: not a git repository"}},
+  {"id":"wf-4-legacy-dirty","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-4","state":"Stopped",
+   "unsaved":"1 uncommitted change(s) (pixi.lock)"},
+  {"id":"wf-5-legacy-clean","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-5","state":"Stopped","unsaved":null},
+  {"id":"not-ours","devlaunch":false,"state":"Stopped"}
 ]"#;
 
 /// The tracker's answer to the batched question those three nodes raise:
