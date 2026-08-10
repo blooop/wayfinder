@@ -43,6 +43,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 
 use crate::fetch::{is_open, parse_pr, Assignee, GraphQlResponse, Nodes, PrNode};
+use crate::launch::devlaunch_answers_unsaved;
 use crate::model::PrStatus;
 
 /// The branch prefix `wf` mints its workspaces under (#106): the full branch is
@@ -71,9 +72,271 @@ pub struct Workspace {
     /// devpod's state: `Running`, `Stopped`, …
     #[serde(default)]
     pub state: Option<String>,
-    /// What deleting would destroy, in `dl`'s words, or `None`.
+    /// What deleting would destroy, in `dl`'s words.
+    ///
+    /// `None` is "no answer": the field was `null` or absent, and what that
+    /// means depends on which `dl` wrote it. On devlaunch ≤ 0.0.23 `null` on a
+    /// workspace `dl` made *is* the ordinary clean case. From 0.0.24 the same
+    /// `null` appears exactly where `devlaunch` is false, so one on a clone
+    /// `dl` made means `dl`'s own inspection fell over — and reading that as
+    /// "clean" is devlaunch#171's bug, which is the bug the object form was a
+    /// breaking change to prevent.
+    ///
+    /// No single row can tell the two apart, so the version is asked instead:
+    /// `answered_where_dl_answers` turns the second reading into
+    /// [`Unsaved::Unanswered`] before [`plan`] ever sees the row, and leaves
+    /// the first alone. A `None` still standing here is therefore a `dl` whose
+    /// version said the field was allowed to be empty, or one `wf` could not
+    /// probe at all — and it permits a reap, which is what those releases meant
+    /// by it.
     #[serde(default)]
-    pub unsaved: Option<String>,
+    pub unsaved: Option<Unsaved>,
+}
+
+impl Workspace {
+    /// Is devpod holding a container up for this workspace?
+    ///
+    /// One predicate, because two decisions turn on it — [`plan`] keeps a
+    /// running workspace, and [`Liveness`](crate::liveness::Liveness) marks its
+    /// node — and they were spelt as the same string literal in two files. A
+    /// state `dl` renamed would then have made `reap` quietly stop protecting
+    /// containers *and* the picker quietly call every claimed node stalled,
+    /// with no test able to notice because both sides hardcoded the same word.
+    pub fn is_running(&self) -> bool {
+        self.state.as_deref() == Some("Running")
+    }
+
+    /// Is it *definitely* down — settled, with nothing of it running?
+    ///
+    /// Deliberately not `!is_running()`, and deliberately not `Stopped` alone
+    /// either. devpod's vocabulary is `Running`, `Busy`, `Stopped` and
+    /// `NotFound`, and `dl` writes `null` when `devpod status` will not answer:
+    ///
+    /// - `Stopped` and `NotFound` are both settled and both down. `NotFound` is
+    ///   the *stronger* of the two — the container does not exist, having been
+    ///   pruned or removed by hand — and it appears on ordinary machines; the
+    ///   listing on the one this was written on carries a `NotFound` row.
+    /// - `Busy` is a container mid-start or mid-stop, which is a transition and
+    ///   not a fact about whether work is happening.
+    /// - `null`, and any state a later devpod adds, are states `wf` cannot read.
+    ///
+    /// The last two answer `false` here *and* `false` to
+    /// [`is_running`](Workspace::is_running), which is the point of having two
+    /// predicates rather than one negation: a marking that asserts something on
+    /// a row must be silent where it does not know, and only `!is_running()`
+    /// would have quietly turned every unreadable state into a claim.
+    pub fn is_down(&self) -> bool {
+        matches!(self.state.as_deref(), Some("Stopped" | "NotFound"))
+    }
+}
+
+/// What deleting a workspace's clone would destroy, as `dl` reports it.
+///
+/// Three arms because `dl` has three answers, and the third is not a flavour of
+/// either other one: **it could not tell.** A clone whose `.git` is half-removed
+/// or truncated is still full of files, and nothing has established that those
+/// files exist anywhere else — so "could not read it" has to refuse a reap
+/// exactly as "would lose work" does, and for a reason that reads differently
+/// on the plan. `dl` learned that distinction the hard way (devlaunch#171,
+/// where the guard walked out of the clone into an ancestor repository and
+/// reported *its* cleanliness); `wf` is the caller that has to not re-flatten
+/// it.
+///
+/// The old sentinel is what this replaces. `unsaved` was a string-or-null, and
+/// null carried two unrelated meanings — "clean" and "not `dl`'s clone" — with
+/// the reaper reading both as *go ahead*. The arm that says nothing is at risk
+/// now says so in its own name, and the absence of an answer is the `Option`
+/// around this type rather than a value inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unsaved {
+    /// Every byte of the clone exists on a remote too. Deleting costs nothing.
+    NothingToLose,
+    /// Uncommitted changes, unpushed commits, or both — named, not counted.
+    WouldLose(String),
+    /// `git` could not read the clone as a repository, and says why.
+    CouldNotTell(String),
+    /// `dl` answered something this `wf` does not understand, quoted back.
+    ///
+    /// Two things reach here: a key from a `dl` newer than this binary, and the
+    /// documented `nothingToLose` carrying a payload it is not documented to
+    /// carry. Both are `wf` failing to read `dl` rather than `dl` failing to
+    /// read a clone, which is why the row's wording hedges at a newer `dl`
+    /// rather than asserting one. It refuses a reap for the
+    /// same reason [`Unsaved::CouldNotTell`] does — nothing has established
+    /// that this clone exists anywhere else — and it is a separate arm because
+    /// the two are separate facts: one is `git` failing on the clone, the other
+    /// is `wf` failing on `dl`, and a row that said the first when it meant the
+    /// second would send somebody to look at the wrong thing.
+    Unrecognized(String),
+    /// `dl` made this clone and then said nothing about what it holds.
+    ///
+    /// **Never parsed from the wire** — there is no spelling of it, because it
+    /// is the *absence* of one. It is put here by `answered_where_dl_answers`
+    /// after asking the `dl` on PATH its version, and only for a `dl` that
+    /// documents an answer on every clone of its own. On such a release `null`
+    /// appears exactly where `devlaunch` is false, so a `null` on a clone `dl`
+    /// made is `dl`'s own inspection having fallen over — which is
+    /// devlaunch#171's bug, the one the object form exists to prevent, and
+    /// reaping on it would walk straight back into it.
+    ///
+    /// Separate from [`Unsaved::CouldNotTell`] because `dl` saying "I could not
+    /// read this clone" and `dl` saying nothing at all are different failures
+    /// with different places to look: the first is a broken clone, the second
+    /// is a broken `dl`.
+    Unanswered,
+}
+
+impl Unsaved {
+    /// Why this workspace is kept, or `None` when it is no obstacle to a reap.
+    ///
+    /// The two refusing arms phrase themselves rather than sharing one
+    /// "holds …" sentence: a clone `dl` could not read holds nothing anybody
+    /// has established, and saying it *holds* something would be inventing the
+    /// very reading that failed.
+    fn refusal(&self) -> Option<String> {
+        match self {
+            Self::NothingToLose => None,
+            Self::WouldLose(what) => Some(format!("holds {what}")),
+            Self::CouldNotTell(why) => Some(format!("dl cannot read its clone: {why}")),
+            Self::Unrecognized(said) => Some(format!(
+                "this wf cannot read what dl said about it ({said}) — newer dl?"
+            )),
+            Self::Unanswered => {
+                Some("dl made this clone but did not say what it holds".to_string())
+            }
+        }
+    }
+
+    /// What a `-f` row appends to say what the reap it advises throws away.
+    fn discard(&self) -> Option<String> {
+        match self {
+            Self::NothingToLose => None,
+            Self::WouldLose(what) => Some(format!(", discarding {what}")),
+            Self::CouldNotTell(why) => Some(format!(", discarding a clone dl cannot read: {why}")),
+            Self::Unrecognized(said) => Some(format!(
+                ", discarding a clone this wf cannot read dl's answer about ({said})"
+            )),
+            Self::Unanswered => {
+                Some(", discarding a clone dl did not say anything about".to_string())
+            }
+        }
+    }
+}
+
+/// `dl`'s two spellings of the same field, both accepted.
+///
+/// Both are live on real machines: devlaunch through 0.0.23 emits a bare
+/// sentence or `null`, and 0.0.24 emits the one-key object.
+///
+/// `wf` does now hold `dl` to a floor, but that floor governs what a *launch*
+/// may ask of it, and reaping is the other direction — it reads a listing from
+/// whichever `dl` is on `PATH`, including one too old to isolate with. A
+/// machine can also have reaped its workspaces with an older `dl` and upgraded
+/// since. Refusing to read the older spelling would strand exactly the
+/// workspaces most in need of collecting.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum UnsavedWire {
+    /// devlaunch ≤ 0.0.23. A sentence there was written when `git` reported
+    /// something; `wf` reads it as work at risk, which is the safe direction if
+    /// that release ever wrote a sentence for another reason. The "clean" case
+    /// was `null`, and stays [`None`] here.
+    Sentence(String),
+    /// devlaunch ≥ 0.0.24. Read as a **map**, not as an externally-tagged enum,
+    /// and that is the whole design of this arm.
+    ///
+    /// An enum would require the object to hold exactly one key, so the day
+    /// `dl` adds a sibling — a `path`, a `checkedAt`, a count — *every* row
+    /// stops being readable at once. Every workspace then refuses, `wf reap`
+    /// collects nothing, and the picker's hint disappears without a word.
+    /// Refusing is the safe direction, but losing the whole feature to one
+    /// added field is not degradation, and this arm's job is degradation.
+    ///
+    /// Reading the keys `wf` knows and ignoring the rest costs nothing and
+    /// survives that release. What it cannot survive — a *renamed* or genuinely
+    /// new answer — is what [`UnsavedWire::Unknown`] is for.
+    Reported(serde_json::Map<String, serde_json::Value>),
+    /// Anything else `dl` might one day put here.
+    ///
+    /// **This arm is why the field is a type and not a string.** Without it, a
+    /// value `wf` cannot read makes the *whole listing* fail to parse —
+    /// [`parse_workspaces`] is all or nothing, so one such row takes `wf reap`
+    /// and the picker's reading down with it, silently in the picker's case.
+    /// That is the exact failure this field already caused once, and pinning
+    /// the spellings that have shipped would only have moved the next one a
+    /// release away. The value is kept rather than ignored so the refusal can
+    /// name what it did not understand.
+    Unknown(serde_json::Value),
+}
+
+/// The keys `dl` documents, in the order they are read.
+///
+/// Order is load-bearing, and only in one direction: the two refusing keys are
+/// looked for **before** the permitting one, so an object carrying both — which
+/// `dl` should never write — refuses rather than reaps. Nothing else about the
+/// order matters, because the arms are mutually exclusive in practice.
+const WOULD_LOSE: &str = "wouldLose";
+const COULD_NOT_TELL: &str = "couldNotTell";
+const NOTHING_TO_LOSE: &str = "nothingToLose";
+
+/// How much of an unrecognised value to quote back. Enough to recognise, short
+/// enough to sit in a plan row beside a workspace id.
+const UNKNOWN_QUOTED: usize = 60;
+
+impl<'de> Deserialize<'de> for Unsaved {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match UnsavedWire::deserialize(deserializer)? {
+            UnsavedWire::Sentence(what) => Self::WouldLose(what),
+            UnsavedWire::Reported(object) => Self::from_object(&object),
+            UnsavedWire::Unknown(value) => Self::unrecognized(&value),
+        })
+    }
+}
+
+impl Unsaved {
+    /// Read the object form: the first documented key that answers, and a
+    /// refusal when none does.
+    fn from_object(object: &serde_json::Map<String, serde_json::Value>) -> Self {
+        if let Some(what) = object.get(WOULD_LOSE).and_then(serde_json::Value::as_str) {
+            return Self::WouldLose(what.to_string());
+        }
+        if let Some(why) = object
+            .get(COULD_NOT_TELL)
+            .and_then(serde_json::Value::as_str)
+        {
+            return Self::CouldNotTell(why.to_string());
+        }
+        // The one key that permits a delete, and the only value it may carry.
+        // `false` is `dl` contradicting itself, and anything else is a payload
+        // it does not document: both refuse rather than being read as clean.
+        if object.get(NOTHING_TO_LOSE) == Some(&serde_json::Value::Bool(true)) {
+            return Self::NothingToLose;
+        }
+        Self::unrecognized(&serde_json::Value::Object(object.clone()))
+    }
+
+    /// Name what could not be read, short enough to sit in a plan row.
+    ///
+    /// An object is reported by its **keys**, because the key is what `wf`
+    /// failed to recognise and a reader is going to compare it against `dl`'s
+    /// own documentation. Anything else is rendered whole. Either way this is
+    /// `wf`'s re-rendering rather than `dl`'s bytes back — `serde_json` sorts
+    /// an object's keys and normalises its numbers — which is why the row says
+    /// `dl` said something *this wf* cannot read, and does not offer the text
+    /// as a quotation to grep for.
+    fn unrecognized(value: &serde_json::Value) -> Self {
+        let said = match value {
+            serde_json::Value::Object(object) if !object.is_empty() => {
+                object.keys().cloned().collect::<Vec<_>>().join(", ")
+            }
+            other => other.to_string(),
+        };
+        let mut quoted: String = said.chars().take(UNKNOWN_QUOTED).collect();
+        if said.chars().count() > UNKNOWN_QUOTED {
+            quoted.push('…');
+        }
+        Self::Unrecognized(quoted)
+    }
 }
 
 /// What `wf` decided about one workspace. Three arms, each carrying a reason,
@@ -243,6 +506,17 @@ pub struct Node {
     pub number: u64,
 }
 
+impl Node {
+    /// How a node is named to a human — `wayfinder#133`.
+    ///
+    /// One spelling, shared by the reap plan's rows and the picker's stall
+    /// segment, because they are naming the same things on the same terminal
+    /// and two formats would read as two kinds of object.
+    pub fn name(&self) -> String {
+        format!("{}#{}", short_repo(&self.repo), self.number)
+    }
+}
+
 /// Which node a workspace is for, or `None` if it is not one of `wf`'s.
 ///
 /// Strict on purpose, and every clause is a way for this to be someone else's
@@ -314,22 +588,24 @@ pub fn plan(
             continue;
         };
         let id = workspace.id.clone();
-        let name = format!("{}#{}", short_repo(&node.repo), node.number);
+        let name = node.name();
         // Naming the waived work in the acted-on line, not only in the keep
         // line it replaced: this is the row the human is about to approve, and
         // "and discarding …" is the part they might stop at.
         let discard = match (&workspace.unsaved, insist) {
-            (Some(unsaved), true) => format!(", discarding {unsaved}"),
+            (Some(unsaved), true) => unsaved.discard().unwrap_or_default(),
             _ => String::new(),
         };
         if let (Some(unsaved), false) = (&workspace.unsaved, insist) {
-            verdicts.push(Verdict::Keep {
-                id,
-                reason: format!("holds {unsaved}"),
-            });
-            continue;
+            if let Some(refusal) = unsaved.refusal() {
+                verdicts.push(Verdict::Keep {
+                    id,
+                    reason: refusal,
+                });
+                continue;
+            }
         }
-        if workspace.state.as_deref() == Some("Running") {
+        if workspace.is_running() {
             verdicts.push(Verdict::Keep {
                 id,
                 reason: "still running — stop it first".to_string(),
@@ -402,13 +678,45 @@ pub async fn workspaces() -> Result<Vec<Workspace>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    parse_workspaces(&output.stdout)
+    let mut workspaces = parse_workspaces(&output.stdout)?;
+    answered_where_dl_answers(&mut workspaces, devlaunch_answers_unsaved());
+    Ok(workspaces)
 }
 
 /// The parse boundary for `dl`'s listing, kept apart from the process call so
 /// it is testable without devlaunch installed.
 fn parse_workspaces(body: &[u8]) -> Result<Vec<Workspace>> {
     serde_json::from_slice(body).context("unparseable workspace listing from `dl --ls --json`")
+}
+
+/// Give a missing answer its meaning, once the `dl` that wrote it is known.
+///
+/// The one place a `dl` version reaches this module, and it is applied here —
+/// at the boundary that already ran the process — so that [`plan`] stays a pure
+/// function of rows it is handed. A version probe inside the parser or the
+/// planner would make every test of either depend on what is installed on the
+/// machine running it.
+///
+/// `answers` is [`devlaunch_answers_unsaved`] in production and both values in
+/// the tests. When it is false nothing happens at all: on those releases `null`
+/// on `dl`'s own clone is the ordinary clean case, and rewriting it would make
+/// `wf reap` refuse every workspace on the machine.
+///
+/// Keyed on `devlaunch` rather than on [`node_of`] because that is the
+/// distinction `dl` documents — `unsaved` is null exactly where `devlaunch` is
+/// false — and reading a row `dl` disclaims as an unanswered question would
+/// invent a failure out of a workspace that was never `dl`'s to inspect. Rows
+/// that are `dl`'s but not `wf`'s are left marked anyway; [`plan`] drops them
+/// for not being ours, and this function has no business knowing that.
+fn answered_where_dl_answers(workspaces: &mut [Workspace], answers: bool) {
+    if !answers {
+        return;
+    }
+    for workspace in workspaces {
+        if workspace.devlaunch && workspace.unsaved.is_none() {
+            workspace.unsaved = Some(Unsaved::Unanswered);
+        }
+    }
 }
 
 /// What the tracker says about each of `nodes`.
@@ -1085,7 +1393,9 @@ mod tests {
         // the prompt, so `-f` is the whole flag surface plan can even see.
         for fact in [NodeFact::Superseded { pr: 97 }, NodeFact::Unstarted] {
             let mut ws = workspace("warned", "blooop/devlaunch", "wayfinder/devlaunch-80");
-            ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+            ws.unsaved = Some(Unsaved::WouldLose(
+                "1 uncommitted change(s) (pixi.lock)".to_string(),
+            ));
             let known = facts([(node("blooop/devlaunch", 80), fact)]);
             for insist in [false, true] {
                 let verdicts = plan(std::slice::from_ref(&ws), &known, insist);
@@ -1105,7 +1415,9 @@ mod tests {
         // sits — and the wording is the same for both warning facts.
         for fact in [NodeFact::Superseded { pr: 97 }, NodeFact::Unstarted] {
             let mut ws = workspace("warned", "blooop/devlaunch", "wayfinder/devlaunch-80");
-            ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+            ws.unsaved = Some(Unsaved::WouldLose(
+                "1 uncommitted change(s) (pixi.lock)".to_string(),
+            ));
             let known = facts([(node("blooop/devlaunch", 80), fact)]);
             let quiet = plan(std::slice::from_ref(&ws), &known, false);
             assert!(!quiet[0].reason().contains("discarding"));
@@ -1123,7 +1435,9 @@ mod tests {
         // doing its job, and the deliberate direction: the advisory row is the
         // one that can afford to be missed.
         let mut ws = workspace("ghost", "blooop/devlaunch", "wayfinder/devlaunch-80");
-        ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+        ws.unsaved = Some(Unsaved::WouldLose(
+            "1 uncommitted change(s) (pixi.lock)".to_string(),
+        ));
         let known = facts([(node("blooop/devlaunch", 80), NodeFact::Unstarted)]);
         assert_eq!(
             plan(std::slice::from_ref(&ws), &known, false),
@@ -1171,7 +1485,7 @@ mod tests {
             NodeFact::DoneByMerge { pr: 97 },
         )]);
         let mut dirty = workspace("merged", "blooop/devlaunch", "wayfinder/devlaunch-80");
-        dirty.unsaved = Some("2 uncommitted change(s)".to_string());
+        dirty.unsaved = Some(Unsaved::WouldLose("2 uncommitted change(s)".to_string()));
         assert_eq!(
             plan(&[dirty], &known, false),
             vec![Verdict::Keep {
@@ -1195,7 +1509,9 @@ mod tests {
     #[test]
     fn insisting_on_done_by_merge_names_the_discard() {
         let mut ws = workspace("merged", "blooop/devlaunch", "wayfinder/devlaunch-80");
-        ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+        ws.unsaved = Some(Unsaved::WouldLose(
+            "1 uncommitted change(s) (pixi.lock)".to_string(),
+        ));
         let known = facts([(
             node("blooop/devlaunch", 80),
             NodeFact::DoneByMerge { pr: 97 },
@@ -1264,7 +1580,7 @@ mod tests {
         // and a caller that walks into a refusal it could have anticipated is
         // one that eventually learns to pass --force.
         let mut ws = workspace("done", "blooop/devlaunch", "wayfinder/devlaunch-80");
-        ws.unsaved = Some("2 uncommitted change(s)".to_string());
+        ws.unsaved = Some(Unsaved::WouldLose("2 uncommitted change(s)".to_string()));
         let known = facts([(node("blooop/devlaunch", 80), NodeFact::Closed)]);
         let verdicts = plan(&[ws], &known, false);
         assert_eq!(
@@ -1295,7 +1611,7 @@ mod tests {
     fn unsaved_work_outranks_a_running_container_so_the_worse_news_is_the_one_shown() {
         let mut ws = workspace("done", "blooop/devlaunch", "wayfinder/devlaunch-80");
         ws.state = Some("Running".to_string());
-        ws.unsaved = Some("1 unpushed commit(s)".to_string());
+        ws.unsaved = Some(Unsaved::WouldLose("1 unpushed commit(s)".to_string()));
         let known = facts([(node("blooop/devlaunch", 80), NodeFact::Closed)]);
         assert!(plan(&[ws], &known, false)[0].reason().contains("unpushed"));
     }
@@ -1334,6 +1650,272 @@ mod tests {
         assert_eq!(node_of(&parsed[1]), None);
     }
 
+    /// The two `dl` releases are read the same way, arm for arm.
+    ///
+    /// This is the assertion whose absence let the field change under `wf`:
+    /// both sides documented `unsaved` in prose and neither ever executed the
+    /// other's output, so the string→object change in devlaunch 0.0.24 was
+    /// invisible until a listing failed to parse — which takes the reap *and*
+    /// the picker's hint down together, since [`parse_workspaces`] is all or
+    /// nothing.
+    #[test]
+    fn every_shape_dl_has_emitted_for_unsaved_is_read_back_as_the_arm_it_means() {
+        let parsed = parse_workspaces(crate::probe::DL_LISTING_UNSAVED.as_bytes())
+            .expect("dl's listing parses, in either release's shape");
+        let read: Vec<(&str, Option<&Unsaved>)> = parsed
+            .iter()
+            .map(|w| (w.id.as_str(), w.unsaved.as_ref()))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                ("wf-1-clean", Some(&Unsaved::NothingToLose)),
+                (
+                    "wf-2-dirty",
+                    Some(&Unsaved::WouldLose(
+                        "2 uncommitted change(s) (pixi.lock, notes.md) and 1 unpushed commit(s)"
+                            .to_string()
+                    ))
+                ),
+                (
+                    "wf-3-unreadable",
+                    Some(&Unsaved::CouldNotTell(
+                        "fatal: not a git repository".to_string()
+                    ))
+                ),
+                // 0.0.23 and older wrote a sentence only when there was
+                // something to lose, so it lands on the one arm it can mean.
+                (
+                    "wf-4-legacy-dirty",
+                    Some(&Unsaved::WouldLose(
+                        "1 uncommitted change(s) (pixi.lock)".to_string()
+                    ))
+                ),
+                // `null` on either release: no answer, which is not the same
+                // fact as `nothingToLose` and must not become it.
+                ("wf-5-legacy-clean", None),
+                // A key this wf has never heard of, and the one key that
+                // permits a delete carrying a payload dl does not document.
+                // Both land on the arm that refuses, and — the whole point —
+                // neither stops the six rows around them from parsing.
+                // Named by its key: that is the half `wf` failed to recognise
+                // and the half a reader compares against dl's own docs.
+                (
+                    "wf-6-newer-dl",
+                    Some(&Unsaved::Unrecognized("someAnswerFromALaterDl".to_string()))
+                ),
+                (
+                    "wf-7-odd-payload",
+                    Some(&Unsaved::Unrecognized("nothingToLose".to_string()))
+                ),
+                // A documented key beside an undocumented sibling: still read.
+                // The day `dl` adds a field to this object, every row would
+                // otherwise stop parsing at once and `wf reap` would collect
+                // nothing at all.
+                ("wf-8-sibling-key", Some(&Unsaved::NothingToLose)),
+                ("not-ours", None),
+            ]
+        );
+    }
+
+    /// The failure this whole type exists to prevent, stated as a fact about
+    /// the boundary rather than about one value.
+    ///
+    /// `unsaved` broke `wf` once by changing shape. Accepting the two shapes
+    /// `dl` has shipped would have fixed that one incident and left the next
+    /// one identical: [`parse_workspaces`] is all or nothing, so one row `wf`
+    /// cannot read costs every row — `wf reap` aborts, and the picker's reading
+    /// fails silently, taking the reclaim hint and every liveness marking with
+    /// it and saying nothing on screen about why.
+    #[test]
+    fn an_answer_from_a_later_dl_costs_that_row_a_reap_and_costs_the_others_nothing() {
+        let workspaces = parse_workspaces(crate::probe::DL_LISTING_UNSAVED.as_bytes())
+            .expect("a field this wf cannot read must not take the listing down with it");
+        assert_eq!(
+            workspaces.len(),
+            9,
+            "every row survives one unreadable field"
+        );
+
+        let known: BTreeMap<Node, NodeFact> = (1..=8)
+            .map(|n| (node("blooop/wayfinder", n), NodeFact::Closed))
+            .collect();
+        let verdicts = plan(&workspaces, &known, false);
+        let kept: Vec<&str> = verdicts
+            .iter()
+            .filter_map(|v| match v {
+                Verdict::Keep { id, reason } if id.starts_with("wf-6") => Some(reason.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            vec!["this wf cannot read what dl said about it (someAnswerFromALaterDl) — newer dl?"],
+            "the row says dl is ahead of this wf, not that the clone is broken"
+        );
+        // And the rows either side of it are decided on their own merits.
+        let reaped: Vec<&str> = doomed(&verdicts).into_iter().map(Verdict::id).collect();
+        assert_eq!(
+            reaped,
+            vec!["wf-1-clean", "wf-5-legacy-clean", "wf-8-sibling-key"]
+        );
+    }
+
+    /// Only the arm that says the clone is clean lets a finished ticket go.
+    ///
+    /// The same `null`, read as the two opposite things it means either side of
+    /// devlaunch 0.0.24.
+    ///
+    /// `wf-5-legacy-clean` is the row that carries the whole argument: on the
+    /// release that wrote it, `null` on `dl`'s own clone is *clean* and it must
+    /// reap, and on a release that answers every clone it made, the same `null`
+    /// is `dl`'s inspection having fallen over and it must not. One row cannot
+    /// say which, which is why the version is asked once and applied here.
+    ///
+    /// `not-ours` pins the other edge: `unsaved` is null on it under every
+    /// release, because there is no clone of `dl`'s own there to inspect. It is
+    /// never an unanswered question, and marking it as one would invent a
+    /// failure out of a workspace `dl` explicitly disclaims.
+    #[test]
+    fn a_missing_answer_reads_as_clean_or_as_a_broken_dl_depending_on_which_dl_wrote_it() {
+        let read = |answers| {
+            let mut workspaces =
+                parse_workspaces(crate::probe::DL_LISTING_UNSAVED.as_bytes()).unwrap();
+            answered_where_dl_answers(&mut workspaces, answers);
+            workspaces
+        };
+        let unsaved_of = |workspaces: &[Workspace], id: &str| {
+            workspaces
+                .iter()
+                .find(|w| w.id == id)
+                .expect("the fixture row")
+                .unsaved
+                .clone()
+        };
+
+        // A `dl` that documents an answer on every clone of its own.
+        let answering = read(true);
+        assert_eq!(
+            unsaved_of(&answering, "wf-5-legacy-clean"),
+            Some(Unsaved::Unanswered),
+            "a clone dl made and said nothing about is a question it failed to answer"
+        );
+        assert_eq!(
+            unsaved_of(&answering, "not-ours"),
+            None,
+            "a workspace dl did not make is not one it failed to answer for"
+        );
+
+        // A `dl` from before the field changed, or one `wf` could not probe.
+        // Nothing is rewritten: on those releases the `null` meant clean, and
+        // reading it as a failure would refuse every workspace on the machine.
+        let legacy = read(false);
+        assert_eq!(unsaved_of(&legacy, "wf-5-legacy-clean"), None);
+        assert_eq!(unsaved_of(&legacy, "not-ours"), None);
+
+        // Rows that did answer are untouched by either reading — the upgrade
+        // fills a gap and never overwrites what `dl` actually said.
+        for answers in [true, false] {
+            let workspaces = read(answers);
+            assert_eq!(
+                unsaved_of(&workspaces, "wf-1-clean"),
+                Some(Unsaved::NothingToLose)
+            );
+            assert_eq!(
+                unsaved_of(&workspaces, "wf-3-unreadable"),
+                Some(Unsaved::CouldNotTell("fatal: not a git repository".into()))
+            );
+        }
+
+        // And the whole point, at the level the human sees: the same listing
+        // reaps that workspace under one `dl` and refuses it under the other.
+        let known: BTreeMap<Node, NodeFact> = (1..=5)
+            .map(|n| (node("blooop/wayfinder", n), NodeFact::Closed))
+            .collect();
+        assert!(
+            doomed(&plan(&legacy, &known, false))
+                .into_iter()
+                .any(|v| v.id() == "wf-5-legacy-clean"),
+            "the release that meant clean by it still collects it"
+        );
+        let refused = plan(&answering, &known, false);
+        assert!(
+            !doomed(&refused)
+                .into_iter()
+                .any(|v| v.id() == "wf-5-legacy-clean"),
+            "the release that promised an answer does not get a reap out of silence"
+        );
+        assert!(
+            refused.iter().any(|v| matches!(
+                v,
+                Verdict::Keep { id, reason }
+                    if id == "wf-5-legacy-clean"
+                        && reason == "dl made this clone but did not say what it holds"
+            )),
+            "and it says which of dl and the clone is the thing to go and look at: {refused:?}"
+        );
+    }
+
+    /// `couldNotTell` refusing is the point: those files are still on disk and
+    /// nothing has established they exist anywhere else, so it is `wouldLose`'s
+    /// neighbour and not `nothingToLose`'s. Flattening the three answers back
+    /// onto "is it `Some`?" would reap the unreadable clone.
+    #[test]
+    fn a_clean_clone_reaps_and_an_unreadable_one_refuses_like_dirty_work_does() {
+        let workspaces = parse_workspaces(crate::probe::DL_LISTING_UNSAVED.as_bytes()).unwrap();
+        let known: BTreeMap<Node, NodeFact> = (1..=5)
+            .map(|n| (node("blooop/wayfinder", n), NodeFact::Closed))
+            .collect();
+
+        let verdicts = plan(&workspaces, &known, false);
+        let reaped: Vec<&str> = doomed(&verdicts).into_iter().map(Verdict::id).collect();
+        assert_eq!(
+            reaped,
+            vec!["wf-1-clean", "wf-5-legacy-clean"],
+            "a clean clone and an unanswered one go; nothing else does"
+        );
+        let refusals: Vec<&str> = verdicts
+            .iter()
+            .filter_map(|v| match v {
+                Verdict::Keep { id, reason } if id.starts_with("wf-3") => Some(reason.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            refusals,
+            vec!["dl cannot read its clone: fatal: not a git repository"],
+            "the unreadable clone says so, rather than claiming to hold work"
+        );
+
+        // `-f` waives both refusing arms, because that is what it hands `dl`:
+        // the flag exists so a lockfile every container dirties cannot make a
+        // workspace unreapable forever, and `dl rm --force` overrides its own
+        // guard in both cases too. What changes is that the row says which.
+        let insisted = plan(&workspaces, &known, true);
+        let claimed: Vec<&str> = doomed(&insisted).into_iter().map(Verdict::id).collect();
+        assert_eq!(
+            claimed,
+            vec![
+                "wf-1-clean",
+                "wf-2-dirty",
+                "wf-3-unreadable",
+                "wf-4-legacy-dirty",
+                "wf-5-legacy-clean"
+            ]
+        );
+        let unreadable = insisted
+            .iter()
+            .find(|v| v.id().starts_with("wf-3"))
+            .expect("the unreadable clone is planned");
+        assert!(
+            unreadable
+                .reason()
+                .contains("discarding a clone dl cannot read: fatal: not a git repository"),
+            "a forced reap names what it cannot account for: {}",
+            unreadable.reason()
+        );
+    }
+
     #[test]
     fn insisting_waives_the_unsaved_guard_and_says_what_it_is_discarding() {
         // The case this exists for: a devcontainer that installs packages in
@@ -1342,7 +1924,9 @@ mod tests {
         // forever. The reap line has to name what is being thrown away, since
         // that is the row being approved.
         let mut ws = workspace("done", "blooop/devlaunch", "wayfinder/devlaunch-80");
-        ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+        ws.unsaved = Some(Unsaved::WouldLose(
+            "1 uncommitted change(s) (pixi.lock)".to_string(),
+        ));
         let known = facts([(node("blooop/devlaunch", 80), NodeFact::Closed)]);
         assert_eq!(
             plan(std::slice::from_ref(&ws), &known, true),
@@ -1369,7 +1953,9 @@ mod tests {
         // given an answer to.
         let mut ws = workspace("done", "blooop/devlaunch", "wayfinder/devlaunch-80");
         ws.state = Some("Running".to_string());
-        ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+        ws.unsaved = Some(Unsaved::WouldLose(
+            "1 uncommitted change(s) (pixi.lock)".to_string(),
+        ));
         let known = facts([(node("blooop/devlaunch", 80), NodeFact::Closed)]);
         assert_eq!(
             plan(&[ws], &known, true),

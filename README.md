@@ -270,6 +270,71 @@ open PRs — one red PR makes the node red. With no open PR, a merged one means
 done; with no PR at all it falls back to unclaimed → ready, claimed → building,
 closed → done.
 
+### What is actually running, and what stopped
+
+Every glyph above is a **tracker** fact. That is the right vocabulary for what
+the work *is*, and it is silent about the half `wf` itself created: a launch
+`exec`s an agent into a container and exits, so nothing has ever reported back
+whether that agent is still there. `⏎` comes closest and deliberately stops
+short — it says a launch *happened*.
+
+`dl` knows the missing half and already publishes it, so the same background
+reading that finds [reclaimable workspaces](#startup) reads it too, and two
+markings come out of the join:
+
+- **`▣` a container of this node's is up.**
+- **`⧖` claimed, nothing pushed, and nothing of its running.** Somebody — almost
+  always an agent — took this ticket and is no longer on it.
+
+`⧖` is the one that needed both halves, and it is why this is a join rather than
+a field. A claim on its own is the ordinary look of work in progress; a stopped
+container on its own is the ordinary look of work that finished. It is the
+*pair* that means a lifecycle went down between its stages. It reads against the
+stage glyph beside it, and that contrast is the finding: `◐ #133 … ⧖` is the
+tracker saying *building* and the machine saying *nothing is*.
+
+`ctrl-r` retakes the reading along with everything else, and what it said is
+dropped the moment you press it rather than when its replacement lands: these
+are claims in the present tense, and a screen asserting last hour's containers
+beside freshly fetched tickets would be worse than one asserting nothing.
+
+Stalls also reach the [count line](#startup) as
+`· 2 stalled: wayfinder#133, wayfinder#134`, because the row is not always on
+screen — the project list has no
+ticket rows at all, and a stall can be inside a fold or another map. Running
+containers stay on their rows: they are the ordinary state of a machine in use,
+and a count of them would be a status bar rather than a summons.
+
+Four things this deliberately does not claim, because the honest version is
+narrower than the useful-sounding one:
+
+- **A container being up is not an agent being alive.** `dl` reports the
+  container; nobody reports the process inside it, and `wf` is long gone by
+  then. `▣` covers a session you left, a session that exited an hour ago inside
+  a container nobody stopped, and a `WF_PREWARM` container never entered. It is
+  a floor on activity, not a reading of it.
+- **A stall is not a crash**, and a reboot marks everything at once. The same
+  shape is left by an agent that died mid-slice, one that handed off cleanly, a
+  `dl <ws> stop` you ran yourself, and a restart that stopped every container on
+  the machine. None of those is a false positive — each of those runs really has
+  stopped and really does want picking up — but they arrive together, so
+  `12 stalled` the morning after a reboot is a fact about the host rather than
+  about the work. The breadcrumb trail on the ticket says which.
+- **A node launched on the host can still be marked**, and this is the one
+  outright wrong answer. `wf` cannot see host processes, so a node whose agent
+  is running on the host, but which owns a stopped workspace from some *other*
+  launch — the repo grew a `.devcontainer/` later, or `WF_PREWARM` built one at
+  a staging you backed out of — looks exactly like a stall. A node with no
+  workspace at all is genuinely unmarked rather than wrongly marked.
+- **This machine only**, the same limit [resume](#resuming-picking-a-conversation-back-up)
+  carries: the listing is local, so a ticket worked on another machine looks
+  unstarted here.
+
+Nothing is done about any of it. `wf reap` still keeps a claimed workspace — a
+stale claim is a person's stated intent and reap does not overrule it — which is
+exactly why the stall was worth drawing: it was the one thing on the machine
+that nothing pointed at.
+
 `↑`/`↓` prefer **siblings at the cursor's depth**, so on the default screen they
 move between tickets you can actually take and step over the blocked context
 hanging beneath them; `→` reveals what the cursor is on and `←` closes it again.
@@ -381,8 +446,19 @@ ask again.
 count line when it arrives:
 
 ```
-  12/30  · 2 reclaimable: devlaunch-github-…oop-wayfinder-127, +1 more — wf reap
+  12/30  · 1 stalled: wayfinder#133 · 2 reclaimable: devlaunch-github-…oop-wayfinder-127, +1 more — wf reap
 ```
+
+That one reading answers two questions, because the same `dl --ls --json` and
+the same tracker query settle both: what a reap would claim, and
+[what is running and what stopped](#what-is-actually-running-and-what-stopped).
+Stalls are laid down first, so on a narrowing terminal it is the `wf reap`
+pointer and the warned aside that go while stalls are still naming nodes — the
+one trade in here worth disagreeing with: work that has stopped moving outranks
+tidying that can wait. What stalls will not do is squeeze the reclaim note below
+its own count, because that segment clips rather than vanishing and `· 2
+reclaima` is not a word; they give up a name instead, which the rows' own `⧖`
+markings make readable anyway.
 
 It is the same reading `wf reap` prints, taken by the same code — a `dl --ls
 --json` and one batched tracker query, neither of them on the way to a frame.
@@ -703,6 +779,8 @@ an empty one.
 | `enter` | on the project list: enter that project. On a project's screen: open the launch picker — the creation rows on the project's own row, the launch modes on a ticket or a cluster header — and a second `enter` runs the agent here and exits. On a group line it folds instead, since there is no agent to run |
 | `←`/`→`, `↑`/`↓` or `tab`, *type*, then `enter`* | in the launch picker: pick Claude/Codex, pick the row, fill its field (a steering prompt, a task, or a map seed), launch — `esc` backs out with the query and cursor intact. `←`/`→` does nothing on a `resume` row, whose agent comes from the record |
 | `⏎` in a row | a previous launch left a conversation on this node: its picker leads with `resume`, and `enter enter` rejoins it |
+| `▣` in a row | [a container of this node's is up](#what-is-actually-running-and-what-stopped) — which is not the same as an agent being alive in it |
+| `⧖` in a row | claimed, nothing pushed, and nothing of its running: a run that stopped between its stages |
 | `ctrl-r` | refetch every map in place, keeping your query, level and cursor |
 | `esc` | clear the query; on an empty query, quit |
 | `q` | quit — on an empty query only, since mid-query it types |
@@ -797,24 +875,41 @@ over its index. (Isolated launches used to run in the picked tree itself, which
 meant every launch of a repo shared one tree and one container — serial by
 construction.)
 
-Two things have to be true for a Claude launch to be isolated, and otherwise it
-runs on the host exactly as it always has:
+Three things have to be true for a Claude launch to be isolated, and otherwise
+it runs on the host exactly as it always has:
 
-1. the checkout declares one of those two configs, and
-2. `dl` is on PATH.
+1. the checkout declares one of those two configs,
+2. `dl` is on PATH, and
+3. that `dl` is **0.0.24 or newer**.
 
-**`WF_PREWARM=1` needs `dl` 0.0.24 or newer.** `dl <workspace> up` — start
-without attaching — and the per-workspace launch lock are what the warm-up is
-made of; on an older `dl` the background spawn fails silently and the launch
-simply pays the cold start at the second enter, as it always did.
+The third is there because "installed" and "speaks this binary's command line"
+are different questions, and asking only the first moved the failure past the
+point where it could still degrade: the prewarm below fires `dl <workspace> up`,
+which no release before 0.0.24 had, so a machine with everything up to date
+satisfied both of the old conditions and then failed *inside* the launch. `wf`
+asks `dl --version` once per run instead. A `dl` that is installed and cannot be
+used says so in the launch notice, because that is the fixable case — an absent
+`dl` stays quiet, since a repo may carry a `devcontainer.json` for its editor
+users on a machine that never wanted containers.
 
-**Use `dl` 0.0.20 or newer.** Launching several tickets at once means several
-`dl` processes preparing the same repo's cache at the same moment; 0.0.20 is
-where those runs serialize over a per-repo lock instead of racing (the loser
-of the old race could delete the winner's half-written clone). The older floor
-still matters too: `wf` pins no version and never will — the launch
-is one `exec` of a program found on PATH — but older `dl` on devpod 0.26 hands
-the agent **no terminal**, and an agent with no terminal decides it was invoked
+Installing `wf` from the channel brings a conforming `dl` with it: the recipe
+declares `devlaunch >=0.0.24`, so the container half of the binary is not
+invisibly absent on a fresh machine. That is what takes `wf` from ~3 MB to
+~370 MB where devlaunch is not already present.
+
+**`WF_PREWARM=1` needs `dl` 0.0.24 or newer** — the same floor, and the release
+that set it. `dl <workspace> up` — start without attaching — and the
+per-workspace launch lock are what the warm-up is made of.
+
+**Two older floors, now subsumed by the one above.** Both are kept as the
+record of why a floor exists at all — they are what an older `dl` did, and
+0.0.24 is above both, so nothing `wf` will isolate with can still do either.
+
+Launching several tickets at once means several `dl` processes preparing the
+same repo's cache at the same moment; **0.0.20** is where those runs serialize
+over a per-repo lock instead of racing (the loser of the old race could delete
+the winner's half-written clone). And older `dl` on devpod 0.26 hands the agent
+**no terminal**, and an agent with no terminal decides it was invoked
 non-interactively: it prints one answer and exits, so the symptom is a session
 that never starts rather than an error. Measured here on devpod 0.26.1:
 `devpod ssh --command` (what `dl` ≤ 0.0.12 uses) gives `not a tty`, `TERM=dumb`
@@ -895,6 +990,16 @@ their branch looks like), branches that are not `wayfinder/<repo>-<n>` for that
 repo, tickets with an open or draft PR (in review is where review fixes happen),
 tickets someone has claimed, and anything **running** — a ticket closing is no
 evidence that the session in the container ended.
+
+**A `dl` that says nothing is not a `dl` saying nothing is at risk.** From
+devlaunch **0.0.24** the listing answers `unsaved` for every clone `dl` made,
+and leaves it null only on workspaces it did not make. So on 0.0.24 and newer a
+missing answer about one of `wf`'s own workspaces means `dl`'s inspection fell
+over, and the row is kept saying so rather than collected as clean. Releases
+before that wrote null for a clean clone, and are still read that way. No single
+row can tell the two apart, so `wf` asks `dl --version` once per run and reads
+the listing accordingly; a `dl` it cannot place is read the older, permissive
+way, so the worst case is the behaviour that shipped before the floor existed.
 
 One `gh api graphql` call per repo answers all of this, however many workspaces
 that repo has — which is also what makes the picker's background reading cheap

@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use crate::fetch;
 use crate::model::{Map, MapId, MapSet};
 use crate::projects::ProjectsCache;
-use crate::reclaim::Reclaimable;
+use crate::reclaim::Reading;
 
 /// How long the map search waits before trying again. The only recurring timer
 /// left: nothing polls, but a search that never answers would leave `wf`
@@ -61,12 +61,22 @@ pub enum LoadEvent {
     SearchFailed,
     /// One map's load reported.
     Fetched { id: MapId, outcome: MapFetch },
-    /// The background reading found workspaces a `wf reap` would claim (#137).
+    /// The background reading landed (#137) — what a `wf reap` would claim,
+    /// and what is running or has stopped.
     ///
     /// Only ever sent when there is something to say: a reading that failed and
     /// a reading that found nothing are the same silence, because neither is
     /// anything the screen should draw.
-    Reclaimable(Reclaimable),
+    ///
+    /// `taken` says *which* reading this is, and it exists because that silence
+    /// breaks newest-write-wins. `ctrl-r` clears what the screen holds and asks
+    /// again; an answer to the *previous* question can already be sitting in
+    /// the channel at that moment, and folding it would put the cleared state
+    /// back — with nothing to correct it, since a fresh reading that finds
+    /// nothing sends no event at all. Every other `LoadEvent` reports either
+    /// way, so send order is enough for them; this one is answered only when
+    /// the answer is interesting, so it says which question it answers.
+    Surveyed { taken: u64, reading: Reading },
 }
 
 /// Has the `wayfinder:map` label search answered yet?
@@ -353,13 +363,13 @@ pub fn spawn_discovery(
 /// Returns a [`Survey`] so the launch path can stop it and wait, exactly as it
 /// does for the map loads: the reading holds child processes of its own, and an
 /// in-flight one outliving the `exec` would be inherited by the agent.
-pub fn spawn_survey<S>(survey: S, tx: mpsc::UnboundedSender<LoadEvent>) -> Survey
+pub fn spawn_survey<S>(survey: S, tx: mpsc::UnboundedSender<LoadEvent>, taken: u64) -> Survey
 where
-    S: Future<Output = Option<Reclaimable>> + Send + 'static,
+    S: Future<Output = Option<Reading>> + Send + 'static,
 {
     Survey(tokio::spawn(async move {
-        if let Some(found) = survey.await {
-            let _ = tx.send(LoadEvent::Reclaimable(found));
+        if let Some(reading) = survey.await {
+            let _ = tx.send(LoadEvent::Surveyed { taken, reading });
         }
     }))
 }
@@ -443,7 +453,7 @@ mod tests {
     /// A reading that never answers — the reading `wf` must be able to draw
     /// over. A `pending` future rather than a long sleep, so "the picker did
     /// not wait" is a fact about the code and not about a timer.
-    async fn never() -> Option<Reclaimable> {
+    async fn never() -> Option<Reading> {
         std::future::pending().await
     }
 
@@ -456,7 +466,7 @@ mod tests {
         // hang this test rather than slow it.
         let (tx, mut rx) = mpsc::unbounded_channel();
         tokio::time::timeout(Duration::from_secs(5), async {
-            let survey = spawn_survey(never(), tx.clone());
+            let survey = spawn_survey(never(), tx.clone(), 0);
             assert!(
                 rx.try_recv().is_err(),
                 "nothing may be on the channel before the reading lands"
@@ -470,12 +480,18 @@ mod tests {
     #[tokio::test]
     async fn a_reading_that_lands_folds_in_through_the_one_channel() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let found = Reclaimable::for_test(&["ws-a"], 0);
-        spawn_survey(std::future::ready(Some(found.clone())), tx.clone())
+        let found = Reading::for_test(
+            Some(crate::reclaim::Reclaimable::for_test(&["ws-a"], 0)),
+            crate::liveness::Liveness::default(),
+        );
+        spawn_survey(std::future::ready(Some(found.clone())), tx.clone(), 7)
             .settle()
             .await;
         match rx.try_recv() {
-            Ok(LoadEvent::Reclaimable(got)) => assert_eq!(got, found),
+            Ok(LoadEvent::Surveyed { taken, reading }) => {
+                assert_eq!(reading, found);
+                assert_eq!(taken, 7, "the event says which reading answered");
+            }
             other => panic!("the reading must arrive as its own event, got {other:?}"),
         }
     }
@@ -485,7 +501,7 @@ mod tests {
         // No `dl`, a failed listing, a tracker that would not answer, or simply
         // nothing to reclaim: one silence, no event, and above all no error.
         let (tx, mut rx) = mpsc::unbounded_channel();
-        spawn_survey(std::future::ready(None), tx.clone())
+        spawn_survey(std::future::ready(None), tx.clone(), 0)
             .settle()
             .await;
         assert!(
@@ -514,6 +530,7 @@ mod tests {
                 None
             },
             tx,
+            0,
         );
         survey.stop().await;
         assert_eq!(

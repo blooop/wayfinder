@@ -41,6 +41,7 @@ pub mod app;
 pub mod fetch;
 pub mod filter;
 pub mod launch;
+pub mod liveness;
 pub mod model;
 /// Test scaffolding shared by more than one module, and by both crates —
 /// `src/probe.rs` is declared here *and* in `src/main.rs`, which is the only

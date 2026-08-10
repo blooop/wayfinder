@@ -1228,6 +1228,33 @@ impl Devlaunch {
             )),
         }
     }
+
+    /// Does this `dl` say what every clone it made would lose?
+    ///
+    /// [`reap`](crate::reap) asks, because a missing answer means opposite
+    /// things either side of [`UNSAVED_IS_AN_OBJECT`]: before it, `null` on
+    /// `dl`'s own clone was the ordinary *clean* case; from it, `null` appears
+    /// exactly where `devlaunch` is false, so a `null` on a clone `dl` made
+    /// means `dl`'s own inspection fell over. Reaping is right in the first
+    /// reading and destroys work in the second, and no single row can tell them
+    /// apart — only the version can, which is why this is asked here rather
+    /// than guessed in the parser.
+    ///
+    /// The two states with no version to compare answer `false`, so anything
+    /// this binary cannot place reads the old, permissive way. The failure mode
+    /// is then "behaves as it did before the floor existed" rather than
+    /// "refuses every workspace on a machine `wf` could not probe".
+    fn answers_unsaved(self) -> bool {
+        match self {
+            Devlaunch::Usable => true,
+            // Too old for the *floor* is not too old for this question: a `dl`
+            // that answers `unsaved` but lacks some later subcommand still
+            // answered. Compared rather than assumed, so raising the floor
+            // cannot quietly restate a fact about a past release.
+            Devlaunch::TooOld(found) => found >= UNSAVED_IS_AN_OBJECT,
+            Devlaunch::Absent | Devlaunch::Unreadable => false,
+        }
+    }
 }
 
 /// Ask `dl` its version, once per process.
@@ -1254,6 +1281,31 @@ fn devlaunch_on_path() -> Devlaunch {
             Err(_) => Devlaunch::Absent,
         }
     })
+}
+
+/// The release where `--ls --json` began answering `unsaved` for every clone
+/// `dl` made.
+///
+/// devlaunch 0.0.24 replaced a string-or-null field with a one-key object, and
+/// from there `unsaved` is null *exactly* where `devlaunch` is false — there is
+/// no clone of `dl`'s own to inspect. That is the same release [`prewarm`]'s
+/// `up` arrived in, so this equals [`DEVLAUNCH_FLOOR`] today.
+///
+/// Two constants for one release anyway, because they answer two questions.
+/// Raising the floor is about what `wf` may *ask* `dl` to do; this is about how
+/// to read what `dl` already said, and [`reap`](crate::reap) reads listings
+/// from whatever `dl` is on PATH rather than only from one a launch would
+/// accept. Collapsing them would make a future floor bump silently restate a
+/// fact about a past release.
+const UNSAVED_IS_AN_OBJECT: DlVersion = DlVersion(0, 0, 24);
+
+/// Does the `dl` on this machine say what every clone it made would lose?
+///
+/// Split from the probe for the same reason [`Devlaunch::from_version_output`]
+/// is — the rule is the part worth testing, and it is testable without a `dl`
+/// on the machine running the tests.
+pub(crate) fn devlaunch_answers_unsaved() -> bool {
+    devlaunch_on_path().answers_unsaved()
 }
 
 /// Wrap one argument so a POSIX shell hands it back unchanged.
@@ -3561,6 +3613,30 @@ mod tests {
         // Unreadable, not usable: a `dl` whose answer cannot be compared is a
         // `dl` whose command line cannot be relied on.
         assert_eq!(Devlaunch::from_version_output("???"), Devlaunch::Unreadable);
+    }
+
+    #[test]
+    fn the_unsaved_reading_follows_the_release_that_changed_it_not_the_floor() {
+        // Usable is the ordinary yes. It is only sound because the floor is at
+        // or above the release that changed the field — assert that, so raising
+        // the floor below it can never make `Usable` claim an answer that
+        // release did not give.
+        assert!(DEVLAUNCH_FLOOR >= UNSAVED_IS_AN_OBJECT);
+
+        // The case the two constants exist for: a `dl` below a future floor
+        // that still answers `unsaved`. Read as answering, because it does.
+        assert!(Devlaunch::TooOld(DlVersion(0, 0, 24)).answers_unsaved());
+        assert!(Devlaunch::TooOld(DlVersion(0, 1, 0)).answers_unsaved());
+
+        // 0.0.23 is the release whose `null` meant clean. Reading it as an
+        // unanswered question would refuse every workspace on that machine.
+        assert!(!Devlaunch::TooOld(DlVersion(0, 0, 23)).answers_unsaved());
+
+        // No version to compare: read the old, permissive way rather than
+        // refusing everything.
+        assert!(!Devlaunch::Absent.answers_unsaved());
+        assert!(!Devlaunch::Unreadable.answers_unsaved());
+        assert!(Devlaunch::Usable.answers_unsaved());
     }
 
     #[test]

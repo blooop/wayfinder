@@ -16,6 +16,7 @@ use ratatui::Frame;
 use crate::app::{App, Overlay};
 use crate::filter;
 use crate::launch::{Agent, Candidate, Launch, Staged};
+use crate::liveness::Life;
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
 use crate::reclaim::Reclaimable;
 use crate::view::{Branch, Fold, GroupKind, Item, Plan, ProjectRow};
@@ -56,7 +57,7 @@ fn cluster_header(
     map: &Map,
     lit: &[usize],
     under_cursor: bool,
-    resumable: bool,
+    marks: Marks,
 ) -> Line<'static> {
     let cyan = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     // The cursor rides *before* the `▌`, not after it: the bar is the cluster's
@@ -65,14 +66,10 @@ fn cluster_header(
     let mut spans = vec![cursor_span(under_cursor), Span::styled("▌ ", cyan)];
     spans.extend(lit_spans(id.short_repo(), lit, cyan));
     spans.push(Span::styled(format!(" · {}", map.title), cyan));
-    // A map is a node, so a charting session is as resumable as a build one —
-    // and the header is the only place the list can say so (#35).
-    if resumable {
-        spans.push(Span::styled(
-            RESUME_BADGE,
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
-        ));
-    }
+    // A map is a node, so a charting session is as resumable as a build one,
+    // and a map's own workspace is as launchable — the header is the only place
+    // the list can say either (#35).
+    spans.extend(marks.spans());
     for (glyph, count) in map.tally() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -293,7 +290,7 @@ fn ticket_line(
     branch: &Branch,
     lit: &[usize],
     under_cursor: bool,
-    resumable: bool,
+    marks: Marks,
 ) -> Line<'static> {
     // Nested rows carry the cursor column as extra indent, so a branch begins
     // directly under the glyph of the row it hangs from instead of to its left.
@@ -319,12 +316,7 @@ fn ticket_line(
             Style::new().add_modifier(Modifier::DIM),
         ));
     }
-    if resumable {
-        spans.push(Span::styled(
-            RESUME_BADGE,
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
-        ));
-    }
+    spans.extend(marks.spans());
     for pr in &ticket.prs {
         spans.extend(pr_badge(&ticket.repo, pr));
     }
@@ -355,8 +347,22 @@ fn context_line(ticket: &Ticket, prefix: &str) -> Line<'static> {
     // No resume badge either, for the same reason it carries no cursor: a
     // context row is not somewhere `enter` can be pressed, so a badge about
     // what `enter` would do there would be an offer the row cannot honour.
-    ticket_line(ticket, prefix, &[], &Branch::Plain, &[], false, false)
-        .patch_style(Style::new().add_modifier(Modifier::DIM))
+    //
+    // No liveness marking, on the narrower ground these rows already stand on:
+    // a context row shows no PR badges either. It is drawn to say *where* the
+    // matches beneath it live, and everything it says about itself is furniture
+    // — so a stalled node reachable only as somebody else's context is not
+    // marked on a sifted screen, and is there the moment the query clears.
+    ticket_line(
+        ticket,
+        prefix,
+        &[],
+        &Branch::Plain,
+        &[],
+        false,
+        Marks::default(),
+    )
+    .patch_style(Style::new().add_modifier(Modifier::DIM))
 }
 
 /// The body as styled lines: the [`Plan`] walked in order. Shared by the live
@@ -452,7 +458,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                     map,
                     &lit,
                     under_cursor,
-                    app.resume(&id.repo, id.number).is_some(),
+                    Marks::of(app, &id.repo, id.number),
                 ));
             }
             Item::Ticket {
@@ -475,7 +481,7 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                     branch,
                     &lit,
                     under_cursor,
-                    app.resume(&ticket.repo, ticket.number).is_some(),
+                    Marks::of(app, &ticket.repo, ticket.number),
                 ));
             }
             Item::Project(project) => lines.push(project_line(project, under_cursor)),
@@ -613,6 +619,89 @@ pub fn idle_note(plan: &Plan) -> String {
 /// The badge a row carries when a previous launch left a conversation on it
 /// (#35) — the same glyph as the key that rejoins it.
 const RESUME_BADGE: &str = "  ⏎";
+
+/// The badge a node carries when a container of its is up.
+///
+/// A square, where every stage glyph is round, because it is not a stage: the
+/// row's leading glyph is what the *tracker* says the work is, and this is what
+/// the *machine* says is happening to it. Two vocabularies that must not be
+/// mistaken for one another at a glance, so they do not share a shape.
+const RUNNING_BADGE: &str = "  ▣";
+
+/// The badge a node carries when it is claimed, has nothing pushed, and nothing
+/// of its is running.
+///
+/// It sits next to a `◐ building` stage glyph, and that juxtaposition *is* the
+/// finding: the tracker believes this is in progress, and no container of its
+/// is up. An hourglass because what it reports is elapsed time and nothing else
+/// — see [`Life::Stalled`](crate::liveness::Life::Stalled) for how little that
+/// claims.
+const STALLED_BADGE: &str = "  ⧖";
+
+/// What the app knows about a row's node that the ticket itself cannot say.
+///
+/// Both fields are per-node lookups against state the tracker never supplied —
+/// one from the launch record, one from this machine — and both are decided at
+/// the same call site for the same `(repo, number)`. Carrying them as one value
+/// is what keeps a row's signature from growing a parameter every time `wf`
+/// learns something new about a node, and it puts the two badges in one place
+/// so a ticket row and a cluster header cannot drift apart about their order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Marks {
+    /// A previous launch left a conversation on this node (#35).
+    resumable: bool,
+    /// What this machine says is happening to it, if anything.
+    life: Option<Life>,
+}
+
+impl Marks {
+    /// Everything the app has to say about one node.
+    fn of(app: &App, repo: &str, number: u64) -> Self {
+        Self {
+            resumable: app.resume(repo, number).is_some(),
+            life: app.liveness.of(repo, number),
+        }
+    }
+
+    /// The badges, in the one order both row kinds draw them: what `enter`
+    /// would rejoin, then what is happening to it now.
+    fn spans(self) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        if self.resumable {
+            spans.push(Span::styled(
+                RESUME_BADGE,
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
+            ));
+        }
+        spans.extend(life_span(self.life));
+        spans
+    }
+}
+
+/// The spans a row's liveness marking contributes, if any.
+///
+/// **No new colour.** Cyan is already "`wf`'s own record about this row" — it
+/// is what `⏎` is drawn in — and these two are the same kind of fact from the
+/// same background reading, so they join it rather than minting a seventh hue
+/// on a screen that deliberately spends six (see [`CURSOR_COLOR`], and the
+/// query-match modifier that was chosen over a colour for the same reason).
+///
+/// The two are told apart by weight instead: a running container is live, so it
+/// is undimmed; a stall is a session that is over, which is exactly what DIM
+/// means everywhere else here. That leaves the badge for the thing that has
+/// stopped quieter than the one still going, which is the right way round for a
+/// picker — the loud version of "stalled" belongs on the count line, where it
+/// is a summons and not a decoration.
+fn life_span(life: Option<Life>) -> Option<Span<'static>> {
+    let cyan = Style::new().fg(Color::Cyan);
+    match life? {
+        Life::Running => Some(Span::styled(RUNNING_BADGE, cyan)),
+        Life::Stalled => Some(Span::styled(
+            STALLED_BADGE,
+            cyan.add_modifier(Modifier::DIM),
+        )),
+    }
+}
 
 /// How long ago `then` was, from `now`, in the one unit that reads: `20m ago`,
 /// `3h ago`, `5d ago`.
@@ -904,7 +993,29 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
             .map(|part| part.chars().count() + 1)
             .sum::<usize>()
         + notice.chars().count();
-    let note = reclaim_note(app, (count_area.width as usize).saturating_sub(spent));
+    let mut left = (count_area.width as usize).saturating_sub(spent);
+    // Stalls are laid down before the reclaim note, but not at any price: what
+    // is held back for the reclaim note is exactly the width at which it stops
+    // being a word (`Reclaimable::min_width`), because its own last arm clips
+    // the count rather than vanishing. Without that, two named stalls on a
+    // 60-column terminal left it three characters short and it rendered
+    // `· 2 reclaima`.
+    //
+    // Yielding is the whole of the concession. Stalls still outrank the reap
+    // pointer and the warned aside — both of those go while `· N stalled` is
+    // still naming nodes — and `Liveness::hint`'s own ladder does the yielding
+    // gracefully, dropping to one name and then to the bare count, which the
+    // rows' own `⧖` markings make readable anyway.
+    let reserved = app
+        .reclaimable
+        .as_ref()
+        .map_or(0, |found| found.min_width() + 1);
+    let stalled = app.liveness.hint(left.saturating_sub(reserved));
+    if !stalled.is_empty() {
+        left = left.saturating_sub(stalled.chars().count() + 1);
+        parts.push(stalled);
+    }
+    let note = reclaim_note(app, left);
     if !note.is_empty() {
         parts.push(note);
     }
@@ -1426,6 +1537,143 @@ mod tests {
             screen.contains("└─  ● #2 Choose the stack"),
             "the done ticket hangs off the group line: {screen}"
         );
+    }
+
+    /// The two markings land on the rows they are about, and say different
+    /// things: one node has a container up, another is claimed with nothing
+    /// running. Both come from the same reading.
+    #[test]
+    fn a_running_container_and_a_stall_are_marked_on_the_rows_they_belong_to() {
+        let mut app = fixture_app();
+        app.liveness = crate::liveness::Liveness::for_test(
+            &[("blooop/wayfinder", 6)],
+            &[("blooop/wayfinder", 9)],
+        );
+        let screen = render(&app);
+        let row = |needle: &str| {
+            screen
+                .lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no row for {needle}: {screen}"))
+                .to_string()
+        };
+        assert!(
+            row("Re-entry breadcrumbs").contains('▣'),
+            "a node with a container up says so: {screen}"
+        );
+        assert!(
+            row("Main screen design").contains('⧖'),
+            "a claimed node with nothing running says so: {screen}"
+        );
+        // The two are never the same mark, and neither leaks onto a row the
+        // reading said nothing about.
+        assert!(!row("Re-entry breadcrumbs").contains('⧖'), "{screen}");
+        assert!(!row("Supervising AFK agents").contains('▣'), "{screen}");
+        assert!(!row("Supervising AFK agents").contains('⧖'), "{screen}");
+    }
+
+    #[test]
+    fn the_first_frame_marks_no_row_and_names_no_stall() {
+        // No reading has landed, which is the state every run starts in and
+        // stays in when `dl` is absent or the listing failed.
+        let app = fixture_app();
+        let screen = render(&app);
+        assert!(!screen.contains('▣'), "{screen}");
+        assert!(!screen.contains('⧖'), "{screen}");
+        assert!(!screen.contains("stalled"), "{screen}");
+    }
+
+    /// A stall reaches the count line as well as the row, because the row is
+    /// not always on screen: the project list has no ticket rows at all, and a
+    /// stalled node can be inside a fold or another map.
+    #[test]
+    fn the_count_line_names_what_stopped_moving() {
+        let mut app = fixture_app();
+        app.liveness = crate::liveness::Liveness::for_test(
+            &[],
+            &[("blooop/wayfinder", 9), ("blooop/wayfinder", 14)],
+        );
+        let screen = render(&app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("stalled"))
+            .unwrap_or_else(|| panic!("no stall segment: {screen}"));
+        assert!(line.contains("2 stalled"), "{line}");
+        assert!(line.contains("wayfinder#9"), "{line}");
+    }
+
+    /// The two variable-length segments share one line, and neither may leave
+    /// the other unreadable: the `wf reap` pointer is the half of the reclaim
+    /// hint a reader can act on, and it still fits.
+    #[test]
+    fn a_stall_segment_leaves_the_reclaim_pointer_its_room() {
+        let mut app = fixture_app();
+        app.liveness = crate::liveness::Liveness::for_test(
+            &[],
+            &[
+                ("blooop/wayfinder", 9),
+                ("blooop/wayfinder", 14),
+                ("blooop/wayfinder", 7),
+            ],
+        );
+        app.reclaimable = Some(Reclaimable::for_test(&["wf-129-closed"], 0));
+        let screen = render_at(120, &app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("stalled"))
+            .unwrap_or_else(|| panic!("no stall segment: {screen}"));
+        assert!(line.contains("3 stalled"), "{line}");
+        assert!(
+            line.contains("wf reap"),
+            "the command survives beside the stalls: {line}"
+        );
+    }
+
+    /// Neither segment is ever clipped to a fragment, at any width.
+    ///
+    /// The regression this pins was visible only on a rendered screen: with two
+    /// stalls named on a 60-column terminal, the reclaim note was left three
+    /// characters short of its own count and its last arm — which clips rather
+    /// than vanishing — put `· 2 reclaima` on the line. Every assertion about
+    /// these two segments passed, because each was measured on its own.
+    ///
+    /// Fragments are also how an *overrun* shows up here, and deliberately the
+    /// only way it can: the frame buffer is the area's width by construction,
+    /// so a line that asked for more was already truncated by the time it can
+    /// be read back, and `inner.len() <= width` is a fact about `ratatui`
+    /// rather than about this code. What a truncation leaves behind is a
+    /// partial word at the end of the line, which is what is asserted.
+    #[test]
+    fn neither_count_line_segment_can_clip_the_other_into_a_fragment() {
+        let mut app = fixture_app();
+        app.liveness = crate::liveness::Liveness::for_test(
+            &[],
+            &[("blooop/wayfinder", 9), ("blooop/wayfinder", 14)],
+        );
+        app.reclaimable = Some(Reclaimable::for_test(
+            &["devlaunch-github-blooop-wayfinder-127-ladepomi", "wf-80-x"],
+            1,
+        ));
+        for width in 40..=130u16 {
+            let screen = render_at(width, &app);
+            let line = screen.lines().nth(2).expect("a count line");
+            let inner: String = line.chars().skip(1).take(width as usize - 2).collect();
+            // A word or nothing. Any proper prefix of "reclaimable"/"stalled"
+            // left at the end of the line is the fragment this exists to catch.
+            // From one character: `· 2 r` is as wrong as `· 2 reclaima`, and no
+            // segment ends in a letter that could be mistaken for one — the
+            // names end in digits, the asides in `)`, the pointer in `p`.
+            for whole in ["reclaimable", "stalled"] {
+                for cut in 1..whole.len() {
+                    let fragment = &whole[..cut];
+                    assert!(
+                        !inner.trim_end().ends_with(fragment),
+                        "{width}: {whole:?} was clipped to {fragment:?}: {:?}",
+                        inner.trim_end()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

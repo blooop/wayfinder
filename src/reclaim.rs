@@ -1,4 +1,5 @@
-//! Noticing what [`reap`] would claim, without being asked (#137).
+//! Noticing, without being asked: what [`reap`] would claim (#137), and what is
+//! running or has stopped ([`Liveness`](crate::liveness)).
 //!
 //! `wf reap` already decides what is finished. What it lacks is a trigger: it
 //! fires only when a person remembers to type it. This module is that trigger
@@ -16,12 +17,19 @@
 //!
 //! **Nothing here can delete.** `plan` is asked with `insist` false, so a
 //! workspace holding work that exists nowhere else is not surfaced at all; and
-//! the whole module reads facts and returns a sentence. It cannot reach
+//! the whole module reads facts and returns a description of them — a sentence
+//! for the count line, and a per-node marking beside it. It cannot reach
 //! `reap`'s deletion side even by trying: the function that removes a workspace
 //! is private to `reap`'s own module, so `reap::remove(id, true).await` written
 //! anywhere in this file is `E0603`, not a test failure. The reading is the
 //! product; the waiver, the prompt and the deletion all stay with the human
 //! typing `wf reap`.
+//!
+//! **One reading, two questions.** [`survey`] takes a single `dl --ls --json`
+//! and a single batched tracker query and derives both observations from them;
+//! [`Reading`] says why they are carried together and kept apart. The second is
+//! [`Liveness`](crate::liveness)'s own derivation, called here rather than
+//! written here.
 //!
 //! **It fails silent.** [`survey`] answers `Option`, not `Result`. No `dl` on
 //! PATH, a `dl --ls --json` that failed, a GraphQL error, no network: the hint
@@ -33,6 +41,7 @@ use std::future::Future;
 
 use anyhow::Result;
 
+use crate::liveness::Liveness;
 use crate::reap::{self, Node, NodeFact, Verdict, Workspace};
 
 /// How many workspaces the hint spells before it starts counting.
@@ -136,6 +145,19 @@ impl Reclaimable {
         self.warned
     }
 
+    /// The narrowest this segment can be and still read as a sentence.
+    ///
+    /// The last arm of [`Reclaimable::hint`] clips the count itself rather than
+    /// vanishing — deliberately, because a segment that disappears at a width
+    /// nothing else disappears at looks like a bug. But a clip is only the
+    /// right answer when the *line* has run out; a neighbouring segment that
+    /// could have yielded instead should, and it needs this number to know how
+    /// much yielding is enough. Below it the reader gets `· 2 reclaima`, which
+    /// is not a word.
+    pub fn min_width(&self) -> usize {
+        format!("· {} reclaimable", self.ids.len()).chars().count()
+    }
+
     /// The count-line segment, in `width` characters: how many, which ones,
     /// and what to type.
     ///
@@ -234,6 +256,60 @@ pub fn reading(workspaces: &[Workspace], known: &BTreeMap<Node, NodeFact>) -> Op
     Reclaimable::read(&reap::plan(workspaces, known, false))
 }
 
+/// Everything one look at the machine and the tracker is worth.
+///
+/// Two observations, carried together because they come from **one** reading:
+/// the same `dl --ls --json` and the same batched tracker query answer both, so
+/// splitting them into two surveys would double the subprocess and the round
+/// trip to learn two things about the same six workspaces.
+///
+/// They stay separate values inside it rather than merging into one verdict per
+/// node, because they are answers to unrelated questions and are acted on by
+/// different parts of the screen: [`Reclaimable`] is a sentence naming a
+/// command, and [`Liveness`] is a per-row marking. A node can easily be in one
+/// and not the other, and a type that made them one field would have to invent
+/// a precedence between "this could be tidied away" and "this stopped moving"
+/// that nothing actually wants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reading {
+    reclaimable: Option<Reclaimable>,
+    liveness: Liveness,
+}
+
+impl Reading {
+    /// `None` when neither half found anything — the ordinary quiet machine,
+    /// and the case that must not wake the draw path at all.
+    fn of(reclaimable: Option<Reclaimable>, liveness: Liveness) -> Option<Self> {
+        if reclaimable.is_none() && liveness.is_empty() {
+            return None;
+        }
+        Some(Self {
+            reclaimable,
+            liveness,
+        })
+    }
+
+    /// What this machine says about each node — borrowed, for a caller that
+    /// wants to look without taking the reading apart.
+    pub fn liveness(&self) -> &Liveness {
+        &self.liveness
+    }
+
+    /// Hand both halves to their separate homes on the app. Consuming, because
+    /// there is exactly one consumer and nothing should be tempted to keep a
+    /// second copy of a reading that arrives once.
+    pub fn into_parts(self) -> (Option<Reclaimable>, Liveness) {
+        (self.reclaimable, self.liveness)
+    }
+
+    /// A reading with these halves on it, for the tests of the channel that
+    /// carries one.
+    #[cfg(test)]
+    pub(crate) fn for_test(reclaimable: Option<Reclaimable>, liveness: Liveness) -> Self {
+        Self::of(reclaimable, liveness).expect("a reading is never empty")
+    }
+}
+
 /// Take the reading, silently.
 ///
 /// Generic over its two reads so the whole fail-silent path is exercisable
@@ -244,7 +320,7 @@ pub fn reading(workspaces: &[Workspace], known: &BTreeMap<Node, NodeFact>) -> Op
 /// tracker that would not answer, a repo slug that will not parse — none of
 /// them is a fact about a workspace, and the only honest thing to show for one
 /// is nothing.
-pub async fn survey<L, LFut, F, FFut>(listing: L, facts: F) -> Option<Reclaimable>
+pub async fn survey<L, LFut, F, FFut>(listing: L, facts: F) -> Option<Reading>
 where
     L: FnOnce() -> LFut,
     LFut: Future<Output = Result<Vec<Workspace>>>,
@@ -259,12 +335,15 @@ where
         return None;
     }
     let known = facts(nodes).await.ok()?;
-    reading(&workspaces, &known)
+    Reading::of(
+        reading(&workspaces, &known),
+        Liveness::read(&workspaces, &known),
+    )
 }
 
 /// [`survey`] against the real `dl` listing and the real batched tracker query
 /// — one subprocess and one GraphQL round trip, both `reap`'s own.
-pub async fn survey_live() -> Option<Reclaimable> {
+pub async fn survey_live() -> Option<Reading> {
     survey(reap::workspaces, |nodes| async move {
         reap::node_facts(&nodes).await
     })
@@ -274,6 +353,7 @@ pub async fn survey_live() -> Option<Reclaimable> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reap::Unsaved;
     use anyhow::anyhow;
 
     fn workspace(id: &str, repo: &str, number: u64) -> Workspace {
@@ -336,7 +416,7 @@ mod tests {
             for unsaved in [None, Some("1 uncommitted change(s) (pixi.lock)")] {
                 for state in ["Stopped", "Running"] {
                     let mut ws = workspace("solo", "blooop/devlaunch", 80);
-                    ws.unsaved = unsaved.map(str::to_string);
+                    ws.unsaved = unsaved.map(|u| Unsaved::WouldLose(u.to_string()));
                     ws.state = Some(state.to_string());
                     let known = facts([(node("blooop/devlaunch", 80), fact.clone())]);
                     let listed = std::slice::from_ref(&ws);
@@ -372,7 +452,7 @@ mod tests {
         for fact in [NodeFact::Superseded { pr: 97 }, NodeFact::Unstarted] {
             for unsaved in [None, Some("1 uncommitted change(s) (pixi.lock)")] {
                 let mut ws = workspace("warned", "blooop/devlaunch", 80);
-                ws.unsaved = unsaved.map(str::to_string);
+                ws.unsaved = unsaved.map(|u| Unsaved::WouldLose(u.to_string()));
                 let known = facts([(node("blooop/devlaunch", 80), fact.clone())]);
                 assert_eq!(
                     reading(std::slice::from_ref(&ws), &known),
@@ -402,7 +482,9 @@ mod tests {
             workspace("in-flight", "blooop/devlaunch", 98),
             {
                 let mut dirty = workspace("dirty", "blooop/devlaunch", 99);
-                dirty.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+                dirty.unsaved = Some(Unsaved::WouldLose(
+                    "1 uncommitted change(s) (pixi.lock)".to_string(),
+                ));
                 dirty
             },
         ];
@@ -443,7 +525,9 @@ mod tests {
         // hint must inherit that keep rather than quietly count it — otherwise
         // the picker is advertising a reap that would throw work away.
         let mut ws = workspace("dirty", "blooop/devlaunch", 80);
-        ws.unsaved = Some("1 uncommitted change(s) (pixi.lock)".to_string());
+        ws.unsaved = Some(Unsaved::WouldLose(
+            "1 uncommitted change(s) (pixi.lock)".to_string(),
+        ));
         let known = facts([(node("blooop/devlaunch", 80), NodeFact::Closed)]);
         assert_eq!(reading(std::slice::from_ref(&ws), &known), None);
         // And the same node with a clean clone *is* surfaced, so the assertion
@@ -691,7 +775,7 @@ mod tests {
         .await;
         assert_eq!(
             surfaced,
-            reading(&listed, &known),
+            Reading::of(reading(&listed, &known), Liveness::read(&listed, &known)),
             "the survey's answer is the reading over what the two reads returned"
         );
         assert_eq!(
@@ -714,14 +798,25 @@ mod tests {
             return;
         }
         let said = match survey_live().await {
-            Some(found) => found.hint(120),
+            Some(found) => {
+                let (reclaimable, liveness) = found.into_parts();
+                let claim = reclaimable.map_or_else(
+                    || "nothing reclaimable".to_string(),
+                    |found| found.hint(120),
+                );
+                format!(
+                    "{claim} | running {} stalled {}",
+                    liveness.running(),
+                    liveness.stalled()
+                )
+            }
             None => "no reading at all".to_string(),
         };
         println!("{}{said}", crate::probe::MARK);
     }
 
     #[test]
-    fn the_surfacing_path_runs_two_reads_and_nothing_else() {
+    fn the_surfacing_path_asks_only_questions_and_never_names_a_workspace() {
         // #137's safety claim, as a fact about a run rather than a grep over
         // the source. `reap::workspaces` and `reap::node_facts` both reach a
         // PATH-resolved binary, so everything this path is *capable* of doing
@@ -729,26 +824,41 @@ mod tests {
         // Rust, in whichever module, and whether or not it named any word a
         // reader thought to forbid. A `dl <ws> rm` added anywhere between
         // `survey_live` and the reading it returns fails this test.
+        // Stated as a rule over every call rather than as a list, so a fourth
+        // read is not a failure but a fourth *kind* of call is. What makes a
+        // `dl` call safe here is that its argument is a question — no call on
+        // this path may name a workspace, which is where every destructive `dl`
+        // subcommand takes its target.
+        const ASKED: [&str; 2] = ["dl <--ls> <--json>", "dl <--version>"];
+
         let run = crate::probe::record(
             "reclaim::tests::survey_live_probe",
             crate::probe::DL_LISTING,
             crate::probe::GH_FACTS,
         );
         run.destroyed_nothing();
+        for call in &run.argv {
+            let asked = ASKED.contains(&call.as_str())
+                || call.starts_with("gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>");
+            assert!(asked, "this path may only ask questions, and asked: {call}");
+        }
+
+        // And that it did each of them exactly once. The version probe is
+        // memoized per process, so a second one would mean the memo broke and
+        // every survey is paying for a Python start it was told not to.
+        for question in ASKED {
+            assert_eq!(
+                run.argv.iter().filter(|call| *call == question).count(),
+                1,
+                "asked exactly once: {question} in {:?}",
+                run.argv
+            );
+        }
         assert_eq!(
             run.argv.len(),
-            2,
-            "one listing and one batched query, and nothing else: {:?}",
+            3,
+            "two questions to `dl` and one batched query to `gh`: {:?}",
             run.argv
-        );
-        assert_eq!(
-            run.argv[0], "dl <--ls> <--json>",
-            "the only thing this path asks `dl` for is what exists"
-        );
-        assert!(
-            run.argv[1].starts_with("gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>"),
-            "one batched read of the tracker: {}",
-            run.argv[1]
         );
     }
 
@@ -766,7 +876,7 @@ mod tests {
         );
         assert_eq!(
             run.printed(),
-            ["· 1 reclaimable: wf-129-closed (+1 to check by hand) — wf reap"],
+            ["· 1 reclaimable: wf-129-closed (+1 to check by hand) — wf reap | running 1 stalled 1"],
             "the live reading is the same sentence the offline tests pin"
         );
     }

@@ -74,12 +74,17 @@ pub const MARK: &str = "PROBE|";
 /// contain a `|`.
 const NOTED: &str = "note|";
 
-/// The workspace ids [`record`] lays a scratch home out for — the three
+/// The workspace ids [`record`] lays a scratch home out for — the four
 /// [`DL_LISTING`] names, so every workspace the code under test can *see* is
 /// also a directory it can be caught destroying.
-const LAID_OUT: [&str; 3] = ["wf-129-closed", "wf-138-unstarted", "wf-137-open"];
+const LAID_OUT: [&str; 4] = [
+    "wf-129-closed",
+    "wf-138-unstarted",
+    "wf-137-open",
+    "wf-134-stalled",
+];
 
-/// The repo those three belong to in [`DL_LISTING`], which is also the
+/// The repo those four belong to in [`DL_LISTING`], which is also the
 /// directory `dl` files their clones under.
 const LAID_OUT_REPO: &str = "blooop/wayfinder";
 
@@ -417,35 +422,105 @@ pub fn note(what: &str) {
         .expect("the probe log");
 }
 
-/// A `dl --ls --json` listing over three workspaces of this repo, in the shape
-/// devlaunch 0.0.21 and newer emit — one finished ticket, one the planner warns
-/// about, one in use.
+/// A `dl --ls --json` listing over four workspaces of this repo, as devlaunch
+/// 0.0.24 writes them — one finished ticket, one the planner warns about, one
+/// in use, and one whose run stopped between its stages.
+///
+/// The newest shape on purpose: this is the fixture the *whole reading* is
+/// driven through, so it should look like the `dl` this `wf` will be run
+/// against next. Every older spelling of `unsaved` has its own row in
+/// [`DL_LISTING_UNSAVED`], which is where that field is the subject.
+///
+/// The fourth exists so the live path can produce a **stall**, not just be
+/// asserted to derive one from hand-built state: it is the only row whose
+/// container is down while its ticket is claimed, and it is what makes the
+/// recorded reading say `stalled 1`.
 ///
 /// Here rather than beside either probe that uses it: the reading's own probe
 /// and the picker's drive the same two reads, and a fixture written twice is a
 /// fixture that can disagree with itself about what the machine looks like.
 ///
-/// The three ids are also [`LAID_OUT`] as directories in the child's scratch
+/// The four ids are also [`LAID_OUT`] as directories in the child's scratch
 /// home, so what the code under test can see is exactly what it can be caught
 /// destroying.
 pub const DL_LISTING: &str = r#"[
   {"id":"wf-129-closed","devlaunch":true,"repo":"blooop/wayfinder",
-   "branch":"wayfinder/wayfinder-129","state":"Stopped"},
+   "branch":"wayfinder/wayfinder-129","state":"Stopped",
+   "unsaved":{"nothingToLose":true}},
   {"id":"wf-138-unstarted","devlaunch":true,"repo":"blooop/wayfinder",
-   "branch":"wayfinder/wayfinder-138","state":"Stopped"},
+   "branch":"wayfinder/wayfinder-138","state":"Stopped",
+   "unsaved":{"nothingToLose":true}},
   {"id":"wf-137-open","devlaunch":true,"repo":"blooop/wayfinder",
-   "branch":"wayfinder/wayfinder-137","state":"Running"}
+   "branch":"wayfinder/wayfinder-137","state":"Running",
+   "unsaved":{"nothingToLose":true}},
+  {"id":"wf-134-stalled","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-134","state":"Stopped",
+   "unsaved":{"nothingToLose":true}}
 ]"#;
 
-/// The tracker's answer to the batched question those three nodes raise:
+/// Every shape `dl` has ever emitted for `unsaved`, in one listing.
+///
+/// The top three rows are devlaunch **0.0.24 and newer**: an object with
+/// exactly one key. The next two are **0.0.23 and older**, whose field was a
+/// bare sentence or `null` — still on real machines, because `wf` pins no `dl`
+/// version. Then two rows no `dl` has ever emitted: a key from a *later* `dl`
+/// than this binary, and the documented key carrying an undocumented payload.
+/// One of those carries a documented key **beside** an undocumented sibling,
+/// which is the shape a later `dl` produces by adding one field: it must go on
+/// being read, because the alternative is every row in the listing refusing at
+/// once. The last row is a workspace `dl` did not create, where the field is
+/// absent altogether.
+///
+/// Those two invented rows are the ones that matter most. `parse_workspaces` is
+/// all or nothing, so a listing this `wf` cannot fully read is a listing it
+/// reads *none* of — and a fixture containing only the shapes already shipped
+/// would prove nothing about the release after this one.
+///
+/// This is a transcription of `dl`'s own documented output rather than
+/// something `wf` finds convenient to parse: the object arms and their spelling
+/// come from devlaunch's `--ls --json` table, and the whole reason this fixture
+/// exists is that the two repos had no executed agreement about this field at
+/// all — only prose on each side, which is how the string→object change was
+/// able to land unnoticed.
+pub const DL_LISTING_UNSAVED: &str = r#"[
+  {"id":"wf-1-clean","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-1","state":"Stopped",
+   "unsaved":{"nothingToLose":true}},
+  {"id":"wf-2-dirty","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-2","state":"Stopped",
+   "unsaved":{"wouldLose":"2 uncommitted change(s) (pixi.lock, notes.md) and 1 unpushed commit(s)"}},
+  {"id":"wf-3-unreadable","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-3","state":"Stopped",
+   "unsaved":{"couldNotTell":"fatal: not a git repository"}},
+  {"id":"wf-4-legacy-dirty","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-4","state":"Stopped",
+   "unsaved":"1 uncommitted change(s) (pixi.lock)"},
+  {"id":"wf-5-legacy-clean","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-5","state":"Stopped","unsaved":null},
+  {"id":"wf-6-newer-dl","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-6","state":"Stopped",
+   "unsaved":{"someAnswerFromALaterDl":"whatever it means"}},
+  {"id":"wf-7-odd-payload","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-7","state":"Stopped",
+   "unsaved":{"nothingToLose":false}},
+  {"id":"wf-8-sibling-key","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-8","state":"Stopped",
+   "unsaved":{"nothingToLose":true,"checkedAt":"2026-08-10T00:00:00Z"}},
+  {"id":"not-ours","devlaunch":false,"state":"Stopped"}
+]"#;
+
+/// The tracker's answer to the batched question those four nodes raise:
 /// #129 closed (a reap), #138 open with nobody on it and no PR (a warning),
-/// #137 open and claimed (a keep).
+/// #137 open and claimed (a keep, and — its container being up — a `▣`),
+/// #134 open and claimed with its container down (a keep, and a `⧖`).
 pub const GH_FACTS: &str = r#"{"data":{"repository":{
   "i129":{"state":"CLOSED","assignees":{"nodes":[]},
           "closedByPullRequestsReferences":{"nodes":[]}},
   "i137":{"state":"OPEN","assignees":{"nodes":[{"login":"blooop"}]},
           "closedByPullRequestsReferences":{"nodes":[]}},
   "i138":{"state":"OPEN","assignees":{"nodes":[]},
+          "closedByPullRequestsReferences":{"nodes":[]}},
+  "i134":{"state":"OPEN","assignees":{"nodes":[{"login":"blooop"}]},
           "closedByPullRequestsReferences":{"nodes":[]}}
 }}}"#;
 
@@ -488,17 +563,35 @@ fn scratch(test: &str) -> PathBuf {
 /// the same time interleave into one log line, and every assertion that counts
 /// the lines becomes a race. An `O_APPEND` write this small is atomic; two are
 /// not.
+/// The release the shimmed `dl` claims to be, and it must match what the
+/// fixtures are written as.
+///
+/// [`DL_LISTING`] answers `unsaved` with the one-key object, which is a 0.0.24
+/// listing, and `reap` reads a *missing* answer differently either side of that
+/// release. A shim that listed like 0.0.24 and versioned like 0.0.23 would be
+/// evidence about a machine that cannot exist, which is worse than no probe.
+const SHIMMED_DL: &str = "0.0.24";
+
 fn shim(dir: &Path, name: &str) {
     let path = dir.join(name);
+    // `--version` is answered before the fixture, because `dl` answers it with
+    // a version rather than with a listing, and a shim that returned the
+    // listing to both would be a `dl` that exists nowhere. The recording still
+    // happens first, so the call is counted either way.
+    //
+    // The answer is [`SHIMMED_DL`] for the same reason the fixtures name a
+    // release: a probe is only evidence about a machine it could be.
     let body = r#"#!/bin/sh
 line=$({
   printf '%s' 'PROGRAM'
   for a in "$@"; do printf ' <%s>' "$a"; done
 } | tr '\n' ' ')
 printf '%s\n' "$line" >> "$LOGVAR"
+if [ "$1" = "--version" ]; then printf '%s\n' 'PROGRAM VERSION'; exit 0; fi
 cat 'FIXTURE'
 "#
     .replace("PROGRAM", name)
+    .replace("VERSION", SHIMMED_DL)
     .replace("LOGVAR", LOG)
     .replace(
         "FIXTURE",
