@@ -54,7 +54,7 @@
 //!    - **which arm**: all four [`Outcome`] arms are driven, the launch one
 //!      included, and so is [`fold`] — but only through the events the child's
 //!      fixtures actually produce. Its `Discovered`, `Fetched` and
-//!      `Read` arms are entered; `SearchFailed` is not, because the `gh`
+//!      `Surveyed` arms are entered; `SearchFailed` is not, because the `gh`
 //!      shim answers the map search successfully, and a `dl <ws> rm` planted in
 //!      that one arm is green. What stands against it there is the denylist in
 //!      (1) — it has to be spelt in another file to get past that; the
@@ -308,7 +308,7 @@ fn fold(
         // a screen that has been up and answering keys the whole time —
         // it changes one dim segment of the count line and nothing else,
         // and it arrives at most once because nothing asks again.
-        LoadEvent::Read(found) => {
+        LoadEvent::Surveyed(found) => {
             let (reclaimable, liveness) = found.into_parts();
             app.reclaimable = reclaimable;
             app.liveness = liveness;
@@ -330,6 +330,18 @@ fn fold(
 /// fails.
 fn spawn_reading(tx: &UnboundedSender<LoadEvent>) -> Survey {
     wf::refresh::spawn_survey(wf::reclaim::survey_live(), tx.clone())
+}
+
+/// Take the reading again, on `ctrl-r`.
+///
+/// The previous one is stopped **and waited for** before a second is started,
+/// for the reason the handover does it: a reading holds a `dl` and a `gh` of
+/// its own, and two overlapping ones would race to write the same two fields
+/// with answers taken at different moments — the older one landing last, which
+/// is exactly the bug `Loaders::restart` exists to avoid on the map side.
+async fn restart_reading(previous: Survey, tx: &UnboundedSender<LoadEvent>) -> Survey {
+    previous.stop().await;
+    spawn_reading(tx)
 }
 
 /// Stop everything running behind the screen, and wait for it to be gone.
@@ -363,7 +375,7 @@ async fn run<B: Backend, K: Keys>(
     keys: &mut K,
     mut picker: Picker,
     discovery: JoinHandle<()>,
-    survey: Survey,
+    mut survey: Survey,
 ) -> Result<Ending> {
     loop {
         picker.tick(terminal)?;
@@ -381,6 +393,23 @@ async fn run<B: Backend, K: Keys>(
                 picker.loaders.restart(&picker.app.open_maps, &picker.tx);
                 picker.app.startup.reloading();
                 picker.app.failed.clear();
+                // The reading is refetched with everything else, and what it
+                // said is dropped *now* rather than when its replacement lands.
+                // It was one dim segment naming a command when it could be read
+                // once at startup and left; it now also marks rows with claims
+                // in the present tense — which container is up, which run has
+                // stopped — and those go stale the moment anything starts or
+                // stops. A stale `▣` on a node whose container this session's
+                // own launch picker just built is the version of it a person
+                // would actually hit.
+                //
+                // Clearing before the refetch is the honest order: a reading
+                // that finds nothing sends no event, so keeping the old one
+                // until it is replaced would leave a screen asserting last
+                // hour's containers with nothing able to correct it.
+                picker.app.reclaimable = None;
+                picker.app.liveness = wf::liveness::Liveness::default();
+                survey = restart_reading(survey, &picker.tx).await;
             }
             // Nothing after this can be drawn. Stop the background work
             // *and wait for it* before handing over: an in-flight `gh`
@@ -845,17 +874,34 @@ mod tests {
         // does is not here.
         let run = a_session();
         run.destroyed_nothing();
+        // Stated as a rule over every call rather than as a fixed list, because
+        // the *number* of readings is a property of the keys pressed — this
+        // script presses `ctrl-r` — while "these two questions and no others"
+        // is the safety claim, and it must hold however many times the run
+        // asks them.
+        for argv in &run.argv {
+            assert!(
+                argv == "dl <--ls> <--json>"
+                    || argv.starts_with(
+                        "gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>"
+                    ),
+                "a session asks for the listing and the tracker, and nothing else: {argv}"
+            );
+        }
+        // And the refresh really does ask again. `ctrl-r` is documented as
+        // refetching everything in place, and the reading became a per-row
+        // claim in the present tense — so a refresh that left it at its startup
+        // value would be drawing an hour-old container state beside freshly
+        // fetched tickets. Read off the run rather than from the call site: the
+        // pair repeats.
         assert_eq!(
-            run.argv.len(),
-            2,
-            "a session asks for the listing and the tracker, and nothing else: {:?}",
             run.argv
-        );
-        assert_eq!(run.argv[0], "dl <--ls> <--json>");
-        assert!(
-            run.argv[1].starts_with("gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>"),
-            "one batched read of the tracker: {}",
-            run.argv[1]
+                .iter()
+                .filter(|argv| *argv == "dl <--ls> <--json>")
+                .count(),
+            2,
+            "the reading is taken at startup and again on ctrl-r: {:?}",
+            run.argv
         );
     }
 
@@ -873,12 +919,15 @@ mod tests {
         // in flight would land in this log after the reading did.
         let run = a_launching_session();
         run.destroyed_nothing();
-        assert_eq!(
-            run.argv.len(),
-            2,
-            "launching asks nothing extra of the machine: {:?}",
-            run.argv
-        );
+        for argv in &run.argv {
+            assert!(
+                argv == "dl <--ls> <--json>"
+                    || argv.starts_with(
+                        "gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>"
+                    ),
+                "launching asks nothing extra of the machine: {argv}"
+            );
+        }
         assert_eq!(run.argv[0], "dl <--ls> <--json>");
     }
 
@@ -991,9 +1040,12 @@ mod tests {
         // outside [`session`], or after that run, nothing does, which is true
         // of any code in any file.
         //
-        // The list is five tokens, against six in [`wf::reclaim`] and seven in
-        // [`wf::refresh`], and the difference is worth writing down rather than
-        // rounding off. Both siblings forbid `remove`, `"rm"` and `--force`;
+        // The list is five tokens, against six in [`wf::reclaim`], seven in
+        // [`wf::refresh`] and seven in [`wf::liveness`], and the difference is
+        // worth writing down rather than rounding off. `liveness` is the newest
+        // and holds the union: it is a pure join over two borrowed slices, so
+        // every token is free there and none of them constrains anything it had
+        // occasion to write. Both siblings forbid `remove`, `"rm"` and `--force`;
         // this file forbids none of the three. `remove` it cannot:
         // `app.failed.remove(&id)` is `App`'s own bookkeeping, one occurrence,
         // and renaming a `HashMap` method to satisfy a grep is the distortion a

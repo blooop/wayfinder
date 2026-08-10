@@ -74,12 +74,17 @@ pub const MARK: &str = "PROBE|";
 /// contain a `|`.
 const NOTED: &str = "note|";
 
-/// The workspace ids [`record`] lays a scratch home out for — the three
+/// The workspace ids [`record`] lays a scratch home out for — the four
 /// [`DL_LISTING`] names, so every workspace the code under test can *see* is
 /// also a directory it can be caught destroying.
-const LAID_OUT: [&str; 3] = ["wf-129-closed", "wf-138-unstarted", "wf-137-open"];
+const LAID_OUT: [&str; 4] = [
+    "wf-129-closed",
+    "wf-138-unstarted",
+    "wf-137-open",
+    "wf-134-stalled",
+];
 
-/// The repo those three belong to in [`DL_LISTING`], which is also the
+/// The repo those four belong to in [`DL_LISTING`], which is also the
 /// directory `dl` files their clones under.
 const LAID_OUT_REPO: &str = "blooop/wayfinder";
 
@@ -417,9 +422,14 @@ pub fn note(what: &str) {
         .expect("the probe log");
 }
 
-/// A `dl --ls --json` listing over three workspaces of this repo, in the shape
+/// A `dl --ls --json` listing over four workspaces of this repo, in the shape
 /// devlaunch 0.0.21 and newer emit — one finished ticket, one the planner warns
-/// about, one in use.
+/// about, one in use, and one whose run stopped between its stages.
+///
+/// The fourth exists so the live path can produce a **stall**, not just be
+/// asserted to derive one from hand-built state: it is the only row whose
+/// container is down while its ticket is claimed, and it is what makes the
+/// recorded reading say `stalled 1`.
 ///
 /// Here rather than beside either probe that uses it: the reading's own probe
 /// and the picker's drive the same two reads, and a fixture written twice is a
@@ -437,16 +447,26 @@ pub const DL_LISTING: &str = r#"[
    "unsaved":{"nothingToLose":true}},
   {"id":"wf-137-open","devlaunch":true,"repo":"blooop/wayfinder",
    "branch":"wayfinder/wayfinder-137","state":"Running",
+   "unsaved":{"nothingToLose":true}},
+  {"id":"wf-134-stalled","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-134","state":"Stopped",
    "unsaved":{"nothingToLose":true}}
 ]"#;
 
 /// Every shape `dl` has ever emitted for `unsaved`, in one listing.
 ///
 /// The top three rows are devlaunch **0.0.24 and newer**: an object with
-/// exactly one key. The bottom two are **0.0.23 and older**, whose field was a
+/// exactly one key. The next two are **0.0.23 and older**, whose field was a
 /// bare sentence or `null` — still on real machines, because `wf` pins no `dl`
-/// version. The last row is a workspace `dl` did not create, where the field is
-/// absent altogether.
+/// version. Then two rows no `dl` has ever emitted: a key from a *later* `dl`
+/// than this binary, and the documented key carrying an undocumented payload.
+/// The last row is a workspace `dl` did not create, where the field is absent
+/// altogether.
+///
+/// Those two invented rows are the ones that matter most. `parse_workspaces` is
+/// all or nothing, so a listing this `wf` cannot fully read is a listing it
+/// reads *none* of — and a fixture containing only the shapes already shipped
+/// would prove nothing about the release after this one.
 ///
 /// This is a transcription of `dl`'s own documented output rather than
 /// something `wf` finds convenient to parse: the object arms and their spelling
@@ -469,18 +489,27 @@ pub const DL_LISTING_UNSAVED: &str = r#"[
    "unsaved":"1 uncommitted change(s) (pixi.lock)"},
   {"id":"wf-5-legacy-clean","devlaunch":true,"repo":"blooop/wayfinder",
    "branch":"wayfinder/wayfinder-5","state":"Stopped","unsaved":null},
+  {"id":"wf-6-newer-dl","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-6","state":"Stopped",
+   "unsaved":{"someAnswerFromALaterDl":"whatever it means"}},
+  {"id":"wf-7-odd-payload","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-7","state":"Stopped",
+   "unsaved":{"nothingToLose":false}},
   {"id":"not-ours","devlaunch":false,"state":"Stopped"}
 ]"#;
 
-/// The tracker's answer to the batched question those three nodes raise:
+/// The tracker's answer to the batched question those four nodes raise:
 /// #129 closed (a reap), #138 open with nobody on it and no PR (a warning),
-/// #137 open and claimed (a keep).
+/// #137 open and claimed (a keep, and — its container being up — a `▣`),
+/// #134 open and claimed with its container down (a keep, and a `⧖`).
 pub const GH_FACTS: &str = r#"{"data":{"repository":{
   "i129":{"state":"CLOSED","assignees":{"nodes":[]},
           "closedByPullRequestsReferences":{"nodes":[]}},
   "i137":{"state":"OPEN","assignees":{"nodes":[{"login":"blooop"}]},
           "closedByPullRequestsReferences":{"nodes":[]}},
   "i138":{"state":"OPEN","assignees":{"nodes":[]},
+          "closedByPullRequestsReferences":{"nodes":[]}},
+  "i134":{"state":"OPEN","assignees":{"nodes":[{"login":"blooop"}]},
           "closedByPullRequestsReferences":{"nodes":[]}}
 }}}"#;
 

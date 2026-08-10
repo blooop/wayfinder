@@ -66,7 +66,7 @@ pub enum LoadEvent {
     /// Only ever sent when there is something to say: a reading that failed and
     /// a reading that found nothing are the same silence, because neither is
     /// anything the screen should draw.
-    Read(Reading),
+    Surveyed(Reading),
 }
 
 /// Has the `wayfinder:map` label search answered yet?
@@ -359,7 +359,7 @@ where
 {
     Survey(tokio::spawn(async move {
         if let Some(found) = survey.await {
-            let _ = tx.send(LoadEvent::Read(found));
+            let _ = tx.send(LoadEvent::Surveyed(found));
         }
     }))
 }
@@ -478,7 +478,7 @@ mod tests {
             .settle()
             .await;
         match rx.try_recv() {
-            Ok(LoadEvent::Read(got)) => assert_eq!(got, found),
+            Ok(LoadEvent::Surveyed(got)) => assert_eq!(got, found),
             other => panic!("the reading must arrive as its own event, got {other:?}"),
         }
     }

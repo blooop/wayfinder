@@ -620,15 +620,6 @@ pub fn idle_note(plan: &Plan) -> String {
 /// (#35) — the same glyph as the key that rejoins it.
 const RESUME_BADGE: &str = "  ⏎";
 
-/// The most of one line the stall segment may take.
-///
-/// It goes down before the reclaim note, so without a ceiling a machine with
-/// six stalled nodes could spend the whole line on them and leave the `wf reap`
-/// pointer nowhere to go. Two names and their lead-in fit inside this; a third
-/// would not, which is the same budget [`Liveness::hint`] states in its own
-/// terms.
-const STALL_BUDGET: usize = 44;
-
 /// The badge a node carries when a container of its is up.
 ///
 /// A square, where every stage glyph is round, because it is not a stage: the
@@ -668,7 +659,7 @@ impl Marks {
     fn of(app: &App, repo: &str, number: u64) -> Self {
         Self {
             resumable: app.resume(repo, number).is_some(),
-            life: app.life(repo, number),
+            life: app.liveness.of(repo, number),
         }
     }
 
@@ -1003,11 +994,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
             .sum::<usize>()
         + notice.chars().count();
     let mut left = (count_area.width as usize).saturating_sub(spent);
-    // Stalls are laid down before the reclaim note and capped, so the two
-    // unbounded segments cannot fight over one line. The cap is what keeps this
-    // one from being unbounded in practice: it names at most two nodes, and a
-    // node's name is short where a `dl` workspace id is not.
-    let stalled = app.liveness.hint(left.min(STALL_BUDGET));
+    // Stalls are laid down before the reclaim note, and what bounds them is
+    // `Liveness::hint`'s own `NAMED` — at most two nodes, each a short repo and
+    // a number — rather than a ceiling written here. A second cap on top of
+    // that only ever cost a name: an extra constant tuned to a width buys two
+    // columns and drops the segment from two names to one at exactly the sizes
+    // where both would have fitted.
+    let stalled = app.liveness.hint(left);
     if !stalled.is_empty() {
         left = left.saturating_sub(stalled.chars().count() + 1);
         parts.push(stalled);
@@ -1571,8 +1564,9 @@ mod tests {
 
     #[test]
     fn the_first_frame_marks_no_row_and_names_no_stall() {
+        // No reading has landed, which is the state every run starts in and
+        // stays in when `dl` is absent or the listing failed.
         let app = fixture_app();
-        assert!(app.liveness.is_empty(), "nothing has been read yet");
         let screen = render(&app);
         assert!(!screen.contains('▣'), "{screen}");
         assert!(!screen.contains('⧖'), "{screen}");

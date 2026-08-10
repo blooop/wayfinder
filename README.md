@@ -282,8 +282,7 @@ short — it says a launch *happened*.
 reading that finds [reclaimable workspaces](#startup) reads it too, and two
 markings come out of the join:
 
-- **`▣` a container of this node's is up.** Something is very likely working
-  here.
+- **`▣` a container of this node's is up.**
 - **`⧖` claimed, nothing pushed, and nothing of its running.** Somebody — almost
   always an agent — took this ticket and is no longer on it.
 
@@ -293,6 +292,11 @@ container on its own is the ordinary look of work that finished. It is the
 *pair* that means a lifecycle went down between its stages. It reads against the
 stage glyph beside it, and that contrast is the finding: `◐ #133 … ⧖` is the
 tracker saying *building* and the machine saying *nothing is*.
+
+`ctrl-r` retakes the reading along with everything else, and what it said is
+dropped the moment you press it rather than when its replacement lands: these
+are claims in the present tense, and a screen asserting last hour's containers
+beside freshly fetched tickets would be worse than one asserting nothing.
 
 Stalls also reach the [count line](#startup) as `· 2 stalled: wayfinder#133,
 +1 more`, because the row is not always on screen — the project list has no
@@ -308,12 +312,19 @@ narrower than the useful-sounding one:
   then. `▣` covers a session you left, a session that exited an hour ago inside
   a container nobody stopped, and a `WF_PREWARM` container never entered. It is
   a floor on activity, not a reading of it.
-- **A stall is not a crash.** An agent that handed off cleanly and one that died
-  mid-slice leave the same shape. The ticket's breadcrumb trail is what tells
-  them apart, and reading it is yours.
-- **Host launches are invisible.** A checkout with no devcontainer runs on the
-  host, where there is no workspace and no state to read. Those nodes carry no
-  marking at all rather than a wrong one.
+- **A stall is not a crash**, and a reboot marks everything at once. The same
+  shape is left by an agent that died mid-slice, one that handed off cleanly, a
+  `dl <ws> stop` you ran yourself, and a restart that stopped every container on
+  the machine. None of those is a false positive — each of those runs really has
+  stopped and really does want picking up — but they arrive together, so
+  `12 stalled` the morning after a reboot is a fact about the host rather than
+  about the work. The breadcrumb trail on the ticket says which.
+- **A node launched on the host can still be marked**, and this is the one
+  outright wrong answer. `wf` cannot see host processes, so a node whose agent
+  is running on the host, but which owns a stopped workspace from some *other*
+  launch — the repo grew a `.devcontainer/` later, or `WF_PREWARM` built one at
+  a staging you backed out of — looks exactly like a stall. A node with no
+  workspace at all is genuinely unmarked rather than wrongly marked.
 - **This machine only**, the same limit [resume](#resuming-picking-a-conversation-back-up)
   carries: the listing is local, so a ticket worked on another machine looks
   unstarted here.

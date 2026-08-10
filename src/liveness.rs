@@ -39,20 +39,29 @@
 //! prewarmed and was never entered. It is a floor on activity, not a reading of
 //! it.
 //!
-//! **A stall is not a crash.** The same shape is left by an agent that handed
-//! off cleanly and by one that died mid-slice; the ticket's breadcrumb trail is
-//! what tells those apart, and reading it is a person's job. The claim here is
-//! only that nothing is moving.
+//! **A stall is not a crash.** The same shape is left by an agent that died
+//! mid-slice, by one that handed off cleanly, by a `dl <ws> stop` you ran
+//! yourself, and by a reboot — which stops every container on the machine at
+//! once, so the morning after one, every claimed node with a workspace is
+//! marked. Those are not false positives: each of those runs really has
+//! stopped, and each really does want picking up. But they arrive together, so
+//! the count line can read `12 stalled` for a reason that is about the host and
+//! not about the work. The ticket's breadcrumb trail is what says which; the
+//! claim here is only that nothing is moving.
 //!
-//! **Host launches are invisible.** A checkout with no devcontainer runs the
-//! agent on the host, where there is no workspace and so no `state` to read.
-//! Those nodes have no liveness at all rather than a false negative — `of`
-//! answers `None`, and the stall count never includes them.
+//! **A node launched on the host can still be marked**, and this is the one
+//! outright false positive. A checkout with no devcontainer runs the agent on
+//! the host, where there is no container to report — but if that node has a
+//! workspace from *some other* launch (the repo grew a `.devcontainer/` later,
+//! or `WF_PREWARM` built one at a staging you backed out of), the stopped
+//! workspace and the live claim look exactly like a stall. `wf` cannot see host
+//! processes, so it cannot tell. A node with no workspace at all is genuinely
+//! invisible here rather than wrongly marked.
 //!
 //! **This machine only.** The listing is local, the same limit the resume
 //! record carries. A ticket worked on another machine looks unstarted here.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::reap::{node_of, Node, NodeFact, Workspace};
 
@@ -81,15 +90,15 @@ pub enum Life {
 
 /// The machine's half of the picture, per node.
 ///
-/// Sets rather than a map because both arms are *presence*: a node either
-/// answers one of them or has no liveness at all. `running` wins where a node
-/// could somehow satisfy both — a stall is defined by the absence of a running
-/// container, so the two are disjoint by construction and the ordering is
-/// belt-and-braces stated as a test.
+/// **One map, not a set per arm.** A node has at most one liveness, and two
+/// parallel sets can represent it having two — which then forces a precedence
+/// rule at every read, to resolve a state that is not supposed to exist. The
+/// map makes the question unaskable instead: the arms are values, so the
+/// precedence lives once, in [`Liveness::read`], where the facts that decide it
+/// are actually in hand.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Liveness {
-    running: BTreeSet<Node>,
-    stalled: BTreeSet<Node>,
+    life: BTreeMap<Node, Life>,
 }
 
 impl Liveness {
@@ -97,27 +106,29 @@ impl Liveness {
     ///
     /// Takes the same two values [`reap::plan`](crate::reap::plan) does, from
     /// the same reading, and reads different fields of them. Nothing here can
-    /// delete: it consumes two borrowed slices and returns sets of numbers.
+    /// delete: it consumes two borrowed slices and returns a map of numbers.
+    ///
+    /// Running is settled first and wins, because a node can own more than one
+    /// workspace: with one container up and another down, the node is being
+    /// worked on, and the down one is not evidence of anything.
     pub fn read(workspaces: &[Workspace], known: &BTreeMap<Node, NodeFact>) -> Self {
-        let mut running = BTreeSet::new();
-        let mut has_workspace = BTreeSet::new();
-        for workspace in workspaces {
-            let Some(node) = node_of(workspace) else {
-                // Not one of `wf`'s — its branch is not a name `wf` minted, so
-                // nothing about it is a fact about a node.
-                continue;
-            };
-            if workspace.state.as_deref() == Some("Running") {
-                running.insert(node.clone());
-            }
-            has_workspace.insert(node);
-        }
-        let stalled = has_workspace
-            .into_iter()
-            .filter(|node| !running.contains(node))
-            .filter(|node| matches!(known.get(node), Some(NodeFact::Claimed)))
+        // Not one of `wf`'s — a branch it never minted is no fact about a node.
+        let ours = || workspaces.iter().filter_map(|w| Some((node_of(w)?, w)));
+        let mut life: BTreeMap<Node, Life> = ours()
+            .filter(|(_, w)| w.is_running())
+            .map(|(node, _)| (node, Life::Running))
             .collect();
-        Self { running, stalled }
+        for (node, workspace) in ours() {
+            // `is_stopped`, not `!is_running`: a state neither predicate knows
+            // is a state `wf` has no business turning into a claim on a row.
+            if !workspace.is_stopped() || life.contains_key(&node) {
+                continue;
+            }
+            if matches!(known.get(&node), Some(NodeFact::Claimed)) {
+                life.insert(node, Life::Stalled);
+            }
+        }
+        Self { life }
     }
 
     /// What to mark this node with, if anything.
@@ -126,17 +137,12 @@ impl Liveness {
     /// `(repo, number)`. Same shape as [`App::resume`](crate::app::App::resume),
     /// because it is answering the same kind of question about the same rows.
     pub fn of(&self, repo: &str, number: u64) -> Option<Life> {
-        let node = Node {
-            repo: repo.to_string(),
-            number,
-        };
-        if self.running.contains(&node) {
-            return Some(Life::Running);
-        }
-        if self.stalled.contains(&node) {
-            return Some(Life::Stalled);
-        }
-        None
+        self.life
+            .get(&Node {
+                repo: repo.to_string(),
+                number,
+            })
+            .copied()
     }
 
     /// Is there anything here worth carrying to the screen at all?
@@ -144,19 +150,28 @@ impl Liveness {
     /// The reading is only sent when something has something to say, so this is
     /// what keeps an empty join from waking the draw path.
     pub fn is_empty(&self) -> bool {
-        self.running.is_empty() && self.stalled.is_empty()
+        self.life.is_empty()
+    }
+
+    /// The nodes at one arm, in a stable order — `BTreeMap`'s, so the count
+    /// line never reshuffles between frames.
+    fn at(&self, arm: Life) -> impl Iterator<Item = &Node> {
+        self.life
+            .iter()
+            .filter(move |(_, life)| **life == arm)
+            .map(|(node, _)| node)
     }
 
     /// How many nodes are stalled — the count the line leads with.
     pub fn stalled(&self) -> usize {
-        self.stalled.len()
+        self.at(Life::Stalled).count()
     }
 
     /// How many nodes have a container up. Never drawn on the count line (see
     /// [`Liveness::hint`]); this is what the probe reads to prove the live path
     /// produces liveness at all.
     pub fn running(&self) -> usize {
-        self.running.len()
+        self.at(Life::Running).count()
     }
 
     /// The count-line segment: how many are stalled, and which.
@@ -182,11 +197,11 @@ impl Liveness {
     /// first — deliberate, and the one trade in here worth disagreeing with:
     /// work that has stopped moving outranks tidying that can wait.
     pub fn hint(&self, width: usize) -> String {
-        if self.stalled.is_empty() {
+        if self.stalled() == 0 {
             return String::new();
         }
-        let head = format!("· {} stalled", self.stalled.len());
-        let names: Vec<String> = self.stalled.iter().map(Node::name).collect();
+        let head = format!("· {} stalled", self.stalled());
+        let names: Vec<String> = self.at(Life::Stalled).map(Node::name).collect();
         for count in (1..=NAMED.min(names.len())).rev() {
             let rest = names.len() - count;
             let more = if rest == 0 {
@@ -209,18 +224,25 @@ impl Liveness {
     /// channel that carry one.
     #[cfg(test)]
     pub(crate) fn for_test(running: &[(&str, u64)], stalled: &[(&str, u64)]) -> Self {
-        let set = |nodes: &[(&str, u64)]| {
+        fn arm(nodes: &[(&str, u64)], life: Life) -> Vec<(Node, Life)> {
             nodes
                 .iter()
-                .map(|(repo, number)| Node {
-                    repo: (*repo).to_string(),
-                    number: *number,
+                .map(|(repo, number)| {
+                    (
+                        Node {
+                            repo: (*repo).to_string(),
+                            number: *number,
+                        },
+                        life,
+                    )
                 })
                 .collect()
-        };
+        }
         Self {
-            running: set(running),
-            stalled: set(stalled),
+            life: arm(running, Life::Running)
+                .into_iter()
+                .chain(arm(stalled, Life::Stalled))
+                .collect(),
         }
     }
 }
@@ -330,6 +352,43 @@ mod tests {
         let live = Liveness::read(&workspaces, &BTreeMap::new());
         assert_eq!(live.stalled(), 0);
         assert!(live.is_empty());
+    }
+
+    /// This module is on the picker's reading path, so it carries the path's
+    /// denylist too.
+    ///
+    /// [`reclaim`](crate::reclaim), [`refresh`](crate::refresh),
+    /// [`picker`](crate::picker) and `main` each hold one, and the point of
+    /// having them in every file is stated in `reclaim`'s own module doc: a
+    /// grep over N files cannot see the same call written in the N+1th. This
+    /// module *is* that N+1th file — new, importing `reap`, and reached from
+    /// the survey the picker spawns — so it arrived owing the guard rather than
+    /// being exempt from it.
+    ///
+    /// `tokio::spawn` is the one worth spelling out here, and it is on this
+    /// list for `picker`'s reason rather than `reclaim`'s: a task spawned in a
+    /// derivation like this one outlives the run that recorded it, and the
+    /// runtime probes watch a bounded window. `--force` and `"rm"` are the argv
+    /// of a subprocess this file has no means to start, and cost nothing to
+    /// forbid anyway. Substring match, as everywhere else: `fs` here also
+    /// forbids `refs` and `offset`, which this file has no occasion to write.
+    #[test]
+    fn deriving_liveness_can_delete_nothing() {
+        let code = crate::probe::code_only("liveness.rs", include_str!("liveness.rs"));
+        for forbidden in [
+            "remove",
+            "\"rm\"",
+            "--force",
+            "Command",
+            "process::",
+            "tokio::spawn",
+            "fs",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "reading liveness is a join over two borrowed slices: it names {forbidden:?}"
+            );
+        }
     }
 
     #[test]

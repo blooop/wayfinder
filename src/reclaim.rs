@@ -834,7 +834,7 @@ mod tests {
         );
         assert_eq!(
             run.printed(),
-            ["· 1 reclaimable: wf-129-closed (+1 to check by hand) — wf reap | running 1 stalled 0"],
+            ["· 1 reclaimable: wf-129-closed (+1 to check by hand) — wf reap | running 1 stalled 1"],
             "the live reading is the same sentence the offline tests pin"
         );
     }

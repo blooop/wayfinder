@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::launch::{self, Agent, Candidate, Launch, LaunchMode, MapRef, Route, Staged, Targets};
-use crate::liveness::{Life, Liveness};
+use crate::liveness::Liveness;
 use crate::model::{stage, Activity, Map, MapId, MapSet, Status, Ticket};
 use crate::projects::{self, Checkout, Resume, Session};
 use crate::reclaim::Reclaimable;
@@ -341,13 +341,6 @@ impl App {
     pub fn with_sessions(mut self, sessions: Vec<Session>) -> Self {
         self.sessions = sessions;
         self
-    }
-
-    /// What this machine says about the node, if anything — beside
-    /// [`App::resume`] because the row asks them together and they are the two
-    /// facts on a row that come from outside the tracker.
-    pub fn life(&self, repo: &str, number: u64) -> Option<Life> {
-        self.liveness.of(repo, number)
     }
 
     /// The conversation a previous launch of this node left, if any.
