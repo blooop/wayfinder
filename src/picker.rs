@@ -51,7 +51,7 @@
 //!      green, and when the token was added as `fs::`, the next reviewer
 //!      reopened it with `use std::fs as sys;`. It is the bare name now, for
 //!      the reason `reap` is;
-//!    - **which arm**: all four [`Outcome`] arms are driven, the launch one
+//!    - **which arm**: all three [`Outcome`] arms are driven, the launch one
 //!      included, and so is [`fold`] — but only through the events the child's
 //!      fixtures actually produce. Its `Discovered`, `Fetched` and
 //!      `Surveyed` arms are entered; `SearchFailed` is not, because the `gh`
@@ -182,10 +182,6 @@ struct Picker {
     /// The sending end, kept because a fold can start further loads.
     tx: UnboundedSender<LoadEvent>,
     updates: UnboundedReceiver<LoadEvent>,
-    /// Which reading the screen is currently asking for — bumped by every
-    /// `ctrl-r`, so an answer to a question already withdrawn can be told from
-    /// the answer to the live one. See [`LoadEvent::Surveyed`].
-    reading: u64,
 }
 
 impl Picker {
@@ -208,9 +204,6 @@ impl Picker {
             loaders,
             tx,
             updates,
-            // The reading `session` starts alongside this picker. They agree by
-            // both being the first, which is the only coupling between them.
-            reading: 0,
         }
     }
 
@@ -233,7 +226,6 @@ impl Picker {
                 &mut self.clusters,
                 &mut self.loaders,
                 &self.tx,
-                self.reading,
             );
         }
         terminal.draw(|frame| wf::ui::draw(frame, &self.app))?;
@@ -266,7 +258,6 @@ fn fold(
     clusters: &mut BTreeMap<MapId, Map>,
     loaders: &mut Loaders,
     tx: &UnboundedSender<LoadEvent>,
-    reading: u64,
 ) {
     match event {
         LoadEvent::Discovered(found) => {
@@ -315,18 +306,18 @@ fn fold(
         }
         // The background reading landed (#137). A plain state write on
         // a screen that has been up and answering keys the whole time.
-        // It reaches further than it once did: a dim segment of the count
-        // line, and — through `app.liveness` — a marking on any row whose
-        // node this machine has something to say about. And it arrives
-        // more than once, because `ctrl-r` asks again.
-        // An answer to a question the screen has since withdrawn. Dropping it
-        // is the whole reason the event says which reading it is: `ctrl-r`
-        // clears what is held and asks again, and a stale answer folded after
-        // that clear would restore it with nothing able to correct it — a
-        // fresh reading that finds nothing is silent by design.
-        LoadEvent::Surveyed { taken, .. } if taken != reading => {}
-        LoadEvent::Surveyed { reading: found, .. } => {
-            let (reclaimable, liveness) = found.into_parts();
+        // It reaches further than the count line's dim segment: through
+        // `app.liveness` it marks any row whose node this machine has
+        // something to say about.
+        //
+        // It arrives exactly once. This arm used to be two — a guard
+        // dropping answers to a question the refresh key had withdrawn, and
+        // the fold proper — because the reading is silent when it finds
+        // nothing, so a stale answer folded after a clear would restore it
+        // with nothing able to correct it. With no key to clear anything
+        // there is one question and one answer, and one arm.
+        LoadEvent::Surveyed(reading) => {
+            let (reclaimable, liveness) = reading.into_parts();
             app.reclaimable = reclaimable;
             app.liveness = liveness;
         }
@@ -345,20 +336,8 @@ fn fold(
 /// subprocess and one batched GraphQL call, neither of them on the way to a
 /// frame. What lands folds into the count line and into the rows' own
 /// markings; a reading that fails says nothing at all.
-fn spawn_reading(tx: &UnboundedSender<LoadEvent>, taken: u64) -> Survey {
-    wf::refresh::spawn_survey(wf::reclaim::survey_live(), tx.clone(), taken)
-}
-
-/// Take the reading again, on `ctrl-r`.
-///
-/// The previous one is stopped **and waited for** before a second is started,
-/// for the reason the handover does it: a reading holds a `dl` and a `gh` of
-/// its own, and two overlapping ones would race to write the same two fields
-/// with answers taken at different moments — the older one landing last, which
-/// is exactly the bug `Loaders::restart` exists to avoid on the map side.
-async fn restart_reading(previous: Survey, tx: &UnboundedSender<LoadEvent>, taken: u64) -> Survey {
-    previous.stop().await;
-    spawn_reading(tx, taken)
+fn spawn_reading(tx: &UnboundedSender<LoadEvent>) -> Survey {
+    wf::refresh::spawn_survey(wf::reclaim::survey_live(), tx.clone())
 }
 
 /// Stop everything running behind the screen, and wait for it to be gone.
@@ -382,17 +361,25 @@ async fn stop_background(discovery: JoinHandle<()>, survey: Survey) {
 ///
 /// Generic over the backend and over [`Keys`] so that the probe drives *this*
 /// function rather than a hand-written imitation of it, and it drives every one
-/// of the four arms below: a scripted keyboard that only ever sent `Esc` left
-/// `Refresh` and `Launch` unentered, which is where a fifth escape was found.
-/// Whatever the loop body reaches — a helper in another module, a task it
-/// spawns, a `dl` it shells out to — is recorded there as argv, for as long as
-/// that probe watches.
+/// of the three arms below: a scripted keyboard that only ever sent `Esc` left
+/// `Launch` unentered, which is where a fifth escape was found. Whatever the
+/// loop body reaches — a helper in another module, a task it spawns, a `dl` it
+/// shells out to — is recorded there as argv, for as long as that probe
+/// watches.
+///
+/// There were four arms until the refresh key was retired, and the fourth was
+/// the only one that ever *wrote* to the picker instead of reading it: it
+/// restarted the loads, put the startup state back into loading, cleared the
+/// failures, threw the reading away and took another. What is left only drains,
+/// draws and ends — which is why nothing here holds a generation, and why
+/// `survey` is handed straight on rather than being something this function can
+/// replace.
 async fn run<B: Backend, K: Keys>(
     terminal: &mut Terminal<B>,
     keys: &mut K,
     mut picker: Picker,
     discovery: JoinHandle<()>,
-    mut survey: Survey,
+    survey: Survey,
 ) -> Result<Ending> {
     loop {
         picker.tick(terminal)?;
@@ -401,34 +388,6 @@ async fn run<B: Backend, K: Keys>(
         };
         match picker.app.handle_key(key) {
             Outcome::Quit => return Ok(Ending::Quit),
-            // Through the loaders, not alongside them: a refetch that
-            // raced an in-flight load used to be silently overwritten
-            // by the older snapshot. One channel, send order, newest
-            // write wins. Results stream in as they land, so the last
-            // word on how it went is the count line, not this notice.
-            Outcome::Refresh => {
-                picker.loaders.restart(&picker.app.open_maps, &picker.tx);
-                picker.app.startup.reloading();
-                picker.app.failed.clear();
-                // The reading is refetched with everything else, and what it
-                // said is dropped *now* rather than when its replacement lands.
-                // It was one dim segment naming a command when it could be read
-                // once at startup and left; it now also marks rows with claims
-                // in the present tense — which container is up, which run has
-                // stopped — and those go stale the moment anything starts or
-                // stops. A stale `▣` on a node whose container this session's
-                // own launch picker just built is the version of it a person
-                // would actually hit.
-                //
-                // Clearing before the refetch is the honest order: a reading
-                // that finds nothing sends no event, so keeping the old one
-                // until it is replaced would leave a screen asserting last
-                // hour's containers with nothing able to correct it.
-                picker.app.reclaimable = None;
-                picker.app.liveness = wf::liveness::Liveness::default();
-                picker.reading += 1;
-                survey = restart_reading(survey, &picker.tx, picker.reading).await;
-            }
             // Nothing after this can be drawn. Stop the background work
             // *and wait for it* before handing over: an in-flight `gh`
             // outlives the `exec` otherwise, and the agent inherits it
@@ -461,7 +420,7 @@ async fn session<B: Backend, K: Keys>(
 ) -> Result<Ending> {
     let (tx, updates) = mpsc::unbounded_channel();
     let discovery = wf::refresh::spawn_discovery(repos, cache_path, tx.clone());
-    let survey = spawn_reading(&tx, 0);
+    let survey = spawn_reading(&tx);
     let picker = Picker::new(app, tx, updates);
     run(terminal, keys, picker, discovery, survey).await
 }
@@ -656,13 +615,13 @@ mod tests {
     /// that is where the ordering note goes.
     ///
     /// The keys it types are a *plan*, because one of them is not enough. `run`
-    /// has four [`Outcome`] arms and for three review rounds this script sent
-    /// only `Esc`, so `Refresh` and `Launch` were never entered and a deletion
-    /// written into either was green — including in `Launch`, which is both the
-    /// product's primary action and the natural home of a "free the disk on the
-    /// way out" cleanup. A plan that runs out falls back to `Esc`, so a loop
-    /// that failed to end where it was supposed to ends anyway and fails on an
-    /// assertion rather than on the suite's timeout.
+    /// has three [`Outcome`] arms and for three review rounds this script sent
+    /// only `Esc`, so `Launch` was never entered and a deletion written into it
+    /// was green — and `Launch` is both the product's primary action and the
+    /// natural home of a "free the disk on the way out" cleanup. A plan that
+    /// runs out falls back to `Esc`, so a loop that failed to end where it was
+    /// supposed to ends anyway and fails on an assertion rather than on the
+    /// suite's timeout.
     struct Script {
         /// What to type, in order, one key per [`WATCH`].
         plan: std::collections::VecDeque<KeyEvent>,
@@ -687,13 +646,13 @@ mod tests {
         }
     }
 
-    /// A key with no modifiers, and the `ctrl` variant `Refresh` needs.
+    /// A key with no modifiers, which is all this script needs. There was a
+    /// `ctrl` variant beside it for the one chord that reached an [`Outcome`]
+    /// of its own — refresh, now retired. The chords that are left either quit
+    /// (`ctrl-c`, which `Esc` already covers here) or move the cursor, and the
+    /// plain keys reach both.
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    fn ctrl(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
     impl Keys for Script {
@@ -785,9 +744,9 @@ mod tests {
         ending.expect("the session")
     }
 
-    /// The quit path, with the two arms that do not end the loop driven on the
-    /// way: `ctrl-r` is [`Outcome::Refresh`], `down` on a screen with nothing
-    /// on it is [`Outcome::Continue`], `esc` is [`Outcome::Quit`].
+    /// The quit path, with the one arm that does not end the loop driven on the
+    /// way: `down` on a screen with nothing on it is [`Outcome::Continue`],
+    /// `esc` is [`Outcome::Quit`].
     #[test]
     #[ignore = "run by `probe::record` from the tests below, under recording shims"]
     fn picker_session_probe() {
@@ -796,11 +755,7 @@ mod tests {
         }
         let ending = drive(
             App::empty(),
-            vec![
-                ctrl(KeyCode::Char('r')),
-                press(KeyCode::Down),
-                press(KeyCode::Esc),
-            ],
+            vec![press(KeyCode::Down), press(KeyCode::Esc)],
         );
         assert!(
             matches!(ending, Ending::Quit),
@@ -837,7 +792,6 @@ mod tests {
         let ending = drive(
             app,
             vec![
-                ctrl(KeyCode::Char('r')),
                 press(KeyCode::Enter),
                 press(KeyCode::Down),
                 press(KeyCode::Enter),
@@ -911,30 +865,29 @@ mod tests {
         // does is not here.
         let run = a_session();
         run.destroyed_nothing();
-        // Stated as a rule over every call rather than as a fixed list, because
-        // the *number* of readings is a property of the keys pressed — this
-        // script presses `ctrl-r` — while "these two questions and no others"
-        // is the safety claim, and it must hold however many times the run
-        // asks them.
+        // Stated as a rule over every call rather than as a fixed list. "These
+        // two questions and no others" is the safety claim, and it has to hold
+        // however many times the run asks them — a rule keeps saying that if
+        // anything ever asks again, which is the half of this assertion that
+        // does not depend on today's keybindings.
         for argv in &run.argv {
             assert!(
                 asked_a_question(argv),
                 "a session asks for the listing and the tracker, and nothing else: {argv}"
             );
         }
-        // And the refresh really does ask again. `ctrl-r` is documented as
-        // refetching everything in place, and the reading became a per-row
-        // claim in the present tense — so a refresh that left it at its startup
-        // value would be drawing an hour-old container state beside freshly
-        // fetched tickets. Read off the run rather than from the call site: the
-        // pair repeats.
+        // And it asks them **once**. This used to be two, because the script
+        // pressed the refresh key and it took the reading again; with that key
+        // retired there is one reading per session, and a second `dl` here
+        // would mean something started asking on its own. Read off the run
+        // rather than from the call site: the pair does not repeat.
         assert_eq!(
             run.argv
                 .iter()
                 .filter(|argv| *argv == "dl <--ls> <--json>")
                 .count(),
-            2,
-            "the reading is taken at startup and again on ctrl-r: {:?}",
+            1,
+            "one reading per session, taken at startup and never again: {:?}",
             run.argv
         );
     }
@@ -963,26 +916,16 @@ mod tests {
         // Bounded as well as filtered. A predicate over each call says nothing
         // about how many there are, and "nothing extra" is a claim about the
         // count — fifty tracker reads on the launch path would satisfy every
-        // assertion above. Not pinned to an exact number, because this script
-        // presses `ctrl-r` and the second reading is racing `stop_background`:
-        // its `dl` may or may not have run by the time the arm aborts it. Two
-        // readings, two calls each, plus the one `dl <--version>` the process
-        // asks once however many readings it takes, is the ceiling either way.
-        assert!(
-            run.argv.len() <= 5,
-            "at most the two readings this script asks for: {:?}",
-            run.argv
-        );
-        // The version is the part that must not scale with the readings — it is
-        // memoized per process precisely so a refresh does not pay for another
-        // Python start, and nothing else in this run would notice if it did.
-        assert!(
-            run.argv
-                .iter()
-                .filter(|argv| *argv == "dl <--version>")
-                .count()
-                <= 1,
-            "the version is asked once per process, not once per reading: {:?}",
+        // assertion above. One reading — a listing, the version behind it, and
+        // one batched query — and the script does not type until that reading
+        // has reached the screen, so all three have landed before the launch
+        // arm is anywhere near being entered. It was a loose ceiling while the
+        // refresh key was in the plan, because the second reading raced
+        // `stop_background`; with one reading the count is exact.
+        assert_eq!(
+            run.argv.len(),
+            3,
+            "the one reading this session takes, and nothing the launch added: {:?}",
             run.argv
         );
     }
@@ -1029,106 +972,6 @@ mod tests {
             "it names the workspace: {line}"
         );
         assert!(line.contains("wf reap"), "and the command: {line}");
-    }
-
-    /// A reading answering a question the screen has withdrawn is dropped.
-    ///
-    /// The window is real rather than theoretical: `Picker::tick` drains the
-    /// channel once per turn and then parks in `next_press`, so a reading that
-    /// lands while the loop is parked waits there. Press `ctrl-r` in that
-    /// window and the clear happens *first*; without the tag, the next drain
-    /// folds the withdrawn answer straight back over it.
-    ///
-    /// What makes that unrecoverable rather than merely brief is the silence
-    /// this event is designed around: a fresh reading that finds nothing sends
-    /// nothing, so if the containers really did stop, no later event exists to
-    /// correct the restored markings. They would sit there until the session
-    /// ended.
-    #[tokio::test]
-    async fn an_answer_to_a_withdrawn_reading_is_dropped_rather_than_folded() {
-        let (tx, updates) = mpsc::unbounded_channel();
-        let mut picker = Picker::new(App::new(BTreeMap::new()), tx.clone(), updates);
-        // A real reading, taken through the real derivation with the two reads
-        // stubbed — the test-only constructors live in the library's own test
-        // build and this is the binary. Going through `survey` is the better
-        // seam anyway: the value folded below is one the production path can
-        // actually produce.
-        let node = wf::reap::Node {
-            repo: "blooop/wayfinder".to_string(),
-            number: 7,
-        };
-        let other = wf::reap::Node {
-            repo: node.repo.clone(),
-            number: 8,
-        };
-        let workspace = |number: u64, state: &str| wf::reap::Workspace {
-            id: format!("wf-{number}"),
-            devlaunch: true,
-            repo: Some(node.repo.clone()),
-            branch: Some(format!("wayfinder/wayfinder-{number}")),
-            state: Some(state.to_string()),
-            unsaved: None,
-        };
-        // One finished node whose container is down — a reap would claim it —
-        // and one whose container is up, so the reading carries both halves.
-        let listed = vec![workspace(7, "Stopped"), workspace(8, "Running")];
-        let known: BTreeMap<_, _> = [
-            (node.clone(), wf::reap::NodeFact::Closed),
-            (other, wf::reap::NodeFact::Closed),
-        ]
-        .into_iter()
-        .collect();
-        let stale = wf::reclaim::survey(
-            || async { Ok(listed.clone()) },
-            |_| async { Ok(known.clone()) },
-        )
-        .await
-        .expect("a finished workspace and a live container are both worth reporting");
-        assert!(
-            !stale.liveness().is_empty(),
-            "the fixture must carry a marking for the drop to be about anything"
-        );
-
-        // The reading the screen is waiting for lands: it is folded.
-        fold(
-            LoadEvent::Surveyed {
-                taken: 0,
-                reading: stale.clone(),
-            },
-            &mut picker.app,
-            &mut picker.clusters,
-            &mut picker.loaders,
-            &picker.tx,
-            picker.reading,
-        );
-        assert!(picker.app.reclaimable.is_some(), "the live answer is taken");
-        assert!(!picker.app.liveness.is_empty(), "markings and all");
-
-        // `ctrl-r`: what is held goes, and the question is asked again.
-        picker.app.reclaimable = None;
-        picker.app.liveness = wf::liveness::Liveness::default();
-        picker.reading += 1;
-
-        // The previous reading's answer, already queued when the key landed.
-        fold(
-            LoadEvent::Surveyed {
-                taken: 0,
-                reading: stale,
-            },
-            &mut picker.app,
-            &mut picker.clusters,
-            &mut picker.loaders,
-            &picker.tx,
-            picker.reading,
-        );
-        assert_eq!(
-            picker.app.reclaimable, None,
-            "a withdrawn reading must not restore the hint"
-        );
-        assert!(
-            picker.app.liveness.is_empty(),
-            "nor the row markings it came with"
-        );
     }
 
     #[test]
@@ -1251,7 +1094,6 @@ mod tests {
                 None
             },
             tx,
-            0,
         );
         stop_background(discovery, survey).await;
         assert_eq!(

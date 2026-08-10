@@ -293,10 +293,18 @@ container on its own is the ordinary look of work that finished. It is the
 stage glyph beside it, and that contrast is the finding: `◐ #133 … ⧖` is the
 tracker saying *building* and the machine saying *nothing is*.
 
-`ctrl-r` retakes the reading along with everything else, and what it said is
-dropped the moment you press it rather than when its replacement lands: these
-are claims in the present tense, and a screen asserting last hour's containers
-beside freshly fetched tickets would be worse than one asserting nothing.
+**These markings are taken once, at startup, and never again** — and that is a
+real limitation rather than an oversight. The reading is taken behind the first
+frame and there is no key that retakes it, so `▣` and `⧖` say what was true when
+`wf` started, not what is true now. Start a container from the launch picker of
+this very session and the row behind it will not learn: the marking you are
+looking at was decided before you pressed anything.
+
+They stay useful because of how short a session is — `wf` is on screen for
+seconds — and because the thing they report moves in minutes rather than
+milliseconds. But a screen you left open while a build ran is a screen making
+claims in the past tense, and the only way to bring them up to date is to quit
+and run `wf` again, which is ~0.6 s warm.
 
 Stalls also reach the [count line](#startup) as
 `· 2 stalled: wayfinder#133, wayfinder#134`, because the row is not always on
@@ -436,11 +444,12 @@ retried rather than fatal. Which project's screen is up is not the search's
 business either way: it comes from the local `git` call that registers the
 checkout, before the first frame, and nothing arriving later moves it.
 
-Each map is fetched exactly once. Nothing polls: `wf` is on screen for seconds
-and restarts warm in ~0.6 s, so there is nothing worth keeping fresh. `ctrl-r`
-refetches everything when you want it — after closing a ticket in the browser,
-say. A fetch that fails says so on the count line and stays failed until you
-ask again.
+Each map is fetched exactly once per run, and there is no key that asks again.
+Nothing polls either: `wf` is on screen for seconds and restarts warm in ~0.6 s,
+so a whole new run is the refresh — at the price of the query, the project you
+had entered and where the cursor was. A fetch that fails says so on the count
+line and stays failed for the rest of the run; the screen says `run wf again`
+rather than naming a key, because running it again is what retries.
 
 **What a `wf reap` would claim is read in the background too**, and lands on the
 count line when it arrives:
@@ -495,8 +504,8 @@ or a second name for the module exported from the library.
 
 Everything else is watched rather than proven. A test drives the real event loop
 against a recording `dl` and `gh`, through every arm the loop has — quit,
-refresh, continue, and the launch that ends the session — and reads back every
-argv the run made, plus a scratch `HOME` laid out the way this machine is
+continue, and the launch that ends the session — and reads back every argv the
+run made, plus a scratch `HOME` laid out the way this machine is
 (`~/.cache/devlaunch/repos/<owner>/<repo>/<id>` for the clone,
 `~/.devpod/contexts/<ctx>/workspaces/<id>` for the record), compared before and
 after. That catches a workspace deleted by running `dl` and one deleted
@@ -781,16 +790,21 @@ an empty one.
 | `⏎` in a row | a previous launch left a conversation on this node: its picker leads with `resume`, and `enter enter` rejoins it |
 | `▣` in a row | [a container of this node's is up](#what-is-actually-running-and-what-stopped) — which is not the same as an agent being alive in it |
 | `⧖` in a row | claimed, nothing pushed, and nothing of its running: a run that stopped between its stages |
-| `ctrl-r` | refetch every map in place, keeping your query, level and cursor |
 | `esc` | clear the query; on an empty query, quit |
 | `q` | quit — on an empty query only, since mid-query it types |
 | `ctrl-c` | quit from anywhere, including the which-checkout picker |
 | `↑`/`↓` or `j`/`k`, `enter`, `esc`/`q` | in the which-checkout picker: pick which tree the agent runs in, or cancel |
 
-`ctrl-r` is the only thing that updates the list in place. Quitting and running
-`wf` again is nearly as fast (~0.6 s warm) but throws away the query, the
-project you had entered and where the cursor was, which is the whole reason the
-key still exists now that nothing polls.
+**Nothing updates the list in place.** There was a key that refetched every map
+without losing your query, level or cursor, and it is gone: it was the only
+thing in `wf` that wrote the screen's state twice, and each of those second
+writes needed its own machinery to be safe — a load restart so a refetch could
+not be beaten by the load it replaced, a way to put the startup counter back
+into loading, and a generation tag on the background reading so an answer to a
+question you had already withdrawn could be told from a live one. One key's
+worth of freshness was not worth a second write path through everything behind
+the screen. Quitting and running `wf` again is ~0.6 s warm and costs you the
+query, the level and the cursor, and that is the trade as it now stands.
 
 That picker is the one prompt left, and only a repo with several registered
 checkouts (the `~/k1/kinisi_ros`, `~/k2/kinisi_ros` pattern) ever sees it: the

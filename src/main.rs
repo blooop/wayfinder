@@ -6,8 +6,9 @@
 //! 2. The screen goes up before any network call (#27), with the cached map
 //!    numbers (#28) already being fetched.
 //! 3. One `wayfinder:map` label search reconciles that set; every map streams
-//!    in as it lands. `ctrl-r` asks again. Nothing polls: `wf` is on screen for
-//!    seconds and restarts warm in ~0.6 s.
+//!    in as it lands, once. Nothing polls and no key asks again: `wf` is on
+//!    screen for seconds and restarts warm in ~0.6 s, so running it again is
+//!    the refresh.
 //! 4. Inside a checkout, the screen opens **on that project** and nowhere
 //!    else; run outside one and it opens on the project list, most recently
 //!    used first. Both are drawn from the cache, so neither waits on the
@@ -103,7 +104,7 @@ With no arguments: opens on the project you are standing in, or on the list of
 every registered project — most recently used first — when you are not standing
 in one. enter selects a project, or runs an agent on the picked ticket in that
 project's checkout, replacing wf — so wf is gone by the time the agent draws.
-Left backs out, ctrl-r refetches, esc quits.
+Left backs out, esc quits. Each map is fetched once per run.
 
 wf skills          report which prompt each route would actually run
 wf skills install  link this build's skills into ~/.claude/skills and ~/.codex/skills
