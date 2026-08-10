@@ -901,14 +901,15 @@ invisibly absent on a fresh machine. That is what takes `wf` from ~3 MB to
 that set it. `dl <workspace> up` — start without attaching — and the
 per-workspace launch lock are what the warm-up is made of.
 
-**Use `dl` 0.0.20 or newer.** Launching several tickets at once means several
-`dl` processes preparing the same repo's cache at the same moment; 0.0.20 is
-where those runs serialize over a per-repo lock instead of racing (the loser
-of the old race could delete the winner's half-written clone). This one is
-below the isolation floor, so it now only describes what a `dl` too old to
-isolate with would have done. It is kept because `wf reap` still reads a
-listing from whichever `dl` is on PATH: older `dl` on devpod 0.26 hands
-the agent **no terminal**, and an agent with no terminal decides it was invoked
+**Two older floors, now subsumed by the one above.** Both are kept as the
+record of why a floor exists at all — they are what an older `dl` did, and
+0.0.24 is above both, so nothing `wf` will isolate with can still do either.
+
+Launching several tickets at once means several `dl` processes preparing the
+same repo's cache at the same moment; **0.0.20** is where those runs serialize
+over a per-repo lock instead of racing (the loser of the old race could delete
+the winner's half-written clone). And older `dl` on devpod 0.26 hands the agent
+**no terminal**, and an agent with no terminal decides it was invoked
 non-interactively: it prints one answer and exits, so the symptom is a session
 that never starts rather than an error. Measured here on devpod 0.26.1:
 `devpod ssh --command` (what `dl` ≤ 0.0.12 uses) gives `not a tty`, `TERM=dumb`
