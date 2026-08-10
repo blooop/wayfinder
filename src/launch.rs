@@ -1651,9 +1651,9 @@ impl Launch {
 /// that is the caller naming a file, not `$PATH` resolution.
 ///
 /// Two callers, and the difference matters: [`Launch::exec`] resolves the
-/// program it is about to become and reports the miss, while
-/// [`Isolation::detect`] only asks whether `dl` is there and quietly answers
-/// [`Isolation::Host`] when it is not.
+/// program it is about to become and reports the miss, while the `dl` probe
+/// wants only a path to run `--version` on and treats a miss as "no `dl` here",
+/// which [`Isolation::detect`] answers with [`Isolation::Host`].
 fn resolve_on_path(program: &str) -> Result<PathBuf, anyhow::Error> {
     if program.contains('/') {
         return Ok(PathBuf::from(program));
