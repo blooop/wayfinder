@@ -614,11 +614,11 @@ fn executable(_path: &Path) {
 /// `probe.rs` panic. It does **not** always name the line at fault, and the two
 /// halves differ: an unbalanced `}` closes the depth early, so the loop fails at
 /// the offending line and quotes it (a stray `}` in a comment above
-/// `picker.rs`'s `a_session` reported *line 802 of 1011*, which is that
+/// `picker.rs`'s `a_session` reported *line 809 of 1037*, which is that
 /// comment). An unbalanced `{` never brings the depth back to zero, so nothing
 /// fails until the count is checked at the end, and the message can only quote
 /// the file's **last** line — deleting `main.rs`'s balancing `// }` reports
-/// *line 644*, which is the end of `main.rs` and 200 lines from the edit. In
+/// *line 680*, which is the end of `main.rs` and 183 lines from the edit. In
 /// that direction the message says which file and which guard, and the reader
 /// finds the brace.
 ///

@@ -549,10 +549,14 @@ mod tests {
         //
         // `fs` is bare for the same reason, and that took a second round to
         // notice: written `fs::`, it was reopened by `use std::fs as sys;`.
-        // Measured here rather than assumed for the two library files as well
-        // as for `picker.rs` — that alias inside the spawned task is lib 356/1
-        // against the bare name, and `fs` occurs in none of the four guarded
-        // files' code.
+        // Measured, not assumed, that it costs nothing: `fs` occurs in none of
+        // the four guarded files' code. What it buys here is not the aliased
+        // `remove_dir_all` inside the spawned task — `remove` catches that at
+        // either spelling — but the calls `remove` does not name; see
+        // [`crate::reclaim`], where an aliased `fs::write` is red at `fs` and
+        // green at `fs::`. That pair was measured there and not here, so this
+        // list carries the bare name by the same argument rather than by its
+        // own row.
         let code = crate::probe::code_only("refresh.rs", include_str!("refresh.rs"));
         for forbidden in [
             "reap",

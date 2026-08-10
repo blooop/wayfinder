@@ -792,8 +792,16 @@ mod tests {
         // `use std::fs as sys;`, which is a one-line edit that a reviewer used
         // to reopen an escape this PR had already closed once. The bare name
         // catches both spellings and costs nothing — `fs` occurs nowhere in
-        // this file's code. Measured: the alias in this module's reading is
-        // lib 356/1 against the bare name.
+        // this file's code. What the bare name adds here is narrower than it
+        // first looks, and the measurement is worth stating precisely: an
+        // aliased `remove_dir_all` is caught either way, because `remove` is
+        // already on this list — two reviewers measured that row at different
+        // sites and got 356/1 and 355/2, the difference being how many guards
+        // fire, not whether one does. The bare name earns its place on the
+        // calls `remove` does not name: an aliased `fs::write` truncating a
+        // file is red at `fs` and **fully green** at `fs::`. Note this is a
+        // substring match, so it also forbids `offset`, `refs` and `prefs`
+        // here — see the same note in [`crate::picker`].
         let code = crate::probe::code_only("reclaim.rs", include_str!("reclaim.rs"));
         for forbidden in ["remove", "\"rm\"", "--force", "Command", "process::", "fs"] {
             assert!(

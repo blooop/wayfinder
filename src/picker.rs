@@ -965,9 +965,21 @@ mod tests {
         // from — the module cannot be reached without its own name being
         // written — and it was not applied here the first time. Measured:
         // `fs::` in the list is green against the alias and the bare name is
-        // bins 16/1; bare `fs` still costs this file nothing, because `fs`
+        // bins 16/1; bare `fs` costs this file nothing *today*, because `fs`
         // does not occur in its code at all, in an identifier or anywhere else.
         //
+        // That "today" is the cost, and it is worth writing down rather than
+        // discovering: this is a substring match, so bare `fs` also forbids
+        // `offset`, `refs` and `prefs`. Measured — `let offset = 0usize;` in
+        // this file is bins 16/1, reporting *it names "fs"*, which is a
+        // misleading message for an edit that reaches nothing. This is a
+        // scrolling list, so a scroll offset is a plausible future edit, and
+        // the maintainer who hits it will be told the wrong thing. It is the
+        // same class of cost `remove` already imposes (see `app.failed`
+        // above, which is written `retain` for exactly this reason); the
+        // token stays because an argv-less deletion is worse than a confusing
+        // test failure, but the next person should not have to rediscover why
+        // their `offset` is red.
         // So what this token covers is the part of this file the run does not
         // reach. It is *not* a claim that nothing on the picker's path can
         // delete, and a grep over one file could never be one. The same call
