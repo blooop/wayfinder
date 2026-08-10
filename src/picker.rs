@@ -54,7 +54,7 @@
 //!    - **which arm**: all four [`Outcome`] arms are driven, the launch one
 //!      included, and so is [`fold`] — but only through the events the child's
 //!      fixtures actually produce. Its `Discovered`, `Fetched` and
-//!      `Reclaimable` arms are entered; `SearchFailed` is not, because the `gh`
+//!      `Read` arms are entered; `SearchFailed` is not, because the `gh`
 //!      shim answers the map search successfully, and a `dl <ws> rm` planted in
 //!      that one arm is green. What stands against it there is the denylist in
 //!      (1) — it has to be spelt in another file to get past that; the
@@ -308,8 +308,10 @@ fn fold(
         // a screen that has been up and answering keys the whole time —
         // it changes one dim segment of the count line and nothing else,
         // and it arrives at most once because nothing asks again.
-        LoadEvent::Reclaimable(found) => {
-            app.reclaimable = Some(found);
+        LoadEvent::Read(found) => {
+            let (reclaimable, liveness) = found.into_parts();
+            app.reclaimable = reclaimable;
+            app.liveness = liveness;
         }
     }
 }
@@ -660,7 +662,7 @@ mod tests {
                 // `the_first_frame_is_drawn_before_anything_is_asked` reads.
                 probe::note("the first frame");
             }
-            if self.due.is_none() && app.reclaimable.is_some() {
+            if self.due.is_none() && (app.reclaimable.is_some() || !app.liveness.is_empty()) {
                 self.due = Some(now + WATCH);
             }
             let ready = self.due.is_some_and(|at| now >= at);

@@ -343,6 +343,17 @@ pub struct Node {
     pub number: u64,
 }
 
+impl Node {
+    /// How a node is named to a human — `wayfinder#133`.
+    ///
+    /// One spelling, shared by the reap plan's rows and the picker's stall
+    /// segment, because they are naming the same things on the same terminal
+    /// and two formats would read as two kinds of object.
+    pub fn name(&self) -> String {
+        format!("{}#{}", short_repo(&self.repo), self.number)
+    }
+}
+
 /// Which node a workspace is for, or `None` if it is not one of `wf`'s.
 ///
 /// Strict on purpose, and every clause is a way for this to be someone else's
@@ -414,7 +425,7 @@ pub fn plan(
             continue;
         };
         let id = workspace.id.clone();
-        let name = format!("{}#{}", short_repo(&node.repo), node.number);
+        let name = node.name();
         // Naming the waived work in the acted-on line, not only in the keep
         // line it replaced: this is the row the human is about to approve, and
         // "and discarding …" is the part they might stop at.

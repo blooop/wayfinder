@@ -270,6 +270,59 @@ open PRs — one red PR makes the node red. With no open PR, a merged one means
 done; with no PR at all it falls back to unclaimed → ready, claimed → building,
 closed → done.
 
+### What is actually running, and what stopped
+
+Every glyph above is a **tracker** fact. That is the right vocabulary for what
+the work *is*, and it is silent about the half `wf` itself created: a launch
+`exec`s an agent into a container and exits, so nothing has ever reported back
+whether that agent is still there. `⏎` comes closest and deliberately stops
+short — it says a launch *happened*.
+
+`dl` knows the missing half and already publishes it, so the same background
+reading that finds [reclaimable workspaces](#startup) reads it too, and two
+markings come out of the join:
+
+- **`▣` a container of this node's is up.** Something is very likely working
+  here.
+- **`⧖` claimed, nothing pushed, and nothing of its running.** Somebody — almost
+  always an agent — took this ticket and is no longer on it.
+
+`⧖` is the one that needed both halves, and it is why this is a join rather than
+a field. A claim on its own is the ordinary look of work in progress; a stopped
+container on its own is the ordinary look of work that finished. It is the
+*pair* that means a lifecycle went down between its stages. It reads against the
+stage glyph beside it, and that contrast is the finding: `◐ #133 … ⧖` is the
+tracker saying *building* and the machine saying *nothing is*.
+
+Stalls also reach the [count line](#startup) as `· 2 stalled: wayfinder#133,
++1 more`, because the row is not always on screen — the project list has no
+ticket rows at all, and a stall can be inside a fold or another map. Running
+containers stay on their rows: they are the ordinary state of a machine in use,
+and a count of them would be a status bar rather than a summons.
+
+Four things this deliberately does not claim, because the honest version is
+narrower than the useful-sounding one:
+
+- **A container being up is not an agent being alive.** `dl` reports the
+  container; nobody reports the process inside it, and `wf` is long gone by
+  then. `▣` covers a session you left, a session that exited an hour ago inside
+  a container nobody stopped, and a `WF_PREWARM` container never entered. It is
+  a floor on activity, not a reading of it.
+- **A stall is not a crash.** An agent that handed off cleanly and one that died
+  mid-slice leave the same shape. The ticket's breadcrumb trail is what tells
+  them apart, and reading it is yours.
+- **Host launches are invisible.** A checkout with no devcontainer runs on the
+  host, where there is no workspace and no state to read. Those nodes carry no
+  marking at all rather than a wrong one.
+- **This machine only**, the same limit [resume](#resuming-picking-a-conversation-back-up)
+  carries: the listing is local, so a ticket worked on another machine looks
+  unstarted here.
+
+Nothing is done about any of it. `wf reap` still keeps a claimed workspace — a
+stale claim is a person's stated intent and reap does not overrule it — which is
+exactly why the stall was worth drawing: it was the one thing on the machine
+that nothing pointed at.
+
 `↑`/`↓` prefer **siblings at the cursor's depth**, so on the default screen they
 move between tickets you can actually take and step over the blocked context
 hanging beneath them; `→` reveals what the cursor is on and `←` closes it again.
@@ -381,8 +434,16 @@ ask again.
 count line when it arrives:
 
 ```
-  12/30  · 2 reclaimable: devlaunch-github-…oop-wayfinder-127, +1 more — wf reap
+  12/30  · 1 stalled: wayfinder#133  · 2 reclaimable: devlaunch-…-127, +1 more — wf reap
 ```
+
+That one reading answers two questions, because the same `dl --ls --json` and
+the same tracker query settle both: what a reap would claim, and
+[what is running and what stopped](#what-is-actually-running-and-what-stopped).
+Stalls are laid down first and capped, so the two variable-length segments
+cannot fight over one line — on a terminal too narrow for both it is the reap
+pointer that goes, which is the one trade in here worth disagreeing with: work
+that has stopped moving outranks tidying that can wait.
 
 It is the same reading `wf reap` prints, taken by the same code — a `dl --ls
 --json` and one batched tracker query, neither of them on the way to a frame.
@@ -703,6 +764,8 @@ an empty one.
 | `enter` | on the project list: enter that project. On a project's screen: open the launch picker — the creation rows on the project's own row, the launch modes on a ticket or a cluster header — and a second `enter` runs the agent here and exits. On a group line it folds instead, since there is no agent to run |
 | `←`/`→`, `↑`/`↓` or `tab`, *type*, then `enter`* | in the launch picker: pick Claude/Codex, pick the row, fill its field (a steering prompt, a task, or a map seed), launch — `esc` backs out with the query and cursor intact. `←`/`→` does nothing on a `resume` row, whose agent comes from the record |
 | `⏎` in a row | a previous launch left a conversation on this node: its picker leads with `resume`, and `enter enter` rejoins it |
+| `▣` in a row | a container of this node's is up — [something is very likely working here](#what-is-actually-running-and-what-stopped) |
+| `⧖` in a row | claimed, nothing pushed, and nothing of its running: a run that stopped between its stages |
 | `ctrl-r` | refetch every map in place, keeping your query, level and cursor |
 | `esc` | clear the query; on an empty query, quit |
 | `q` | quit — on an empty query only, since mid-query it types |

@@ -33,6 +33,7 @@ use std::future::Future;
 
 use anyhow::Result;
 
+use crate::liveness::Liveness;
 use crate::reap::{self, Node, NodeFact, Verdict, Workspace};
 
 /// How many workspaces the hint spells before it starts counting.
@@ -234,6 +235,54 @@ pub fn reading(workspaces: &[Workspace], known: &BTreeMap<Node, NodeFact>) -> Op
     Reclaimable::read(&reap::plan(workspaces, known, false))
 }
 
+/// Everything one look at the machine and the tracker is worth.
+///
+/// Two observations, carried together because they come from **one** reading:
+/// the same `dl --ls --json` and the same batched tracker query answer both, so
+/// splitting them into two surveys would double the subprocess and the round
+/// trip to learn two things about the same six workspaces.
+///
+/// They stay separate values inside it rather than merging into one verdict per
+/// node, because they are answers to unrelated questions and are acted on by
+/// different parts of the screen: [`Reclaimable`] is a sentence naming a
+/// command, and [`Liveness`] is a per-row marking. A node can easily be in one
+/// and not the other, and a type that made them one field would have to invent
+/// a precedence between "this could be tidied away" and "this stopped moving"
+/// that nothing actually wants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reading {
+    reclaimable: Option<Reclaimable>,
+    liveness: Liveness,
+}
+
+impl Reading {
+    /// `None` when neither half found anything — the ordinary quiet machine,
+    /// and the case that must not wake the draw path at all.
+    fn of(reclaimable: Option<Reclaimable>, liveness: Liveness) -> Option<Self> {
+        if reclaimable.is_none() && liveness.is_empty() {
+            return None;
+        }
+        Some(Self {
+            reclaimable,
+            liveness,
+        })
+    }
+
+    /// Hand both halves to their separate homes on the app. Consuming, because
+    /// there is exactly one consumer and nothing should be tempted to keep a
+    /// second copy of a reading that arrives once.
+    pub fn into_parts(self) -> (Option<Reclaimable>, Liveness) {
+        (self.reclaimable, self.liveness)
+    }
+
+    /// A reading with these halves on it, for the tests of the channel that
+    /// carries one.
+    #[cfg(test)]
+    pub(crate) fn for_test(reclaimable: Option<Reclaimable>, liveness: Liveness) -> Self {
+        Self::of(reclaimable, liveness).expect("a reading is never empty")
+    }
+}
+
 /// Take the reading, silently.
 ///
 /// Generic over its two reads so the whole fail-silent path is exercisable
@@ -244,7 +293,7 @@ pub fn reading(workspaces: &[Workspace], known: &BTreeMap<Node, NodeFact>) -> Op
 /// tracker that would not answer, a repo slug that will not parse — none of
 /// them is a fact about a workspace, and the only honest thing to show for one
 /// is nothing.
-pub async fn survey<L, LFut, F, FFut>(listing: L, facts: F) -> Option<Reclaimable>
+pub async fn survey<L, LFut, F, FFut>(listing: L, facts: F) -> Option<Reading>
 where
     L: FnOnce() -> LFut,
     LFut: Future<Output = Result<Vec<Workspace>>>,
@@ -259,12 +308,15 @@ where
         return None;
     }
     let known = facts(nodes).await.ok()?;
-    reading(&workspaces, &known)
+    Reading::of(
+        reading(&workspaces, &known),
+        Liveness::read(&workspaces, &known),
+    )
 }
 
 /// [`survey`] against the real `dl` listing and the real batched tracker query
 /// — one subprocess and one GraphQL round trip, both `reap`'s own.
-pub async fn survey_live() -> Option<Reclaimable> {
+pub async fn survey_live() -> Option<Reading> {
     survey(reap::workspaces, |nodes| async move {
         reap::node_facts(&nodes).await
     })
@@ -696,7 +748,7 @@ mod tests {
         .await;
         assert_eq!(
             surfaced,
-            reading(&listed, &known),
+            Reading::of(reading(&listed, &known), Liveness::read(&listed, &known)),
             "the survey's answer is the reading over what the two reads returned"
         );
         assert_eq!(
@@ -719,7 +771,18 @@ mod tests {
             return;
         }
         let said = match survey_live().await {
-            Some(found) => found.hint(120),
+            Some(found) => {
+                let (reclaimable, liveness) = found.into_parts();
+                let claim = reclaimable.map_or_else(
+                    || "nothing reclaimable".to_string(),
+                    |found| found.hint(120),
+                );
+                format!(
+                    "{claim} | running {} stalled {}",
+                    liveness.running(),
+                    liveness.stalled()
+                )
+            }
             None => "no reading at all".to_string(),
         };
         println!("{}{said}", crate::probe::MARK);
@@ -771,7 +834,7 @@ mod tests {
         );
         assert_eq!(
             run.printed(),
-            ["· 1 reclaimable: wf-129-closed (+1 to check by hand) — wf reap"],
+            ["· 1 reclaimable: wf-129-closed (+1 to check by hand) — wf reap | running 1 stalled 0"],
             "the live reading is the same sentence the offline tests pin"
         );
     }

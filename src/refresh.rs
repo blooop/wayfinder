@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use crate::fetch;
 use crate::model::{Map, MapId, MapSet};
 use crate::projects::ProjectsCache;
-use crate::reclaim::Reclaimable;
+use crate::reclaim::Reading;
 
 /// How long the map search waits before trying again. The only recurring timer
 /// left: nothing polls, but a search that never answers would leave `wf`
@@ -66,7 +66,7 @@ pub enum LoadEvent {
     /// Only ever sent when there is something to say: a reading that failed and
     /// a reading that found nothing are the same silence, because neither is
     /// anything the screen should draw.
-    Reclaimable(Reclaimable),
+    Read(Reading),
 }
 
 /// Has the `wayfinder:map` label search answered yet?
@@ -355,11 +355,11 @@ pub fn spawn_discovery(
 /// in-flight one outliving the `exec` would be inherited by the agent.
 pub fn spawn_survey<S>(survey: S, tx: mpsc::UnboundedSender<LoadEvent>) -> Survey
 where
-    S: Future<Output = Option<Reclaimable>> + Send + 'static,
+    S: Future<Output = Option<Reading>> + Send + 'static,
 {
     Survey(tokio::spawn(async move {
         if let Some(found) = survey.await {
-            let _ = tx.send(LoadEvent::Reclaimable(found));
+            let _ = tx.send(LoadEvent::Read(found));
         }
     }))
 }
@@ -443,7 +443,7 @@ mod tests {
     /// A reading that never answers — the reading `wf` must be able to draw
     /// over. A `pending` future rather than a long sleep, so "the picker did
     /// not wait" is a fact about the code and not about a timer.
-    async fn never() -> Option<Reclaimable> {
+    async fn never() -> Option<Reading> {
         std::future::pending().await
     }
 
@@ -470,12 +470,15 @@ mod tests {
     #[tokio::test]
     async fn a_reading_that_lands_folds_in_through_the_one_channel() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let found = Reclaimable::for_test(&["ws-a"], 0);
+        let found = Reading::for_test(
+            Some(crate::reclaim::Reclaimable::for_test(&["ws-a"], 0)),
+            crate::liveness::Liveness::default(),
+        );
         spawn_survey(std::future::ready(Some(found.clone())), tx.clone())
             .settle()
             .await;
         match rx.try_recv() {
-            Ok(LoadEvent::Reclaimable(got)) => assert_eq!(got, found),
+            Ok(LoadEvent::Read(got)) => assert_eq!(got, found),
             other => panic!("the reading must arrive as its own event, got {other:?}"),
         }
     }

@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::launch::{self, Agent, Candidate, Launch, LaunchMode, MapRef, Route, Staged, Targets};
+use crate::liveness::{Life, Liveness};
 use crate::model::{stage, Activity, Map, MapId, MapSet, Status, Ticket};
 use crate::projects::{self, Checkout, Resume, Session};
 use crate::reclaim::Reclaimable;
@@ -258,6 +259,15 @@ pub struct App {
     /// cleared would be gone before it was read. Nothing in the picker acts on
     /// it — it is a sentence naming a command a person may choose to type.
     pub reclaimable: Option<Reclaimable>,
+    /// What is running on this machine, and what stopped without finishing —
+    /// the other half of the same background reading (#137's survey, read for
+    /// a second question).
+    ///
+    /// Not an `Option`: an empty [`Liveness`] and one that has not arrived draw
+    /// exactly the same nothing, and every reader of it asks about one node at
+    /// a time. A second layer of "have we looked yet" would be a distinction no
+    /// caller can act on.
+    pub liveness: Liveness,
     pub overlay: Overlay,
     /// The structural screen `tab` toggles (#51). Only the lens is stored;
     /// whether the body is currently *flattened* is derived from the query in
@@ -290,6 +300,7 @@ impl App {
             failed: BTreeSet::new(),
             startup: Startup::loaded(),
             reclaimable: None,
+            liveness: Liveness::default(),
             overlay: Overlay::None,
             lens: Lens::Leverage,
             expanded: Expanded::new(),
@@ -330,6 +341,13 @@ impl App {
     pub fn with_sessions(mut self, sessions: Vec<Session>) -> Self {
         self.sessions = sessions;
         self
+    }
+
+    /// What this machine says about the node, if anything — beside
+    /// [`App::resume`] because the row asks them together and they are the two
+    /// facts on a row that come from outside the tracker.
+    pub fn life(&self, repo: &str, number: u64) -> Option<Life> {
+        self.liveness.of(repo, number)
     }
 
     /// The conversation a previous launch of this node left, if any.
