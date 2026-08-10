@@ -98,9 +98,15 @@ jobs:
           recipe-path: recipe/recipe.yaml
           # --no-config: rattler-build otherwise discovers any pixi or
           # rattler-build config file in the tree and adopts its default-channels,
-          # so this keeps the build resolving against conda-forge alone no matter
-          # what configuration later lands in the repo.
-          build-args: --channel conda-forge --no-config
+          # so this keeps the build resolving against exactly the two channels
+          # named here no matter what configuration later lands in the repo.
+          #
+          # blooop is listed because the recipe declares `devlaunch`, which lives
+          # there and not on conda-forge (nor do its own `iterfzf` and `devpod`
+          # dependencies). The build needs it for the test environment
+          # rattler-build creates from the freshly built package, not for the
+          # cargo build itself, which still resolves from conda-forge alone.
+          build-args: --channel https://prefix.dev/blooop --channel conda-forge --no-config
           artifact-name: wf-conda-package
 
       - name: Locate the package
@@ -121,6 +127,7 @@ jobs:
         run: |
           rattler-build test \
             --package-file "${{ steps.locate.outputs.package-file }}" \
+            --channel https://prefix.dev/blooop \
             --channel conda-forge
 
   release:

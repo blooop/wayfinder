@@ -35,6 +35,7 @@
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -1053,12 +1054,19 @@ const DEVLAUNCH: &str = "dl";
 impl Isolation {
     /// Which environment `checkout` will actually get.
     ///
-    /// Both halves are required, and a missing `dl` **degrades to the host**
-    /// rather than refusing the launch: a repo may carry a `devcontainer.json`
-    /// for its editor users on a machine that has never heard of `dl`, and
-    /// isolation here is for dependencies, not security (#73), so the host is
-    /// a worse environment rather than an unsafe one. The launch notice names
-    /// the mode ([`Launch::describe`]), so the degradation is visible.
+    /// All three conditions are required, and an unusable `dl` **degrades to
+    /// the host** rather than refusing the launch: a repo may carry a
+    /// `devcontainer.json` for its editor users on a machine that has never
+    /// heard of `dl`, and isolation here is for dependencies, not security
+    /// (#73), so the host is a worse environment rather than an unsafe one. The
+    /// launch notice names the mode ([`Launch::describe`]), so the degradation
+    /// is visible.
+    ///
+    /// The third condition — usable, not merely on PATH — is there because
+    /// "installed" and "speaks this binary's command line" are different
+    /// questions, and answering only the first one moved the failure past the
+    /// point where it could still degrade. The floor `dl` is held to, and the
+    /// release that made one necessary, are recorded on `DEVLAUNCH_FLOOR`.
     ///
     /// Codex is deliberately host-only for now. `dl` mounts the host's
     /// `~/.claude` into a workspace — which carries Claude's authentication and
@@ -1069,7 +1077,7 @@ impl Isolation {
     pub fn detect(checkout: &Path, agent: Agent) -> Isolation {
         if agent == Agent::Claude
             && has_devcontainer(checkout)
-            && resolve_on_path(DEVLAUNCH).is_ok()
+            && devlaunch_on_path() == Devlaunch::Usable
         {
             Isolation::Devlaunch
         } else {
@@ -1096,6 +1104,156 @@ fn has_devcontainer(checkout: &Path) -> bool {
     DEVCONTAINER_CONFIGS
         .iter()
         .any(|rel| checkout.join(rel).is_file())
+}
+
+/// The oldest `dl` whose command line this binary actually speaks.
+///
+/// Raised whenever `wf` starts calling something an older `dl` does not have,
+/// and that is not hypothetical: [`prewarm`] fires `dl <workspace> up`, and
+/// `up` arrived in devlaunch **0.0.24**. Before this floor existed, a machine
+/// with everything up to date ran `wf` against the released `dl` 0.0.23,
+/// satisfied every condition [`Isolation::detect`] tested, and then failed
+/// inside the prewarm on an argument that release had never heard of — the one
+/// failure mode a PATH lookup cannot see, because the name was there.
+///
+/// A floor is the honest expression of a subprocess dependency: `wf` cannot
+/// pin `dl`'s version the way a linked crate would (devlaunch#53), so it
+/// checks what it found and degrades when the answer is too old.
+const DEVLAUNCH_FLOOR: DlVersion = DlVersion(0, 0, 24);
+
+/// A `dl` version, ordered by the three numbers `dl --version` prints.
+///
+/// A tuple struct rather than three fields because the derived [`Ord`] is
+/// exactly the comparison wanted — major, then minor, then patch — and there
+/// is nothing else to say about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DlVersion(u32, u32, u32);
+
+impl std::fmt::Display for DlVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.0, self.1, self.2)
+    }
+}
+
+impl DlVersion {
+    /// The version in `dl --version`'s first line, or `None` when there is not
+    /// one to compare.
+    ///
+    /// Tolerant on purpose, because two installs answer differently and both
+    /// are legitimate: the released build prints `dl 0.0.24`, while an editable
+    /// dev install prints `dl 0.0.24 (dev, editable from /path/to/checkout)` —
+    /// devlaunch makes that trailer the way the two are told apart, so a parser
+    /// that insisted on a bare version would refuse isolation to exactly the
+    /// person developing `dl`. A pre-release tail on the patch number
+    /// (`0.0.24rc1`) reads as 0.0.24, because that is the version carrying the
+    /// feature.
+    fn parse(stdout: &str) -> Option<DlVersion> {
+        let mut parts = stdout
+            .lines()
+            .next()?
+            .split_whitespace()
+            .find(|word| word.starts_with(|c: char| c.is_ascii_digit()))?
+            .split('.');
+        let number = |part: Option<&str>| -> Option<u32> {
+            part?
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .ok()
+        };
+        Some(DlVersion(
+            number(parts.next())?,
+            number(parts.next())?,
+            number(parts.next())?,
+        ))
+    }
+}
+
+/// What the `dl` on this machine is, as far as a launch is concerned.
+///
+/// Four states, because "there but unusable" is a real answer and the only one
+/// worth explaining to anybody. [`Isolation`] stays two-state about the
+/// *outcome* — what will actually happen — and this is the type that carries
+/// why, so neither has to pretend the other's job is simple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Devlaunch {
+    /// Not on PATH, or on PATH and not runnable. The ordinary state of a
+    /// machine that never installed it, and there is no version to report.
+    Absent,
+    /// On PATH, but `--version` answered with nothing this binary can compare:
+    /// a future `dl` that changed the format, or some other program of that
+    /// name.
+    Unreadable,
+    /// On PATH, and older than [`DEVLAUNCH_FLOOR`].
+    TooOld(DlVersion),
+    /// On PATH and new enough for what `wf` asks of it.
+    Usable,
+}
+
+impl Devlaunch {
+    /// Read `dl --version`'s answer.
+    ///
+    /// Split from the probe so the rule is testable without a `dl` on the
+    /// machine running the tests — the same split [`enabled_from`] makes for
+    /// `WF_PREWARM`.
+    fn from_version_output(stdout: &str) -> Devlaunch {
+        match DlVersion::parse(stdout) {
+            None => Devlaunch::Unreadable,
+            Some(found) if found < DEVLAUNCH_FLOOR => Devlaunch::TooOld(found),
+            Some(_) => Devlaunch::Usable,
+        }
+    }
+
+    /// What to add to the launch notice — the half of a degradation that an
+    /// absent `(devlaunch)` suffix cannot carry.
+    ///
+    /// `None` for the two states nobody can act on from here: [`Usable`] has
+    /// nothing to explain, and [`Absent`] is #80's "a repo may carry a
+    /// `devcontainer.json` for its editor users", where a line on every launch
+    /// would be noise about a tool the user never asked for. What is left is a
+    /// `dl` that *is* installed and cannot be used, which is both fixable and
+    /// otherwise indistinguishable from `wf` quietly ignoring the devcontainer.
+    ///
+    /// [`Usable`]: Devlaunch::Usable
+    /// [`Absent`]: Devlaunch::Absent
+    fn shortfall(self) -> Option<String> {
+        match self {
+            Devlaunch::Absent | Devlaunch::Usable => None,
+            Devlaunch::TooOld(found) => Some(format!(
+                " — dl {found} is older than the {DEVLAUNCH_FLOOR} this wf needs, so it ran on the host"
+            )),
+            Devlaunch::Unreadable => Some(format!(
+                " — `{DEVLAUNCH} --version` did not answer with a version, so it ran on the host"
+            )),
+        }
+    }
+}
+
+/// Ask `dl` its version, once per process.
+///
+/// Memoized because [`Isolation::detect`] is called per candidate checkout —
+/// both the checkout picker and [`prewarm`] walk every tree of a repo — and
+/// each probe starts a Python interpreter (~90ms, measured in devlaunch#53).
+/// Nothing is lost by answering once: `PATH` is fixed when `wf` is exec'd, and
+/// a `dl` upgraded mid-session would not change the launch already staged.
+///
+/// `output()` rather than `status()` because the version is the answer, and
+/// because it keeps `dl`'s stdio off a screen the TUI owns.
+fn devlaunch_on_path() -> Devlaunch {
+    static PROBED: OnceLock<Devlaunch> = OnceLock::new();
+    *PROBED.get_or_init(|| {
+        let Ok(program) = resolve_on_path(DEVLAUNCH) else {
+            return Devlaunch::Absent;
+        };
+        match Command::new(program).arg("--version").output() {
+            Ok(answer) => Devlaunch::from_version_output(&String::from_utf8_lossy(&answer.stdout)),
+            // On PATH but it would not run — a file that is not executable, or
+            // not a program. There is no version to report, so this is the same
+            // state as never having been installed.
+            Err(_) => Devlaunch::Absent,
+        }
+    })
 }
 
 /// Wrap one argument so a POSIX shell hands it back unchanged.
@@ -1262,6 +1420,11 @@ impl Launch {
     /// — when it is not the host default — in what. "Where" is where the agent
     /// actually works: the checkout on the host, the per-node workspace in a
     /// container.
+    ///
+    /// A host launch of a tree that *declared* a devcontainer also says why it
+    /// is not isolated, when there is a reason worth stating (`dl` installed
+    /// but too old to use). Here rather than at the three call sites in
+    /// `app.rs`, so no notice can be built that leaves it out.
     pub fn describe(&self) -> String {
         let place = match self.isolation {
             Isolation::Host => self.cwd.display().to_string(),
@@ -1277,7 +1440,17 @@ impl Launch {
             // which one was taken.
             Job::Resume { .. } => format!("resume {}", self.key()),
         };
-        format!("{what} in {place}{}", self.isolation.suffix())
+        // A host launch of a tree with no devcontainer wanted no container, so
+        // there is nothing to explain; only the trees that asked get a reason.
+        let shortfall = match self.isolation {
+            Isolation::Host if has_devcontainer(&self.cwd) => devlaunch_on_path().shortfall(),
+            Isolation::Host | Isolation::Devlaunch => None,
+        };
+        format!(
+            "{what} in {place}{}{}",
+            self.isolation.suffix(),
+            shortfall.unwrap_or_default()
+        )
     }
 
     /// The selected agent and its optional one-argument prompt. Both CLIs
@@ -1478,9 +1651,9 @@ impl Launch {
 /// that is the caller naming a file, not `$PATH` resolution.
 ///
 /// Two callers, and the difference matters: [`Launch::exec`] resolves the
-/// program it is about to become and reports the miss, while
-/// [`Isolation::detect`] only asks whether `dl` is there and quietly answers
-/// [`Isolation::Host`] when it is not.
+/// program it is about to become and reports the miss, while the `dl` probe
+/// wants only a path to run `--version` on and treats a miss as "no `dl` here",
+/// which [`Isolation::detect`] answers with [`Isolation::Host`].
 fn resolve_on_path(program: &str) -> Result<PathBuf, anyhow::Error> {
     if program.contains('/') {
         return Ok(PathBuf::from(program));
@@ -3331,6 +3504,79 @@ mod tests {
         let variants = Scratch::new("variants");
         variants.touch(".devcontainer/gpu/devcontainer.json");
         assert!(!has_devcontainer(&variants.0));
+    }
+
+    #[test]
+    fn a_dl_version_is_read_from_either_install_and_from_nothing_else() {
+        // The released build, and the editable dev install whose trailer names
+        // the tree it resolves to. Both are versions `wf` must be able to
+        // compare — refusing the second would refuse isolation to the person
+        // developing `dl`.
+        assert_eq!(DlVersion::parse("dl 0.0.24\n"), Some(DlVersion(0, 0, 24)));
+        assert_eq!(
+            DlVersion::parse("dl 0.0.24 (dev, editable from /home/x/projects/devlaunch)\n"),
+            Some(DlVersion(0, 0, 24))
+        );
+
+        // A pre-release tail belongs to the version that carries the feature.
+        assert_eq!(DlVersion::parse("dl 0.0.24rc1"), Some(DlVersion(0, 0, 24)));
+
+        // Multi-digit components are not parsed a character at a time.
+        assert_eq!(DlVersion::parse("dl 1.12.30"), Some(DlVersion(1, 12, 30)));
+
+        // Nothing to compare: no output, no number, and a number too short to
+        // be a version. Each has to be `None` rather than a zero, because
+        // `0.0.0` would read as "older than the floor" — a wrong reason.
+        assert_eq!(DlVersion::parse(""), None);
+        assert_eq!(DlVersion::parse("dl: command not found"), None);
+        assert_eq!(DlVersion::parse("dl 0.1"), None);
+    }
+
+    #[test]
+    fn the_floor_separates_a_dl_that_speaks_this_binarys_command_line_from_one_that_does_not() {
+        // 0.0.23 is the release that had every other condition right and no
+        // `up` subcommand — the case this floor exists for.
+        assert_eq!(
+            Devlaunch::from_version_output("dl 0.0.23"),
+            Devlaunch::TooOld(DlVersion(0, 0, 23))
+        );
+        assert_eq!(
+            Devlaunch::from_version_output("dl 0.0.24"),
+            Devlaunch::Usable
+        );
+        // Everything above the floor stays usable, including across the
+        // components a string comparison would get wrong.
+        assert_eq!(
+            Devlaunch::from_version_output("dl 0.0.100"),
+            Devlaunch::Usable
+        );
+        assert_eq!(
+            Devlaunch::from_version_output("dl 0.1.0"),
+            Devlaunch::Usable
+        );
+        assert_eq!(
+            Devlaunch::from_version_output("dl 1.0.0"),
+            Devlaunch::Usable
+        );
+        // Unreadable, not usable: a `dl` whose answer cannot be compared is a
+        // `dl` whose command line cannot be relied on.
+        assert_eq!(Devlaunch::from_version_output("???"), Devlaunch::Unreadable);
+    }
+
+    #[test]
+    fn only_a_dl_that_could_have_worked_puts_a_reason_in_the_notice() {
+        // Installed and unusable is the fixable state, and the one that reads
+        // as `wf` ignoring the devcontainer if it says nothing.
+        let too_old = Devlaunch::TooOld(DlVersion(0, 0, 23))
+            .shortfall()
+            .expect("a reason");
+        assert!(too_old.contains("dl 0.0.23"), "{too_old}");
+        assert!(too_old.contains("0.0.24"), "names the floor: {too_old}");
+        assert!(Devlaunch::Unreadable.shortfall().is_some());
+
+        // Silent: nothing to fix, or nothing the user asked for.
+        assert_eq!(Devlaunch::Usable.shortfall(), None);
+        assert_eq!(Devlaunch::Absent.shortfall(), None);
     }
 
     #[test]

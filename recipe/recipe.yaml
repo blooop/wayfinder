@@ -13,7 +13,7 @@ schema_version: 1
 
 context:
   # Must equal Cargo.toml's version — CI fails the build if they drift.
-  version: "0.14.0"
+  version: "0.15.1"
 
 package:
   name: wf
@@ -78,17 +78,40 @@ requirements:
     - rust >=1.75
     # Rust links libgcc_s, so without a C compiler's run_exports the package
     # would ship an undeclared dependency on it (rattler-build says so:
-    # "Overlinking against libgcc_s.so.1"). This is what puts `libgcc` in the
-    # run requirements, so the only run dep `wf` has is one it genuinely needs.
+    # "Overlinking against libgcc_s.so.1"). This is what adds `libgcc` to the run
+    # requirements below, so the linkage is declared rather than assumed.
     - ${{ compiler('c') }}
 
-  # No *declared* run requirements, on purpose — the only one the package has is
-  # the `libgcc` that the C compiler's run_exports adds above. `wf` shells out to
-  # `gh` and the agent CLI, but it discovers them on PATH, and a missing one
-  # degrades to a readable error. That is the same call the sibling `zjsh` recipe
-  # makes. Declaring `gh` would clone it into this environment on every machine
-  # that already installs it as its own pixi-global tool, and would still not
-  # guarantee the agent CLI, which does not come from this channel at all.
+  run:
+    # The one tool `wf` declares, and the line to read before adding a second.
+    #
+    # `gh` and the agent CLI are still found on PATH and still undeclared: a
+    # missing one degrades to a readable error, and declaring `gh` would clone
+    # it into this environment on every machine that already installs it as its
+    # own pixi-global tool — the call the sibling `zjsh` recipe makes too.
+    #
+    # `dl` is declared anyway, because the failure it prevents is a different
+    # one. Isolation is not an error path: with no `dl` the launch silently
+    # runs on the host instead, so the whole container half of this binary is
+    # invisibly absent rather than loudly missing, and the person installing
+    # `wf` has no way to know they were meant to install a second thing. The
+    # floor is what pairs the two — `dl <workspace> up` (the prewarm) arrived
+    # in devlaunch 0.0.24, and `wf` holds the `dl` it finds to that version at
+    # runtime as well, so a source build or an older `dl` earlier on PATH
+    # degrades with a reason rather than failing mid-launch.
+    #
+    # It is not free: this pulls python and devpod in, taking `wf` from ~3 MB to
+    # ~370 MB on a machine that does not already have devlaunch. Where one does,
+    # the duplicate is far cheaper than it looks — pixi hardlinks from its
+    # package cache, and measured on this env only 85 MB of 354 MB is copied per
+    # environment (the 310 files needing prefix rewriting); the other 269 MB is
+    # shared. So the real cost is ~370 MB once per machine and ~85 MB for the
+    # second environment that wants it.
+    #
+    # That is the price of `pixi global install wf` being enough on its own, and
+    # it is a runtime coupling that a linked `devlaunch-core` crate
+    # (devlaunch#53) would dissolve.
+    - devlaunch >=0.0.24
 
 tests:
   - script:
