@@ -289,6 +289,12 @@ impl Reading {
         })
     }
 
+    /// What this machine says about each node — borrowed, for a caller that
+    /// wants to look without taking the reading apart.
+    pub fn liveness(&self) -> &Liveness {
+        &self.liveness
+    }
+
     /// Hand both halves to their separate homes on the app. Consuming, because
     /// there is exactly one consumer and nothing should be tempted to keep a
     /// second copy of a reading that arrives once.

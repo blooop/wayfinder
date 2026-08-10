@@ -120,9 +120,10 @@ impl Liveness {
             .map(|(node, _)| (node, Life::Running))
             .collect();
         for (node, workspace) in ours() {
-            // `is_stopped`, not `!is_running`: a state neither predicate knows
-            // is a state `wf` has no business turning into a claim on a row.
-            if !workspace.is_stopped() || life.contains_key(&node) {
+            // `is_down`, not `!is_running`: a container mid-start, or a state
+            // this `wf` cannot read, is not something to turn into a claim on
+            // a row. A container devpod cannot find at all *is* down.
+            if !workspace.is_down() || life.contains_key(&node) {
                 continue;
             }
             if matches!(known.get(&node), Some(NodeFact::Claimed)) {
@@ -331,6 +332,40 @@ mod tests {
                 "{fact:?} is not a stall"
             );
         }
+    }
+
+    /// The states that settle, and the states that say nothing.
+    ///
+    /// `NotFound` is the one worth pinning: a container devpod cannot find has
+    /// certainly stopped, and reading only `Stopped` left the most definitely
+    /// dead workspace on the machine unmarked.
+    #[test]
+    fn a_container_that_is_gone_is_as_down_as_one_that_is_stopped() {
+        let known = facts([(node(REPO, 133), NodeFact::Claimed)]);
+        for state in ["Stopped", "NotFound"] {
+            let workspaces = [workspace("a", REPO, 133, state)];
+            assert_eq!(
+                Liveness::read(&workspaces, &known).of(REPO, 133),
+                Some(Life::Stalled),
+                "{state} is a stall"
+            );
+        }
+        // Mid-transition, and a state dl could not read. Neither is a claim.
+        for state in ["Busy", "SomethingDevpodAddedLater"] {
+            let workspaces = [workspace("a", REPO, 133, state)];
+            assert_eq!(
+                Liveness::read(&workspaces, &known).of(REPO, 133),
+                None,
+                "{state} asserts nothing"
+            );
+        }
+        let mut unanswered = workspace("a", REPO, 133, "Stopped");
+        unanswered.state = None;
+        assert_eq!(
+            Liveness::read(&[unanswered], &known).of(REPO, 133),
+            None,
+            "a state dl would not answer for asserts nothing"
+        );
     }
 
     #[test]

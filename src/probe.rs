@@ -465,8 +465,11 @@ pub const DL_LISTING: &str = r#"[
 /// bare sentence or `null` — still on real machines, because `wf` pins no `dl`
 /// version. Then two rows no `dl` has ever emitted: a key from a *later* `dl`
 /// than this binary, and the documented key carrying an undocumented payload.
-/// The last row is a workspace `dl` did not create, where the field is absent
-/// altogether.
+/// One of those carries a documented key **beside** an undocumented sibling,
+/// which is the shape a later `dl` produces by adding one field: it must go on
+/// being read, because the alternative is every row in the listing refusing at
+/// once. The last row is a workspace `dl` did not create, where the field is
+/// absent altogether.
 ///
 /// Those two invented rows are the ones that matter most. `parse_workspaces` is
 /// all or nothing, so a listing this `wf` cannot fully read is a listing it
@@ -500,6 +503,9 @@ pub const DL_LISTING_UNSAVED: &str = r#"[
   {"id":"wf-7-odd-payload","devlaunch":true,"repo":"blooop/wayfinder",
    "branch":"wayfinder/wayfinder-7","state":"Stopped",
    "unsaved":{"nothingToLose":false}},
+  {"id":"wf-8-sibling-key","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-8","state":"Stopped",
+   "unsaved":{"nothingToLose":true,"checkedAt":"2026-08-10T00:00:00Z"}},
   {"id":"not-ours","devlaunch":false,"state":"Stopped"}
 ]"#;
 

@@ -182,6 +182,10 @@ struct Picker {
     /// The sending end, kept because a fold can start further loads.
     tx: UnboundedSender<LoadEvent>,
     updates: UnboundedReceiver<LoadEvent>,
+    /// Which reading the screen is currently asking for — bumped by every
+    /// `ctrl-r`, so an answer to a question already withdrawn can be told from
+    /// the answer to the live one. See [`LoadEvent::Surveyed`].
+    reading: u64,
 }
 
 impl Picker {
@@ -204,6 +208,9 @@ impl Picker {
             loaders,
             tx,
             updates,
+            // The reading `session` starts alongside this picker. They agree by
+            // both being the first, which is the only coupling between them.
+            reading: 0,
         }
     }
 
@@ -226,6 +233,7 @@ impl Picker {
                 &mut self.clusters,
                 &mut self.loaders,
                 &self.tx,
+                self.reading,
             );
         }
         terminal.draw(|frame| wf::ui::draw(frame, &self.app))?;
@@ -258,6 +266,7 @@ fn fold(
     clusters: &mut BTreeMap<MapId, Map>,
     loaders: &mut Loaders,
     tx: &UnboundedSender<LoadEvent>,
+    reading: u64,
 ) {
     match event {
         LoadEvent::Discovered(found) => {
@@ -310,7 +319,13 @@ fn fold(
         // line, and — through `app.liveness` — a marking on any row whose
         // node this machine has something to say about. And it arrives
         // more than once, because `ctrl-r` asks again.
-        LoadEvent::Surveyed(found) => {
+        // An answer to a question the screen has since withdrawn. Dropping it
+        // is the whole reason the event says which reading it is: `ctrl-r`
+        // clears what is held and asks again, and a stale answer folded after
+        // that clear would restore it with nothing able to correct it — a
+        // fresh reading that finds nothing is silent by design.
+        LoadEvent::Surveyed { taken, .. } if taken != reading => {}
+        LoadEvent::Surveyed { reading: found, .. } => {
             let (reclaimable, liveness) = found.into_parts();
             app.reclaimable = reclaimable;
             app.liveness = liveness;
@@ -330,8 +345,8 @@ fn fold(
 /// subprocess and one batched GraphQL call, neither of them on the way to a
 /// frame. What lands folds into the count line and into the rows' own
 /// markings; a reading that fails says nothing at all.
-fn spawn_reading(tx: &UnboundedSender<LoadEvent>) -> Survey {
-    wf::refresh::spawn_survey(wf::reclaim::survey_live(), tx.clone())
+fn spawn_reading(tx: &UnboundedSender<LoadEvent>, taken: u64) -> Survey {
+    wf::refresh::spawn_survey(wf::reclaim::survey_live(), tx.clone(), taken)
 }
 
 /// Take the reading again, on `ctrl-r`.
@@ -341,9 +356,9 @@ fn spawn_reading(tx: &UnboundedSender<LoadEvent>) -> Survey {
 /// its own, and two overlapping ones would race to write the same two fields
 /// with answers taken at different moments — the older one landing last, which
 /// is exactly the bug `Loaders::restart` exists to avoid on the map side.
-async fn restart_reading(previous: Survey, tx: &UnboundedSender<LoadEvent>) -> Survey {
+async fn restart_reading(previous: Survey, tx: &UnboundedSender<LoadEvent>, taken: u64) -> Survey {
     previous.stop().await;
-    spawn_reading(tx)
+    spawn_reading(tx, taken)
 }
 
 /// Stop everything running behind the screen, and wait for it to be gone.
@@ -411,7 +426,8 @@ async fn run<B: Backend, K: Keys>(
                 // hour's containers with nothing able to correct it.
                 picker.app.reclaimable = None;
                 picker.app.liveness = wf::liveness::Liveness::default();
-                survey = restart_reading(survey, &picker.tx).await;
+                picker.reading += 1;
+                survey = restart_reading(survey, &picker.tx, picker.reading).await;
             }
             // Nothing after this can be drawn. Stop the background work
             // *and wait for it* before handing over: an in-flight `gh`
@@ -445,7 +461,7 @@ async fn session<B: Backend, K: Keys>(
 ) -> Result<Ending> {
     let (tx, updates) = mpsc::unbounded_channel();
     let discovery = wf::refresh::spawn_discovery(repos, cache_path, tx.clone());
-    let survey = spawn_reading(&tx);
+    let survey = spawn_reading(&tx, 0);
     let picker = Picker::new(app, tx, updates);
     run(terminal, keys, picker, discovery, survey).await
 }
@@ -931,6 +947,18 @@ mod tests {
             );
         }
         assert_eq!(run.argv[0], "dl <--ls> <--json>");
+        // Bounded as well as filtered. A predicate over each call says nothing
+        // about how many there are, and "nothing extra" is a claim about the
+        // count — fifty tracker reads on the launch path would satisfy every
+        // assertion above. Not pinned to an exact number, because this script
+        // presses `ctrl-r` and the second reading is racing `stop_background`:
+        // its `dl` may or may not have run by the time the arm aborts it. Two
+        // readings, two calls each, is the ceiling either way.
+        assert!(
+            run.argv.len() <= 4,
+            "at most the two readings this script asks for: {:?}",
+            run.argv
+        );
     }
 
     #[test]
@@ -975,6 +1003,106 @@ mod tests {
             "it names the workspace: {line}"
         );
         assert!(line.contains("wf reap"), "and the command: {line}");
+    }
+
+    /// A reading answering a question the screen has withdrawn is dropped.
+    ///
+    /// The window is real rather than theoretical: `Picker::tick` drains the
+    /// channel once per turn and then parks in `next_press`, so a reading that
+    /// lands while the loop is parked waits there. Press `ctrl-r` in that
+    /// window and the clear happens *first*; without the tag, the next drain
+    /// folds the withdrawn answer straight back over it.
+    ///
+    /// What makes that unrecoverable rather than merely brief is the silence
+    /// this event is designed around: a fresh reading that finds nothing sends
+    /// nothing, so if the containers really did stop, no later event exists to
+    /// correct the restored markings. They would sit there until the session
+    /// ended.
+    #[tokio::test]
+    async fn an_answer_to_a_withdrawn_reading_is_dropped_rather_than_folded() {
+        let (tx, updates) = mpsc::unbounded_channel();
+        let mut picker = Picker::new(App::new(BTreeMap::new()), tx.clone(), updates);
+        // A real reading, taken through the real derivation with the two reads
+        // stubbed — the test-only constructors live in the library's own test
+        // build and this is the binary. Going through `survey` is the better
+        // seam anyway: the value folded below is one the production path can
+        // actually produce.
+        let node = wf::reap::Node {
+            repo: "blooop/wayfinder".to_string(),
+            number: 7,
+        };
+        let other = wf::reap::Node {
+            repo: node.repo.clone(),
+            number: 8,
+        };
+        let workspace = |number: u64, state: &str| wf::reap::Workspace {
+            id: format!("wf-{number}"),
+            devlaunch: true,
+            repo: Some(node.repo.clone()),
+            branch: Some(format!("wayfinder/wayfinder-{number}")),
+            state: Some(state.to_string()),
+            unsaved: None,
+        };
+        // One finished node whose container is down — a reap would claim it —
+        // and one whose container is up, so the reading carries both halves.
+        let listed = vec![workspace(7, "Stopped"), workspace(8, "Running")];
+        let known: BTreeMap<_, _> = [
+            (node.clone(), wf::reap::NodeFact::Closed),
+            (other, wf::reap::NodeFact::Closed),
+        ]
+        .into_iter()
+        .collect();
+        let stale = wf::reclaim::survey(
+            || async { Ok(listed.clone()) },
+            |_| async { Ok(known.clone()) },
+        )
+        .await
+        .expect("a finished workspace and a live container are both worth reporting");
+        assert!(
+            !stale.liveness().is_empty(),
+            "the fixture must carry a marking for the drop to be about anything"
+        );
+
+        // The reading the screen is waiting for lands: it is folded.
+        fold(
+            LoadEvent::Surveyed {
+                taken: 0,
+                reading: stale.clone(),
+            },
+            &mut picker.app,
+            &mut picker.clusters,
+            &mut picker.loaders,
+            &picker.tx,
+            picker.reading,
+        );
+        assert!(picker.app.reclaimable.is_some(), "the live answer is taken");
+        assert!(!picker.app.liveness.is_empty(), "markings and all");
+
+        // `ctrl-r`: what is held goes, and the question is asked again.
+        picker.app.reclaimable = None;
+        picker.app.liveness = wf::liveness::Liveness::default();
+        picker.reading += 1;
+
+        // The previous reading's answer, already queued when the key landed.
+        fold(
+            LoadEvent::Surveyed {
+                taken: 0,
+                reading: stale,
+            },
+            &mut picker.app,
+            &mut picker.clusters,
+            &mut picker.loaders,
+            &picker.tx,
+            picker.reading,
+        );
+        assert_eq!(
+            picker.app.reclaimable, None,
+            "a withdrawn reading must not restore the hint"
+        );
+        assert!(
+            picker.app.liveness.is_empty(),
+            "nor the row markings it came with"
+        );
     }
 
     #[test]
@@ -1097,6 +1225,7 @@ mod tests {
                 None
             },
             tx,
+            0,
         );
         stop_background(discovery, survey).await;
         assert_eq!(
