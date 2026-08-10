@@ -875,23 +875,39 @@ over its index. (Isolated launches used to run in the picked tree itself, which
 meant every launch of a repo shared one tree and one container — serial by
 construction.)
 
-Two things have to be true for a Claude launch to be isolated, and otherwise it
-runs on the host exactly as it always has:
+Three things have to be true for a Claude launch to be isolated, and otherwise
+it runs on the host exactly as it always has:
 
-1. the checkout declares one of those two configs, and
-2. `dl` is on PATH.
+1. the checkout declares one of those two configs,
+2. `dl` is on PATH, and
+3. that `dl` is **0.0.24 or newer**.
 
-**`WF_PREWARM=1` needs `dl` 0.0.24 or newer.** `dl <workspace> up` — start
-without attaching — and the per-workspace launch lock are what the warm-up is
-made of; on an older `dl` the background spawn fails silently and the launch
-simply pays the cold start at the second enter, as it always did.
+The third is there because "installed" and "speaks this binary's command line"
+are different questions, and asking only the first moved the failure past the
+point where it could still degrade: the prewarm below fires `dl <workspace> up`,
+which no release before 0.0.24 had, so a machine with everything up to date
+satisfied both of the old conditions and then failed *inside* the launch. `wf`
+asks `dl --version` once per run instead. A `dl` that is installed and cannot be
+used says so in the launch notice, because that is the fixable case — an absent
+`dl` stays quiet, since a repo may carry a `devcontainer.json` for its editor
+users on a machine that never wanted containers.
+
+Installing `wf` from the channel brings a conforming `dl` with it: the recipe
+declares `devlaunch >=0.0.24`, so the container half of the binary is not
+invisibly absent on a fresh machine. That is what takes `wf` from ~3 MB to
+~370 MB where devlaunch is not already present.
+
+**`WF_PREWARM=1` needs `dl` 0.0.24 or newer** — the same floor, and the release
+that set it. `dl <workspace> up` — start without attaching — and the
+per-workspace launch lock are what the warm-up is made of.
 
 **Use `dl` 0.0.20 or newer.** Launching several tickets at once means several
 `dl` processes preparing the same repo's cache at the same moment; 0.0.20 is
 where those runs serialize over a per-repo lock instead of racing (the loser
-of the old race could delete the winner's half-written clone). The older floor
-still matters too: `wf` pins no version and never will — the launch
-is one `exec` of a program found on PATH — but older `dl` on devpod 0.26 hands
+of the old race could delete the winner's half-written clone). This one is
+below the isolation floor, so it now only describes what a `dl` too old to
+isolate with would have done. It is kept because `wf reap` still reads a
+listing from whichever `dl` is on PATH: older `dl` on devpod 0.26 hands
 the agent **no terminal**, and an agent with no terminal decides it was invoked
 non-interactively: it prints one answer and exits, so the symptom is a session
 that never starts rather than an error. Measured here on devpod 0.26.1:
@@ -973,6 +989,16 @@ their branch looks like), branches that are not `wayfinder/<repo>-<n>` for that
 repo, tickets with an open or draft PR (in review is where review fixes happen),
 tickets someone has claimed, and anything **running** — a ticket closing is no
 evidence that the session in the container ended.
+
+**A `dl` that says nothing is not a `dl` saying nothing is at risk.** From
+devlaunch **0.0.24** the listing answers `unsaved` for every clone `dl` made,
+and leaves it null only on workspaces it did not make. So on 0.0.24 and newer a
+missing answer about one of `wf`'s own workspaces means `dl`'s inspection fell
+over, and the row is kept saying so rather than collected as clean. Releases
+before that wrote null for a clean clone, and are still read that way. No single
+row can tell the two apart, so `wf` asks `dl --version` once per run and reads
+the listing accordingly; a `dl` it cannot place is read the older, permissive
+way, so the worst case is the behaviour that shipped before the floor existed.
 
 One `gh api graphql` call per repo answers all of this, however many workspaces
 that repo has — which is also what makes the picker's background reading cheap

@@ -816,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn the_surfacing_path_runs_two_reads_and_nothing_else() {
+    fn the_surfacing_path_asks_only_questions_and_never_names_a_workspace() {
         // #137's safety claim, as a fact about a run rather than a grep over
         // the source. `reap::workspaces` and `reap::node_facts` both reach a
         // PATH-resolved binary, so everything this path is *capable* of doing
@@ -824,26 +824,41 @@ mod tests {
         // Rust, in whichever module, and whether or not it named any word a
         // reader thought to forbid. A `dl <ws> rm` added anywhere between
         // `survey_live` and the reading it returns fails this test.
+        // Stated as a rule over every call rather than as a list, so a fourth
+        // read is not a failure but a fourth *kind* of call is. What makes a
+        // `dl` call safe here is that its argument is a question — no call on
+        // this path may name a workspace, which is where every destructive `dl`
+        // subcommand takes its target.
+        const ASKED: [&str; 2] = ["dl <--ls> <--json>", "dl <--version>"];
+
         let run = crate::probe::record(
             "reclaim::tests::survey_live_probe",
             crate::probe::DL_LISTING,
             crate::probe::GH_FACTS,
         );
         run.destroyed_nothing();
+        for call in &run.argv {
+            let asked = ASKED.contains(&call.as_str())
+                || call.starts_with("gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>");
+            assert!(asked, "this path may only ask questions, and asked: {call}");
+        }
+
+        // And that it did each of them exactly once. The version probe is
+        // memoized per process, so a second one would mean the memo broke and
+        // every survey is paying for a Python start it was told not to.
+        for question in ASKED {
+            assert_eq!(
+                run.argv.iter().filter(|call| *call == question).count(),
+                1,
+                "asked exactly once: {question} in {:?}",
+                run.argv
+            );
+        }
         assert_eq!(
             run.argv.len(),
-            2,
-            "one listing and one batched query, and nothing else: {:?}",
+            3,
+            "two questions to `dl` and one batched query to `gh`: {:?}",
             run.argv
-        );
-        assert_eq!(
-            run.argv[0], "dl <--ls> <--json>",
-            "the only thing this path asks `dl` for is what exists"
-        );
-        assert!(
-            run.argv[1].starts_with("gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>"),
-            "one batched read of the tracker: {}",
-            run.argv[1]
         );
     }
 

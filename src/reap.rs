@@ -43,6 +43,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 
 use crate::fetch::{is_open, parse_pr, Assignee, GraphQlResponse, Nodes, PrNode};
+use crate::launch::devlaunch_answers_unsaved;
 use crate::model::PrStatus;
 
 /// The branch prefix `wf` mints its workspaces under (#106): the full branch is
@@ -73,20 +74,21 @@ pub struct Workspace {
     pub state: Option<String>,
     /// What deleting would destroy, in `dl`'s words.
     ///
-    /// `None` is "no answer": the field was `null` or absent. **It permits a
-    /// reap, and that is a compromise rather than a reading.** On devlaunch
-    /// ≤ 0.0.23 — the release actually installed on most machines today —
-    /// `null` on a workspace `dl` made *is* the ordinary clean case, so
-    /// refusing it would make `wf reap` collect nothing at all there. On 0.0.24
-    /// and newer the same `null` should only ever appear on a workspace `dl`
-    /// did not create, which [`node_of`] has already dropped before the guard
-    /// runs — so a `null` reaching it means `dl`'s own guard fell over, and
-    /// treating that as "clean" is the wrong direction.
+    /// `None` is "no answer": the field was `null` or absent, and what that
+    /// means depends on which `dl` wrote it. On devlaunch ≤ 0.0.23 `null` on a
+    /// workspace `dl` made *is* the ordinary clean case. From 0.0.24 the same
+    /// `null` appears exactly where `devlaunch` is false, so one on a clone
+    /// `dl` made means `dl`'s own inspection fell over — and reading that as
+    /// "clean" is devlaunch#171's bug, which is the bug the object form was a
+    /// breaking change to prevent.
     ///
-    /// The two are indistinguishable from one row, and nothing here asks `dl`
-    /// its version. What the arms below *do* retire is the other half of the
-    /// old sentinel: a clean clone now says so in its own name, so "no answer"
-    /// is at least no longer the same value as "nothing to lose".
+    /// No single row can tell the two apart, so the version is asked instead:
+    /// `answered_where_dl_answers` turns the second reading into
+    /// [`Unsaved::Unanswered`] before [`plan`] ever sees the row, and leaves
+    /// the first alone. A `None` still standing here is therefore a `dl` whose
+    /// version said the field was allowed to be empty, or one `wf` could not
+    /// probe at all — and it permits a reap, which is what those releases meant
+    /// by it.
     #[serde(default)]
     pub unsaved: Option<Unsaved>,
 }
@@ -166,6 +168,22 @@ pub enum Unsaved {
     /// is `wf` failing on `dl`, and a row that said the first when it meant the
     /// second would send somebody to look at the wrong thing.
     Unrecognized(String),
+    /// `dl` made this clone and then said nothing about what it holds.
+    ///
+    /// **Never parsed from the wire** — there is no spelling of it, because it
+    /// is the *absence* of one. It is put here by `answered_where_dl_answers`
+    /// after asking the `dl` on PATH its version, and only for a `dl` that
+    /// documents an answer on every clone of its own. On such a release `null`
+    /// appears exactly where `devlaunch` is false, so a `null` on a clone `dl`
+    /// made is `dl`'s own inspection having fallen over — which is
+    /// devlaunch#171's bug, the one the object form exists to prevent, and
+    /// reaping on it would walk straight back into it.
+    ///
+    /// Separate from [`Unsaved::CouldNotTell`] because `dl` saying "I could not
+    /// read this clone" and `dl` saying nothing at all are different failures
+    /// with different places to look: the first is a broken clone, the second
+    /// is a broken `dl`.
+    Unanswered,
 }
 
 impl Unsaved {
@@ -183,6 +201,9 @@ impl Unsaved {
             Self::Unrecognized(said) => Some(format!(
                 "this wf cannot read what dl said about it ({said}) — newer dl?"
             )),
+            Self::Unanswered => {
+                Some("dl made this clone but did not say what it holds".to_string())
+            }
         }
     }
 
@@ -195,16 +216,24 @@ impl Unsaved {
             Self::Unrecognized(said) => Some(format!(
                 ", discarding a clone this wf cannot read dl's answer about ({said})"
             )),
+            Self::Unanswered => {
+                Some(", discarding a clone dl did not say anything about".to_string())
+            }
         }
     }
 }
 
 /// `dl`'s two spellings of the same field, both accepted.
 ///
-/// `wf` pins no `dl` version and never will — the launch is one `exec` of a
-/// program found on `PATH` — so both are live on real machines: devlaunch
-/// through 0.0.23 emits a bare sentence or `null`, and 0.0.24 emits the
-/// one-key object.
+/// Both are live on real machines: devlaunch through 0.0.23 emits a bare
+/// sentence or `null`, and 0.0.24 emits the one-key object.
+///
+/// `wf` does now hold `dl` to a floor, but that floor governs what a *launch*
+/// may ask of it, and reaping is the other direction — it reads a listing from
+/// whichever `dl` is on `PATH`, including one too old to isolate with. A
+/// machine can also have reaped its workspaces with an older `dl` and upgraded
+/// since. Refusing to read the older spelling would strand exactly the
+/// workspaces most in need of collecting.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum UnsavedWire {
@@ -649,13 +678,45 @@ pub async fn workspaces() -> Result<Vec<Workspace>> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    parse_workspaces(&output.stdout)
+    let mut workspaces = parse_workspaces(&output.stdout)?;
+    answered_where_dl_answers(&mut workspaces, devlaunch_answers_unsaved());
+    Ok(workspaces)
 }
 
 /// The parse boundary for `dl`'s listing, kept apart from the process call so
 /// it is testable without devlaunch installed.
 fn parse_workspaces(body: &[u8]) -> Result<Vec<Workspace>> {
     serde_json::from_slice(body).context("unparseable workspace listing from `dl --ls --json`")
+}
+
+/// Give a missing answer its meaning, once the `dl` that wrote it is known.
+///
+/// The one place a `dl` version reaches this module, and it is applied here —
+/// at the boundary that already ran the process — so that [`plan`] stays a pure
+/// function of rows it is handed. A version probe inside the parser or the
+/// planner would make every test of either depend on what is installed on the
+/// machine running it.
+///
+/// `answers` is [`devlaunch_answers_unsaved`] in production and both values in
+/// the tests. When it is false nothing happens at all: on those releases `null`
+/// on `dl`'s own clone is the ordinary clean case, and rewriting it would make
+/// `wf reap` refuse every workspace on the machine.
+///
+/// Keyed on `devlaunch` rather than on [`node_of`] because that is the
+/// distinction `dl` documents — `unsaved` is null exactly where `devlaunch` is
+/// false — and reading a row `dl` disclaims as an unanswered question would
+/// invent a failure out of a workspace that was never `dl`'s to inspect. Rows
+/// that are `dl`'s but not `wf`'s are left marked anyway; [`plan`] drops them
+/// for not being ours, and this function has no business knowing that.
+fn answered_where_dl_answers(workspaces: &mut [Workspace], answers: bool) {
+    if !answers {
+        return;
+    }
+    for workspace in workspaces {
+        if workspace.devlaunch && workspace.unsaved.is_none() {
+            workspace.unsaved = Some(Unsaved::Unanswered);
+        }
+    }
 }
 
 /// What the tracker says about each of `nodes`.
@@ -1702,6 +1763,99 @@ mod tests {
 
     /// Only the arm that says the clone is clean lets a finished ticket go.
     ///
+    /// The same `null`, read as the two opposite things it means either side of
+    /// devlaunch 0.0.24.
+    ///
+    /// `wf-5-legacy-clean` is the row that carries the whole argument: on the
+    /// release that wrote it, `null` on `dl`'s own clone is *clean* and it must
+    /// reap, and on a release that answers every clone it made, the same `null`
+    /// is `dl`'s inspection having fallen over and it must not. One row cannot
+    /// say which, which is why the version is asked once and applied here.
+    ///
+    /// `not-ours` pins the other edge: `unsaved` is null on it under every
+    /// release, because there is no clone of `dl`'s own there to inspect. It is
+    /// never an unanswered question, and marking it as one would invent a
+    /// failure out of a workspace `dl` explicitly disclaims.
+    #[test]
+    fn a_missing_answer_reads_as_clean_or_as_a_broken_dl_depending_on_which_dl_wrote_it() {
+        let read = |answers| {
+            let mut workspaces =
+                parse_workspaces(crate::probe::DL_LISTING_UNSAVED.as_bytes()).unwrap();
+            answered_where_dl_answers(&mut workspaces, answers);
+            workspaces
+        };
+        let unsaved_of = |workspaces: &[Workspace], id: &str| {
+            workspaces
+                .iter()
+                .find(|w| w.id == id)
+                .expect("the fixture row")
+                .unsaved
+                .clone()
+        };
+
+        // A `dl` that documents an answer on every clone of its own.
+        let answering = read(true);
+        assert_eq!(
+            unsaved_of(&answering, "wf-5-legacy-clean"),
+            Some(Unsaved::Unanswered),
+            "a clone dl made and said nothing about is a question it failed to answer"
+        );
+        assert_eq!(
+            unsaved_of(&answering, "not-ours"),
+            None,
+            "a workspace dl did not make is not one it failed to answer for"
+        );
+
+        // A `dl` from before the field changed, or one `wf` could not probe.
+        // Nothing is rewritten: on those releases the `null` meant clean, and
+        // reading it as a failure would refuse every workspace on the machine.
+        let legacy = read(false);
+        assert_eq!(unsaved_of(&legacy, "wf-5-legacy-clean"), None);
+        assert_eq!(unsaved_of(&legacy, "not-ours"), None);
+
+        // Rows that did answer are untouched by either reading — the upgrade
+        // fills a gap and never overwrites what `dl` actually said.
+        for answers in [true, false] {
+            let workspaces = read(answers);
+            assert_eq!(
+                unsaved_of(&workspaces, "wf-1-clean"),
+                Some(Unsaved::NothingToLose)
+            );
+            assert_eq!(
+                unsaved_of(&workspaces, "wf-3-unreadable"),
+                Some(Unsaved::CouldNotTell("fatal: not a git repository".into()))
+            );
+        }
+
+        // And the whole point, at the level the human sees: the same listing
+        // reaps that workspace under one `dl` and refuses it under the other.
+        let known: BTreeMap<Node, NodeFact> = (1..=5)
+            .map(|n| (node("blooop/wayfinder", n), NodeFact::Closed))
+            .collect();
+        assert!(
+            doomed(&plan(&legacy, &known, false))
+                .into_iter()
+                .any(|v| v.id() == "wf-5-legacy-clean"),
+            "the release that meant clean by it still collects it"
+        );
+        let refused = plan(&answering, &known, false);
+        assert!(
+            !doomed(&refused)
+                .into_iter()
+                .any(|v| v.id() == "wf-5-legacy-clean"),
+            "the release that promised an answer does not get a reap out of silence"
+        );
+        assert!(
+            refused.iter().any(|v| matches!(
+                v,
+                Verdict::Keep { id, reason }
+                    if id == "wf-5-legacy-clean"
+                        && reason == "dl made this clone but did not say what it holds"
+            )),
+            "and it says which of dl and the clone is the thing to go and look at: {refused:?}"
+        );
+    }
+
     /// `couldNotTell` refusing is the point: those files are still on disk and
     /// nothing has established they exist anywhere else, so it is `wouldLose`'s
     /// neighbour and not `nothingToLose`'s. Flattening the three answers back

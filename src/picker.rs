@@ -866,6 +866,25 @@ mod tests {
         )
     }
 
+    /// Is this recorded call one of the questions a session is allowed to ask?
+    ///
+    /// Shared by the two safety assertions so they cannot drift apart, and
+    /// written as "what may be asked" rather than "what must not be run": a
+    /// denylist of destructive spellings is exactly the thing a new `dl`
+    /// subcommand walks around. What makes all three safe is that none of them
+    /// names a workspace, which is where every destructive `dl` takes its
+    /// target.
+    ///
+    /// `--version` is on the list because reading a listing now depends on
+    /// knowing which `dl` wrote it (`reap::answered_where_dl_answers`). It is
+    /// asked once per process and answers nothing about any particular
+    /// workspace.
+    fn asked_a_question(argv: &str) -> bool {
+        argv == "dl <--ls> <--json>"
+            || argv == "dl <--version>"
+            || argv.starts_with("gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>")
+    }
+
     /// The same, for the run that ends in a launch.
     fn a_launching_session() -> probe::Recording {
         probe::record(
@@ -899,10 +918,7 @@ mod tests {
         // asks them.
         for argv in &run.argv {
             assert!(
-                argv == "dl <--ls> <--json>"
-                    || argv.starts_with(
-                        "gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>"
-                    ),
+                asked_a_question(argv),
                 "a session asks for the listing and the tracker, and nothing else: {argv}"
             );
         }
@@ -939,10 +955,7 @@ mod tests {
         run.destroyed_nothing();
         for argv in &run.argv {
             assert!(
-                argv == "dl <--ls> <--json>"
-                    || argv.starts_with(
-                        "gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>"
-                    ),
+                asked_a_question(argv),
                 "launching asks nothing extra of the machine: {argv}"
             );
         }
@@ -953,10 +966,23 @@ mod tests {
         // assertion above. Not pinned to an exact number, because this script
         // presses `ctrl-r` and the second reading is racing `stop_background`:
         // its `dl` may or may not have run by the time the arm aborts it. Two
-        // readings, two calls each, is the ceiling either way.
+        // readings, two calls each, plus the one `dl <--version>` the process
+        // asks once however many readings it takes, is the ceiling either way.
         assert!(
-            run.argv.len() <= 4,
+            run.argv.len() <= 5,
             "at most the two readings this script asks for: {:?}",
+            run.argv
+        );
+        // The version is the part that must not scale with the readings — it is
+        // memoized per process precisely so a refresh does not pay for another
+        // Python start, and nothing else in this run would notice if it did.
+        assert!(
+            run.argv
+                .iter()
+                .filter(|argv| *argv == "dl <--version>")
+                .count()
+                <= 1,
+            "the version is asked once per process, not once per reading: {:?}",
             run.argv
         );
     }

@@ -563,17 +563,35 @@ fn scratch(test: &str) -> PathBuf {
 /// the same time interleave into one log line, and every assertion that counts
 /// the lines becomes a race. An `O_APPEND` write this small is atomic; two are
 /// not.
+/// The release the shimmed `dl` claims to be, and it must match what the
+/// fixtures are written as.
+///
+/// [`DL_LISTING`] answers `unsaved` with the one-key object, which is a 0.0.24
+/// listing, and `reap` reads a *missing* answer differently either side of that
+/// release. A shim that listed like 0.0.24 and versioned like 0.0.23 would be
+/// evidence about a machine that cannot exist, which is worse than no probe.
+const SHIMMED_DL: &str = "0.0.24";
+
 fn shim(dir: &Path, name: &str) {
     let path = dir.join(name);
+    // `--version` is answered before the fixture, because `dl` answers it with
+    // a version rather than with a listing, and a shim that returned the
+    // listing to both would be a `dl` that exists nowhere. The recording still
+    // happens first, so the call is counted either way.
+    //
+    // The answer is [`SHIMMED_DL`] for the same reason the fixtures name a
+    // release: a probe is only evidence about a machine it could be.
     let body = r#"#!/bin/sh
 line=$({
   printf '%s' 'PROGRAM'
   for a in "$@"; do printf ' <%s>' "$a"; done
 } | tr '\n' ' ')
 printf '%s\n' "$line" >> "$LOGVAR"
+if [ "$1" = "--version" ]; then printf '%s\n' 'PROGRAM VERSION'; exit 0; fi
 cat 'FIXTURE'
 "#
     .replace("PROGRAM", name)
+    .replace("VERSION", SHIMMED_DL)
     .replace("LOGVAR", LOG)
     .replace(
         "FIXTURE",
