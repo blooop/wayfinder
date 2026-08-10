@@ -462,8 +462,10 @@ pub const DL_LISTING: &str = r#"[
 ///
 /// The top three rows are devlaunch **0.0.24 and newer**: an object with
 /// exactly one key. The next two are **0.0.23 and older**, whose field was a
-/// bare sentence or `null` — still on real machines, because `wf` pins no `dl`
-/// version. Then two rows no `dl` has ever emitted: a key from a *later* `dl`
+/// bare sentence or `null` — still on real machines, because the floor `wf`
+/// holds `dl` to governs what a *launch* may ask of it, while `wf reap` reads a
+/// listing from whichever `dl` is on PATH. Then two rows no `dl` has ever
+/// emitted: a key from a *later* `dl`
 /// than this binary, and the documented key carrying an undocumented payload.
 /// One of those carries a documented key **beside** an undocumented sibling,
 /// which is the shape a later `dl` produces by adding one field: it must go on

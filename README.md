@@ -11,13 +11,21 @@ below):
 pixi global install -c https://prefix.dev/blooop -c conda-forge wf
 ```
 
-The package declares no run dependencies. `wf` finds what it needs on PATH and
-says so plainly when something is missing, rather than dragging second copies
-into its own environment. It wants an authenticated `gh` and the agent CLI, and
-nothing else — there is no multiplexer to install. Add
-[`dl`](https://github.com/blooop/devlaunch) if you want the agent to run inside
-your repos' devcontainers ([Isolation](#isolation-claude-runs-in-the-repos-devcontainer));
-without it every launch runs on the host, which is what `wf` has always done.
+The package declares **one** run dependency:
+[`devlaunch`](https://github.com/blooop/devlaunch) `>=0.0.24`, so
+`pixi global install wf` is enough to get the agent running inside your repos'
+devcontainers ([Isolation](#isolation-claude-runs-in-the-repos-devcontainer)).
+That is the one thing `wf` will not leave to PATH, because isolation is not an
+error path: with no `dl` a launch silently runs on the host instead, so the
+container half of the binary would be invisibly absent rather than loudly
+missing. It costs python and devpod in the environment — roughly 370 MB once per
+machine, and ~85 MB for a second environment that wants it, since pixi hardlinks
+the rest from its package cache.
+
+Everything else `wf` finds on PATH and says so plainly when it is missing,
+rather than dragging second copies into its own environment. It wants an
+authenticated `gh` and the agent CLI, and nothing else — there is no multiplexer
+to install.
 
 Then link the skills it launches into both CLIs' skills directories:
 
