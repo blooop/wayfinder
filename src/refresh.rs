@@ -10,7 +10,18 @@
 //! 1. The cached map ids (#28) start their fetches before the first frame.
 //! 2. One `wayfinder:map` label search runs unconditionally alongside them and
 //!    reconciles that set — the cache is a head start, never a skip.
-//! 3. Each map lands on screen as it arrives; `ctrl-r` is how you ask again.
+//! 3. Each map lands on screen as it arrives, and that is the last word on it.
+//!
+//! There is **one load per run**, and no way to ask for a second. The refresh
+//! key refetched everything in place until it was retired; what it cost was a
+//! parallel path — a way to put [`Startup`] back into loading, a
+//! `Loaders::restart` that existed only so a refetch could not be beaten by the
+//! load it replaced, and a generation on the reading below so a withdrawn
+//! answer could be told from a live one. None of that is here now, because
+//! every value in this module is written once and read once. What it gave up is
+//! real and is stated where it is felt: a map that changed after `wf` started
+//! stays as it was fetched, and the only way to see the new one is to run `wf`
+//! again — ~0.6 s warm, at the price of the query, the level and the cursor.
 //!
 //! Everything is keyed by [`MapId`] rather than repo slug (#50): a repo can
 //! hold several open maps, and each is its own load, its own arrival, and its
@@ -68,15 +79,16 @@ pub enum LoadEvent {
     /// a reading that found nothing are the same silence, because neither is
     /// anything the screen should draw.
     ///
-    /// `taken` says *which* reading this is, and it exists because that silence
-    /// breaks newest-write-wins. `ctrl-r` clears what the screen holds and asks
-    /// again; an answer to the *previous* question can already be sitting in
-    /// the channel at that moment, and folding it would put the cleared state
-    /// back — with nothing to correct it, since a fresh reading that finds
-    /// nothing sends no event at all. Every other `LoadEvent` reports either
-    /// way, so send order is enough for them; this one is answered only when
-    /// the answer is interesting, so it says which question it answers.
-    Surveyed { taken: u64, reading: Reading },
+    /// It used to carry a `taken` generation saying *which* reading it was,
+    /// because that silence breaks newest-write-wins: the refresh key cleared
+    /// what it held and asked again, an answer to the *previous* question could
+    /// already be sitting in the channel at that moment, and folding it would
+    /// have put the cleared state back — with nothing able to correct it, since
+    /// a fresh reading that finds nothing sends no event at all. The tag is
+    /// gone with the key. One reading is taken per run and it is never
+    /// withdrawn, so there is no previous question an answer could belong to,
+    /// and the payload can be the reading itself.
+    Surveyed(Reading),
 }
 
 /// Has the `wayfinder:map` label search answered yet?
@@ -154,16 +166,6 @@ impl Startup {
         self.arrived.insert(id.clone());
     }
 
-    /// `ctrl-r`: every map is being fetched again, so nothing has arrived yet.
-    ///
-    /// The same state a load uses, because it is the same question — how many
-    /// of the maps we expect are in — and answering it once means the count
-    /// line reports a manual refresh exactly as it reports a start, instead of
-    /// a refresh being a silent pause with a stale hint.
-    pub fn reloading(&mut self) {
-        self.arrived.clear();
-    }
-
     /// Maps still out.
     fn pending(&self) -> impl Iterator<Item = &MapId> {
         self.expected.difference(&self.arrived)
@@ -205,6 +207,14 @@ impl Startup {
 /// set is reconciled against the truth instead. The id *is* the whole target
 /// — repo and number both — so "same repo, different map number" is simply a
 /// different key, not a number to compare.
+///
+/// Reconciling is now the *only* thing that starts a load. There used to be a
+/// `restart` beside it for the refresh key, and its reason was ordering: a load
+/// started at t₀ and a refetch started at t₁ > t₀ both write the same map's
+/// cluster, and the older one can land second, so a refetch racing the initial
+/// load was silently overwritten by the stale snapshot it was meant to replace.
+/// With the key retired there is never a second write to lose that race, and
+/// the hazard is gone rather than guarded against.
 #[derive(Debug, Default)]
 pub struct Loaders {
     running: BTreeMap<MapId, JoinHandle<()>>,
@@ -240,21 +250,6 @@ impl Loaders {
             let task = spawn_load(id.clone(), tx.clone());
             self.running.insert(id.clone(), task);
         }
-    }
-
-    /// `ctrl-r`: throw every load away and start them all again.
-    ///
-    /// The refetch has to go through *this* rather than fetching alongside it,
-    /// and the reason is ordering. A load started at t₀ and a refetch started
-    /// at t₁ > t₀ both write the same map's cluster, and the load can land
-    /// second — so a refetch racing the initial load used to be overwritten by
-    /// an older snapshot while the screen said `refreshed`. Nothing polls now,
-    /// so that stale map would be final. Restarting means every result reaches
-    /// the UI through one channel, in send order, and the newest write wins by
-    /// construction.
-    pub fn restart(&mut self, want: &MapSet, tx: &mpsc::UnboundedSender<LoadEvent>) {
-        self.abort_all();
-        self.reconcile(want, tx);
     }
 
     /// Stop every load and wait for it to actually be gone.
@@ -305,10 +300,11 @@ fn spawn_load(id: MapId, tx: mpsc::UnboundedSender<LoadEvent>) -> JoinHandle<()>
 /// Find every open `wayfinder:map` across the cached repos, off the path to
 /// the first frame (#27).
 ///
-/// It **retries** on [`RETRY_INTERVAL`] rather than giving up. A single failed
-/// search would otherwise leave `wf` permanently empty with no way back:
-/// `ctrl-r` refetches the maps it knows about, and after a failed search it
-/// knows about none.
+/// It **retries** on [`RETRY_INTERVAL`] rather than giving up, and that is now
+/// the only recovery a session has. A single failed search would otherwise
+/// leave `wf` empty for the whole run with no way back: the only other thing
+/// that fetches is the cached seed, a cold start has none, and no key asks
+/// again.
 ///
 /// It runs **unconditionally**, warm cache or cold (#28). The cache is a head
 /// start, never a skip: this is the one thing that can add a map opened since
@@ -363,13 +359,13 @@ pub fn spawn_discovery(
 /// Returns a [`Survey`] so the launch path can stop it and wait, exactly as it
 /// does for the map loads: the reading holds child processes of its own, and an
 /// in-flight one outliving the `exec` would be inherited by the agent.
-pub fn spawn_survey<S>(survey: S, tx: mpsc::UnboundedSender<LoadEvent>, taken: u64) -> Survey
+pub fn spawn_survey<S>(survey: S, tx: mpsc::UnboundedSender<LoadEvent>) -> Survey
 where
     S: Future<Output = Option<Reading>> + Send + 'static,
 {
     Survey(tokio::spawn(async move {
         if let Some(reading) = survey.await {
-            let _ = tx.send(LoadEvent::Surveyed { taken, reading });
+            let _ = tx.send(LoadEvent::Surveyed(reading));
         }
     }))
 }
@@ -423,7 +419,7 @@ impl Survey {
     }
 }
 
-/// Where the cursor lands after a load or a refresh swaps the ticket list.
+/// Where the cursor lands after a load swaps the ticket list.
 ///
 /// Identity wins over position: if the previously selected row still exists
 /// anywhere in the new order, the cursor follows it. Only if it vanished does
@@ -466,7 +462,7 @@ mod tests {
         // hang this test rather than slow it.
         let (tx, mut rx) = mpsc::unbounded_channel();
         tokio::time::timeout(Duration::from_secs(5), async {
-            let survey = spawn_survey(never(), tx.clone(), 0);
+            let survey = spawn_survey(never(), tx.clone());
             assert!(
                 rx.try_recv().is_err(),
                 "nothing may be on the channel before the reading lands"
@@ -484,14 +480,11 @@ mod tests {
             Some(crate::reclaim::Reclaimable::for_test(&["ws-a"], 0)),
             crate::liveness::Liveness::default(),
         );
-        spawn_survey(std::future::ready(Some(found.clone())), tx.clone(), 7)
+        spawn_survey(std::future::ready(Some(found.clone())), tx.clone())
             .settle()
             .await;
         match rx.try_recv() {
-            Ok(LoadEvent::Surveyed { taken, reading }) => {
-                assert_eq!(reading, found);
-                assert_eq!(taken, 7, "the event says which reading answered");
-            }
+            Ok(LoadEvent::Surveyed(reading)) => assert_eq!(reading, found),
             other => panic!("the reading must arrive as its own event, got {other:?}"),
         }
     }
@@ -501,7 +494,7 @@ mod tests {
         // No `dl`, a failed listing, a tracker that would not answer, or simply
         // nothing to reclaim: one silence, no event, and above all no error.
         let (tx, mut rx) = mpsc::unbounded_channel();
-        spawn_survey(std::future::ready(None), tx.clone(), 0)
+        spawn_survey(std::future::ready(None), tx.clone())
             .settle()
             .await;
         assert!(
@@ -530,7 +523,6 @@ mod tests {
                 None
             },
             tx,
-            0,
         );
         survey.stop().await;
         assert_eq!(
@@ -689,9 +681,10 @@ mod tests {
 
     #[test]
     fn one_map_reporting_twice_does_not_complete_another_maps_load() {
-        // The loads are concurrent, and `ctrl-r` can make a map report again
-        // while a slow one is still out. Counting arrivals would call that
-        // done; naming who is still pending cannot.
+        // The loads are concurrent, and a map whose load was aborted mid-flight
+        // can already have queued its answer. Counting arrivals would call two
+        // reports from one map a finished load of two; naming who is still
+        // pending cannot be fooled that way, whoever reports twice and why.
         let mut startup = cold();
         startup.searched(&found(&[("fast/one", 1), ("slow/two", 2)]));
         startup.record_arrival(&MapId::new("fast/one", 1));
@@ -742,30 +735,6 @@ mod tests {
         assert_eq!(startup.hint(), "· searching for maps…");
         startup.searched(&found(&[("a/one", 1), ("b/two", 2)]));
         assert!(startup.is_loaded());
-    }
-
-    #[test]
-    fn ctrl_r_puts_the_load_back_on_the_count_line() {
-        // A refresh refetches every map, so nothing has arrived until it does.
-        // Without this the hint stays empty and `ctrl-r` is a silent pause.
-        let mut startup = cold();
-        let maps = found(&[("a/one", 1), ("b/two", 2)]);
-        startup.searched(&maps);
-        startup.record_arrival(&MapId::new("a/one", 1));
-        startup.record_arrival(&MapId::new("b/two", 2));
-        assert!(startup.is_loaded());
-
-        startup.reloading();
-        assert!(!startup.is_loaded());
-        assert_eq!(startup.hint(), "· loading maps 0/2");
-        startup.record_arrival(&MapId::new("a/one", 1));
-        assert_eq!(startup.hint(), "· loading maps 1/2");
-        startup.record_arrival(&MapId::new("b/two", 2));
-        assert!(
-            startup.is_loaded(),
-            "the search already answered; it stays answered"
-        );
-        assert_eq!(startup.hint(), "");
     }
 
     #[test]

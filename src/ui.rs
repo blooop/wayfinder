@@ -507,9 +507,9 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
 /// there is somewhere to go back to.
 fn key_hints(app: &App) -> &'static str {
     if app.current_repo().is_some() {
-        "  enter launch · ←→ open · ← back · tab structure · ctrl-r refresh · esc quit"
+        "  enter launch · ←→ open · ← back · tab structure · esc quit"
     } else {
-        "  enter open · ↑↓ move · type to filter · ctrl-r refresh · esc quit"
+        "  enter open · ↑↓ move · type to filter · esc quit"
     }
 }
 
@@ -542,14 +542,20 @@ pub fn heading(app: &App) -> String {
     // Naming the map is the whole value when there is one: "GitHub is
     // unreachable" and "that project has nothing open" are different problems
     // with different fixes, and a bare count reads the same either way.
+    //
+    // This named the refresh chord as the retry until that key was retired.
+    // Naming a key that no longer exists is worse than saying nothing, and
+    // saying nothing leaves the reader on a screen with a failure and no move
+    // to make — so it names the move that is left. Restarting really is the
+    // retry now: each map is fetched once per run, and a warm start is ~0.6 s.
     if app.clusters.is_empty() && app.startup.is_loaded() {
         match app.failed.len() {
             0 => {}
             1 => {
                 let id = app.failed.iter().next().expect("len checked");
-                return format!("{}#{} — fetch failed, ctrl-r retries", id.repo, id.number);
+                return format!("{}#{} — fetch failed, run wf again", id.repo, id.number);
             }
-            n => return format!("{n} maps failed to fetch — ctrl-r retries"),
+            n => return format!("{n} maps failed to fetch — run wf again"),
         }
     }
     match projects.len() {
@@ -1908,8 +1914,11 @@ mod tests {
         assert!(screen.contains("> █"));
         assert!(screen.contains("enter launch"));
         assert!(screen.contains("tab structure"));
-        assert!(screen.contains("ctrl-r refresh"));
         assert!(screen.contains("esc quit"));
+        // The hint bar names only keys that do something. The refresh chord
+        // used to sit between `tab structure` and `esc quit`; it is unbound
+        // now, and a hint outliving its binding is a screen telling a lie.
+        assert!(!screen.contains("refresh"), "{screen}");
         assert!(screen.contains("wf · blooop/wayfinder"));
     }
 
@@ -2318,7 +2327,7 @@ mod tests {
         let screen = render(&app);
         assert!(!screen.contains("no projects"), "{screen}");
         assert!(
-            screen.contains("blooop/wayfinder#35 — fetch failed, ctrl-r retries"),
+            screen.contains("blooop/wayfinder#35 — fetch failed, run wf again"),
             "{screen}"
         );
 

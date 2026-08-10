@@ -178,52 +178,6 @@ async fn a_stale_seed_reports_failure_and_is_replaced_by_the_search() {
 }
 
 #[tokio::test]
-async fn restarting_the_loaders_refetches_and_cannot_be_beaten_by_the_load_it_replaced() {
-    // `ctrl-r`'s path. It goes through `Loaders` rather than fetching alongside
-    // them for one reason: a refetch started at t₁ and a load started at t₀ < t₁
-    // both write the same map's cluster, and the *older* one can land second.
-    // Nothing polls any more, so that stale map would be the last word. Every
-    // result reaching the UI through one channel in send order is what makes
-    // the newest write win, and that is what this pins.
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let live = common::a_live_map().await;
-    let seed: MapSet = [live.clone()].into_iter().collect();
-
-    let mut loaders = Loaders::new();
-    loaders.reconcile(&seed, &tx);
-    match next(&mut rx).await {
-        LoadEvent::Fetched {
-            outcome: MapFetch::Loaded(_),
-            ..
-        } => {}
-        other => panic!("the initial load must land first, got {other:?}"),
-    }
-
-    // The refresh: same map, and it must fetch again rather than skip a map it
-    // has already loaded — the `continue` in `reconcile` is exactly what
-    // `restart` exists to get past.
-    loaders.restart(&seed, &tx);
-    assert_eq!(loaders.targets(), seed);
-    match next(&mut rx).await {
-        LoadEvent::Fetched {
-            id,
-            outcome: MapFetch::Loaded(map),
-        } => {
-            assert_eq!(id, live);
-            assert!(!map.tickets.is_empty());
-        }
-        other => panic!("ctrl-r must refetch, got {other:?}"),
-    }
-
-    // And the channel is empty: exactly one result per load, so no third event
-    // is queued behind the refresh waiting to overwrite it.
-    assert!(
-        rx.try_recv().is_err(),
-        "a superseded load must not still be queued to clobber the refresh"
-    );
-}
-
-#[tokio::test]
 async fn shutdown_leaves_nothing_in_flight() {
     // The launch path awaits this immediately before `exec`. An in-flight `gh`
     // that outlives the exec is inherited by the agent as a zombie holding its

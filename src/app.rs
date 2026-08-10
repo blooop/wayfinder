@@ -52,9 +52,6 @@ pub enum Level {
 pub enum Outcome {
     Continue,
     Quit,
-    /// Force a refetch (`ctrl-r`). The loop performs it and puts the results
-    /// back via [`App::replace_clusters`].
-    Refresh,
     /// Run this ticket's agent. The last thing `wf` ever does: the loop
     /// returns, the terminal is restored, and the process becomes the agent.
     ///
@@ -218,7 +215,9 @@ pub struct App {
     /// [`App::scoped_clusters`], which leads on activity.
     pub clusters: BTreeMap<MapId, Map>,
     /// The maps believed open — the cached seed until the search answers, the
-    /// search's answer afterwards. This is what `ctrl-r` refetches.
+    /// search's answer afterwards. This is the set the loaders are reconciled
+    /// against, and with one load per run the search's answer is the last word
+    /// on it.
     pub open_maps: MapSet,
     pub query: String,
     /// Which screen is up: the project list, or one project's own.
@@ -235,11 +234,11 @@ pub struct App {
     /// Maps whose last fetch failed — **state, not a message.**
     ///
     /// A failure has to be drawn on every frame, and the one-shot `notice` is
-    /// cleared by the very next keypress. Nothing polls any more either, so a
-    /// failed fetch is the final word on that map until `ctrl-r`: with only a
-    /// notice, one keystroke turns "GitHub is down" into a screen that says
-    /// *no projects — run wf inside a checkout to register it*, which is the
-    /// exact lie [`crate::refresh::Startup`] exists to prevent for the
+    /// cleared by the very next keypress. Nothing polls and nothing asks again,
+    /// so a failed fetch is the final word on that map for the rest of the run:
+    /// with only a notice, one keystroke turns "GitHub is down" into a screen
+    /// that says *no projects — run wf inside a checkout to register it*, which
+    /// is the exact lie [`crate::refresh::Startup`] exists to prevent for the
     /// still-loading case.
     ///
     /// A set of [`MapId`]s rather than a flag, because the flag it replaces
@@ -1158,15 +1157,28 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => Outcome::Quit,
-            KeyCode::Char('r') if ctrl => {
-                self.notice = Some("refreshing…".to_string());
-                Outcome::Refresh
-            }
-            // `ctrl-f` and `ctrl-g` are gone, not merely undocumented: focusing
-            // a project is entering it and widening is `←` out of it, so both
-            // chords named a move the arrows already make. They fall through
-            // to nothing here rather than being caught and ignored — an unbound
-            // key is unbound.
+            // `ctrl-f`, `ctrl-g` and the refresh chord are gone, not merely
+            // undocumented, and they fall through to nothing here rather than
+            // being caught and ignored — an unbound key is unbound.
+            //
+            // The first two named a move the arrows already make: focusing a
+            // project is entering it and widening is `←` out of it. Refresh
+            // named something nothing else does — refetch every map in place,
+            // keeping the query, the level and the cursor — so retiring it is a
+            // trade rather than a tidy-up. What it bought was the one screen
+            // update a session could have; what it cost was a *second write* to
+            // every piece of state behind that screen, and each of those writes
+            // needed machinery of its own: a `Loaders::restart` so a refetch
+            // could not be beaten by the load it replaced, a way to put
+            // [`crate::refresh::Startup`] back into loading, and a generation
+            // tag on the background reading so an answer to a withdrawn
+            // question could be told from a live one. All of it went with the
+            // key, and everything the loop folds is now written once.
+            //
+            // The price is paid by anyone who closes a ticket in the browser
+            // and wants to see it: run `wf` again — ~0.6 s warm — and lose the
+            // query, the project you had entered and where the cursor was.
+
             // Toggle the structural lens (#51): leverage ⇄ forest. The cursor
             // stays on its ticket if the other screen shows it; a live query
             // keeps flattening either lens until it is cleared.
@@ -3302,9 +3314,10 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_r_requests_refresh_and_replace_clusters_keeps_anchor() {
+    fn replace_clusters_keeps_the_anchor_when_the_ticket_survives() {
+        // A map arriving swaps its whole cluster, and the cursor must stay on
+        // the ticket it was on rather than on the position it happened to hold.
         let mut app = fixture_app();
-        assert_eq!(app.handle_key(ctrl('r')), Outcome::Refresh);
         go_to(&mut app, "#6");
         let same = app.clusters.clone();
         app.replace_clusters(same);
