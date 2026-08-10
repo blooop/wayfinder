@@ -19,11 +19,14 @@
 //!    the picker from a function the same binary has to call, so what stands in
 //!    its place is a denylist — `reap` is a forbidden token in this file
 //!    ([`tests::the_picker_names_neither_a_subprocess_nor_reap`]) and `main.rs`
-//!    counts its own two mentions of the module. A denylist over two files
-//!    cannot see the same call made one hop away in a third. That hole is real;
-//!    the only thing that would close it is the picker living in a crate that
-//!    cannot depend on reap at all, which is a change to `wf`'s build and its
-//!    own decision (#137).
+//!    holds the list of every line in itself that writes the word. Those are
+//!    greps over the source text of two files: they catch a cleanup wired in by
+//!    accident, and they do not stop anyone who means to get around them. The
+//!    same call made one hop away in a third file is caught by neither, and so
+//!    is a second name for the module re-exported from the library. Those holes
+//!    are real; the only thing that would close them is the picker living in a
+//!    crate that cannot depend on reap at all, which is a change to `wf`'s
+//!    build and its own decision (#137).
 //! 2. **Running a command is watched, across every arm of the loop.**
 //!    [`tests::no_deletion_survives_a_whole_session_of_the_real_assembly`]
 //!    drives [`session`] for real against recording `dl` and `gh` shims, so a
@@ -43,6 +46,15 @@
 //!    the tree before and after. An `fs::remove_dir_all` aimed at a workspace
 //!    fails it. An `fs` call aimed somewhere else is caught by nothing — as it
 //!    would be in any file of any crate, and this file claims no better.
+//!
+//! None of that says the picker deletes nothing at all. [`run_picker`] calls
+//! [`refresh_skills`] on the way into the agent, and a copy that has fallen
+//! behind the bundle is rewritten by removing it first — `wf::skills`' `clear`
+//! is a `remove_dir_all` under `~/.claude/wf-skills`, reached from this file's
+//! own code on this file's own launch path. It is `wf`'s copy of `wf`'s own
+//! prompts, not a workspace and not anyone's work; the probe above stops one
+//! line short of it; and the claim here is about workspaces, which is why it is
+//! written as one rather than as "nothing here deletes".
 //!
 //! The ordering that matters is at the bottom of [`run_picker`]: restore the
 //! terminal, *then* exec, because after the exec there is no `wf` left to
@@ -804,15 +816,15 @@ mod tests {
         run.destroyed_nothing();
         assert_eq!(
             run.argv.len(),
-            3,
+            2,
             "a session asks for the listing and the tracker, and nothing else: {:?}",
             run.argv
         );
-        assert_eq!(run.argv[1], "dl <--ls> <--json>");
+        assert_eq!(run.argv[0], "dl <--ls> <--json>");
         assert!(
-            run.argv[2].starts_with("gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>"),
+            run.argv[1].starts_with("gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>"),
             "one batched read of the tracker: {}",
-            run.argv[2]
+            run.argv[1]
         );
     }
 
@@ -832,11 +844,11 @@ mod tests {
         run.destroyed_nothing();
         assert_eq!(
             run.argv.len(),
-            3,
+            2,
             "launching asks nothing extra of the machine: {:?}",
             run.argv
         );
-        assert_eq!(run.argv[1], "dl <--ls> <--json>");
+        assert_eq!(run.argv[0], "dl <--ls> <--json>");
     }
 
     #[test]
@@ -849,12 +861,15 @@ mod tests {
         // fact: awaiting the reading anywhere in `session` before the loop
         // starts, which *does* compile, puts `dl <--ls> <--json>` above the
         // note and fails here.
+        //
+        // Read off the timeline rather than the argv, because the note is the
+        // one line in it the code under test did not write.
         let run = a_session();
         assert_eq!(
-            run.argv.first().map(String::as_str),
-            Some("note <the first frame>"),
+            run.timeline.first().map(String::as_str),
+            Some("note| <the first frame>"),
             "the first frame waited for something: {:?}",
-            run.argv
+            run.timeline
         );
     }
 

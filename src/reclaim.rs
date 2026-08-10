@@ -772,12 +772,16 @@ mod tests {
     }
 
     #[test]
-    fn no_deletion_is_reachable_from_the_surfacing_path() {
+    fn the_surfacing_module_names_no_means_of_destruction() {
         // The structural half, which the run above cannot cover: a subprocess
         // is observable, and `std::fs::remove_dir_all` is not. So argv is
         // watched at run time and the means of destruction that leave no argv
         // are pinned here — this module reads two functions and formats a
         // sentence, and has no business naming any of these.
+        //
+        // A fact about this file's text, and named as one: it says nothing
+        // about what a function it calls in another file may do. That is what
+        // the recorded run above is for, within the bounds that run states.
         //
         // `unsafe` used to be on this list and is not: `unsafe_code = "deny"`
         // in `Cargo.toml` covers every target in the crate, so a copy here was

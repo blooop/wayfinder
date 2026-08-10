@@ -540,9 +540,15 @@ mod tests {
         // `unsafe` used to be on this list and is not, for the reason its
         // sibling gives: `unsafe_code = "deny"` in `Cargo.toml` already covers
         // every target in the crate.
+        //
+        // `reap` bare rather than `reap::`, matching `picker.rs`: this file has
+        // no business naming the module at all, and the module cannot be
+        // reached without its name being written, so `use crate::reap as tidy;`
+        // is caught here too. It costs nothing — nothing in this file's code
+        // says the word.
         let code = crate::probe::code_only(include_str!("refresh.rs"));
         for forbidden in [
-            "reap::",
+            "reap",
             "remove",
             "\"rm\"",
             "--force",

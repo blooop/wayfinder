@@ -391,19 +391,25 @@ this names workspaces and a command, and you type the command. It names them
 rather than only counting them, because "2 reclaimable" is not something you can
 agree or disagree with.
 
-Nothing on this path deletes anything, and it is worth being exact about what
+**This path does not delete workspaces**, and it is worth being exact about what
 holds that up, because it is three different things with three different
-reaches.
+reaches — and only the first of them is a proof.
 
 The function that removes a workspace is private to the library module that owns
 `wf reap`. The picker is in the binary, so no line of it — no helper, alias or
 submodule — can call that function, and the edit that tries does not compile.
+That one is settled by the compiler and needs no test.
+
 `wf reap` as a whole *command* is another matter: it has to be public for `main`
 to dispatch it, and `reap::run(true, true)` is a forced reap. So the picker file
-may not name `reap` at all, and `main.rs` must name the module exactly once and
-call into it exactly once — counted by reachability rather than by one spelling,
-so an aliased import cannot slip past. Those two are greps over two files, and a
-grep over a file cannot see the same call made in a third.
+may not write the word `reap` at all, and `main.rs` carries the list of every
+line in itself that does — a word, not a path, so an alias or a `crate::` route
+has to appear in it too. Those are greps over the source text of two files.
+They catch a cleanup wired in by accident, which is the mistake anyone is
+actually likely to make; they do not stop someone who means to get around them,
+and several review rounds of this feature were spent proving exactly that. A
+grep over two files cannot see the same call written in a third, or a second
+name for the module exported from the library.
 
 Everything else is watched rather than proven. A test drives the real event loop
 against a recording `dl` and `gh`, through every arm the loop has — quit,
@@ -413,9 +419,16 @@ argv the run made, plus a scratch `HOME` laid out the way this machine is
 `~/.devpod/contexts/<ctx>/workspaces/<id>` for the record), compared before and
 after. That catches a workspace deleted by running `dl` and one deleted
 in-process, whatever file the call was written in — for the length of the
-session and a stated window after it. It does not catch a deletion deferred past
-that window, or an `std::fs` call aimed somewhere else; nothing in any Rust file
-catches those.
+session, plus 400 ms after the reading lands, after every key, and after the
+session returns. It does not catch a deletion deferred past that window (a
+spawned task that sleeps a second and a half is green; the same one with the
+window at three seconds is caught), or an `std::fs` call aimed somewhere else;
+nothing in any Rust file catches those.
+
+The picker does delete one thing, and it is not a workspace: the launch path
+brings the installed skill copies back in step with the bundle, which removes
+and rewrites `~/.claude/wf-skills/<skill>` when a copy has fallen behind. That
+is `wf`'s copy of `wf`'s own prompts.
 
 A `dl` workspace id is around forty characters and this segment shares one line
 with the load state and the match count, so the line is **budgeted** rather than

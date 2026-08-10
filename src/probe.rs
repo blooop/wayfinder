@@ -27,7 +27,10 @@
 //!
 //! [`note`] is what makes the log a timeline the probe body can put its own
 //! marks on, so an *ordering* — this frame was painted before that subprocess
-//! ran — is as observable as the argv itself.
+//! ran — is as observable as the argv itself. Notes are prefixed so that
+//! [`Recording::argv`] holds subprocesses and nothing else: a note is written
+//! by the probe, not by the code under test, and one that happened to contain
+//! the word `rm` would otherwise fail a deletion assertion.
 //!
 //! [`code_only`] is the smaller one: this crate's own source with the comments
 //! and the test module stripped, for the structural guards in
@@ -58,6 +61,18 @@ const LOG: &str = "WF_PROBE_LOG";
 /// the test is named for it. Everything the probe says is marked, and
 /// [`Recording::printed`] keeps only the marked part.
 pub const MARK: &str = "PROBE|";
+
+/// What [`note`] puts in front of its lines, so the one log can be read back
+/// two ways.
+///
+/// The shims and the probe body append to the same file, which is what makes
+/// an *ordering* observable — but they are not the same kind of fact. A shim
+/// line is something the code under test did; a note is something the test
+/// said about it. Without a marker the two are one list, and a probe that
+/// noted `<rm>` would fail [`Recording::destroyed_nothing`] on its own
+/// commentary. A shim writes a program name first, and a program name cannot
+/// contain a `|`.
+const NOTED: &str = "note|";
 
 /// The workspace ids [`record`] lays a scratch home out for — the three
 /// [`DL_LISTING`] names, so every workspace the code under test can *see* is
@@ -94,7 +109,15 @@ pub struct Recording {
     /// One line per subprocess the child ran, in order: the program name and
     /// then each argument in angle brackets, so an argument containing a space
     /// cannot be mistaken for two.
+    ///
+    /// Subprocesses only. The probe body's own [`note`]s share the log, so
+    /// that the two can be *ordered* against each other, but they are not
+    /// things the code under test ran and they are not counted here — see
+    /// [`Recording::timeline`] for the merged view.
     pub argv: Vec<String>,
+    /// The same log with the notes left in and in order, for the assertions
+    /// that are about *when* something happened rather than whether it did.
+    pub timeline: Vec<String>,
     /// Everything the child printed.
     pub stdout: String,
     /// Every path under the child's scratch `HOME` that was not the same
@@ -207,12 +230,17 @@ pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
         .expect("the probe child");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    let argv: Vec<String> = std::fs::read_to_string(&log)
+    let timeline: Vec<String> = std::fs::read_to_string(&log)
         .expect("the log")
         .lines()
         .map(str::trim_end)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
+        .collect();
+    let argv: Vec<String> = timeline
+        .iter()
+        .filter(|line| !line.starts_with(NOTED))
+        .cloned()
         .collect();
     let disturbed = differences(&before, &tree(&home));
     // Read the log and the home *before* asserting anything, so that the
@@ -234,6 +262,7 @@ pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
     );
     Recording {
         argv,
+        timeline,
         stdout,
         disturbed,
     }
@@ -369,6 +398,10 @@ fn differences(before: &[(String, Vec<u8>)], after: &[(String, Vec<u8>)]) -> Vec
 /// machine a question" is `note` sitting above every argv, and no amount of
 /// grepping the source can say that.
 ///
+/// Marked with [`NOTED`], so that a note joins [`Recording::timeline`] and not
+/// [`Recording::argv`]: what the probe said about the run is not part of what
+/// the run did.
+///
 /// Silent outside a probe child, for the same reason [`is_child`] exists.
 pub fn note(what: &str) {
     use std::io::Write;
@@ -380,7 +413,7 @@ pub fn note(what: &str) {
         .open(log)
         .expect("the probe log");
     // One write, terminator included, for the reason [`shim`] gives.
-    log.write_all(format!("note <{what}>\n").as_bytes())
+    log.write_all(format!("{NOTED} <{what}>\n").as_bytes())
         .expect("the probe log");
 }
 
@@ -488,7 +521,7 @@ fn executable(_path: &Path) {
     unimplemented!("the probe shims are `/bin/sh` scripts; `wf` targets unix");
 }
 
-/// One of this crate's source files with the comments and the whole test module
+/// One of this crate's source files with the comments and the test module
 /// stripped — what the code can *do*, rather than what the prose beside it says
 /// it does.
 ///
@@ -496,17 +529,87 @@ fn executable(_path: &Path) {
 /// stay at the call site, because its path is resolved against the file it is
 /// written in.
 ///
-/// The test module is found by its `mod tests {` line rather than by the
+/// # What is dropped, and why that is safe
+///
+/// The test module is dropped because every guard built on this reads a
+/// *denylist* — `picker.rs`'s says the file may not name `reap`, and the test
+/// that says so has to write `reap` to say it. Keeping the module would make
+/// each guard fail on itself.
+///
+/// Dropping it is only safe if the part dropped is exactly a `#[cfg(test)]`
+/// module and nothing else, so that is checked here rather than assumed. An
+/// earlier version took the lines *before* the first `mod tests {` and threw
+/// the rest away unexamined, which had two holes, both demonstrated: a helper
+/// written below the test module was invisible to all four guards (only
+/// clippy's `items_after_test_module` saw it), and a raw string containing a
+/// line reading `mod tests {` cut the file short wherever its author liked —
+/// which silenced that lint too, and made every guard green for a deletion.
+///
+/// So the whole file is read, and three things are asserted about it:
+///
+/// 1. exactly one line *starts* a `mod tests {` — a second one anywhere,
+///    including inside a string, is the decoy above;
+/// 2. it is preceded by `#[cfg(test)]` — so what is dropped is compiled out of
+///    every release, not merely named `tests`;
+/// 3. it is the file's last item — the only thing at column 0 below it is its
+///    own closing brace, on the last non-blank line.
+///
+/// What remains uncovered is the *inside* of that module, which cannot run in a
+/// shipped binary. Everything else in the file is returned and read.
+///
+/// The module is found by its `mod tests {` line rather than by the
 /// `#[cfg(test)]` above it, and that is not a detail. `main.rs` declares
 /// `#[cfg(test)] mod probe;` among its imports, so a cut at the first
 /// `#[cfg(test)]` left thirty lines of `use` statements — a guard over that
-/// file would have read no code at all and passed for it. Anything smuggled in
-/// *below* `mod tests` is caught by clippy's `items_after_test_module` instead.
+/// file would have read no code at all and passed for it.
+///
+/// # Panics
+///
+/// If any of the three does not hold, which fails the guard that called it.
 pub fn code_only(source: &str) -> String {
-    source
-        .lines()
-        .take_while(|line| !line.starts_with("mod tests {"))
+    let lines: Vec<&str> = source.lines().collect();
+    let opens: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("mod tests {"))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        opens.len(),
+        1,
+        "a file guarded by its source text must open exactly one test module at \
+         column 0, and this one has {} such lines (a second is how a raw string \
+         hides the rest of the file from every guard): {:?}",
+        opens.len(),
+        opens.iter().map(|at| at + 1).collect::<Vec<_>>()
+    );
+    let opens = opens[0];
+    assert_eq!(
+        opens.checked_sub(1).map(|above| lines[above].trim()),
+        Some("#[cfg(test)]"),
+        "what is dropped must be announced `#[cfg(test)]`: line {} is {:?}",
+        opens,
+        opens.checked_sub(1).map(|above| lines[above])
+    );
+    let last = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .expect("a source file has a line");
+    for (at, line) in lines.iter().enumerate().skip(opens + 1) {
+        if line.trim().is_empty() || line.starts_with([' ', '\t']) {
+            continue;
+        }
+        assert!(
+            at == last && *line == "}",
+            "the test module must be this file's last item, and line {} is {line:?} \
+             — an item below it is read by no guard here",
+            at + 1
+        );
+    }
+    lines[..opens]
+        .iter()
         .filter(|line| !line.trim_start().starts_with("//"))
+        .copied()
         .collect::<Vec<_>>()
         .join("\n")
 }

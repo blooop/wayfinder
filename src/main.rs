@@ -30,14 +30,19 @@
 //!
 //! The other half is not. `wf::reap::run` has to be public for the arm below to
 //! dispatch it, and it *contains* the deletion — `reap::run(true, true)` is a
-//! forced reap with the unsaved-work guard waived. Nothing stops a line
-//! anywhere in this crate calling it, so what stands in its place is a count:
-//! [`tests::the_binary_reaches_reap_at_exactly_one_place`] pins that this file
-//! names the library's `reap` once and calls into it once, whatever spelling or
-//! alias is used, and `picker.rs` may not name it at all. Those are two greps
-//! over two files. A third file calling `reap::run` is caught by neither; see
-//! [`picker`] for what does and does not cover that, and #137 for the crate
-//! split that would.
+//! forced reap with the unsaved-work guard waived. Nothing in the language
+//! stops a line anywhere in this crate calling it, so what stands in its place
+//! is a grep: [`tests::the_binary_writes_reap_only_where_it_is_listed_here`]
+//! holds the whole list of lines in this file that write the word `reap`, and
+//! `picker.rs` may not write it at all.
+//!
+//! That is a guard over the source text of two files, and it is worth what that
+//! is: it catches a cleanup wired in here by accident, which is the mistake
+//! anyone is actually likely to make. It does not stop someone routing around
+//! it. A third file calling `wf::reap::run` is caught by neither grep, and
+//! neither is a second name for the module re-exported from the library. See
+//! [`picker`] for the guard that watches a run rather than a file, and #137 for
+//! the crate split that would settle it.
 
 use anyhow::Result;
 use tokio::signal::unix::{signal, SignalKind};
@@ -264,10 +269,11 @@ async fn main() -> Result<()> {
         Invocation::SkillsInstall => run_skills(true),
         // The one place in this binary that reaches a deletion, and it reaches
         // it as a whole command: prompt, plan, and the private `remove` this
-        // crate could not spell if it wanted to. Pinned as a *count* by
-        // `the_binary_reaches_reap_at_exactly_one_place` — an arm that merely
-        // exists says nothing about the rest of the file, and a prologue before
-        // this match is how an earlier round deleted a workspace on
+        // crate could not spell if it wanted to. Listed, with every other line
+        // here that writes the word, by
+        // `the_binary_writes_reap_only_where_it_is_listed_here` — an arm that
+        // merely exists says nothing about the rest of the file, and a prologue
+        // before this match is how an earlier round deleted a workspace on
         // `wf --version`.
         Invocation::Reap { yes, insist } => reap::run(yes, insist).await,
         // And the one shape that opens the TUI, which is the whole of what this
@@ -331,8 +337,31 @@ mod tests {
         args.iter().copied().map(String::from).collect()
     }
 
+    /// Every line of `code` that writes `token` as a word of its own — not as
+    /// part of a longer identifier, so `parse_reap` and `Reap` are not
+    /// occurrences of `reap`.
+    ///
+    /// A *word*, and that is the whole technique. Counting `"reap::"` was green
+    /// for `use wf::reap as tidy;`, and counting `"wf::reap"` was green for
+    /// `use crate::reap as tidy;` — each round found another spelling of the
+    /// same path. There is no spelling of the module that does not write its
+    /// name, so the name is what is counted. `picker.rs` has been immune since
+    /// round 5 for exactly this reason; this is that technique, applied here.
+    fn lines_naming<'a>(code: &'a str, token: &str) -> Vec<&'a str> {
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        code.lines()
+            .filter(|line| {
+                line.match_indices(token).any(|(at, _)| {
+                    !line[..at].chars().next_back().is_some_and(ident)
+                        && !line[at + token.len()..].chars().next().is_some_and(ident)
+                })
+            })
+            .map(str::trim)
+            .collect()
+    }
+
     #[test]
-    fn the_binary_reaches_reap_at_exactly_one_place() {
+    fn the_binary_writes_reap_only_where_it_is_listed_here() {
         // What is left for a grep to say once the deletion itself is out of
         // reach.
         //
@@ -344,45 +373,38 @@ mod tests {
         // that as a prologue before the match, and `wf --version` reaped a
         // workspace and exited 0.
         //
-        // So the claim is a count of **reachability**, not of one spelling.
-        // The version of this test that counted `"reap::"` alone was green for
-        // `use wf::reap as tidy;` plus `tidy::run(true, true)`, because an
-        // alias produces no `reap::` anywhere. Three assertions close that,
-        // and each is load-bearing:
+        // So this is the whole list of lines in this file that write the word
+        // `reap`, and it is compared as a list rather than as a count. Two of
+        // them are code — the import and the arm — and the rest are the help
+        // text, which is prose in a string and calls nothing. Any new line that
+        // writes the word fails here, whatever it writes around it: an alias
+        // (`use wf::reap as tidy;`, `use crate::reap as tidy;`), a path through
+        // the crate root, a call split over two lines. The module cannot be
+        // reached without its name being written somewhere, and every somewhere
+        // is below.
         //
-        // 1. the module is named once — a second `wf::reap::run(…)` written
-        //    inline, or an alias *added* beside the import, pushes this to two;
-        // 2. that one naming is the plain import — `use wf::reap as tidy;` and
-        //    `use wf::reap::run as nuke;` both leave the count at one and fail
-        //    here instead;
-        // 3. the name it binds is used once — a glob `use wf::*;` names no
-        //    `wf::reap` at all, but still has to write `reap::run` to call it,
-        //    and a second call anywhere in the file lands here.
+        // What this does **not** reach: a third file calling `wf::reap::run`,
+        // and a re-export that gives the module a second name in the library.
+        // It is a grep over one file, and a grep over one file cannot see
+        // either. What it is good for is the accident — a maintainer wiring a
+        // cleanup in without noticing — and that is the claim the module doc
+        // makes for it too.
         //
-        // Between them, every way this file can reach `reap` has to be spelt
-        // in one of two places, and both are checked below. What none of it
-        // reaches is a *third* file calling `reap::run`; that is stated in the
-        // module doc rather than pretended away.
+        // If you changed the usage text, update the prose lines below; the two
+        // code lines are the ones that matter.
         let code = probe::code_only(include_str!("main.rs"));
         assert_eq!(
-            code.matches("wf::reap").count(),
-            1,
-            "this file may name the library's `reap` once, and that once is its import"
-        );
-        assert!(
-            code.contains("use wf::reap;"),
-            "and it must be the plain import: an alias is a second name for the \
-             same module, spelt so that a grep for `reap::` misses it"
-        );
-        assert_eq!(
-            code.matches("reap::").count(),
-            1,
-            "the imported name may be used once, for the `wf reap` argv and \
-             nothing else"
-        );
-        assert!(
-            code.contains("Invocation::Reap { yes, insist } => reap::run(yes, insist).await,"),
-            "and that once is the arm the `reap` argv produced"
+            lines_naming(&code, "reap"),
+            [
+                "use wf::reap;",
+                "wf reap [-y] [-f]",
+                "wf reap            remove the workspaces whose work is over — a closed ticket,",
+                "\"reap\" => Invocation::Reap {",
+                "[first, rest @ ..] if first == \"reap\" => parse_reap(rest),",
+                "\"wf: unknown reap argument {other:?} (expected `-y` or `-f`)\\n{USAGE}\"",
+                "Invocation::Reap { yes, insist } => reap::run(yes, insist).await,",
+            ],
+            "this file writes `reap` somewhere new"
         );
         // The other half of the same claim, at the other arm: opening the TUI
         // is the whole of what `wf` with no arguments does.

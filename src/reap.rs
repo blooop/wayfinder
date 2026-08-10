@@ -571,13 +571,19 @@ fn parse_node_facts(body: &[u8], repo: &str, numbers: &[u64]) -> Result<BTreeMap
 
 /// Hand one finished workspace back to `dl`.
 ///
-/// **Private to this module, and that is the whole of #137's separation.** The
-/// picker is a module of the *binary*; this is the library. A deletion the
-/// binary crate cannot name is a deletion no line of the picker — nor a helper
-/// it calls, in any file, under any alias, from any submodule — can reach: the
-/// edit is a compile error rather than a thing a test has to notice. Three
-/// review rounds each found a different way past a source-text denylist over
-/// the picker's own file, and each of those routes ended at this function.
+/// **Private to this module, and that is the strongest part of #137's
+/// separation.** The picker is a module of the *binary*; this is the library.
+/// No line of the binary can name this function — not under an alias, not from
+/// a submodule, not through a helper in another of its files — and the edit
+/// that tries is a compile error rather than a thing a test has to notice.
+/// Three review rounds each found a different way past a source-text denylist
+/// over the picker's own file, and each of those routes ended here.
+///
+/// What privacy does *not* close is [`run`] below: it is public because `main`
+/// must dispatch `wf reap`, it calls this, and the binary may name it from
+/// anywhere. That half is guarded by greps over two of the binary's files and
+/// by a recorded run of the picker — weaker things, and described as such where
+/// they live.
 ///
 /// The one caller is [`run`] below, which is `wf reap` — a human typing the
 /// command, reading the plan and answering the prompt.
