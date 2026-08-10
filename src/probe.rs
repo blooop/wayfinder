@@ -573,15 +573,25 @@ fn executable(_path: &Path) {
 /// closed**, and that is the intended trade: an edit it cannot account for is
 /// rejected rather than waved through.
 ///
-/// The cost is real, and these three were run against `picker.rs` — each is an
-/// ordinary, security-neutral edit that now fails the guard over whichever file
-/// it is made in, with the whole rest of the selection green:
+/// The cost is real, and these four were run against `picker.rs` (the last one
+/// also against `main.rs`) — each is an ordinary, security-neutral edit that now
+/// fails the guard over whichever file it is made in, with the whole rest of the
+/// selection green:
 ///
 /// - `#[allow(clippy::too_many_lines)]` written between the `#[cfg(test)]` and
 ///   the `mod tests {` — the announcement is no longer the line above;
 /// - `#[cfg(all(test, unix))]` in place of `#[cfg(test)]` — likewise;
 /// - a second `#[cfg(test)] mod` written *below* the test module — the braces
-///   close before the end of the file, which is the whole point of (3).
+///   close before the end of the file, which is the whole point of (3);
+/// - **a `{` or a `}` that does not balance, written in a string, a char
+///   literal or a comment anywhere inside the test module.** Nothing here
+///   parses Rust, so an assertion message reading `"expected {"`, or a comment
+///   ending `and nothing else }`, moves the depth. This is the widest of the
+///   four by a long way — it is a cost on writing ordinary tests, not on
+///   arranging modules — and this repository is already paying it: the `// }`
+///   at the end of the second entry in `main.rs`'s `reap` list exists only to
+///   balance the `{` inside the string above it. Deleting that comment is bins
+///   16 / 1, on `main.rs`'s own guard, for an edit that changes nothing.
 ///
 /// Two that read like the same class and are **not** rejected, checked rather
 /// than assumed: a trailing `} // end` on the closing brace passes, because
@@ -597,9 +607,20 @@ fn executable(_path: &Path) {
 /// last in the file — and a maintainer who departs from it gets a security
 /// guard failing on an edit that has nothing to do with security. That is
 /// deliberate: the alternative is a check that can be argued out of reading
-/// part of the file, and that is how both previous versions were defeated. The
-/// panic names the file at fault so the message points at the edit rather than
-/// at this function.
+/// part of the file, and that is how both previous versions were defeated.
+///
+/// The panic names the file at fault, which is the part that was missing when
+/// this check was written — before, a `picker.rs` problem was reported as a
+/// `probe.rs` panic. It does **not** always name the line at fault, and the two
+/// halves differ: an unbalanced `}` closes the depth early, so the loop fails at
+/// the offending line and quotes it (a stray `}` in a comment above
+/// `picker.rs`'s `a_session` reported *line 802 of 1011*, which is that
+/// comment). An unbalanced `{` never brings the depth back to zero, so nothing
+/// fails until the count is checked at the end, and the message can only quote
+/// the file's **last** line — deleting `main.rs`'s balancing `// }` reports
+/// *line 644*, which is the end of `main.rs` and 200 lines from the edit. In
+/// that direction the message says which file and which guard, and the reader
+/// finds the brace.
 ///
 /// What a textual count does not reach, measured rather than reasoned: a tail
 /// whose braces are *balanced* by braces written inside string literals — one

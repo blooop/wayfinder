@@ -19,7 +19,11 @@
 //!    the picker from a function the same binary has to call, so what stands in
 //!    its place is a denylist — `reap` is a forbidden token in this file
 //!    ([`tests::the_picker_names_neither_a_subprocess_nor_reap`]) and `main.rs`
-//!    holds the list of every line in itself that writes the word. Those are
+//!    holds the list of every line of its own *code* that writes the word. Not
+//!    every line: the `USAGE` help text writes `wf reap` twice, because that is
+//!    the command it documents, and it is cut out before the list is taken —
+//!    with the cut checked against `USAGE`'s own line count, because an
+//!    unbounded cut was itself an escape. Those are
 //!    greps over the source text of two files: they catch a cleanup wired in by
 //!    accident, and they do not stop anyone who means to get around them. The
 //!    same call made one hop away in a third file is caught by neither, and so
@@ -41,9 +45,12 @@
 //!      `run_picker` composes the registration, the terminal, the `session`
 //!      call and the handover, and no test in this repository executes it, so
 //!      everything it does above and below that call is outside the recording.
-//!      What covers that part of this file is the denylist in (1), widened to
-//!      `fs::` for exactly this reason after a reviewer deleted a workspace
-//!      from `run_picker` with the whole selection green;
+//!      What stands there instead is the denylist in (1), which is why it
+//!      carries `fs` — twice over: a reviewer deleted a workspace from
+//!      `run_picker` with `std::fs::remove_dir_all` and the whole selection
+//!      green, and when the token was added as `fs::`, the next reviewer
+//!      reopened it with `use std::fs as sys;`. It is the bare name now, for
+//!      the reason `reap` is;
 //!    - **which arm**: all four [`Outcome`] arms are driven, the launch one
 //!      included, and so is [`fold`] — but only through the events the child's
 //!      fixtures actually produce. Its `Discovered`, `Fetched` and
@@ -60,11 +67,14 @@
 //!    same run gives the child a scratch `HOME` laid out the way this machine
 //!    is — `~/.cache/devlaunch/repos/<owner>/<repo>/<id>` for the clone,
 //!    `~/.devpod/contexts/<ctx>/workspaces/<id>` for the record — and compares
-//!    the tree before and after. An `fs::remove_dir_all` aimed at a workspace
-//!    fails it *if it runs inside `session`* — the same three bounds as (2)
-//!    apply, and the `run_picker` escape above was one of them being real. An
-//!    `fs` call aimed somewhere else is caught by nothing — as it would be in
-//!    any file of any crate, and this file claims no better.
+//!    the tree before and after. A `remove_dir_all` aimed at a workspace fails
+//!    it *if it runs inside `session`* — the same three bounds as (2) apply,
+//!    and the `run_picker` escape above was one of them being real. An `fs`
+//!    call aimed outside that home, **or written outside `session`** — which is
+//!    the whole of [`run_picker`] and the whole of `main.rs` — is caught by
+//!    nothing here; what covers those two files is the denylist in (1), and
+//!    nothing covers a third file. That is as true of any code in any crate,
+//!    and this file claims no better.
 //!
 //! None of that says the picker deletes nothing at all. [`run_picker`] calls
 //! [`refresh_skills`] on the way into the agent, and a copy that has fallen
@@ -937,36 +947,52 @@ mod tests {
         // [`Picker::tick`] and [`fold`], neither of which is async, and a task
         // that outlives the loop outlives the probe with it.
         //
-        // `fs::` is here because the probe drives [`session`], and
-        // [`run_picker`] is the function *above* it — composed of a
-        // registration, a terminal, the `session` call and the handover, and
-        // executed by no test in this repository. A reviewer planted
-        // `std::fs::remove_dir_all` in `run_picker` aimed at the real layout
+        // `fs` is here because the probe drives [`session`], and [`run_picker`]
+        // is the function *above* it — composed of a registration, a terminal,
+        // the `session` call and the handover, and executed by no test in this
+        // repository. A reviewer planted `std::fs::remove_dir_all` in
+        // `run_picker` aimed at the real layout
         // (`~/.cache/devlaunch/repos/<owner>/<repo>/<id>` and
         // `~/.devpod/contexts/default/workspaces/<id>`); it named none of the
         // four tokens above, the whole selection was green, and driven under a
-        // pty it destroyed a workspace while the picker drew normally. So the
-        // token is what covers the part of this file the run does not reach.
-        // Adding it cost nothing: `fs::` appears nowhere in this file's code.
+        // pty it destroyed a workspace while the picker drew normally.
         //
-        // It is *not* a claim that nothing on the picker's path can delete, and
-        // a grep over one file could never be one. The same call spelt in
-        // `app.rs` or in a submodule of this module names none of these and
-        // compiles; what stands against it there is the recorded argv and the
-        // scratch home the run above compares — and outside that home, outside
-        // [`session`], or after that run, nothing does, which is true of any
-        // code in any file.
+        // Bare `fs`, and that is the second attempt. The token went on as
+        // `fs::`, and the next reviewer reopened the same escape with one line:
+        // `use std::fs as sys;` writes no `fs::` anywhere, and
+        // `sys::remove_dir_all(…)` in `run_picker` was green again and really
+        // destroyed the fixture. It is the same lesson `reap` above is written
+        // from — the module cannot be reached without its own name being
+        // written — and it was not applied here the first time. Measured:
+        // `fs::` in the list is green against the alias and the bare name is
+        // bins 16/1; bare `fs` still costs this file nothing, because `fs`
+        // does not occur in its code at all, in an identifier or anywhere else.
         //
-        // The list is still one short of the ones [`wf::reclaim`] and
-        // [`wf::refresh`] carry. Those two also forbid `remove`, and this file
-        // cannot: `app.failed.remove(&id)` is `App`'s own bookkeeping, one
-        // occurrence, and renaming a `HashMap` method to satisfy a grep is the
-        // distortion a previous round was asked to undo. `"rm"` and `--force`
-        // are absent from this file's code and could be added at no cost; they
-        // are the argv of the subprocess `Command` and `process::` already
-        // forbid spelling, and the recorded run reads argv directly.
+        // So what this token covers is the part of this file the run does not
+        // reach. It is *not* a claim that nothing on the picker's path can
+        // delete, and a grep over one file could never be one. The same call
+        // spelt in `app.rs` or in a submodule of this module names none of
+        // these and compiles; what stands against it there is the recorded argv
+        // and the scratch home the run above compares — and outside that home,
+        // outside [`session`], or after that run, nothing does, which is true
+        // of any code in any file.
+        //
+        // The list is five tokens, against six in [`wf::reclaim`] and seven in
+        // [`wf::refresh`], and the difference is worth writing down rather than
+        // rounding off. Both siblings forbid `remove`, `"rm"` and `--force`;
+        // this file forbids none of the three. `remove` it cannot:
+        // `app.failed.remove(&id)` is `App`'s own bookkeeping, one occurrence,
+        // and renaming a `HashMap` method to satisfy a grep is the distortion a
+        // previous round was asked to undo. `"rm"` and `--force` are absent
+        // from this file's code and could be added at no cost; they are the
+        // argv of the subprocess `Command` and `process::` already forbid
+        // spelling, and the recorded run reads argv directly. Going the other
+        // way, `tokio::spawn` is on this list and on neither sibling's, because
+        // a task spawned here outlives the loop and the probe with it; `reap`
+        // is here and in `refresh`'s list but not in `reclaim`'s, which calls
+        // `reap::plan` and `reap::doomed` by name and pins that call instead.
         let code = probe::code_only("picker.rs", include_str!("picker.rs"));
-        for forbidden in ["reap", "Command", "process::", "tokio::spawn", "fs::"] {
+        for forbidden in ["reap", "Command", "process::", "tokio::spawn", "fs"] {
             assert!(
                 !code.contains(forbidden),
                 "the picker draws a screen and drains a channel: it names {forbidden:?}"

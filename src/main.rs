@@ -33,8 +33,14 @@
 //! forced reap with the unsaved-work guard waived. Nothing in the language
 //! stops a line anywhere in this crate calling it, so what stands in its place
 //! is a grep: [`tests::the_binary_writes_reap_only_where_it_is_listed_here`]
-//! holds the whole list of lines in this file that write the word `reap`, and
-//! `picker.rs` may not write it at all.
+//! holds the whole list of lines of *code* in this file that write the word
+//! `reap`, and `picker.rs` may not write it at all. Lines of code, not lines:
+//! `USAGE` writes `wf reap` twice because that is the command it documents, and
+//! the help text is cut out before the list is taken — the cut being checked
+//! against `USAGE`'s own line count, because an unbounded one was itself an
+//! escape (see `tests::without_usage`). The same test also forbids this file
+//! the two ways to delete that go nowhere near `reap`: `Command`, and the bare
+//! word `fs`, which no spelling of `std::fs` can avoid writing.
 //!
 //! That is a guard over the source text of two files, and it is worth what that
 //! is: it catches a cleanup wired in here by accident, which is the mistake
@@ -374,9 +380,20 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// If `USAGE` is not found, or its literal is not closed by a line ending
-    /// `";` — the same fail-closed posture as [`probe::code_only`]: a shape
-    /// this cannot locate is refused rather than skipped.
+    /// If `USAGE` is not found; if no line at or below it ends `";`; or if the
+    /// first line that does is not `USAGE`'s own closing line, measured against
+    /// the constant's line count. The third is not decoration — without it this
+    /// function cut from `USAGE` to whatever `";` came next, however far below,
+    /// and that was an escape rather than a hypothetical: see the comment on
+    /// the assertion.
+    ///
+    /// All three are the fail-closed posture of [`probe::code_only`]: a shape
+    /// this cannot account for fails the guard rather than being skipped past.
+    /// It is a real constraint on `USAGE` and not only on attackers, and it is
+    /// stated from the three lines below rather than from a run: the literal
+    /// has to open with `const USAGE: &str = "` at column 0, and it has to
+    /// close on a line whose last two characters are `";`. A `concat!`, or a
+    /// trailing comment on the closing line, is a shape this refuses.
     fn without_usage(code: &str) -> String {
         let lines: Vec<&str> = code.lines().collect();
         let opens = lines
@@ -388,6 +405,38 @@ mod tests {
                 .iter()
                 .position(|line| line.trim_end().ends_with("\";"))
                 .expect("the USAGE literal is closed by a line ending `\";`");
+        // The line found above is the first one ending `";` at or below the
+        // `const`. That it closes *`USAGE`'s own* literal is a separate fact,
+        // and it has to be checked rather than assumed: a trailing comment on
+        // the closing line makes `ends_with` miss it, the search runs on to the
+        // next `";`-terminated line anywhere below, and everything between is
+        // cut out of the list. That is not hypothetical and it was this
+        // function's own doing: written without this assertion, a helper placed
+        // directly under `USAGE` — `async fn wash_up() { reap::run(true, true);
+        // let _ = "swept"; }`, called from `main()`'s first line — was cut out
+        // whole by a trailing comment on `USAGE`'s closing line, and the whole
+        // selection was green. With the assertion the same edit is bins 16/1;
+        // without the trailing comment it is bins 16/1 on the list below, which
+        // is what says the comment was the vehicle.
+        //
+        // Comparing the span to the constant's own line count is what ties the
+        // cut to the literal: it is the compiler that says how many lines
+        // `USAGE` has. A rewrap that changes that count changes both sides
+        // together — measured, not assumed: rewording and rewrapping the
+        // `wf reap` paragraph from eight lines to ten stays green — so this
+        // does not put back the pin on the wrapping that it removed.
+        assert_eq!(
+            closes - opens,
+            USAGE.lines().count(),
+            "the lines cut here are not `USAGE`. Counting this file's code with \
+             its comment lines already dropped, the `const` is at line {}, the \
+             first line below it ending `\";` is line {}, and `USAGE` itself is \
+             {} lines — so that line closes some other literal and this cut is \
+             swallowing code that the `reap` list below would otherwise read",
+            opens + 1,
+            closes + 1,
+            USAGE.lines().count()
+        );
         lines
             .iter()
             .enumerate()
@@ -418,18 +467,28 @@ mod tests {
         // because it is prose and pinning its line wrapping here made the guard
         // fail on rewraps and say something untrue when it did.
         //
-        // Any new line that writes the word fails here, whatever it writes
-        // around it: an alias (`use wf::reap as tidy;`, `use crate::reap as
-        // tidy;`), a path through the crate root, a call split over two lines.
-        // The module cannot be reached without its name being written
-        // somewhere, and every somewhere is below.
+        // Any new line of code *this reads* that writes the word fails here,
+        // whatever it writes around it: an alias (`use wf::reap as tidy;`,
+        // `use crate::reap as tidy;`), a path through the crate root, a call
+        // split over two lines — each of those was a reviewer's escape and each
+        // is red now. The module cannot be reached without its name being
+        // written somewhere, so the name is what is counted.
         //
-        // What this does **not** reach: a third file calling `wf::reap::run`,
-        // and a re-export that gives the module a second name in the library.
-        // It is a grep over one file, and a grep over one file cannot see
-        // either. What it is good for is the accident — a maintainer wiring a
-        // cleanup in without noticing — and that is the claim the module doc
-        // makes for it too.
+        // "That this reads" is doing work in that sentence, and it is the part
+        // that has failed twice. What this test sees is `code_only` minus
+        // `without_usage`'s cut, and both of those are text handling that can be
+        // argued out of reading part of the file — `code_only` was defeated by a
+        // decoy and then by indentation, and `without_usage` shipped for one
+        // round with an unbounded cut that hid a `reap::run(true, true)` call
+        // outright. Both now check their own shape and fail closed, which is why
+        // this comment says what it reads rather than "every line".
+        //
+        // What this does **not** reach, in the design rather than by defect: a
+        // third file calling `wf::reap::run`, and a re-export that gives the
+        // module a second name in the library. It is a grep over one file, and a
+        // grep over one file cannot see either. What it is good for is the
+        // accident — a maintainer wiring a cleanup in without noticing — and
+        // that is the claim the module doc makes for it too.
         let code = probe::code_only("main.rs", include_str!("main.rs"));
         assert_eq!(
             lines_naming(&without_usage(&code), "reap"),
@@ -473,6 +532,23 @@ mod tests {
             !code.contains("Command"),
             "this file dispatches; it does not run anything itself, and a \
              subprocess started here runs on every `wf` invocation"
+        );
+
+        // And the deletion that starts no subprocess at all. A reviewer put
+        // `std::fs::remove_dir_all` of the real clone and record paths in
+        // `main()`: `wf --version` printed the version, exited 0, and destroyed
+        // both, with the whole selection green — the same accidental cleanup
+        // the line above is for, written in-process instead of as argv.
+        //
+        // Bare `fs`, not `fs::`, for the reason `lines_naming`'s doc gives for
+        // `reap`: `use std::fs as sys;` writes no `fs::` and reopens the whole
+        // thing. The module cannot be reached without its name being written,
+        // so the name is what is counted. It is free here — `fs` does not
+        // occur in this file's code at all, in an identifier or anywhere else.
+        assert!(
+            !code.contains("fs"),
+            "this file dispatches; deleting a directory in-process is not \
+             something it does, under any spelling of `std::fs`"
         );
     }
 

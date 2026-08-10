@@ -786,15 +786,16 @@ mod tests {
         // `unsafe` used to be on this list and is not: `unsafe_code = "deny"`
         // in `Cargo.toml` covers every target in the crate, so a copy here was
         // a second, weaker statement of a rule the compiler already enforces.
+        //
+        // `fs` bare rather than `fs::`, matching `picker.rs` and
+        // [`crate::refresh`]: written `fs::`, the token is defeated by
+        // `use std::fs as sys;`, which is a one-line edit that a reviewer used
+        // to reopen an escape this PR had already closed once. The bare name
+        // catches both spellings and costs nothing — `fs` occurs nowhere in
+        // this file's code. Measured: the alias in this module's reading is
+        // lib 356/1 against the bare name.
         let code = crate::probe::code_only("reclaim.rs", include_str!("reclaim.rs"));
-        for forbidden in [
-            "remove",
-            "\"rm\"",
-            "--force",
-            "Command",
-            "process::",
-            "fs::",
-        ] {
+        for forbidden in ["remove", "\"rm\"", "--force", "Command", "process::", "fs"] {
             assert!(
                 !code.contains(forbidden),
                 "the surfacing path must not be able to delete: it names {forbidden:?}"

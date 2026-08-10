@@ -403,15 +403,19 @@ That one is settled by the compiler and needs no test.
 `wf reap` as a whole *command* is another matter: it has to be public for `main`
 to dispatch it, and `reap::run(true, true)` is a forced reap. So the picker file
 may not write the word `reap` at all — nor `Command`, `process::`,
-`tokio::spawn` or `fs::` — and `main.rs` carries the list of every line of code
-in itself that writes `reap`, and may not write `Command` either. A word, not a
-path, so an alias or a `crate::` route has to appear in that list too. Those are
-greps over the source text of two files. They catch a cleanup wired in by
-accident, which is the mistake anyone is actually likely to make; they do not
-stop someone who means to get around them, and several review rounds of this
-feature were spent proving exactly that. A grep over two files cannot see the
-same call written in a third, or a second name for the module exported from the
-library.
+`tokio::spawn` or `fs` — and `main.rs` carries the list of every line of code in
+itself that writes `reap`, and may not write `Command` or `fs` either. Words,
+not paths: `use std::fs as sys;` writes no `fs::` and `use crate::reap as tidy;`
+writes no `reap::`, and both of those were live escapes against the narrower
+spelling. `main.rs`'s list is of lines of *code* — its `USAGE` help text writes
+`wf reap` because that is the command it documents, and it is cut out before the
+list is taken, with the cut checked against `USAGE`'s own line count so it
+cannot run past the literal and swallow code. Those are greps over the source
+text of two files. They catch a cleanup wired in by accident, which is the
+mistake anyone is actually likely to make; they do not stop someone who means to
+get around them, and several review rounds of this feature were spent proving
+exactly that. A grep over two files cannot see the same call written in a third,
+or a second name for the module exported from the library.
 
 Everything else is watched rather than proven. A test drives the real event loop
 against a recording `dl` and `gh`, through every arm the loop has — quit,
@@ -422,17 +426,23 @@ argv the run made, plus a scratch `HOME` laid out the way this machine is
 after. That catches a workspace deleted by running `dl` and one deleted
 in-process, whatever file the call was written in, inside three stated bounds.
 It starts at the loop's composition — the function that spawns the reading and
-runs the loop — so what `wf` does above and below that call is outside it; the
-tokens above are what cover that part of the picker file. It runs for the length
-of that call plus 400 ms after the reading lands, after every key and after it
+runs the loop — so what `wf` does above and below that call is outside it; what
+stands there instead is the token list above, in those two files and no others.
+It runs for the length of that call plus 400 ms after the reading lands, after
+every key and after it
 returns, so a deletion deferred past the window is not seen (a spawned task that
 sleeps a second and a half is green; the same one with the window at three
 seconds is caught). And it sees only what the child's fixtures reach: a deletion
 in the one fold arm a failed map search would take is green, because the `gh`
-shim succeeds. An `std::fs` call aimed outside that scratch `HOME` is caught by
-nothing — a `remove_dir_all` pointed at a directory elsewhere on the disk passes
-the whole suite, and really does destroy it. Nothing in any Rust file catches
-that.
+shim succeeds. An `std::fs` call is caught by nothing when it is aimed outside
+that scratch `HOME` **or written outside the span the run covers** — and that
+span is the loop's composition, so "outside" it is the whole of the picker's own
+entry point and the whole of `main`. A `remove_dir_all` pointed at a directory
+elsewhere on the disk passes the whole suite and really does destroy it; a
+`remove_dir_all` aimed squarely *inside* the watched home, written in either of
+those two functions, passed it too until the `fs` token above went on. What
+catches the second kind is that token, in the two files that carry it, and it is
+a grep. Nothing catches either kind in a third file.
 
 The picker does delete one thing, and it is not a workspace: the launch path
 brings the installed skill copies back in step with the bundle, which removes

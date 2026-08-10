@@ -531,7 +531,7 @@ mod tests {
         // this file, not about everything a future handed to it might do — the
         // reading itself is guarded in [`crate::reclaim`] and the loop that
         // consumes it in the binary's `picker`.
-        // The same list its sibling in [`crate::reclaim`] carries, and for the
+        // Its sibling in [`crate::reclaim`]'s list plus `reap`, and for the
         // same reason: a shorter one here was a door in the same wall. A
         // `std::fs::remove_dir_all` inside the spawned task passed both this
         // and the argv probe, because a directory removed in-process runs no
@@ -546,6 +546,13 @@ mod tests {
         // reached without its name being written, so `use crate::reap as tidy;`
         // is caught here too. It costs nothing — nothing in this file's code
         // says the word.
+        //
+        // `fs` is bare for the same reason, and that took a second round to
+        // notice: written `fs::`, it was reopened by `use std::fs as sys;`.
+        // Measured here rather than assumed for the two library files as well
+        // as for `picker.rs` — that alias inside the spawned task is lib 356/1
+        // against the bare name, and `fs` occurs in none of the four guarded
+        // files' code.
         let code = crate::probe::code_only("refresh.rs", include_str!("refresh.rs"));
         for forbidden in [
             "reap",
@@ -554,7 +561,7 @@ mod tests {
             "--force",
             "Command",
             "process::",
-            "fs::",
+            "fs",
         ] {
             assert!(
                 !code.contains(forbidden),
