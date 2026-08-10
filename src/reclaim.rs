@@ -1,4 +1,5 @@
-//! Noticing what [`reap`] would claim, without being asked (#137).
+//! Noticing, without being asked: what [`reap`] would claim (#137), and what is
+//! running or has stopped ([`Liveness`](crate::liveness)).
 //!
 //! `wf reap` already decides what is finished. What it lacks is a trigger: it
 //! fires only when a person remembers to type it. This module is that trigger
@@ -16,12 +17,19 @@
 //!
 //! **Nothing here can delete.** `plan` is asked with `insist` false, so a
 //! workspace holding work that exists nowhere else is not surfaced at all; and
-//! the whole module reads facts and returns a sentence. It cannot reach
+//! the whole module reads facts and returns a description of them — a sentence
+//! for the count line, and a per-node marking beside it. It cannot reach
 //! `reap`'s deletion side even by trying: the function that removes a workspace
 //! is private to `reap`'s own module, so `reap::remove(id, true).await` written
 //! anywhere in this file is `E0603`, not a test failure. The reading is the
 //! product; the waiver, the prompt and the deletion all stay with the human
 //! typing `wf reap`.
+//!
+//! **One reading, two questions.** [`survey`] takes a single `dl --ls --json`
+//! and a single batched tracker query and derives both observations from them;
+//! [`Reading`] says why they are carried together and kept apart. The second is
+//! [`Liveness`](crate::liveness)'s own derivation, called here rather than
+//! written here.
 //!
 //! **It fails silent.** [`survey`] answers `Option`, not `Result`. No `dl` on
 //! PATH, a `dl --ls --json` that failed, a GraphQL error, no network: the hint
@@ -135,6 +143,19 @@ impl Reclaimable {
     /// How many rows `wf` is uneasy about but will not act on.
     pub fn warned(&self) -> usize {
         self.warned
+    }
+
+    /// The narrowest this segment can be and still read as a sentence.
+    ///
+    /// The last arm of [`Reclaimable::hint`] clips the count itself rather than
+    /// vanishing — deliberately, because a segment that disappears at a width
+    /// nothing else disappears at looks like a bug. But a clip is only the
+    /// right answer when the *line* has run out; a neighbouring segment that
+    /// could have yielded instead should, and it needs this number to know how
+    /// much yielding is enough. Below it the reader gets `· 2 reclaima`, which
+    /// is not a word.
+    pub fn min_width(&self) -> usize {
+        format!("· {} reclaimable", self.ids.len()).chars().count()
     }
 
     /// The count-line segment, in `width` characters: how many, which ones,

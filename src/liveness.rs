@@ -106,7 +106,8 @@ impl Liveness {
     ///
     /// Takes the same two values [`reap::plan`](crate::reap::plan) does, from
     /// the same reading, and reads different fields of them. Nothing here can
-    /// delete: it consumes two borrowed slices and returns a map of numbers.
+    /// delete: it borrows a listing and a set of tracker answers, and returns a
+    /// map of numbers.
     ///
     /// Running is settled first and wins, because a node can own more than one
     /// workspace: with one container up and another down, the node is being
@@ -192,10 +193,17 @@ impl Liveness {
     /// somebody to press enter in a list is spending the scarcest characters on
     /// the line saying nothing.
     ///
-    /// The width is a budget. This segment is laid down before the reclaim
-    /// note, so on a line too narrow for both it is the reap pointer that goes
-    /// first — deliberate, and the one trade in here worth disagreeing with:
-    /// work that has stopped moving outranks tidying that can wait.
+    /// The width is a budget, and this segment is laid down before the reclaim
+    /// note — so on a narrowing line the reap pointer and the warned aside go
+    /// while stalls are still naming nodes. Deliberate, and the one trade in
+    /// here worth disagreeing with: work that has stopped moving outranks
+    /// tidying that can wait.
+    ///
+    /// The caller holds back [`Reclaimable::min_width`](crate::reclaim::Reclaimable::min_width)
+    /// before asking, which is where that priority stops. Below its own count
+    /// the reclaim note clips rather than disappearing, so taking those last
+    /// characters would not buy the line a stall name — it would spend them
+    /// turning the neighbouring segment into a fragment.
     pub fn hint(&self, width: usize) -> String {
         if self.stalled() == 0 {
             return String::new();
@@ -386,7 +394,7 @@ mod tests {
         ] {
             assert!(
                 !code.contains(forbidden),
-                "reading liveness is a join over two borrowed slices: it names {forbidden:?}"
+                "reading liveness is a join over what it was handed: it names {forbidden:?}"
             );
         }
     }

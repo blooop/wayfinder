@@ -994,13 +994,23 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
             .sum::<usize>()
         + notice.chars().count();
     let mut left = (count_area.width as usize).saturating_sub(spent);
-    // Stalls are laid down before the reclaim note, and what bounds them is
-    // `Liveness::hint`'s own `NAMED` — at most two nodes, each a short repo and
-    // a number — rather than a ceiling written here. A second cap on top of
-    // that only ever cost a name: an extra constant tuned to a width buys two
-    // columns and drops the segment from two names to one at exactly the sizes
-    // where both would have fitted.
-    let stalled = app.liveness.hint(left);
+    // Stalls are laid down before the reclaim note, but not at any price: what
+    // is held back for the reclaim note is exactly the width at which it stops
+    // being a word (`Reclaimable::min_width`), because its own last arm clips
+    // the count rather than vanishing. Without that, two named stalls on a
+    // 60-column terminal left it three characters short and it rendered
+    // `· 2 reclaima`.
+    //
+    // Yielding is the whole of the concession. Stalls still outrank the reap
+    // pointer and the warned aside — both of those go while `· N stalled` is
+    // still naming nodes — and `Liveness::hint`'s own ladder does the yielding
+    // gracefully, dropping to one name and then to the bare count, which the
+    // rows' own `⧖` markings make readable anyway.
+    let reserved = app
+        .reclaimable
+        .as_ref()
+        .map_or(0, |found| found.min_width() + 1);
+    let stalled = app.liveness.hint(left.saturating_sub(reserved));
     if !stalled.is_empty() {
         left = left.saturating_sub(stalled.chars().count() + 1);
         parts.push(stalled);
@@ -1592,9 +1602,9 @@ mod tests {
         assert!(line.contains("wayfinder#9"), "{line}");
     }
 
-    /// The two unbounded segments share one line, and the stall cap is what
-    /// keeps the earlier one from spending it all: the `wf reap` pointer is the
-    /// half of the reclaim hint a reader can act on, and it still fits.
+    /// The two variable-length segments share one line, and neither may leave
+    /// the other unreadable: the `wf reap` pointer is the half of the reclaim
+    /// hint a reader can act on, and it still fits.
     #[test]
     fn a_stall_segment_leaves_the_reclaim_pointer_its_room() {
         let mut app = fixture_app();
@@ -1617,6 +1627,53 @@ mod tests {
             line.contains("wf reap"),
             "the command survives beside the stalls: {line}"
         );
+    }
+
+    /// Neither segment is ever clipped to a fragment, at any width.
+    ///
+    /// The regression this pins was visible only on a rendered screen: with two
+    /// stalls named on a 60-column terminal, the reclaim note was left three
+    /// characters short of its own count and its last arm — which clips rather
+    /// than vanishing — put `· 2 reclaima` on the line. Every assertion about
+    /// these two segments passed, because each was measured on its own.
+    ///
+    /// Fragments are also how an *overrun* shows up here, and deliberately the
+    /// only way it can: the frame buffer is the area's width by construction,
+    /// so a line that asked for more was already truncated by the time it can
+    /// be read back, and `inner.len() <= width` is a fact about `ratatui`
+    /// rather than about this code. What a truncation leaves behind is a
+    /// partial word at the end of the line, which is what is asserted.
+    #[test]
+    fn neither_count_line_segment_can_clip_the_other_into_a_fragment() {
+        let mut app = fixture_app();
+        app.liveness = crate::liveness::Liveness::for_test(
+            &[],
+            &[("blooop/wayfinder", 9), ("blooop/wayfinder", 14)],
+        );
+        app.reclaimable = Some(Reclaimable::for_test(
+            &["devlaunch-github-blooop-wayfinder-127-ladepomi", "wf-80-x"],
+            1,
+        ));
+        for width in 40..=130u16 {
+            let screen = render_at(width, &app);
+            let line = screen.lines().nth(2).expect("a count line");
+            let inner: String = line.chars().skip(1).take(width as usize - 2).collect();
+            // A word or nothing. Any proper prefix of "reclaimable"/"stalled"
+            // left at the end of the line is the fragment this exists to catch.
+            // From one character: `· 2 r` is as wrong as `· 2 reclaima`, and no
+            // segment ends in a letter that could be mistaken for one — the
+            // names end in digits, the asides in `)`, the pointer in `p`.
+            for whole in ["reclaimable", "stalled"] {
+                for cut in 1..whole.len() {
+                    let fragment = &whole[..cut];
+                    assert!(
+                        !inner.trim_end().ends_with(fragment),
+                        "{width}: {whole:?} was clipped to {fragment:?}: {:?}",
+                        inner.trim_end()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

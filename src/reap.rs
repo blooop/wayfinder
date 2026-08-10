@@ -143,7 +143,11 @@ pub enum Unsaved {
     CouldNotTell(String),
     /// `dl` answered something this `wf` does not understand, quoted back.
     ///
-    /// A newer `dl` than this binary, in other words. It refuses a reap for the
+    /// Two things reach here: a key from a `dl` newer than this binary, and the
+    /// documented `nothingToLose` carrying a payload it is not documented to
+    /// carry. Both are `wf` failing to read `dl` rather than `dl` failing to
+    /// read a clone, which is why the row's wording hedges at a newer `dl`
+    /// rather than asserting one. It refuses a reap for the
     /// same reason [`Unsaved::CouldNotTell`] does — nothing has established
     /// that this clone exists anywhere else — and it is a separate arm because
     /// the two are separate facts: one is `git` failing on the clone, the other
@@ -219,12 +223,14 @@ enum UnsavedWire {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum UnsavedReported {
-    /// The payload `dl` documents is `true`. It is read rather than ignored:
-    /// this is the one key that *permits* a delete, so anything but the
-    /// documented `true` under it falls through to [`UnsavedWire::Unknown`] and
-    /// refuses. An unrecognised key failing loudly while an unrecognised
-    /// payload under the permissive key quietly unlocked deletion would be the
-    /// asymmetry the wrong way round.
+    /// The payload `dl` documents is `true`. It is read rather than ignored,
+    /// because this is the one key that *permits* a delete: `false` is matched
+    /// here and mapped to [`Unsaved::Unrecognized`] below, and a payload that
+    /// is not a boolean at all misses this variant entirely and lands on
+    /// [`UnsavedWire::Unknown`]. Two routes, one outcome — refuse. Ignoring the
+    /// payload would have left an unrecognised *key* failing loudly while an
+    /// unrecognised value under the permissive key quietly unlocked deletion,
+    /// which is the asymmetry the wrong way round.
     NothingToLose(bool),
     WouldLose(String),
     CouldNotTell(String),

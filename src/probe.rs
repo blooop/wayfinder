@@ -422,9 +422,14 @@ pub fn note(what: &str) {
         .expect("the probe log");
 }
 
-/// A `dl --ls --json` listing over four workspaces of this repo, in the shape
-/// devlaunch 0.0.21 and newer emit — one finished ticket, one the planner warns
-/// about, one in use, and one whose run stopped between its stages.
+/// A `dl --ls --json` listing over four workspaces of this repo, as devlaunch
+/// 0.0.24 writes them — one finished ticket, one the planner warns about, one
+/// in use, and one whose run stopped between its stages.
+///
+/// The newest shape on purpose: this is the fixture the *whole reading* is
+/// driven through, so it should look like the `dl` this `wf` will be run
+/// against next. Every older spelling of `unsaved` has its own row in
+/// [`DL_LISTING_UNSAVED`], which is where that field is the subject.
 ///
 /// The fourth exists so the live path can produce a **stall**, not just be
 /// asserted to derive one from hand-built state: it is the only row whose
@@ -435,7 +440,7 @@ pub fn note(what: &str) {
 /// and the picker's drive the same two reads, and a fixture written twice is a
 /// fixture that can disagree with itself about what the machine looks like.
 ///
-/// The three ids are also [`LAID_OUT`] as directories in the child's scratch
+/// The four ids are also [`LAID_OUT`] as directories in the child's scratch
 /// home, so what the code under test can see is exactly what it can be caught
 /// destroying.
 pub const DL_LISTING: &str = r#"[

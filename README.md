@@ -298,8 +298,9 @@ dropped the moment you press it rather than when its replacement lands: these
 are claims in the present tense, and a screen asserting last hour's containers
 beside freshly fetched tickets would be worse than one asserting nothing.
 
-Stalls also reach the [count line](#startup) as `· 2 stalled: wayfinder#133,
-+1 more`, because the row is not always on screen — the project list has no
+Stalls also reach the [count line](#startup) as
+`· 2 stalled: wayfinder#133, wayfinder#134`, because the row is not always on
+screen — the project list has no
 ticket rows at all, and a stall can be inside a fold or another map. Running
 containers stay on their rows: they are the ordinary state of a machine in use,
 and a count of them would be a status bar rather than a summons.
@@ -445,16 +446,19 @@ ask again.
 count line when it arrives:
 
 ```
-  12/30  · 1 stalled: wayfinder#133  · 2 reclaimable: devlaunch-…-127, +1 more — wf reap
+  12/30  · 1 stalled: wayfinder#133 · 2 reclaimable: devlaunch-github-…oop-wayfinder-127, +1 more — wf reap
 ```
 
 That one reading answers two questions, because the same `dl --ls --json` and
 the same tracker query settle both: what a reap would claim, and
 [what is running and what stopped](#what-is-actually-running-and-what-stopped).
-Stalls are laid down first and capped, so the two variable-length segments
-cannot fight over one line — on a terminal too narrow for both it is the reap
-pointer that goes, which is the one trade in here worth disagreeing with: work
-that has stopped moving outranks tidying that can wait.
+Stalls are laid down first, so on a narrowing terminal it is the `wf reap`
+pointer and the warned aside that go while stalls are still naming nodes — the
+one trade in here worth disagreeing with: work that has stopped moving outranks
+tidying that can wait. What stalls will not do is squeeze the reclaim note below
+its own count, because that segment clips rather than vanishing and `· 2
+reclaima` is not a word; they give up a name instead, which the rows' own `⧖`
+markings make readable anyway.
 
 It is the same reading `wf reap` prints, taken by the same code — a `dl --ls
 --json` and one batched tracker query, neither of them on the way to a frame.
@@ -775,7 +779,7 @@ an empty one.
 | `enter` | on the project list: enter that project. On a project's screen: open the launch picker — the creation rows on the project's own row, the launch modes on a ticket or a cluster header — and a second `enter` runs the agent here and exits. On a group line it folds instead, since there is no agent to run |
 | `←`/`→`, `↑`/`↓` or `tab`, *type*, then `enter`* | in the launch picker: pick Claude/Codex, pick the row, fill its field (a steering prompt, a task, or a map seed), launch — `esc` backs out with the query and cursor intact. `←`/`→` does nothing on a `resume` row, whose agent comes from the record |
 | `⏎` in a row | a previous launch left a conversation on this node: its picker leads with `resume`, and `enter enter` rejoins it |
-| `▣` in a row | a container of this node's is up — [something is very likely working here](#what-is-actually-running-and-what-stopped) |
+| `▣` in a row | [a container of this node's is up](#what-is-actually-running-and-what-stopped) — which is not the same as an agent being alive in it |
 | `⧖` in a row | claimed, nothing pushed, and nothing of its running: a run that stopped between its stages |
 | `ctrl-r` | refetch every map in place, keeping your query, level and cursor |
 | `esc` | clear the query; on an empty query, quit |

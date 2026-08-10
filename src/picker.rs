@@ -305,9 +305,11 @@ fn fold(
             }
         }
         // The background reading landed (#137). A plain state write on
-        // a screen that has been up and answering keys the whole time —
-        // it changes one dim segment of the count line and nothing else,
-        // and it arrives at most once because nothing asks again.
+        // a screen that has been up and answering keys the whole time.
+        // It reaches further than it once did: a dim segment of the count
+        // line, and — through `app.liveness` — a marking on any row whose
+        // node this machine has something to say about. And it arrives
+        // more than once, because `ctrl-r` asks again.
         LoadEvent::Surveyed(found) => {
             let (reclaimable, liveness) = found.into_parts();
             app.reclaimable = reclaimable;
@@ -326,8 +328,8 @@ fn fold(
 ///
 /// Read behind the screen exactly as the map search is: a `dl --ls --json`
 /// subprocess and one batched GraphQL call, neither of them on the way to a
-/// frame. It folds into the count line when it lands and says nothing when it
-/// fails.
+/// frame. What lands folds into the count line and into the rows' own
+/// markings; a reading that fails says nothing at all.
 fn spawn_reading(tx: &UnboundedSender<LoadEvent>) -> Survey {
     wf::refresh::spawn_survey(wf::reclaim::survey_live(), tx.clone())
 }
@@ -1043,9 +1045,13 @@ mod tests {
         // The list is five tokens, against six in [`wf::reclaim`], seven in
         // [`wf::refresh`] and seven in [`wf::liveness`], and the difference is
         // worth writing down rather than rounding off. `liveness` is the newest
-        // and holds the union: it is a pure join over two borrowed slices, so
-        // every token is free there and none of them constrains anything it had
-        // occasion to write. Both siblings forbid `remove`, `"rm"` and `--force`;
+        // and forbids seven of the eight tokens the four lists use between
+        // them. The exception is the interesting one: `liveness` cannot forbid
+        // `reap`, because it is written on `use crate::reap::{node_of, Node,
+        // NodeFact, Workspace}` — it reads that module's *types*. What stands
+        // there instead is the same thing that stands in `reclaim`, which calls
+        // `reap::plan` by name for the same reason: `reap`'s deletion is
+        // private to `reap`, so no import can reach it. Both siblings forbid `remove`, `"rm"` and `--force`;
         // this file forbids none of the three. `remove` it cannot:
         // `app.failed.remove(&id)` is `App`'s own bookkeeping, one occurrence,
         // and renaming a `HashMap` method to satisfy a grep is the distortion a
