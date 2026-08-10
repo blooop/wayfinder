@@ -369,13 +369,21 @@ where
 /// A `JoinHandle` would do the job and did, until the guard on "the picker
 /// never waits for this" turned out to be a grep over `main.rs` — which passes
 /// happily for `let _ = survey.await;` written any of the several ways that
-/// spelling admits. A handle nobody can await is a stronger statement than a
-/// test that nobody awaited it: the only thing this type offers is
-/// [`stop`](Survey::stop), and waiting for the reading before the first frame
-/// stops being a thing that compiles.
+/// spelling admits. The only thing this type offers is
+/// [`stop`](Survey::stop), so *this handle* cannot be waited on.
 ///
-/// Which leaves exactly one hazard, and [`stop`](Survey::stop) is where it is
-/// answered.
+/// It is worth being exact about how far that goes, because the obvious
+/// stronger claim is false and was made here: it does **not** put the reading
+/// off limits before the first frame. The reading is a separate value, and
+/// `let found = survey_live().await;` above the call compiles, is green, and
+/// puts a subprocess and a round trip in front of the screen. What rules that
+/// out is a fact about a run —
+/// `picker::tests::the_first_frame_is_drawn_before_anything_is_asked`, which
+/// records the frame and the subprocesses into one ordered log and reads the
+/// order off it.
+///
+/// Which leaves exactly one hazard this type does answer, and
+/// [`stop`](Survey::stop) is where it is.
 #[derive(Debug)]
 pub struct Survey(JoinHandle<()>);
 
@@ -520,8 +528,22 @@ mod tests {
         // #137's safety claim, at the seam that spawns the work: this module
         // takes a future that answers with a reading. It cannot reach `reap`'s
         // deletion side, because it cannot reach `reap` at all.
+        // The same list its sibling in [`crate::reclaim`] carries, and for the
+        // same reason: a shorter one here was a door in the same wall. A
+        // `std::fs::remove_dir_all` inside the spawned task passed both this
+        // and the argv probe, because a directory removed in-process runs no
+        // command for a shim to write down.
         let code = crate::probe::code_only(include_str!("refresh.rs"));
-        for forbidden in ["reap::", "\"rm\"", "--force", "Command"] {
+        for forbidden in [
+            "reap::",
+            "remove",
+            "\"rm\"",
+            "--force",
+            "Command",
+            "process::",
+            "fs::",
+            "unsafe",
+        ] {
             assert!(
                 !code.contains(forbidden),
                 "the background reading must not be able to delete: it names {forbidden:?}"

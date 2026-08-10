@@ -19,6 +19,10 @@
 //! keeps the environment surgery out of the parent — where it would race every
 //! other test in the binary — and costs one process spawn.
 //!
+//! [`note`] is what makes the log a timeline the probe body can put its own
+//! marks on, so an *ordering* — this frame was painted before that subprocess
+//! ran — is as observable as the argv itself.
+//!
 //! [`code_only`] is the smaller one: this crate's own source with the comments
 //! and the test module stripped, for the structural guards in
 //! [`reclaim`](crate::reclaim) and [`refresh`](crate::refresh). It was written
@@ -140,10 +144,22 @@ pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
         .output()
         .expect("the probe child");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let argv: Vec<String> = std::fs::read_to_string(&log)
+        .expect("the log")
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    // Read the log *before* asserting anything, so that the scratch directory
+    // is swept on the way out of a failing run too — a probe that leaked a
+    // directory per failure would fill `/tmp` on exactly the day someone is
+    // running it in a loop.
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(
         out.status.success(),
-        "the probe child `{test}` failed:\n{stdout}\n{}",
-        String::from_utf8_lossy(&out.stderr)
+        "the probe child `{test}` failed:\n{stdout}\n{stderr}"
     );
     // A name that matches nothing leaves a child that ran no tests, exited 0
     // and recorded no argv — and every assertion about what the probe did *not*
@@ -153,16 +169,58 @@ pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
         stdout.contains("test result: ok. 1 passed"),
         "the probe child `{test}` ran no test — is that name still right?\n{stdout}"
     );
-    let argv = std::fs::read_to_string(&log)
-        .expect("the log")
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
-    let _ = std::fs::remove_dir_all(&dir);
     Recording { argv, stdout }
 }
+
+/// Write a marked line into the recording log from inside a probe body.
+///
+/// The log is a *timeline*, not a set: the shims append to it as they are run,
+/// so a line the probe writes itself lands between the subprocesses that ran
+/// before it and the ones that ran after. That is what lets a probe pin an
+/// **ordering** — "the first frame was painted before anything asked the
+/// machine a question" is `note` sitting above every argv, and no amount of
+/// grepping the source can say that.
+///
+/// Silent outside a probe child, for the same reason [`is_child`] exists.
+pub fn note(what: &str) {
+    use std::io::Write;
+    let Some(log) = std::env::var_os(LOG) else {
+        return;
+    };
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(log)
+        .expect("the probe log");
+    writeln!(log, "note <{what}>").expect("the probe log");
+}
+
+/// A `dl --ls --json` listing over three workspaces of this repo, in the shape
+/// devlaunch 0.0.21 and newer emit — one finished ticket, one the planner warns
+/// about, one in use.
+///
+/// Here rather than beside either probe that uses it: the reading's own probe
+/// and the picker's drive the same two reads, and a fixture written twice is a
+/// fixture that can disagree with itself about what the machine looks like.
+pub const DL_LISTING: &str = r#"[
+  {"id":"wf-129-closed","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-129","state":"Stopped"},
+  {"id":"wf-138-unstarted","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-138","state":"Stopped"},
+  {"id":"wf-137-open","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-137","state":"Running"}
+]"#;
+
+/// The tracker's answer to the batched question those three nodes raise:
+/// #129 closed (a reap), #138 open with nobody on it and no PR (a warning),
+/// #137 open and claimed (a keep).
+pub const GH_FACTS: &str = r#"{"data":{"repository":{
+  "i129":{"state":"CLOSED","assignees":{"nodes":[]},
+          "closedByPullRequestsReferences":{"nodes":[]}},
+  "i137":{"state":"OPEN","assignees":{"nodes":[{"login":"blooop"}]},
+          "closedByPullRequestsReferences":{"nodes":[]}},
+  "i138":{"state":"OPEN","assignees":{"nodes":[]},
+          "closedByPullRequestsReferences":{"nodes":[]}}
+}}}"#;
 
 /// True when this process *is* a probe child — the guard an `#[ignore]`d probe
 /// body needs, because `cargo test -- --ignored` would otherwise run it with
@@ -237,10 +295,17 @@ fn executable(_path: &Path) {
 /// Called as `code_only(include_str!("reclaim.rs"))`: the `include_str!` has to
 /// stay at the call site, because its path is resolved against the file it is
 /// written in.
+///
+/// The test module is found by its `mod tests {` line rather than by the
+/// `#[cfg(test)]` above it, and that is not a detail. `main.rs` declares
+/// `#[cfg(test)] mod probe;` among its imports, so a cut at the first
+/// `#[cfg(test)]` left thirty lines of `use` statements — a guard over that
+/// file would have read no code at all and passed for it. Anything smuggled in
+/// *below* `mod tests` is caught by clippy's `items_after_test_module` instead.
 pub fn code_only(source: &str) -> String {
     source
         .lines()
-        .take_while(|line| !line.starts_with("#[cfg(test)]"))
+        .take_while(|line| !line.starts_with("mod tests {"))
         .filter(|line| !line.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n")

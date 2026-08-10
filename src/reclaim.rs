@@ -141,15 +141,23 @@ impl Reclaimable {
     /// be read as including it — the whole point of the `Warn` arm is that
     /// those rows are not part of what would go.
     ///
-    /// **The width is a budget, not a suggestion.** This shares one line with
-    /// the load state and the match count, and a real `dl` id is ~40
-    /// characters, so three of them written out unconditionally push the
-    /// `wf reap` pointer and the warned aside off the end of an 80-column
-    /// terminal — leaving a hint that names things and says nothing about what
-    /// to do with them, which is the one shape #137 rules out. So the two ends
-    /// of the sentence are laid down first and the names take what is left:
-    /// as many whole ones as fit, then one shortened in the middle, then —
-    /// only on a screen too narrow for any readable name — none.
+    /// **The width is a budget, not a suggestion**, at every width and not
+    /// merely at the comfortable ones. This shares one line with the load state
+    /// and the match count, and a real `dl` id is ~40 characters, so three of
+    /// them written out unconditionally push the `wf reap` pointer and the
+    /// warned aside off the end of an 80-column terminal — leaving a hint that
+    /// names things and says nothing about what to do with them, which is the
+    /// one shape #137 rules out. So the two ends of the sentence are laid down
+    /// first and the names take what is left: as many whole ones as fit, then
+    /// one shortened in the middle, then — on a screen too narrow for any
+    /// readable name — none.
+    ///
+    /// Below that the fixed halves themselves stop fitting, and the same
+    /// argument decides the order they go in. The aside is a count of rows
+    /// nobody has to act on today; the pointer is the half a reader can act on,
+    /// the same reason a name below `READABLE` characters is dropped. So the
+    /// aside is dropped before the pointer, and only a width too narrow for
+    /// even `· N reclaimable` clips anything at all.
     pub fn hint(&self, width: usize) -> String {
         let head = format!("· {} reclaimable", self.ids.len());
         let aside = match self.warned {
@@ -183,7 +191,19 @@ impl Reclaimable {
         if left >= READABLE {
             return say(&format!("{}{rest}", abbreviate(&self.ids[0], left)));
         }
-        format!("{head}{aside}{POINTER}")
+
+        // No name at all, so the fixed halves are all there is — and they are
+        // measured too, in the order that keeps the actionable one. The last
+        // arm is the count alone; a width even that does not fit gets what
+        // there is room for, because overflowing the budget is what clips the
+        // *neighbouring* segments of the count line.
+        for tail in [format!("{aside}{POINTER}"), POINTER.to_string()] {
+            let line = format!("{head}{tail}");
+            if line.chars().count() <= width {
+                return line;
+            }
+        }
+        head.chars().take(width).collect()
     }
 }
 
@@ -524,8 +544,59 @@ mod tests {
     fn a_screen_too_narrow_for_any_readable_name_keeps_the_command() {
         // The last resort, and the right one: half a name is not something a
         // reader can check, while `wf reap` is still something they can run.
-        let hint = realistic().hint(45);
+        // 47 characters is what the count, the aside and the pointer cost
+        // together, so that is the narrowest screen all three survive on.
+        let hint = realistic().hint(47);
         assert_eq!(hint, "· 3 reclaimable (+1 to check by hand) — wf reap");
+        // One character narrower and something has to go. The aside counts
+        // rows nobody has to act on today; the pointer is the only thing on
+        // this line anyone can do — so the aside is what goes.
+        assert_eq!(realistic().hint(46), "· 3 reclaimable — wf reap");
+        assert_eq!(realistic().hint(25), "· 3 reclaimable — wf reap");
+    }
+
+    #[test]
+    fn the_hint_fits_its_budget_at_every_width() {
+        // The doc says the width is a budget and not a suggestion, and this is
+        // the sentence that says it at *every* width rather than at the five
+        // comfortable ones the test above picks. The count line is shared: a
+        // hint that overruns does not merely lose its own tail, it clips the
+        // segments beside it.
+        for warned in [0, 1, 12] {
+            for count in 1..=4 {
+                let found = Reclaimable {
+                    ids: (0..count)
+                        .map(|i| format!("devlaunch-github-com-blooop-wayfinder-12{i}"))
+                        .collect(),
+                    warned,
+                };
+                for width in 0..=140 {
+                    let hint = found.hint(width);
+                    assert!(
+                        hint.chars().count() <= width,
+                        "{count} ids, {warned} warned, width {width}: {hint:?} is \
+                         {} characters",
+                        hint.chars().count()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_command_is_the_last_thing_the_budget_gives_up() {
+        // The ordering the last-resort branch encodes, stated as its own
+        // claim: as the screen narrows, the names go, then the aside, and
+        // `wf reap` survives every width that can hold it at all.
+        let found = realistic();
+        let widest_without_the_command = (0..=140)
+            .filter(|w| !found.hint(*w).contains("wf reap"))
+            .max()
+            .expect("some width is too narrow for the pointer");
+        assert_eq!(
+            widest_without_the_command, 24,
+            "the pointer must survive every width `· N reclaimable — wf reap` fits in"
+        );
     }
 
     #[test]
@@ -618,30 +689,6 @@ mod tests {
         );
     }
 
-    /// A `dl --ls --json` listing over three workspaces of this repo, in the
-    /// shape devlaunch 0.0.21 and newer emit — one finished ticket, one the
-    /// planner warns about, one in use.
-    const DL_LISTING: &str = r#"[
-      {"id":"wf-129-closed","devlaunch":true,"repo":"blooop/wayfinder",
-       "branch":"wayfinder/wayfinder-129","state":"Stopped"},
-      {"id":"wf-138-unstarted","devlaunch":true,"repo":"blooop/wayfinder",
-       "branch":"wayfinder/wayfinder-138","state":"Stopped"},
-      {"id":"wf-137-open","devlaunch":true,"repo":"blooop/wayfinder",
-       "branch":"wayfinder/wayfinder-137","state":"Running"}
-    ]"#;
-
-    /// The tracker's answer to the batched question those three nodes raise:
-    /// #129 closed (a reap), #138 open with nobody on it and no PR (a warning),
-    /// #137 open and claimed (a keep).
-    const GH_FACTS: &str = r#"{"data":{"repository":{
-      "i129":{"state":"CLOSED","assignees":{"nodes":[]},
-              "closedByPullRequestsReferences":{"nodes":[]}},
-      "i137":{"state":"OPEN","assignees":{"nodes":[{"login":"blooop"}]},
-              "closedByPullRequestsReferences":{"nodes":[]}},
-      "i138":{"state":"OPEN","assignees":{"nodes":[]},
-              "closedByPullRequestsReferences":{"nodes":[]}}
-    }}}"#;
-
     /// The reading taken for real, in a child process whose `dl` and `gh` are
     /// the fixtures above and whose every invocation is written down. The
     /// `#[ignore]` is what keeps it out of an ordinary run: without the shims
@@ -668,7 +715,11 @@ mod tests {
         // Rust, in whichever module, and whether or not it named any word a
         // reader thought to forbid. A `dl <ws> rm` added anywhere between
         // `survey_live` and the reading it returns fails this test.
-        let run = crate::probe::record("reclaim::tests::survey_live_probe", DL_LISTING, GH_FACTS);
+        let run = crate::probe::record(
+            "reclaim::tests::survey_live_probe",
+            crate::probe::DL_LISTING,
+            crate::probe::GH_FACTS,
+        );
         run.destroyed_nothing();
         assert_eq!(
             run.argv.len(),
@@ -694,7 +745,11 @@ mod tests {
         // reading that never reached the sentence, leaves this with nothing to
         // match — which is the point, because "surfaces nothing, ever" is the
         // failure mode a guard on capability alone would call a pass.
-        let run = crate::probe::record("reclaim::tests::survey_live_probe", DL_LISTING, GH_FACTS);
+        let run = crate::probe::record(
+            "reclaim::tests::survey_live_probe",
+            crate::probe::DL_LISTING,
+            crate::probe::GH_FACTS,
+        );
         assert_eq!(
             run.printed(),
             ["· 1 reclaimable: wf-129-closed (+1 to check by hand) — wf reap"],
@@ -726,8 +781,19 @@ mod tests {
         }
         // And the one call it *does* make into reap's planning is never the
         // insisting one — the waiver stays with the human reading the plan.
-        assert!(
-            code.contains("reap::plan(workspaces, known, false)"),
+        // Read as "whatever the last argument is, it is `false`" rather than as
+        // the whole call written out: renaming a parameter is not a change to
+        // this claim, and a test that broke on one would be a test about
+        // spelling.
+        let insist = code
+            .split("reap::plan(")
+            .nth(1)
+            .and_then(|call| call.split(')').next())
+            .and_then(|args| args.rsplit(',').next())
+            .map(str::trim);
+        assert_eq!(
+            insist,
+            Some("false"),
             "the reading must plan without insisting"
         );
         // #129's single definition, pinned at the one site that could quietly

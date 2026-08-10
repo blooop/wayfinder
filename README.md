@@ -398,7 +398,9 @@ written and clipped: the count, the `(+N to check by hand)` aside and the
 are spelt out whole as fit; the next one is shortened in the middle, keeping the
 project at the front and the ticket number at the back; the rest are counted as
 `+N more`. On a terminal too narrow for a name anybody could read, the names go
-and the command stays.
+and the command stays; narrower still, the aside goes and the command *still*
+stays, because it is the only part of the line you can act on. The segment never
+overruns the width it is given at any terminal size.
 
 It **fails silent**. No `dl` on PATH, a listing that failed, a GraphQL error, no
 network, or simply nothing to reclaim: the segment is absent, and there is no
