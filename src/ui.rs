@@ -17,6 +17,7 @@ use crate::app::{App, Overlay};
 use crate::filter;
 use crate::launch::{Agent, Candidate, Launch, Staged};
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
+use crate::reclaim::Reclaimable;
 use crate::view::{Branch, Fold, GroupKind, Item, Plan, ProjectRow};
 
 /// One colour per glyph meaning, shared by the row column and the rollup
@@ -573,6 +574,30 @@ pub fn failure_note(app: &App) -> String {
     }
 }
 
+/// The `· N reclaimable: …` segment on the count line (#137): what a
+/// `wf reap` would claim, once the background reading has landed.
+///
+/// Empty while the reading is out, and empty forever if it failed or found
+/// nothing — the three are one silence on purpose, because none of them is
+/// something a person picking a ticket needs told about.
+///
+/// It names the workspaces rather than only counting them: a bare number is
+/// something a reader has no way to agree or disagree with, and the point of
+/// surfacing this at all is that `wf reap` is then a decision rather than an
+/// errand. The picker does nothing with it — the segment *is* the feature.
+///
+/// `width` is what is left of the count line once everything else on it has
+/// been laid down. Real workspace ids are ~40 characters, so this segment is
+/// the one on the line that has to be *sized* rather than written and clipped:
+/// see [`Reclaimable::hint`] for what it gives up first, and what it never
+/// gives up.
+pub fn reclaim_note(app: &App, width: usize) -> String {
+    app.reclaimable
+        .as_ref()
+        .map(|found| Reclaimable::hint(found, width))
+        .unwrap_or_default()
+}
+
 /// The `· N idle maps hidden` segment on the count line (#51): the leverage
 /// view drops a map with nothing takeable from the body, and the count is the
 /// only trace of it — silence would read as the map not existing at all. The
@@ -856,22 +881,44 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     // staged — the staged launch is a modal now (#62's line became
     // [`draw_launch_picker`]), and a modal does not need the row it covers to
     // move out of its way.
-    let status = [app.startup.hint(), failure_note(app), idle_note(&plan)]
+    let mut parts: Vec<String> = [app.startup.hint(), failure_note(app), idle_note(&plan)]
         .into_iter()
         .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+        .collect();
     let (shown, total) = app.counts();
+    let counts = format!("  {shown}/{total}");
+    let notice = app
+        .notice
+        .as_ref()
+        .map(|notice| format!("   {notice}"))
+        .unwrap_or_default();
+    // The reclaim segment is sized rather than written and clipped, because it
+    // is the only one on this line whose content is unbounded — a `dl`
+    // workspace id is ~40 characters and there can be three of them. It goes
+    // last and takes what the rest of the line has left, which is why the rest
+    // of the line is measured first.
+    let spent = counts.chars().count()
+        + 2
+        + parts
+            .iter()
+            .map(|part| part.chars().count() + 1)
+            .sum::<usize>()
+        + notice.chars().count();
+    let note = reclaim_note(app, (count_area.width as usize).saturating_sub(spent));
+    if !note.is_empty() {
+        parts.push(note);
+    }
+    let status = parts.join(" ");
     let mut count_spans = vec![
-        Span::raw(format!("  {shown}/{total}")),
+        Span::raw(counts),
         Span::styled(
             format!("  {status}"),
             Style::new().add_modifier(Modifier::DIM),
         ),
     ];
-    if let Some(notice) = &app.notice {
+    if !notice.is_empty() {
         count_spans.push(Span::styled(
-            format!("   {notice}"),
+            notice,
             Style::new().add_modifier(Modifier::DIM),
         ));
     }
@@ -960,7 +1007,13 @@ mod tests {
 
     /// Render the app through `TestBackend` and return the screen as text.
     fn render(app: &App) -> String {
-        let backend = TestBackend::new(90, 24);
+        render_at(90, app)
+    }
+
+    /// The same, on a terminal of a stated width — for the claims that are
+    /// about what survives a narrow one.
+    fn render_at(width: u16, app: &App) -> String {
+        let backend = TestBackend::new(width, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|f| draw(f, app)).expect("draw");
         let buf = terminal.backend().buffer();
@@ -1373,6 +1426,91 @@ mod tests {
             screen.contains("└─  ● #2 Choose the stack"),
             "the done ticket hangs off the group line: {screen}"
         );
+    }
+
+    #[test]
+    fn the_first_frame_says_nothing_about_reclaimable_workspaces() {
+        // The reading is a `dl` subprocess and a GraphQL call behind the
+        // screen. Until it lands — and forever, if it failed or found nothing —
+        // the picker looks exactly as it did before #137.
+        let app = fixture_app();
+        assert_eq!(app.reclaimable, None, "nothing has been read yet");
+        let screen = render(&app);
+        assert!(
+            !screen.contains("reclaimable"),
+            "the picker must not mention a reading it has not got: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_count_line_names_what_a_reap_would_claim_once_the_reading_lands() {
+        // A count alone cannot be judged, so the segment names the workspaces
+        // and the command that acts on them. Nothing here deletes anything —
+        // the whole feature is this sentence.
+        let mut app = fixture_app();
+        app.reclaimable = Some(Reclaimable::for_test(&["ws-a", "ws-b"], 0));
+        let screen = render(&app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("reclaimable"))
+            .unwrap_or_else(|| panic!("the count line says so: {screen}"));
+        assert!(line.contains("2 reclaimable"), "{line}");
+        assert!(line.contains("ws-a"), "{line}");
+        assert!(line.contains("ws-b"), "{line}");
+        assert!(line.contains("wf reap"), "{line}");
+    }
+
+    #[test]
+    fn a_warned_workspace_is_never_drawn_as_reclaimable() {
+        // #128's posture, at the last place it could be lost: the warned count
+        // is an aside, and the leading number is the doomed set's alone.
+        let mut app = fixture_app();
+        app.reclaimable = Some(Reclaimable::for_test(&["ws-a"], 2));
+        let screen = render(&app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("reclaimable"))
+            .unwrap_or_else(|| panic!("the count line says so: {screen}"));
+        assert!(line.contains("1 reclaimable"), "{line}");
+        assert!(line.contains("+2 to check by hand"), "{line}");
+    }
+
+    #[test]
+    fn the_count_line_keeps_the_command_when_the_names_are_real_ones() {
+        // `ws-a` fits anywhere and proves nothing. A `dl` workspace id is ~40
+        // characters, and three of them written out unconditionally push the
+        // aside and the `wf reap` pointer past the right edge of an
+        // 80-column terminal — leaving a segment that names workspaces and
+        // says nothing about what to do with them.
+        let mut app = fixture_app();
+        app.reclaimable = Some(Reclaimable::for_test(
+            &[
+                "devlaunch-github-com-blooop-wayfinder-129",
+                "devlaunch-github-com-blooop-wayfinder-127",
+                "devlaunch-github-com-blooop-wayfinder-80x",
+            ],
+            1,
+        ));
+        for width in [80, 100, 120] {
+            let screen = render_at(width, &app);
+            let line = screen
+                .lines()
+                .find(|line| line.contains("reclaimable"))
+                .unwrap_or_else(|| panic!("{width}: the count line says so: {screen}"));
+            assert!(line.contains("3 reclaimable"), "{width}: {line}");
+            assert!(
+                line.contains("(+1 to check by hand)"),
+                "{width}: the aside is never what gets clipped: {line}"
+            );
+            assert!(
+                line.contains("wf reap"),
+                "{width}: nor is the command: {line}"
+            );
+            assert!(
+                line.contains("129"),
+                "{width}: and a workspace is still named: {line}"
+            );
+        }
     }
 
     #[test]

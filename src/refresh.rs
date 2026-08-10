@@ -20,6 +20,7 @@
 //! failed load leaves the picker up with a notice rather than taking it down.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ use tokio::task::JoinHandle;
 use crate::fetch;
 use crate::model::{Map, MapId, MapSet};
 use crate::projects::ProjectsCache;
+use crate::reclaim::Reclaimable;
 
 /// How long the map search waits before trying again. The only recurring timer
 /// left: nothing polls, but a search that never answers would leave `wf`
@@ -59,6 +61,12 @@ pub enum LoadEvent {
     SearchFailed,
     /// One map's load reported.
     Fetched { id: MapId, outcome: MapFetch },
+    /// The background reading found workspaces a `wf reap` would claim (#137).
+    ///
+    /// Only ever sent when there is something to say: a reading that failed and
+    /// a reading that found nothing are the same silence, because neither is
+    /// anything the screen should draw.
+    Reclaimable(Reclaimable),
 }
 
 /// Has the `wayfinder:map` label search answered yet?
@@ -324,6 +332,87 @@ pub fn spawn_discovery(
     })
 }
 
+/// Take the background reading of what a `wf reap` would claim, off the path to
+/// the first frame (#137).
+///
+/// The same shape as [`spawn_discovery`] and for the same reason: the reading
+/// costs a `dl --ls --json` subprocess and one batched GraphQL call, and the
+/// picker is already drawn and answering keys. Nothing on the way to the first
+/// frame waits for this — it folds into the view when it lands, through the one
+/// channel everything else arrives on.
+///
+/// The reading is handed in as a *future* rather than taken as a capability
+/// this could invoke: what reaches the screen is a value, and nothing in this
+/// module can ask for a deletion or perform one.
+///
+/// Silent by construction: the future answers `Option`, and a `None` — no `dl`,
+/// a listing that failed, a tracker that would not answer, nothing to reclaim —
+/// sends nothing at all. There is no failure event because there is no failure
+/// worth a word.
+///
+/// Returns a [`Survey`] so the launch path can stop it and wait, exactly as it
+/// does for the map loads: the reading holds child processes of its own, and an
+/// in-flight one outliving the `exec` would be inherited by the agent.
+pub fn spawn_survey<S>(survey: S, tx: mpsc::UnboundedSender<LoadEvent>) -> Survey
+where
+    S: Future<Output = Option<Reclaimable>> + Send + 'static,
+{
+    Survey(tokio::spawn(async move {
+        if let Some(found) = survey.await {
+            let _ = tx.send(LoadEvent::Reclaimable(found));
+        }
+    }))
+}
+
+/// The running reading, as something that can only be **stopped**.
+///
+/// A `JoinHandle` would do the job and did, until the guard on "the picker
+/// never waits for this" turned out to be a grep over `main.rs` — which passes
+/// happily for `let _ = survey.await;` written any of the several ways that
+/// spelling admits. The only thing this type offers is
+/// [`stop`](Survey::stop), so *this handle* cannot be waited on.
+///
+/// It is worth being exact about how far that goes, because the obvious
+/// stronger claim is false and was made here: it does **not** put the reading
+/// off limits before the first frame. The reading is a separate value, and
+/// `let found = survey_live().await;` above the call compiles, is green, and
+/// puts a subprocess and a round trip in front of the screen. What rules that
+/// out is a fact about a run —
+/// `picker::tests::the_first_frame_is_drawn_before_anything_is_asked`, which
+/// records the frame and the subprocesses into one ordered log and reads the
+/// order off it.
+///
+/// Which leaves exactly one hazard this type does answer, and
+/// [`stop`](Survey::stop) is where it is.
+#[derive(Debug)]
+pub struct Survey(JoinHandle<()>);
+
+impl Survey {
+    /// Stop the reading and wait until it is really gone.
+    ///
+    /// Both halves matter, and only on the launch path. `abort` asks; the
+    /// `await` is what waits for the task's future to be *dropped*, and
+    /// dropping it is what closes the `dl` or `gh` this reading may have in
+    /// flight (`kill_on_drop`). Skipping the wait — or dropping the handle, or
+    /// forgetting it — leaves a live child that outlives the `exec`, and the
+    /// agent that replaces `wf` inherits it holding the terminal it just took
+    /// over.
+    pub async fn stop(self) {
+        self.0.abort();
+        let _ = self.0.await;
+    }
+
+    /// Wait for the reading to finish of its own accord.
+    ///
+    /// Test-only, and that is the whole point of the type: production has no
+    /// way to wait for this, so the tests below can wait for a reading that
+    /// answers immediately without opening the door `main.rs` must not have.
+    #[cfg(test)]
+    pub(crate) async fn settle(self) {
+        self.0.await.expect("the reading task");
+    }
+}
+
 /// Where the cursor lands after a load or a refresh swaps the ticket list.
 ///
 /// Identity wins over position: if the previously selected row still exists
@@ -350,6 +439,140 @@ pub fn preserve_cursor<K: PartialEq>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reading that never answers — the reading `wf` must be able to draw
+    /// over. A `pending` future rather than a long sleep, so "the picker did
+    /// not wait" is a fact about the code and not about a timer.
+    async fn never() -> Option<Reclaimable> {
+        std::future::pending().await
+    }
+
+    #[tokio::test]
+    async fn the_picker_never_waits_on_the_reading() {
+        // The claim that keeps this off the critical path: spawning the reading
+        // hands back control immediately, and the loop that draws the first
+        // frame finds an empty channel rather than a value it had to wait for.
+        // The reading here *never* completes, so anything that awaited it would
+        // hang this test rather than slow it.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let survey = spawn_survey(never(), tx.clone());
+            assert!(
+                rx.try_recv().is_err(),
+                "nothing may be on the channel before the reading lands"
+            );
+            survey.stop().await;
+        })
+        .await
+        .expect("the picker must not wait for the reading");
+    }
+
+    #[tokio::test]
+    async fn a_reading_that_lands_folds_in_through_the_one_channel() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let found = Reclaimable::for_test(&["ws-a"], 0);
+        spawn_survey(std::future::ready(Some(found.clone())), tx.clone())
+            .settle()
+            .await;
+        match rx.try_recv() {
+            Ok(LoadEvent::Reclaimable(got)) => assert_eq!(got, found),
+            other => panic!("the reading must arrive as its own event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reading_that_found_nothing_says_nothing() {
+        // No `dl`, a failed listing, a tracker that would not answer, or simply
+        // nothing to reclaim: one silence, no event, and above all no error.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_survey(std::future::ready(None), tx.clone())
+            .settle()
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a reading with nothing to say must send nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_the_reading_waits_for_it_to_be_gone() {
+        // `abort` on its own only *asks*. What the launch path needs is that
+        // the task's future has been dropped by the time this returns, because
+        // dropping it is what kills the `dl` or `gh` the reading may still have
+        // in flight — an `abort` without the wait, or a handle simply forgotten,
+        // leaves that child alive to be inherited by the agent `wf` execs.
+        //
+        // The witness is an `Arc` the task holds: the future cannot be dropped
+        // while the count is above one, and cannot survive once it is one.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let witness = std::sync::Arc::new(());
+        let held = std::sync::Arc::clone(&witness);
+        let survey = spawn_survey(
+            async move {
+                std::future::pending::<()>().await;
+                drop(held);
+                None
+            },
+            tx,
+        );
+        survey.stop().await;
+        assert_eq!(
+            std::sync::Arc::strong_count(&witness),
+            1,
+            "the reading is still running after it was stopped"
+        );
+    }
+
+    #[test]
+    fn the_background_reading_carries_a_value_and_never_a_capability() {
+        // #137's safety claim, at the seam that spawns the work: this module
+        // takes a future that answers with a reading, and its own text names
+        // neither `reap` nor any means of destruction. That is a fact about
+        // this file, not about everything a future handed to it might do — the
+        // reading itself is guarded in [`crate::reclaim`] and the loop that
+        // consumes it in the binary's `picker`.
+        // Its sibling in [`crate::reclaim`]'s list plus `reap`, and for the
+        // same reason: a shorter one here was a door in the same wall. A
+        // `std::fs::remove_dir_all` inside the spawned task passed both this
+        // and the argv probe, because a directory removed in-process runs no
+        // command for a shim to write down.
+        //
+        // `unsafe` used to be on this list and is not, for the reason its
+        // sibling gives: `unsafe_code = "deny"` in `Cargo.toml` already covers
+        // every target in the crate.
+        //
+        // `reap` bare rather than `reap::`, matching `picker.rs`: this file has
+        // no business naming the module at all, and the module cannot be
+        // reached without its name being written, so `use crate::reap as tidy;`
+        // is caught here too. It costs nothing — nothing in this file's code
+        // says the word.
+        //
+        // `fs` is bare for the same reason, and that took a second round to
+        // notice: written `fs::`, it was reopened by `use std::fs as sys;`.
+        // Measured, not assumed, that it costs nothing: `fs` occurs in none of
+        // the four guarded files' code. What it buys here is not the aliased
+        // `remove_dir_all` inside the spawned task — `remove` catches that at
+        // either spelling — but the calls `remove` does not name; see
+        // [`crate::reclaim`], where an aliased `fs::write` is red at `fs` and
+        // green at `fs::`. That pair was measured there and not here, so this
+        // list carries the bare name by the same argument rather than by its
+        // own row.
+        let code = crate::probe::code_only("refresh.rs", include_str!("refresh.rs"));
+        for forbidden in [
+            "reap",
+            "remove",
+            "\"rm\"",
+            "--force",
+            "Command",
+            "process::",
+            "fs",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the background reading must not be able to delete: it names {forbidden:?}"
+            );
+        }
+    }
 
     const A: (&str, u64) = ("wayfinder", 6);
     const B: (&str, u64) = ("wayfinder", 7);

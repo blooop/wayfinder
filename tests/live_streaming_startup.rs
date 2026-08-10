@@ -52,7 +52,11 @@ async fn discovery_then_every_map_arrives_through_one_channel() {
             // The search retries, so a blip is survivable rather than fatal:
             // go round and wait for the next event.
             LoadEvent::SearchFailed => {}
-            other @ LoadEvent::Fetched { .. } => {
+            // Named rather than `_`, so a seventh kind of arrival is a compile
+            // error here and a decision someone makes — this file is compiled
+            // but never run by CI, which makes a wildcard in it the least
+            // observed thing in the tree.
+            other @ (LoadEvent::Fetched { .. } | LoadEvent::Reclaimable(_)) => {
                 panic!("expected discovery first, got {other:?}")
             }
         }

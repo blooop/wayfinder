@@ -28,6 +28,12 @@
 //! left alone. A suspicion is worth printing and never worth acting on, which
 //! is why [`Verdict::Warn`] exists and why [`doomed`] is the single place that
 //! decides what actually goes.
+//!
+//! The *deciding* is all here; the *noticing* is [`reclaim`](crate::reclaim),
+//! which calls [`plan`] and [`doomed`] behind the picker so `wf` can say what a
+//! reap would claim without being asked (#137). It adds no deletion path — it
+//! reads these two functions and renders a sentence, and everything that
+//! destroys anything is still reached only by a human typing `wf reap`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
@@ -565,6 +571,23 @@ fn parse_node_facts(body: &[u8], repo: &str, numbers: &[u64]) -> Result<BTreeMap
 
 /// Hand one finished workspace back to `dl`.
 ///
+/// **Private to this module, and that is the strongest part of #137's
+/// separation.** The picker is a module of the *binary*; this is the library.
+/// No line of the binary can name this function — not under an alias, not from
+/// a submodule, not through a helper in another of its files — and the edit
+/// that tries is a compile error rather than a thing a test has to notice.
+/// Three review rounds each found a different way past a source-text denylist
+/// over the picker's own file, and each of those routes ended here.
+///
+/// What privacy does *not* close is [`run`] below: it is public because `main`
+/// must dispatch `wf reap`, it calls this, and the binary may name it from
+/// anywhere. That half is guarded by greps over two of the binary's files and
+/// by a recorded run of the picker — weaker things, and described as such where
+/// they live.
+///
+/// The one caller is [`run`] below, which is `wf reap` — a human typing the
+/// command, reading the plan and answering the prompt.
+///
 /// `insist` passes `dl`'s own `--force`, and is only ever the human's `-f`
 /// reaching this far: without it, `dl` refuses when a clone holds work that
 /// exists nowhere else, and that refusal is load-bearing — [`plan`] already
@@ -576,7 +599,7 @@ fn parse_node_facts(body: &[u8], repo: &str, numbers: &[u64]) -> Result<BTreeMap
 ///
 /// No `dl` on PATH, or a `dl <ws> rm` that failed — including the refusal
 /// above, which is a failure `wf` reports rather than quietly overrides.
-pub async fn remove(id: &str, insist: bool) -> Result<()> {
+async fn remove(id: &str, insist: bool) -> Result<()> {
     let mut args = vec![id, "rm"];
     if insist {
         args.push("--force");
@@ -593,6 +616,110 @@ pub async fn remove(id: &str, insist: bool) -> Result<()> {
             "`dl {id} rm` failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
+    }
+    Ok(())
+}
+
+/// `wf reap`: remove the workspaces whose nodes the tracker calls finished.
+///
+/// The whole command, here rather than in the binary, because `remove` above
+/// is private to this module and this is the only thing that may call it. What
+/// `main.rs` keeps is the argv that chooses this — `wf reap [-y] [-f]` — and
+/// nothing else; the picker, in the same crate as that argv, can no more reach
+/// a deletion than it can reach a private function of a library it depends on,
+/// which is exactly what it now is.
+///
+/// The division of labour is the one the launch already draws — `dl` owns the
+/// containers, `wf` owns the tickets — so this asks `dl` what exists, asks the
+/// tracker what has become of those nodes, prints the plan, and hands the
+/// finished ones back to `dl`. No terminal is taken: this is a stream command
+/// like `wf skills`, not a second TUI.
+///
+/// The plan is printed **before** the prompt and includes what is being kept,
+/// because a workspace someone expected to go and that stayed is the thing they
+/// most need told about, and a reason they disagree with ("still running" when
+/// they thought they had stopped it) is only actionable while no is an answer.
+///
+/// `warn` rows are the same argument pointed the other way: workspaces `wf`
+/// suspects are dead weight on evidence too weak to act on — a superseded
+/// ticket, or a node nothing has come of. They are printed and never counted
+/// into the prompt, because the only safe thing to do with a suspicion is say
+/// it out loud.
+///
+/// # Errors
+///
+/// A listing or a tracker query that failed, an unreadable answer to the
+/// prompt, or one or more workspaces `dl` would not remove.
+pub async fn run(yes: bool, insist: bool) -> Result<()> {
+    use std::fmt::Write;
+    use std::io::Write as _;
+
+    use crate::emit;
+
+    let workspaces = workspaces().await?;
+    let nodes: BTreeSet<Node> = workspaces.iter().filter_map(node_of).collect();
+    if nodes.is_empty() {
+        emit("no wayfinder workspaces on this machine — nothing to reap\n");
+        return Ok(());
+    }
+    let known = node_facts(&nodes).await?;
+    let verdicts = plan(&workspaces, &known, insist);
+
+    // The deletion set is asked for rather than re-derived here: `doomed` is
+    // the one definition of what goes, so a warning row cannot become a
+    // deletion by way of a partition written twice.
+    let going = doomed(&verdicts);
+    // Grouped rather than in listing order, and in this order: what stays,
+    // then what `wf` is uneasy about, then — last, immediately above the
+    // prompt — what the y/N is actually about.
+    let mut out = String::new();
+    for label in ["keep", "warn", "reap"] {
+        for verdict in &verdicts {
+            let row = match verdict {
+                Verdict::Keep { .. } => "keep",
+                Verdict::Warn { .. } => "warn",
+                Verdict::Reap { .. } => "reap",
+            };
+            if row == label {
+                let _ = writeln!(out, "  {label}  {}  ({})", verdict.id(), verdict.reason());
+            }
+        }
+    }
+    emit(&out);
+    if going.is_empty() {
+        emit("nothing to reap\n");
+        return Ok(());
+    }
+
+    if !yes {
+        emit(&format!("\ndelete {} workspace(s)? [y/N] ", going.len()));
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .context("cannot read the answer")?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            emit("aborted\n");
+            return Ok(());
+        }
+    }
+
+    // One at a time, reporting each: `dl <ws> rm` tears down a container, and a
+    // failure part-way through leaves a set the next run has to be able to make
+    // sense of. Failures are collected rather than propagated at the first one,
+    // so a single wedged workspace does not strand the rest.
+    let mut failed = Vec::new();
+    for verdict in &going {
+        match remove(verdict.id(), insist).await {
+            Ok(()) => emit(&format!("removed {}\n", verdict.id())),
+            Err(e) => {
+                emit(&format!("could not remove {}: {e}\n", verdict.id()));
+                failed.push(verdict.id().to_string());
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!("{} workspace(s) could not be removed", failed.len());
     }
     Ok(())
 }

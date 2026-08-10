@@ -15,6 +15,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::launch::{self, Agent, Candidate, Launch, LaunchMode, MapRef, Route, Staged, Targets};
 use crate::model::{stage, Activity, Map, MapId, MapSet, Status, Ticket};
 use crate::projects::{self, Checkout, Resume, Session};
+use crate::reclaim::Reclaimable;
 use crate::refresh::Startup;
 use crate::view::{self, Expanded, GroupId, Lens, Plan, Screen, Stop, StopAt};
 
@@ -248,6 +249,15 @@ pub struct App {
     /// before any of it, so this is what stops an empty list from reading as
     /// "no tickets" while the fetch is still out.
     pub startup: Startup,
+    /// What a `wf reap` would claim, once the background reading lands (#137)
+    /// — `None` until then, and `None` forever if the reading failed or found
+    /// nothing, which are deliberately the same thing.
+    ///
+    /// **State, not a notice**, for the reason [`App::failed`] is: the reading
+    /// arrives once and nothing asks again, so a message the next keypress
+    /// cleared would be gone before it was read. Nothing in the picker acts on
+    /// it — it is a sentence naming a command a person may choose to type.
+    pub reclaimable: Option<Reclaimable>,
     pub overlay: Overlay,
     /// The structural screen `tab` toggles (#51). Only the lens is stored;
     /// whether the body is currently *flattened* is derived from the query in
@@ -279,6 +289,7 @@ impl App {
             sessions: Vec::new(),
             failed: BTreeSet::new(),
             startup: Startup::loaded(),
+            reclaimable: None,
             overlay: Overlay::None,
             lens: Lens::Leverage,
             expanded: Expanded::new(),

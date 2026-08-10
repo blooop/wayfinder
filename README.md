@@ -377,6 +377,95 @@ refetches everything when you want it — after closing a ticket in the browser,
 say. A fetch that fails says so on the count line and stays failed until you
 ask again.
 
+**What a `wf reap` would claim is read in the background too**, and lands on the
+count line when it arrives:
+
+```
+  12/30  · 2 reclaimable: devlaunch-github-…oop-wayfinder-127, +1 more — wf reap
+```
+
+It is the same reading `wf reap` prints, taken by the same code — a `dl --ls
+--json` and one batched tracker query, neither of them on the way to a frame.
+The picker draws at exactly the speed it did without it. Nothing is deleted:
+this names workspaces and a command, and you type the command. It names them
+rather than only counting them, because "2 reclaimable" is not something you can
+agree or disagree with.
+
+**This path does not delete workspaces**, and it is worth being exact about what
+holds that up, because it is three different things with three different
+reaches — and only the first of them is a proof.
+
+The function that removes a workspace is private to the library module that owns
+`wf reap`. The picker is in the binary, so no line of it — no helper, alias or
+submodule — can call that function, and the edit that tries does not compile.
+That one is settled by the compiler and needs no test.
+
+`wf reap` as a whole *command* is another matter: it has to be public for `main`
+to dispatch it, and `reap::run(true, true)` is a forced reap. So the picker file
+may not write the word `reap` at all — nor `Command`, `process::`,
+`tokio::spawn` or `fs` — and `main.rs` carries the list of every line of code in
+itself that writes `reap`, and may not write `Command` or `fs` either. Words,
+not paths: `use std::fs as sys;` writes no `fs::` and `use crate::reap as tidy;`
+writes no `reap::`, and both of those were live escapes against the narrower
+spelling. `main.rs`'s list is of lines of *code* — its `USAGE` help text writes
+`wf reap` because that is the command it documents, and it is cut out before the
+list is taken, with the cut checked against `USAGE`'s own line count so it
+cannot run past the literal and swallow code. Those are greps over the source
+text of two files. They catch a cleanup wired in by accident, which is the
+mistake anyone is actually likely to make; they do not stop someone who means to
+get around them, and several review rounds of this feature were spent proving
+exactly that. A grep over two files cannot see the same call written in a third,
+or a second name for the module exported from the library.
+
+Everything else is watched rather than proven. A test drives the real event loop
+against a recording `dl` and `gh`, through every arm the loop has — quit,
+refresh, continue, and the launch that ends the session — and reads back every
+argv the run made, plus a scratch `HOME` laid out the way this machine is
+(`~/.cache/devlaunch/repos/<owner>/<repo>/<id>` for the clone,
+`~/.devpod/contexts/<ctx>/workspaces/<id>` for the record), compared before and
+after. That catches a workspace deleted by running `dl` and one deleted
+in-process, whatever file the call was written in, inside three stated bounds.
+It starts at the loop's composition — the function that spawns the reading and
+runs the loop — so what `wf` does above and below that call is outside it; what
+stands there instead is the token list above, in those two files and no others.
+It runs for the length of that call plus 400 ms after the reading lands, after
+every key and after it
+returns, so a deletion deferred past the window is not seen (a spawned task that
+sleeps a second and a half is green; the same one with the window at three
+seconds is caught). And it sees only what the child's fixtures reach: a deletion
+in the one fold arm a failed map search would take is green, because the `gh`
+shim succeeds. An `std::fs` call is caught by nothing when it is aimed outside
+that scratch `HOME` **or written outside the span the run covers** — and that
+span is the loop's composition, so "outside" it is the whole of the picker's own
+entry point and the whole of `main`. A `remove_dir_all` pointed at a directory
+elsewhere on the disk passes the whole suite and really does destroy it; a
+`remove_dir_all` aimed squarely *inside* the watched home, written in either of
+those two functions, passed it too until the `fs` token above went on. What
+catches the second kind is that token, in the two files that carry it, and it is
+a grep. Nothing catches either kind in a third file.
+
+The picker does delete one thing, and it is not a workspace: the launch path
+brings the installed skill copies back in step with the bundle, which removes
+and rewrites `~/.claude/wf-skills/<skill>` when a copy has fallen behind. That
+is `wf`'s copy of `wf`'s own prompts.
+
+A `dl` workspace id is around forty characters and this segment shares one line
+with the load state and the match count, so the line is **budgeted** rather than
+written and clipped: the count, the `(+N to check by hand)` aside and the
+`— wf reap` pointer are laid down first, and the names take what is left. As many
+are spelt out whole as fit; the next one is shortened in the middle, keeping the
+project at the front and the ticket number at the back; the rest are counted as
+`+N more`. On a terminal too narrow for a name anybody could read, the names go
+and the command stays; narrower still, the aside goes and the command *still*
+stays, because it is the only part of the line you can act on. The segment never
+overruns the width it is given at any terminal size.
+
+It **fails silent**. No `dl` on PATH, a listing that failed, a GraphQL error, no
+network, or simply nothing to reclaim: the segment is absent, and there is no
+error and no delay. A cleanup convenience is not worth a degraded launcher.
+Workspaces `wf reap` would *warn* about rather than delete are never counted
+into it — they show up only as a `(+N to check by hand)` aside.
+
 ## Launching
 
 Picking a ticket runs the agent chosen in the launch picker, with that project's
@@ -753,7 +842,9 @@ an agent exiting. `dl <ws> stop`, `dl <ws> rm` and `dl --ls` are yours to run.
 ### `wf reap` — clearing away finished tickets
 
 A workspace per ticket means workspaces accumulate as fast as tickets are
-worked. `wf reap` removes the ones whose **work is over**:
+worked. `wf reap` removes the ones whose **work is over** — and the picker
+[says so on its count line](#startup) without being asked, so running it is a
+decision rather than a thing you have to remember:
 
 ```
 $ wf reap
@@ -806,7 +897,13 @@ tickets someone has claimed, and anything **running** — a ticket closing is no
 evidence that the session in the container ended.
 
 One `gh api graphql` call per repo answers all of this, however many workspaces
-that repo has.
+that repo has — which is also what makes the picker's background reading cheap
+enough to take on every start.
+
+**Deleting stays yours.** `wf` notices; it never reaps unattended. The plan is
+printed so a reason you disagree with can be caught while "no" is still an
+answer, and the count-line hint is the same reading with the same posture: it
+names what would go and stops there.
 
 Kept by default but waivable: a workspace whose clone holds uncommitted or
 unpushed work. `-f` reaps those too, and the plan says what it is discarding:
