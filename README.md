@@ -391,13 +391,31 @@ this names workspaces and a command, and you type the command. It names them
 rather than only counting them, because "2 reclaimable" is not something you can
 agree or disagree with.
 
-The picker *cannot* delete them, and that is a property of the build rather than
-a promise. The function that removes a workspace is private to the library
-module that owns `wf reap`; the picker lives in the binary, so a line anywhere
-in it — or in any helper, alias or submodule it calls — that tries to reach that
-function does not compile. Shelling out to `dl` instead is caught by a test that
-drives the real event loop with a recording `dl` on `PATH` and reads back every
-argv it ran.
+Nothing on this path deletes anything, and it is worth being exact about what
+holds that up, because it is three different things with three different
+reaches.
+
+The function that removes a workspace is private to the library module that owns
+`wf reap`. The picker is in the binary, so no line of it — no helper, alias or
+submodule — can call that function, and the edit that tries does not compile.
+`wf reap` as a whole *command* is another matter: it has to be public for `main`
+to dispatch it, and `reap::run(true, true)` is a forced reap. So the picker file
+may not name `reap` at all, and `main.rs` must name the module exactly once and
+call into it exactly once — counted by reachability rather than by one spelling,
+so an aliased import cannot slip past. Those two are greps over two files, and a
+grep over a file cannot see the same call made in a third.
+
+Everything else is watched rather than proven. A test drives the real event loop
+against a recording `dl` and `gh`, through every arm the loop has — quit,
+refresh, continue, and the launch that ends the session — and reads back every
+argv the run made, plus a scratch `HOME` laid out the way this machine is
+(`~/.cache/devlaunch/repos/<owner>/<repo>/<id>` for the clone,
+`~/.devpod/contexts/<ctx>/workspaces/<id>` for the record), compared before and
+after. That catches a workspace deleted by running `dl` and one deleted
+in-process, whatever file the call was written in — for the length of the
+session and a stated window after it. It does not catch a deletion deferred past
+that window, or an `std::fs` call aimed somewhere else; nothing in any Rust file
+catches those.
 
 A `dl` workspace id is around forty characters and this segment shares one line
 with the load state and the match count, so the line is **budgeted** rather than

@@ -526,8 +526,11 @@ mod tests {
     #[test]
     fn the_background_reading_carries_a_value_and_never_a_capability() {
         // #137's safety claim, at the seam that spawns the work: this module
-        // takes a future that answers with a reading. It cannot reach `reap`'s
-        // deletion side, because it cannot reach `reap` at all.
+        // takes a future that answers with a reading, and its own text names
+        // neither `reap` nor any means of destruction. That is a fact about
+        // this file, not about everything a future handed to it might do — the
+        // reading itself is guarded in [`crate::reclaim`] and the loop that
+        // consumes it in the binary's `picker`.
         // The same list its sibling in [`crate::reclaim`] carries, and for the
         // same reason: a shorter one here was a door in the same wall. A
         // `std::fs::remove_dir_all` inside the spawned task passed both this

@@ -7,11 +7,11 @@
 //! [`record`] is the important one. `wf`'s dangerous edges are all subprocess
 //! calls — `dl` and `gh` — and a subprocess call is *observable*: put a
 //! recording shim first on `PATH` and every argv the code under test reached
-//! for is written down. That turns "this path cannot delete anything" from a
-//! grep over the source into a fact about a run, which is what #137 asks for
-//! and what a grep cannot give: a mutation that names none of the forbidden
-//! tokens still has to run `dl` to destroy a workspace, and running `dl` is
-//! exactly what this sees.
+//! for is written down. That is weaker than "this path cannot delete anything"
+//! and stronger than a grep: it covers the branches the probe actually drives,
+//! for as long as it watches, and within that it does not care how the deletion
+//! was spelt. A mutation that names none of the forbidden tokens still has to
+//! run `dl` to destroy a workspace, and running `dl` is exactly what this sees.
 //!
 //! The shims have to be first on the `PATH` of the process doing the work, and
 //! `PATH` is per-process, so the work happens in a **child**: an `#[ignore]`d
@@ -64,9 +64,28 @@ pub const MARK: &str = "PROBE|";
 /// also a directory it can be caught destroying.
 const LAID_OUT: [&str; 3] = ["wf-129-closed", "wf-138-unstarted", "wf-137-open"];
 
-/// What each of those directories holds. The name is the point: this stands in
-/// for the one thing `dl`'s own guard exists to protect — a clone holding work
-/// that exists nowhere else.
+/// The repo those three belong to in [`DL_LISTING`], which is also the
+/// directory `dl` files their clones under.
+const LAID_OUT_REPO: &str = "blooop/wayfinder";
+
+/// Where `dl` keeps the clone of each workspace, relative to `HOME`, and where
+/// it keeps the registry naming them all.
+///
+/// Read off a real machine rather than invented: `dl` clones a bare repo to
+/// `~/.cache/devlaunch/repos/<owner>/<repo>/.bare` and adds one worktree
+/// directory per workspace beside it, with `~/.cache/devlaunch/metadata.json`
+/// recording where each one went.
+const CLONES: &str = ".cache/devlaunch/repos";
+const REGISTRY: &str = ".cache/devlaunch/metadata.json";
+
+/// Where devpod keeps its own record of each workspace, relative to `HOME`.
+/// `default` is the context name on a machine nobody has configured a second
+/// one on, which is every machine `wf` has run on.
+const RECORDS: &str = ".devpod/contexts/default/workspaces";
+
+/// What each clone holds. The name is the point: this stands in for the one
+/// thing `dl`'s own guard exists to protect — a checkout holding work that
+/// exists nowhere else.
 const PRECIOUS: &str = "work that exists nowhere else\n";
 
 /// What a probe run saw.
@@ -115,15 +134,19 @@ impl Recording {
     /// visible here however they were reached.
     ///
     /// **In process.** A `std::fs::remove_dir_all` runs no command and leaves
-    /// no argv, so the child is given a scratch `HOME` laid out as a machine
-    /// with the fixture's workspaces on it, and the whole tree is compared
-    /// before and after. Any path under it that was removed, added or
-    /// rewritten fails here, whatever module or alias or submodule did it.
+    /// no argv, so the child is given a scratch `HOME` laid out the way a real
+    /// machine keeps its workspaces — see [`lay_out_a_home`] for the paths and
+    /// where they were read from — and the whole tree is compared before and
+    /// after. Any path under it that was removed, added or rewritten fails
+    /// here, whatever module or alias or submodule did it.
     ///
     /// What that does **not** reach is a path outside the scratch home: a
     /// `remove_dir_all("/etc")` is caught by nothing here, as it would be in
-    /// any code in any file. The claim is about the thing a deletion on this
-    /// path would actually be aimed at — the workspaces the reading names.
+    /// any code in any file. Nor does it reach a deletion the run never gets
+    /// to — the recording ends when the probe body does, so a cleanup deferred
+    /// past that is invisible here. Both limits are real and neither is
+    /// closable by a test; what this covers is a destruction aimed at the
+    /// workspaces the reading names, during the run.
     pub fn destroyed_nothing(&self) {
         for line in &self.argv {
             for forbidden in ["<rm>", "<--force>", "<remove>", "<delete>"] {
@@ -217,19 +240,56 @@ pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
 }
 
 /// A scratch `HOME` for the child: a machine with the fixture's workspaces on
-/// it, each holding a file worth keeping.
+/// it, at the paths a real machine keeps them, each holding a file worth
+/// keeping.
 ///
-/// The layout stands in for `dl`'s rather than reproducing it — what matters is
-/// that a directory named for every workspace the code under test can see is
-/// *there*, so an in-process deletion aimed at one has something to hit and
-/// [`Recording::destroyed_nothing`] has something to miss.
+/// The layout is copied from a real machine and not invented, and that is the
+/// whole of why this is worth doing. An earlier version of this laid the
+/// workspaces out at `$HOME/workspaces/<id>` — a path that exists nowhere, so
+/// the tree comparison was watching a directory no deletion would ever be
+/// aimed at, and a `remove_dir_all` pointed at the *real* clone passed it. What
+/// a cleanup on this path would actually reach for is here instead:
+///
+/// - `~/.cache/devlaunch/repos/<owner>/<repo>/<id>` — the worktree `dl` clones,
+///   which is where uncommitted work lives and the thing `dl`'s own unsaved-work
+///   guard exists to protect;
+/// - `~/.cache/devlaunch/metadata.json` — the registry that says where each of
+///   those went, which a cleanup rewrites rather than removes;
+/// - `~/.devpod/contexts/default/workspaces/<id>` — devpod's record of the
+///   container, which is what `dl <id> rm` deletes when there is no clone.
+///
+/// [`tree`] compares contents as well as names, so the rewritten registry is as
+/// visible as the removed clone.
 fn lay_out_a_home(dir: &Path) -> PathBuf {
     let home = dir.join("home");
+    let mut worktrees = Vec::new();
     for id in LAID_OUT {
-        let workspace = home.join("workspaces").join(id);
-        std::fs::create_dir_all(&workspace).expect("the scratch home");
-        std::fs::write(workspace.join("PRECIOUS.txt"), PRECIOUS).expect("the scratch home");
+        let clone = home.join(CLONES).join(LAID_OUT_REPO).join(id);
+        std::fs::create_dir_all(&clone).expect("the scratch home");
+        std::fs::write(clone.join("PRECIOUS.txt"), PRECIOUS).expect("the scratch home");
+        let record = home.join(RECORDS).join(id);
+        std::fs::create_dir_all(&record).expect("the scratch home");
+        std::fs::write(
+            record.join("workspace.json"),
+            format!("{{\"id\":\"{id}\",\"context\":\"default\"}}\n"),
+        )
+        .expect("the scratch home");
+        worktrees.push(format!(
+            "\"{LAID_OUT_REPO}/{id}\":{{\"local_path\":\"{}\"}}",
+            clone.display()
+        ));
     }
+    let registry = home.join(REGISTRY);
+    std::fs::create_dir_all(registry.parent().expect("the registry's directory"))
+        .expect("the scratch home");
+    std::fs::write(
+        &registry,
+        format!(
+            "{{\"version\":2,\"worktrees\":{{{}}}}}\n",
+            worktrees.join(",")
+        ),
+    )
+    .expect("the scratch home");
     home
 }
 
@@ -319,7 +379,9 @@ pub fn note(what: &str) {
         .append(true)
         .open(log)
         .expect("the probe log");
-    writeln!(log, "note <{what}>").expect("the probe log");
+    // One write, terminator included, for the reason [`shim`] gives.
+    log.write_all(format!("note <{what}>\n").as_bytes())
+        .expect("the probe log");
 }
 
 /// A `dl --ls --json` listing over three workspaces of this repo, in the shape
@@ -387,14 +449,20 @@ fn scratch(test: &str) -> PathBuf {
 /// fixture. One line per call, with newlines inside an argument flattened —
 /// `gh api graphql`'s query is a whole multi-line document, and a record that
 /// spanned lines could not be read back as one call.
+///
+/// The line is assembled first and appended **once**, terminator included.
+/// Written as two appends — the text, then the newline — two shims running at
+/// the same time interleave into one log line, and every assertion that counts
+/// the lines becomes a race. An `O_APPEND` write this small is atomic; two are
+/// not.
 fn shim(dir: &Path, name: &str) {
     let path = dir.join(name);
     let body = r#"#!/bin/sh
-{
+line=$({
   printf '%s' 'PROGRAM'
   for a in "$@"; do printf ' <%s>' "$a"; done
-} | tr '\n' ' ' >> "$LOGVAR"
-printf '\n' >> "$LOGVAR"
+} | tr '\n' ' ')
+printf '%s\n' "$line" >> "$LOGVAR"
 cat 'FIXTURE'
 "#
     .replace("PROGRAM", name)

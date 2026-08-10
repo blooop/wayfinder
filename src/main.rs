@@ -23,10 +23,21 @@
 //! ([`wf::reap`]'s private `remove`) is not something this crate may name. The
 //! picker is [`picker`], a module of its own.
 //!
-//! That arrangement is #137's separation, and it is a fact about visibility
-//! rather than a claim anyone has to check: the picker cannot call the deletion
-//! because the deletion is private to a module in another crate. No alias,
-//! helper or submodule of this binary changes that — the edit does not compile.
+//! Half of that arrangement is a fact about visibility, and needs no checking:
+//! the deletion is private to a module in another crate, so no alias, helper or
+//! submodule of this binary can call it, and the edit that tries does not
+//! compile.
+//!
+//! The other half is not. `wf::reap::run` has to be public for the arm below to
+//! dispatch it, and it *contains* the deletion — `reap::run(true, true)` is a
+//! forced reap with the unsaved-work guard waived. Nothing stops a line
+//! anywhere in this crate calling it, so what stands in its place is a count:
+//! [`tests::the_binary_reaches_reap_at_exactly_one_place`] pins that this file
+//! names the library's `reap` once and calls into it once, whatever spelling or
+//! alias is used, and `picker.rs` may not name it at all. Those are two greps
+//! over two files. A third file calling `reap::run` is caught by neither; see
+//! [`picker`] for what does and does not cover that, and #137 for the crate
+//! split that would.
 
 use anyhow::Result;
 use tokio::signal::unix::{signal, SignalKind};
@@ -251,17 +262,17 @@ async fn main() -> Result<()> {
         // whatever script installs the tool.
         Invocation::SkillsReport => run_skills(false),
         Invocation::SkillsInstall => run_skills(true),
-        // The one thing in this binary that deletes anything, and it is a
-        // *call into the library* — `reap::remove` is private there, so this
-        // whole crate, the picker included, has no way to spell a deletion
-        // except by choosing this arm. Pinned by
-        // `the_binary_reaches_the_deletion_at_exactly_one_place`.
+        // The one place in this binary that reaches a deletion, and it reaches
+        // it as a whole command: prompt, plan, and the private `remove` this
+        // crate could not spell if it wanted to. Pinned as a *count* by
+        // `the_binary_reaches_reap_at_exactly_one_place` — an arm that merely
+        // exists says nothing about the rest of the file, and a prologue before
+        // this match is how an earlier round deleted a workspace on
+        // `wf --version`.
         Invocation::Reap { yes, insist } => reap::run(yes, insist).await,
         // And the one shape that opens the TUI, which is the whole of what this
-        // arm may do. Everything the picker touches lives in a module that
-        // cannot name a deletion — see [`picker`] — and this line is what keeps
-        // `main.rs`, where `wf reap` does its deleting, out of that path
-        // entirely. Pinned by `the_tui_invocation_is_nothing_but_the_picker`.
+        // arm may do — the picker is handed the process, not a deletion, and
+        // this line is what keeps the rest of this file out of its path.
         Invocation::Tui => picker::run_picker().await,
     }
 }
@@ -321,27 +332,52 @@ mod tests {
     }
 
     #[test]
-    fn the_binary_reaches_the_deletion_at_exactly_one_place() {
-        // What is left for a grep to say once the deletion is out of reach.
+    fn the_binary_reaches_reap_at_exactly_one_place() {
+        // What is left for a grep to say once the deletion itself is out of
+        // reach.
         //
         // `reap::remove` is private to the library's `reap` module, so nothing
         // in this crate can call it — that half needs no test, it is a compile
         // error. What this crate *can* still name is `reap::run`, the whole
-        // `wf reap` command, prompt and plan and all. A previous round's
-        // escape was a prologue in `main` before the match; the same edit
-        // spelt with `reap::run(true, true)` would delete unattended too. So
-        // the claim here is a count, not a `contains`: this file reaches into
-        // `reap` exactly once, and that once is the arm `parse_args` produced
-        // for the words `wf reap`.
+        // `wf reap` command, prompt and plan and all, and `reap::run(true,
+        // true)` is a forced deletion. A previous round's escape was exactly
+        // that as a prologue before the match, and `wf --version` reaped a
+        // workspace and exited 0.
         //
-        // Nothing weaker would do. `contains` says an arm exists and says
-        // nothing about the rest of the file, which is precisely how the
-        // prologue got in.
+        // So the claim is a count of **reachability**, not of one spelling.
+        // The version of this test that counted `"reap::"` alone was green for
+        // `use wf::reap as tidy;` plus `tidy::run(true, true)`, because an
+        // alias produces no `reap::` anywhere. Three assertions close that,
+        // and each is load-bearing:
+        //
+        // 1. the module is named once — a second `wf::reap::run(…)` written
+        //    inline, or an alias *added* beside the import, pushes this to two;
+        // 2. that one naming is the plain import — `use wf::reap as tidy;` and
+        //    `use wf::reap::run as nuke;` both leave the count at one and fail
+        //    here instead;
+        // 3. the name it binds is used once — a glob `use wf::*;` names no
+        //    `wf::reap` at all, but still has to write `reap::run` to call it,
+        //    and a second call anywhere in the file lands here.
+        //
+        // Between them, every way this file can reach `reap` has to be spelt
+        // in one of two places, and both are checked below. What none of it
+        // reaches is a *third* file calling `reap::run`; that is stated in the
+        // module doc rather than pretended away.
         let code = probe::code_only(include_str!("main.rs"));
+        assert_eq!(
+            code.matches("wf::reap").count(),
+            1,
+            "this file may name the library's `reap` once, and that once is its import"
+        );
+        assert!(
+            code.contains("use wf::reap;"),
+            "and it must be the plain import: an alias is a second name for the \
+             same module, spelt so that a grep for `reap::` misses it"
+        );
         assert_eq!(
             code.matches("reap::").count(),
             1,
-            "this file may reach into `reap` once, for the `wf reap` argv and \
+            "the imported name may be used once, for the `wf reap` argv and \
              nothing else"
         );
         assert!(

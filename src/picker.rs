@@ -3,34 +3,46 @@
 //! The background reading of what a `wf reap` would claim flows through this
 //! assembly — spawned in [`session`], carried on the one channel, folded in
 //! [`fold`], drawn from [`Picker::tick`] — and #137 asks that nothing on that
-//! path be able to delete a workspace. Three things carry that, and it is worth
-//! being exact about which one carries what, because two review rounds were
-//! spent on a claim that was larger than its evidence.
+//! path delete a workspace. Four rounds of review each found a different hole
+//! in a stronger version of this note than the one below, so it is worth being
+//! exact about what each guard covers and where each one stops.
 //!
-//! 1. **Reap's deletion cannot be named here at all.** `wf::reap`'s `remove` is
-//!    private to its module, in the library; this is the binary. Every route
-//!    three rounds of review found into a deletion — a prologue in `main`, a
-//!    helper in `main.rs`, an aliased import, a submodule of this file — ended
-//!    at that function, and every one of them is now a compile error. Nothing
-//!    has to notice; the build refuses.
-//! 2. **Running a command is watched, over the whole loop.**
+//! 1. **The deletion itself cannot be *named*.** `wf::reap`'s `remove` is
+//!    private to its module, in the library; this is the binary. A prologue in
+//!    `main`, a helper in `main.rs`, an aliased import, a submodule of this
+//!    file — every route that ends at that function is a compile error, and
+//!    nothing has to notice, because the build refuses.
+//!
+//!    That does **not** close `wf::reap::run`, which is public because `main`
+//!    must dispatch `wf reap`, and which contains the deletion:
+//!    `reap::run(true, true)` *is* the forced reap. Visibility cannot separate
+//!    the picker from a function the same binary has to call, so what stands in
+//!    its place is a denylist — `reap` is a forbidden token in this file
+//!    ([`tests::the_picker_names_neither_a_subprocess_nor_reap`]) and `main.rs`
+//!    counts its own two mentions of the module. A denylist over two files
+//!    cannot see the same call made one hop away in a third. That hole is real;
+//!    the only thing that would close it is the picker living in a crate that
+//!    cannot depend on reap at all, which is a change to `wf`'s build and its
+//!    own decision (#137).
+//! 2. **Running a command is watched, across every arm of the loop.**
 //!    [`tests::no_deletion_survives_a_whole_session_of_the_real_assembly`]
 //!    drives [`session`] for real against recording `dl` and `gh` shims, so a
 //!    `dl <ws> rm` reached from anywhere the loop can reach — a helper in
 //!    `app.rs`, a task spawned in a fold arm, a function named nothing anyone
-//!    thought to forbid — is written down as argv. This is the guard that does
-//!    not care what file the route was spelt in.
+//!    thought to forbid — is written down as argv. It does not care what file
+//!    the route was spelt in. It cares about *which arm* and about *when*: all
+//!    four [`Outcome`] arms are driven, the launch one included, and the
+//!    recording runs from the composition site to a stated window past the
+//!    ending (`WATCH`, in the tests below). A cleanup deferred longer than that
+//!    is not seen. The bound is stated rather than silent because it cannot be
+//!    removed — a probe can always be outwaited.
 //! 3. **Destruction that runs no command is watched where it would land.** The
-//!    same run gives the child a scratch `HOME` holding a directory per
-//!    workspace the fixture lists, and compares the tree before and after. An
-//!    `fs::remove_dir_all` aimed at a workspace fails it. An `fs` call aimed
-//!    somewhere else is caught by nothing — as it would be in any file of any
-//!    crate, and this file claims no better.
-//!
-//! What is left of the source-text guard is
-//! [`tests::the_picker_names_no_way_of_running_a_command`], which is three
-//! tokens about starting subprocesses and outliving the loop. It is not the
-//! separation; (1) is.
+//!    same run gives the child a scratch `HOME` laid out the way this machine
+//!    is — `~/.cache/devlaunch/repos/<owner>/<repo>/<id>` for the clone,
+//!    `~/.devpod/contexts/<ctx>/workspaces/<id>` for the record — and compares
+//!    the tree before and after. An `fs::remove_dir_all` aimed at a workspace
+//!    fails it. An `fs` call aimed somewhere else is caught by nothing — as it
+//!    would be in any file of any crate, and this file claims no better.
 //!
 //! The ordering that matters is at the bottom of [`run_picker`]: restore the
 //! terminal, *then* exec, because after the exec there is no `wf` left to
@@ -195,9 +207,10 @@ impl Picker {
 /// It is worth saying what that does *not* buy, because an earlier round of
 /// this file said it did. Not being async rules out `.await` in these arms and
 /// nothing more: a synchronous `std::process::Command`, or a `tokio::spawn`ed
-/// task, reaches `dl` from here perfectly well. What actually stops a deletion
-/// in this arm is the module doc's (1) and (2) — the deletion cannot be named,
-/// and running a command is recorded.
+/// task, reaches `dl` from here perfectly well. What stands against a deletion
+/// in this arm is the module doc's (2) and (3) — a command it runs is recorded,
+/// and a workspace it removes in-process leaves a hole in the scratch home —
+/// with the limits stated there.
 fn fold(
     event: LoadEvent,
     app: &mut App,
@@ -262,16 +275,16 @@ fn fold(
 
 /// Start the background reading of what a `wf reap` would claim (#137).
 ///
-/// The composition site, and a function rather than a line inside
-/// [`run_picker`] so that it is somewhere a probe can *call*. Wrapping the
-/// reading here — awaiting it before it is handed over, folding a deletion into
-/// it — is the edit this covers, and the reason the first frame is measured
-/// against it in [`tests::the_first_frame_is_drawn_before_anything_is_asked`].
+/// A function rather than a line inside [`session`] because *spawning* the
+/// reading — as against awaiting it — is the property
+/// [`tests::the_first_frame_is_drawn_before_anything_is_asked`] pins, and a
+/// name is somewhere to say that. Its only caller is [`session`], which the
+/// probe drives whole, so this is not a seam anything reaches around.
 ///
 /// Read behind the screen exactly as the map search is: a `dl --ls --json`
 /// subprocess and one batched GraphQL call, neither of them on the way to a
-/// frame. It folds into the count line when it lands, says nothing when it
-/// fails, and can delete nothing.
+/// frame. It folds into the count line when it lands and says nothing when it
+/// fails.
 fn spawn_reading(tx: &UnboundedSender<LoadEvent>) -> Survey {
     wf::refresh::spawn_survey(wf::reclaim::survey_live(), tx.clone())
 }
@@ -296,10 +309,12 @@ async fn stop_background(discovery: JoinHandle<()>, survey: Survey) {
 /// is already up and answering keys.
 ///
 /// Generic over the backend and over [`Keys`] so that the probe drives *this*
-/// function rather than a hand-written imitation of it. Everything the loop
-/// body can reach — a helper in another module, a task it spawns, a `dl` it
-/// shells out to — is recorded there as argv, and the escapes three review
-/// rounds found were all one line inside this loop.
+/// function rather than a hand-written imitation of it, and it drives every one
+/// of the four arms below: a scripted keyboard that only ever sent `Esc` left
+/// `Refresh` and `Launch` unentered, which is where a fifth escape was found.
+/// Whatever the loop body reaches — a helper in another module, a task it
+/// spawns, a `dl` it shells out to — is recorded there as argv, for as long as
+/// that probe watches.
 async fn run<B: Backend, K: Keys>(
     terminal: &mut Terminal<B>,
     keys: &mut K,
@@ -516,16 +531,25 @@ mod tests {
     use crate::probe;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-    /// How long the loop runs on after the reading has reached the screen.
+    /// How long the probe waits after each thing it does — after the reading
+    /// reaches the screen, after each key it types, and after the session ends.
     ///
     /// The reason this is not zero. A current-thread runtime polls a spawned
     /// task only at an await point, so a probe that stopped the moment it had
     /// what it came for would give `tokio::spawn(async move { … })` in a fold
     /// arm a window of exactly nothing — the task is dropped unpolled and the
     /// deletion "did not happen". In the real event loop that window is
-    /// seconds. This is the window this probe gives it, and it is generous on
-    /// purpose: what is being watched is a `/bin/sh` shim.
-    const SETTLE: Duration = Duration::from_millis(400);
+    /// seconds.
+    ///
+    /// **This is the bound on what the recording claims, and it is stated
+    /// rather than hidden**, because it cannot be removed. A cleanup that
+    /// sleeps for longer than the probe watches is not observed, and no choice
+    /// of number changes that — a longer window costs suite time and buys a
+    /// bigger number to sleep past. What is bought instead is that the window
+    /// is *everywhere* rather than only at the end: the probe waits this long
+    /// between every key, so a task spawned in any arm is polled before the
+    /// next thing happens, and again after the session returns.
+    pub const WATCH: Duration = Duration::from_millis(400);
 
     /// How long the probe will wait for the background reading to arrive
     /// before quitting anyway. A reading that never lands leaves the screen
@@ -537,31 +561,54 @@ mod tests {
     /// not the real thing.
     ///
     /// It drives the loop the way a person does: watch the screen, wait for
-    /// what you came for, then quit. The first time it is asked for a key the
+    /// what you came for, then type. The first time it is asked for a key the
     /// first frame has just been painted and nothing else has happened yet, so
     /// that is where the ordering note goes.
+    ///
+    /// The keys it types are a *plan*, because one of them is not enough. `run`
+    /// has four [`Outcome`] arms and for three review rounds this script sent
+    /// only `Esc`, so `Refresh` and `Launch` were never entered and a deletion
+    /// written into either was green — including in `Launch`, which is both the
+    /// product's primary action and the natural home of a "free the disk on the
+    /// way out" cleanup. A plan that runs out falls back to `Esc`, so a loop
+    /// that failed to end where it was supposed to ends anyway and fails on an
+    /// assertion rather than on the suite's timeout.
     struct Script {
-        /// When to quit regardless, so a reading that never lands ends the run.
+        /// What to type, in order, one key per [`WATCH`].
+        plan: std::collections::VecDeque<KeyEvent>,
+        /// When to start typing regardless, so a reading that never lands does
+        /// not hang the run.
         deadline: std::time::Instant,
-        /// When the reading first reached the app. The loop runs on for
-        /// [`SETTLE`] past this — see there.
-        landed: Option<std::time::Instant>,
+        /// When the next key may be sent: [`WATCH`] after the reading landed,
+        /// and [`WATCH`] after each key since. `None` until the reading lands.
+        due: Option<std::time::Instant>,
         /// Whether the first frame has been noted yet.
         noted: bool,
     }
 
     impl Script {
-        fn new() -> Self {
+        fn new(plan: Vec<KeyEvent>) -> Self {
             Self {
+                plan: plan.into(),
                 deadline: std::time::Instant::now() + LANDING,
-                landed: None,
+                due: None,
                 noted: false,
             }
         }
     }
 
+    /// A key with no modifiers, and the `ctrl` variant `Refresh` needs.
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
     impl Keys for Script {
         async fn next_press(&mut self, app: &App, timeout: Duration) -> Result<Option<KeyEvent>> {
+            let now = std::time::Instant::now();
             if !self.noted {
                 self.noted = true;
                 // The first frame is painted and nothing has been awaited
@@ -572,12 +619,13 @@ mod tests {
                 // `the_first_frame_is_drawn_before_anything_is_asked` reads.
                 probe::note("the first frame");
             }
-            if self.landed.is_none() && app.reclaimable.is_some() {
-                self.landed = Some(std::time::Instant::now());
+            if self.due.is_none() && app.reclaimable.is_some() {
+                self.due = Some(now + WATCH);
             }
-            let seen_enough = self.landed.is_some_and(|at| at.elapsed() >= SETTLE);
-            if seen_enough || std::time::Instant::now() >= self.deadline {
-                return Ok(Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+            let ready = self.due.is_some_and(|at| now >= at);
+            if ready || now >= self.deadline {
+                self.due = Some(now + WATCH);
+                return Ok(Some(self.plan.pop_front().unwrap_or(press(KeyCode::Esc))));
             }
             // Far shorter than the real `TICK`, because this is the probe's own
             // cadence and a probe that took a quarter of a second per frame
@@ -590,8 +638,8 @@ mod tests {
     }
 
     /// A whole session, driven for real in a child process whose `dl` and `gh`
-    /// are recording shims and whose `HOME` is a scratch machine with the
-    /// fixture's workspaces on it.
+    /// are recording shims and whose `HOME` is a scratch machine laid out the
+    /// way this one is, with the fixture's workspaces on it.
     ///
     /// This is the assembly and not an imitation of it: [`session`] is the
     /// function `run_picker` calls, it starts the real
@@ -604,20 +652,21 @@ mod tests {
     ///
     /// The runtime is built by hand rather than by `#[tokio::test]` so that it
     /// is current-thread: that is what makes the ordering above deterministic
-    /// rather than a race between the first frame and a worker thread.
-    #[test]
-    #[ignore = "run by `probe::record` from the tests below, under recording shims"]
-    fn picker_session_probe() {
-        if !probe::is_child() {
-            return;
-        }
+    /// rather than a race between the first frame and a worker thread. It is
+    /// also kept alive past the session and driven for one more [`WATCH`], so
+    /// that a task spawned by the arm that *ended* the loop is polled rather
+    /// than dropped with the runtime — the launch arm being exactly where a
+    /// cleanup on the way out would go.
+    ///
+    /// The screen is printed on the way out for the assertions that read it.
+    fn drive(app: App, plan: Vec<KeyEvent>) -> Ending {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("a runtime for the probe");
         let backend = ratatui::backend::TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
-        let mut keys = Script::new();
+        let mut keys = Script::new(plan);
 
         // No repos, so the map search answers immediately without asking `gh`
         // anything — the reading is what this run is about, and a discovery
@@ -627,14 +676,13 @@ mod tests {
         let ending = runtime.block_on(session(
             &mut terminal,
             &mut keys,
-            App::empty(),
+            app,
             Vec::new(),
             probe::child_scratch().join("projects.json"),
         ));
-        assert!(
-            matches!(ending.expect("the session"), Ending::Quit),
-            "the scripted keyboard quits, and nothing else ends this loop"
-        );
+        // Built inside the runtime's context, not passed into it: a `sleep`
+        // constructed outside one has no timer to register with.
+        runtime.block_on(async { tokio::time::sleep(WATCH).await });
 
         let buf = terminal.backend().buffer();
         for y in 0..buf.area.height {
@@ -644,14 +692,94 @@ mod tests {
             }
             println!("{}{}", probe::MARK, line.trim_end());
         }
+        ending.expect("the session")
+    }
+
+    /// The quit path, with the two arms that do not end the loop driven on the
+    /// way: `ctrl-r` is [`Outcome::Refresh`], `down` on a screen with nothing
+    /// on it is [`Outcome::Continue`], `esc` is [`Outcome::Quit`].
+    #[test]
+    #[ignore = "run by `probe::record` from the tests below, under recording shims"]
+    fn picker_session_probe() {
+        if !probe::is_child() {
+            return;
+        }
+        let ending = drive(
+            App::empty(),
+            vec![
+                ctrl(KeyCode::Char('r')),
+                press(KeyCode::Down),
+                press(KeyCode::Esc),
+            ],
+        );
+        assert!(
+            matches!(ending, Ending::Quit),
+            "the scripted keyboard quits, and nothing else ends this loop"
+        );
+    }
+
+    /// The launch path — [`Outcome::Launch`], the fourth arm and the product's
+    /// primary action, which no probe drove for the first four rounds of this
+    /// PR.
+    ///
+    /// A registered checkout with no map on it is the shortest real route to
+    /// one: the project's own row is the first stop, `enter` opens the launch
+    /// picker on its creation candidates, `down` moves to `new map` — which
+    /// needs no text typed into it — and `enter` resolves it against the one
+    /// registered checkout and returns a launch. The loop then shuts the
+    /// background work down and returns [`Ending::Handover`], which is where
+    /// `run_picker` would `exec`; this stops one line short of that.
+    ///
+    /// The checkout path is in the probe's own scratch directory rather than
+    /// under `HOME`, because `HOME` is what is being watched for changes.
+    #[test]
+    #[ignore = "run by `probe::record` from the tests below, under recording shims"]
+    fn picker_launch_probe() {
+        if !probe::is_child() {
+            return;
+        }
+        let repo = "blooop/wayfinder";
+        let mut app = App::empty().with_checkouts(vec![projects::Checkout::new(
+            probe::child_scratch().join("checkout"),
+            repo.to_string(),
+        )]);
+        app.enter(repo);
+        let ending = drive(
+            app,
+            vec![
+                ctrl(KeyCode::Char('r')),
+                press(KeyCode::Enter),
+                press(KeyCode::Down),
+                press(KeyCode::Enter),
+            ],
+        );
+        match ending {
+            Ending::Handover(launch) => assert_eq!(
+                launch.cwd(),
+                probe::child_scratch().join("checkout"),
+                "the launch resolves to the one registered checkout"
+            ),
+            Ending::Quit => {
+                panic!("the launch arm was never entered — the plan ran out and the fallback quit")
+            }
+        }
     }
 
     /// One recorded run of [`picker_session_probe`], for the assertions below
     /// to share. Each of them calls this rather than the probe directly,
-    /// because the child costs a process and a `SETTLE`.
+    /// because the child costs a process and several [`WATCH`]es.
     fn a_session() -> probe::Recording {
         probe::record(
             "picker::tests::picker_session_probe",
+            probe::DL_LISTING,
+            probe::GH_FACTS,
+        )
+    }
+
+    /// The same, for the run that ends in a launch.
+    fn a_launching_session() -> probe::Recording {
+        probe::record(
+            "picker::tests::picker_launch_probe",
             probe::DL_LISTING,
             probe::GH_FACTS,
         )
@@ -668,6 +796,10 @@ mod tests {
         // thought to forbid — is recorded here, because destroying a workspace
         // means running `dl`. And a destruction that runs no command at all is
         // caught by the scratch home, which must come back untouched.
+        //
+        // Bounded, and the bound is [`WATCH`]: this is what the run *did*, not
+        // what the code cannot do. A cleanup that waits longer than the probe
+        // does is not here.
         let run = a_session();
         run.destroyed_nothing();
         assert_eq!(
@@ -682,6 +814,29 @@ mod tests {
             "one batched read of the tracker: {}",
             run.argv[2]
         );
+    }
+
+    #[test]
+    fn no_deletion_survives_the_arm_that_launches_either() {
+        // The same claim over the fourth arm, which is the one that matters
+        // most and the one nothing drove until now. `Outcome::Launch` is where
+        // a "free the disk on the way out" cleanup goes: the screen is about to
+        // be given back, the picker knows exactly which workspaces a reap would
+        // claim, and after the `exec` there is no `wf` left to be blamed. The
+        // run this reads ends in that arm, and it asks the machine the same two
+        // questions and no others.
+        //
+        // The arm also shuts the background work down, so a `dl` or `gh` still
+        // in flight would land in this log after the reading did.
+        let run = a_launching_session();
+        run.destroyed_nothing();
+        assert_eq!(
+            run.argv.len(),
+            3,
+            "launching asks nothing extra of the machine: {:?}",
+            run.argv
+        );
+        assert_eq!(run.argv[1], "dl <--ls> <--json>");
     }
 
     #[test]
@@ -726,30 +881,45 @@ mod tests {
     }
 
     #[test]
-    fn the_picker_names_no_way_of_running_a_command() {
-        // What is left for source text to say, now that the deletion itself is
-        // out of reach by construction — `wf::reap`'s `remove` is private to
-        // its module, in a *different crate* from this one, so no helper, no
-        // alias and no submodule of the binary can call it and the edit that
-        // tries is a compile error rather than a test failure.
+    fn the_picker_names_neither_a_subprocess_nor_reap() {
+        // What is left for source text to say, and it is worth being exact
+        // about each token, because a list that claims to be a separation is
+        // how three of this PR's four rounds were spent.
         //
-        // This is much narrower than the list it replaces, and it is worth
-        // being exact about what it is for. Shelling out to `dl` is caught by
-        // the run above, over the whole loop, whatever file it is spelt in.
-        // What that run cannot catch is a subprocess this file starts *after*
-        // the probe stops watching — so `Command` and `process::` stay
-        // forbidden here, where a screen-painting module has no use for either.
-        // `tokio::spawn` is on the list because a spawned task is how an
-        // `.await` gets into [`Picker::tick`] and [`fold`], neither of which is
-        // async, and a task that outlives the loop outlives the probe with it.
+        // `reap` is the one that matters. `wf::reap`'s `remove` is private, in
+        // a different crate, so no helper, alias or submodule can call it and
+        // the edit that tries is a compile error. But `wf::reap::run` is
+        // public — `main` has to dispatch `wf reap` — and `reap::run(true,
+        // true)` *is* the forced deletion, waiver and all. Nothing about
+        // visibility stops this file calling it, so this line does. Bare rather
+        // than `reap::`, because the module cannot be reached without its own
+        // name being written somewhere: `use wf::reap as tidy;` is caught here
+        // too, which `reap::` alone would miss.
         //
-        // It is *not* a claim that nothing in the picker's path can delete.
-        // `std::fs::remove_dir_all` in a submodule of this module names none of
-        // these and would compile; what stops it is the scratch home the run
-        // above compares, and outside that home nothing stops it — which is
-        // true of any code in any file in any crate.
+        // `Command` and `process::` are for the subprocess the run above
+        // cannot see — one started after the probe stops watching. A
+        // screen-painting module has no use for either. `tokio::spawn` is on
+        // the list because a spawned task is how an `.await` gets into
+        // [`Picker::tick`] and [`fold`], neither of which is async, and a task
+        // that outlives the loop outlives the probe with it.
+        //
+        // It is *not* a claim that nothing on the picker's path can delete, and
+        // a grep over one file could never be one. The same call spelt in
+        // `app.rs` or in a submodule of this module names none of these and
+        // compiles; what stands against it there is the recorded argv and the
+        // scratch home the run above compares — and outside that home, or after
+        // that run, nothing does, which is true of any code in any file.
+        //
+        // Which is also why this list is shorter than the ones
+        // [`wf::reclaim`] and [`wf::refresh`] carry, rather than having drifted
+        // from them. Those are leaf modules that read and format, so `fs::` and
+        // `remove` cost them nothing and close the only spelling they have. This
+        // file is a *composition site*: it is reached by a probe that watches the
+        // filesystem directly, and banning `fs::` here would read as "the picker
+        // cannot touch a file" while a submodule of it still could. The
+        // behavioural guard is the honest one for that, so it is the one used.
         let code = probe::code_only(include_str!("picker.rs"));
-        for forbidden in ["Command", "process::", "tokio::spawn"] {
+        for forbidden in ["reap", "Command", "process::", "tokio::spawn"] {
             assert!(
                 !code.contains(forbidden),
                 "the picker draws a screen and drains a channel: it names {forbidden:?}"
