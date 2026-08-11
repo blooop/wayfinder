@@ -39,7 +39,12 @@ use crate::model::{
 /// believed on its own (#28).
 pub const MAP_LABEL: &str = "wayfinder:map";
 
-const MAP_QUERY: &str = "\
+/// The map read, in one round trip.
+///
+/// `pub(crate)` for one reason: [`reap`](crate::reap) selects a subset of these
+/// same fields into its own batched query, and the two are held to each other
+/// by a test rather than by a comment. Nothing outside that test may read it.
+pub(crate) const MAP_QUERY: &str = "\
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
