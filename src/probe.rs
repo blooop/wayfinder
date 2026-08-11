@@ -184,6 +184,20 @@ impl Recording {
                 );
             }
         }
+        self.touched_no_files();
+    }
+
+    /// Fail if the run changed anything under the child's scratch `HOME`.
+    ///
+    /// The in-process half of [`Recording::destroyed_nothing`], on its own —
+    /// for the one path that is *supposed* to destroy a workspace. `wf reap`
+    /// deletes by handing an id to `dl`, so an `<rm>` in its argv is the
+    /// feature rather than the defect, and the whole-recording assertion
+    /// cannot be used there. What must still hold is the separation `dl`'s own
+    /// guard depends on: `wf` names a workspace and `dl` decides what happens
+    /// to its clone. A reap that reached for the directory itself would run the
+    /// same commands and be caught only here.
+    pub fn touched_no_files(&self) {
         assert!(
             self.disturbed.is_empty(),
             "this path must leave the machine as it found it, and it changed: {:?}",

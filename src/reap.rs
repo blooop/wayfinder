@@ -2402,4 +2402,147 @@ mod tests {
         assert!(parse_workspaces(b"not json").is_err());
         assert!(parse_workspaces(b"").is_err());
     }
+
+    #[test]
+    fn the_readme_states_the_keep_rule_the_derivation_implements() {
+        // #132's fourth item. The list of what reap keeps *always* named
+        // "tickets someone has claimed" without qualification, and that is not
+        // a rule this code has: the claim is read only after every PR arm has
+        // declined, so a claimed ticket whose PR merged is `DoneByMerge` and is
+        // collected. `AGENTS.md` makes the README part of `wf`'s interface, so
+        // a keep rule that overstates what is kept is a defect of the same kind
+        // as a wrong reason line — and a worse one to be wrong about, since it
+        // is what someone reads before deciding to trust `wf reap` with a
+        // machine.
+        //
+        // Two halves, and the pairing is the test: the derivation fact that
+        // makes the qualification necessary, and the sentence that has to carry
+        // it. The sentence is matched exactly, so rewording it fails here and
+        // whoever rewords it re-reads the rule above before saying so again.
+        let claimed_and_merged = [PrOutcome::project(33, Some(&PrStatus::Merged))];
+        assert_eq!(
+            node_fact(TicketState::Live, true, &claimed_and_merged),
+            NodeFact::DoneByMerge { pr: 33 },
+            "a claim does not outrank a merge"
+        );
+        assert_eq!(
+            node_fact(TicketState::Live, true, &[]),
+            NodeFact::Claimed,
+            "and it does settle a ticket nothing has come of"
+        );
+
+        let always = include_str!("../README.md")
+            .split_once("Kept, always:")
+            .expect("the README lists what a reap keeps unconditionally")
+            .1
+            .split_once("\n\n")
+            .expect("that list is one paragraph")
+            .0;
+        assert!(
+            always.contains("tickets someone has claimed that no PR has come of"),
+            "the keep list must qualify the claim it names: {always}"
+        );
+    }
+
+    /// `wf reap -y` taken for real, in a child process whose `dl` and `gh` are
+    /// the fixtures the parent hands it and whose every invocation is written
+    /// down. The `#[ignore]` is what keeps it out of an ordinary run: without
+    /// the shims on `PATH` this is `wf reap -y` against the machine running
+    /// the suite, and it is the one path in this crate that deletes.
+    ///
+    /// `-y` and not `-f`: the prompt is a human's, so a recorded run has to
+    /// skip it, but the unsaved-work waiver is a separate decision and the
+    /// tests below say which of them they are asking about.
+    #[tokio::test]
+    #[ignore = "run by `probe::record` from the two tests below, under recording shims"]
+    async fn reap_run_probe() {
+        if !crate::probe::is_child() {
+            return;
+        }
+        let said = match run(true, false).await {
+            Ok(()) => "the reap finished".to_string(),
+            Err(e) => format!("the reap failed: {e}"),
+        };
+        println!("{}{said}", crate::probe::MARK);
+    }
+
+    /// Every `dl` call of a recorded run that names a workspace to remove.
+    fn removals(run: &crate::probe::Recording) -> Vec<&str> {
+        run.argv
+            .iter()
+            .filter(|call| call.contains("<rm>"))
+            .map(String::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn a_reap_hands_dl_the_workspaces_its_plan_doomed_and_no_others() {
+        // The deleting path as a fact about a run. Every other test of this
+        // module stops at a `Verdict`, which is a value in this process — and
+        // a plan that is right about what should go is not the same claim as a
+        // run that destroys only that. Between the two sits `run`: the loop
+        // over `doomed`, the id it passes, and the flag it does or does not
+        // add. This is the only place any of that is observed.
+        //
+        // The four workspaces in the listing are laid out as directories in the
+        // child's scratch home, so `wf` naming the wrong one would show up
+        // here as an id, and `wf` deleting one itself would show up as a
+        // disturbed path.
+        let run = crate::probe::record(
+            "reap::tests::reap_run_probe",
+            crate::probe::DL_LISTING,
+            crate::probe::GH_FACTS,
+        );
+        assert_eq!(
+            run.printed(),
+            ["the reap finished"],
+            "the run reached the end: {}",
+            run.stdout
+        );
+        assert_eq!(
+            removals(&run),
+            ["dl <wf-129-closed> <rm>"],
+            "the closed ticket's workspace goes, alone and by id: {:?}",
+            run.argv
+        );
+        // Without `-f`, and this is where that is observable rather than
+        // asserted about a `Verdict`: `--force` is `dl`'s own waiver of its
+        // uncommitted-work guard, and a `wf` that passed it unasked would be
+        // overriding a guard belonging to the other program.
+        for call in &run.argv {
+            assert!(!call.contains("<--force>"), "unasked-for force: {call}");
+        }
+        run.touched_no_files();
+    }
+
+    #[test]
+    fn a_ticket_state_this_binary_cannot_read_costs_no_workspace() {
+        // #132's first item, at the far end: not "the derivation keeps it" but
+        // "the run deletes nothing". The same fixtures as above with one word
+        // changed — the state of the one ticket whose workspace the run above
+        // removes — so the difference between the two recordings is exactly
+        // the difference between `CLOSED` and a word this binary was never
+        // taught. Before the fix this run removed `wf-129-closed` on the
+        // strength of that word.
+        let unreadable = crate::probe::GH_FACTS.replace(
+            r#""i129":{"state":"CLOSED""#,
+            r#""i129":{"state":"TRANSFERRED""#,
+        );
+        assert_ne!(
+            unreadable,
+            crate::probe::GH_FACTS,
+            "the fixture no longer says what this test edits"
+        );
+        let run = crate::probe::record(
+            "reap::tests::reap_run_probe",
+            crate::probe::DL_LISTING,
+            &unreadable,
+        );
+        run.destroyed_nothing();
+        assert!(
+            run.stdout.contains("nothing to reap"),
+            "the run said what it did instead of deleting: {}",
+            run.stdout
+        );
+    }
 }

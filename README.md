@@ -1010,8 +1010,12 @@ decides. Needs `dl` **0.0.21 or newer** for the JSON listing.
 Kept, always: workspaces `dl` did not create (they are not `wf`'s, whatever
 their branch looks like), branches that are not `wayfinder/<repo>-<n>` for that
 repo, tickets with an open or draft PR (in review is where review fixes happen),
-tickets someone has claimed, and anything **running** — a ticket closing is no
-evidence that the session in the container ended.
+tickets someone has claimed that no PR has come of, and anything **running** — a
+ticket closing is no evidence that the session in the container ended.
+
+The claim is the *last* thing read, not the first: it settles a ticket nothing
+has come of yet, and it does not outrank the PRs. A claimed ticket whose PR
+merged is finished work, and reap collects it like any other.
 
 **A `dl` that says nothing is not a `dl` saying nothing is at risk.** From
 devlaunch **0.0.24** the listing answers `unsaved` for every clone `dl` made,
