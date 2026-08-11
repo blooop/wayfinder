@@ -204,13 +204,33 @@ impl Recording {
 /// If the child could not be run, or failed. A failed child is a failed probe:
 /// its assertions are the test's.
 pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
+    record_as_dl(test, dl_stdout, gh_stdout, SHIMMED_DL)
+}
+
+/// [`record`], with the release the shimmed `dl` claims to be.
+///
+/// Split out for the one question [`record`] cannot ask: what `wf` does
+/// **differently** either side of [`DEVLAUNCH_FLOOR`]. That is a rule about two
+/// versions, so a harness that can only produce one cannot pin it — it can
+/// watch the launch a new `dl` gets and call the conditional tested, which is
+/// how the first version of this guard came to pass against a `wf` with the
+/// floor check deleted.
+///
+/// The caller owns the pairing, and it is a real constraint rather than a
+/// formality: `dl_stdout` has to be a listing the named release could have
+/// written, or the probe is evidence about a machine that does not exist. See
+/// [`SHIMMED_DL`], which is what to pass whenever the version is not itself
+/// the subject.
+///
+/// [`DEVLAUNCH_FLOOR`]: crate::launch
+pub fn record_as_dl(test: &str, dl_stdout: &str, gh_stdout: &str, dl_version: &str) -> Recording {
     let dir = scratch(test);
     std::fs::write(dir.join("dl.out"), dl_stdout).expect("the dl fixture");
     std::fs::write(dir.join("gh.out"), gh_stdout).expect("the gh fixture");
     let log = dir.join("argv.log");
     std::fs::write(&log, "").expect("the log");
-    shim(&dir, "dl");
-    shim(&dir, "gh");
+    shim(&dir, "dl", dl_version);
+    shim(&dir, "gh", dl_version);
     let home = lay_out_a_home(&dir);
     let before = tree(&home);
 
@@ -572,9 +592,16 @@ fn scratch(test: &str) -> PathBuf {
 /// listing, and `reap` reads a *missing* answer differently either side of that
 /// release. A shim that listed like 0.0.24 and versioned like 0.0.23 would be
 /// evidence about a machine that cannot exist, which is worse than no probe.
-const SHIMMED_DL: &str = "0.0.24";
+///
+/// The default, not the only possibility: [`record_as_dl`] takes a version, for
+/// probes whose subject *is* which release is on the machine. The pairing rule
+/// above is what those callers have to satisfy for themselves — a later release
+/// still writes the one-key object, so any version at or above 0.0.24 pairs
+/// with [`DL_LISTING`]; an older one has to be given a listing it could have
+/// written, which is what [`DL_LISTING_UNSAVED`] collects.
+pub const SHIMMED_DL: &str = "0.0.24";
 
-fn shim(dir: &Path, name: &str) {
+fn shim(dir: &Path, name: &str, dl_version: &str) {
     let path = dir.join(name);
     // `--version` is answered before the fixture, because `dl` answers it with
     // a version rather than with a listing, and a shim that returned the
@@ -593,7 +620,7 @@ if [ "$1" = "--version" ]; then printf '%s\n' 'PROGRAM VERSION'; exit 0; fi
 cat 'FIXTURE'
 "#
     .replace("PROGRAM", name)
-    .replace("VERSION", SHIMMED_DL)
+    .replace("VERSION", dl_version)
     .replace("LOGVAR", LOG)
     .replace(
         "FIXTURE",

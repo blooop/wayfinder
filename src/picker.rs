@@ -777,15 +777,101 @@ mod tests {
     ///
     /// The checkout path is in the probe's own scratch directory rather than
     /// under `HOME`, because `HOME` is what is being watched for changes.
+    ///
+    /// The checkout carries a `devcontainer.json`, so the launch this drives is
+    /// an **isolated** one — `dl`, not `claude`. That is deliberate and it is
+    /// the more interesting of the two arms: isolation is conditional on a
+    /// subprocess answer (`dl --version`, against `DEVLAUNCH_FLOOR`), and a
+    /// condition met by asking another program is the kind that degrades
+    /// silently. A `wf` that misread the answer would go on launching perfectly
+    /// well — on the host, with no container and no per-node branch, which is a
+    /// different product. Nothing in the library could see that: the probe is
+    /// where the question is actually asked.
+    ///
+    /// Paired with [`picker_old_dl_launch_probe`], which drives the same keys
+    /// against a `dl` below the floor. Neither is worth much alone — this one
+    /// says a new `dl` gets the launch, that one says an old `dl` does not, and
+    /// only the two together say the *floor* is what decides. See
+    /// [`the_version_floor_is_what_decides_whether_a_launch_is_isolated`].
     #[test]
-    #[ignore = "run by `probe::record` from the tests below, under recording shims"]
+    #[ignore = "run by `probe::record_as_dl` from the tests below, under recording shims"]
     fn picker_launch_probe() {
         if !probe::is_child() {
             return;
         }
+        let (checkout, ending) = drive_a_launch_from_a_devcontainer_checkout();
+        match ending {
+            Ending::Handover(launch) => {
+                assert_eq!(
+                    launch.cwd(),
+                    checkout,
+                    "the launch resolves to the one registered checkout"
+                );
+                assert_eq!(
+                    launch.isolation(),
+                    wf::launch::Isolation::Devlaunch,
+                    "a devcontainer and a `dl` above the floor is an isolated launch"
+                );
+                // The enum and not also the argv. An earlier draft asserted
+                // `agent_argv()[0] == "dl"` beside this, on the theory that a
+                // decision and what reaches `execvp` are different things —
+                // but `agent_argv` is a `match self.isolation` and nothing
+                // else, so the two cannot disagree and the second assertion
+                // was the first one restated. What the argv actually carries
+                // — the quoting, the workspace, the `--` — is pinned where it
+                // meets a real shell, in tests/live_launch_exec.rs.
+            }
+            Ending::Quit => {
+                panic!("the launch arm was never entered — the plan ran out and the fallback quit")
+            }
+        }
+    }
+
+    /// The same launch, against a `dl` too old for the floor: it must come back
+    /// to the host rather than be handed to a `dl` that cannot do what `wf`
+    /// would ask of it.
+    ///
+    /// This is the half that makes the conditional observable. Deleting
+    /// `devlaunch_on_path() == Devlaunch::Usable` from `Isolation::detect`
+    /// leaves every other assertion in this module green — the version is still
+    /// asked, because the startup listing asks it and the answer is memoized —
+    /// and fails here, which is the only place the two versions are told apart.
+    #[test]
+    #[ignore = "run by `probe::record_as_dl` from the tests below, under recording shims"]
+    fn picker_old_dl_launch_probe() {
+        if !probe::is_child() {
+            return;
+        }
+        let (_, ending) = drive_a_launch_from_a_devcontainer_checkout();
+        match ending {
+            Ending::Handover(launch) => {
+                assert_eq!(
+                    launch.isolation(),
+                    wf::launch::Isolation::Host,
+                    "a `dl` below the floor is a `dl` `wf` will not launch into"
+                );
+            }
+            Ending::Quit => {
+                panic!("the launch arm was never entered — the plan ran out and the fallback quit")
+            }
+        }
+    }
+
+    /// The setup both launch probes share: one registered checkout carrying a
+    /// `devcontainer.json`, and the three keys that reach a launch from it.
+    ///
+    /// Shared so the two differ in exactly one thing — the version their `dl`
+    /// answers with — because that is the whole claim they make together. The
+    /// checkout is in the probe's own scratch directory rather than under
+    /// `HOME`, because `HOME` is what is being watched for changes.
+    fn drive_a_launch_from_a_devcontainer_checkout() -> (PathBuf, Ending) {
         let repo = "blooop/wayfinder";
+        let checkout = probe::child_scratch().join("checkout");
+        std::fs::create_dir_all(checkout.join(".devcontainer")).expect("the scratch checkout");
+        std::fs::write(checkout.join(".devcontainer/devcontainer.json"), "{}\n")
+            .expect("the checkout's devcontainer");
         let mut app = App::empty().with_checkouts(vec![projects::Checkout::new(
-            probe::child_scratch().join("checkout"),
+            checkout.clone(),
             repo.to_string(),
         )]);
         app.enter(repo);
@@ -797,16 +883,7 @@ mod tests {
                 press(KeyCode::Enter),
             ],
         );
-        match ending {
-            Ending::Handover(launch) => assert_eq!(
-                launch.cwd(),
-                probe::child_scratch().join("checkout"),
-                "the launch resolves to the one registered checkout"
-            ),
-            Ending::Quit => {
-                panic!("the launch arm was never entered — the plan ran out and the fallback quit")
-            }
-        }
+        (checkout, ending)
     }
 
     /// One recorded run of [`picker_session_probe`], for the assertions below
@@ -839,12 +916,31 @@ mod tests {
             || argv.starts_with("gh <api> <graphql> <-F> <owner=blooop> <-F> <name=wayfinder>")
     }
 
+    /// What the launch probes' `dl` answers `--version` with, either side of
+    /// `DEVLAUNCH_FLOOR`.
+    ///
+    /// Deliberately not adjacent to the floor. `probe::SHIMMED_DL` is 0.0.24
+    /// and so is the floor today, so a probe left on the default would assert
+    /// isolation from an equality — and the floor's own documentation says it
+    /// is raised whenever `wf` starts calling something an older `dl` does not
+    /// have. The next bump would then turn `picker_launch_probe` red with a
+    /// message about isolation, which is not what went wrong. A version far
+    /// above survives every plausible bump; one far below stays below it.
+    ///
+    /// `0.0.23` is not arbitrary: it is the release the floor exists to
+    /// exclude, the one that satisfied every other condition in
+    /// `Isolation::detect` and then failed inside the prewarm on an argument it
+    /// had never heard of.
+    const ABOVE_THE_FLOOR: &str = "9999.0.0";
+    const BELOW_THE_FLOOR: &str = "0.0.23";
+
     /// The same, for the run that ends in a launch.
     fn a_launching_session() -> probe::Recording {
-        probe::record(
+        probe::record_as_dl(
             "picker::tests::picker_launch_probe",
             probe::DL_LISTING,
             probe::GH_FACTS,
+            ABOVE_THE_FLOOR,
         )
     }
 
@@ -928,6 +1024,56 @@ mod tests {
             "the one reading this session takes, and nothing the launch added: {:?}",
             run.argv
         );
+    }
+
+    #[test]
+    fn the_version_floor_is_what_decides_whether_a_launch_is_isolated() {
+        // Two runs of the same three keys against the same checkout, differing
+        // in one thing: the release their `dl` says it is. One lands in a
+        // container, the other on the host. The assertions are the probe
+        // bodies' own — `probe::record_as_dl` panics when a child fails — so
+        // what this test contributes is the *pair*.
+        //
+        // The pair is the point, and the first attempt at this guard is why.
+        // It asserted that a launching run asked `dl <--version>`, which is
+        // true and proves nothing: the startup listing asks it, the answer is
+        // memoized in a `OnceLock`, and the record lands in the log whether or
+        // not `Isolation::detect` ever consults it. Deleting the floor check
+        // outright left that assertion green. A conditional is a claim about
+        // two inputs; only two runs can hold it.
+        //
+        // `DL_LISTING_UNSAVED` for the old one because the fixture has to be a
+        // listing that release could have written — it is the one collecting
+        // every spelling of `unsaved`, including the bare string 0.0.23 emitted
+        // before the field became an object. See `probe::SHIMMED_DL`.
+        let _new = probe::record_as_dl(
+            "picker::tests::picker_launch_probe",
+            probe::DL_LISTING,
+            probe::GH_FACTS,
+            ABOVE_THE_FLOOR,
+        );
+        let old = probe::record_as_dl(
+            "picker::tests::picker_old_dl_launch_probe",
+            probe::DL_LISTING_UNSAVED,
+            probe::GH_FACTS,
+            BELOW_THE_FLOOR,
+        );
+
+        // And the safety sweep over the *host* arm, which is here because this
+        // is the only run that reaches it. Before the launch probe grew a
+        // devcontainer, `no_deletion_survives_the_arm_that_launches_either`
+        // swept a host launch; adding one moved that run to the isolated arm
+        // and left the host arm — still the arm most launches take, on a
+        // machine with no `dl` or a repo with no devcontainer — with no
+        // run-level guard at all. The same two claims as there, over the
+        // recording this test already pays for.
+        old.destroyed_nothing();
+        for argv in &old.argv {
+            assert!(
+                asked_a_question(argv),
+                "a degraded launch asks nothing extra of the machine either: {argv}"
+            );
+        }
     }
 
     #[test]

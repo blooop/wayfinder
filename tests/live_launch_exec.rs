@@ -22,7 +22,9 @@
 //!    `bash`, which is the only place the quoting can be checked at all: `dl`
 //!    joins everything after `--` and hands it to a shell, so an unquoted
 //!    prompt would arrive at `claude` as three arguments and every assertion
-//!    in claim 1 would fail.
+//!    in claim 1 would fail. It also answers `dl --version`, because isolation
+//!    is conditional on that answer and a shim that stayed silent sent the
+//!    whole launch to the host — see `write_shims`.
 //! 1. **`enter` execs the agent.** Two enters since the two-step launch (#62):
 //!    the first opens the launch picker, the second launches the mode it
 //!    opened on — interactive.
@@ -77,6 +79,15 @@ const RAN: &str = "FAKE-CLAUDE-RAN";
 /// *and* not negated, because `stty -a` writes the off state as `-flag`.
 const COOKED: [&str; 4] = ["echo", "icanon", "isig", "opost"];
 
+/// The line a shim writes before each record, so one report file can hold every
+/// invocation of that shim in the order they happened. Not a substring of
+/// anything `stty -a` or an argv can produce, because splitting on it is how
+/// the records are told apart.
+const INVOCATION: &str = "--- shim invocation ---";
+
+/// What the `dl` shim answers `--version` with. See `write_shims`.
+const DL_SHIM_VERSION: &str = "9999.0.0";
+
 /// A scratch tree of this test's own: `claude` and `dl` shims on PATH and a
 /// cache directory, so neither the user's PATH nor their real projects cache is
 /// touched. Removed on drop, panic or not.
@@ -129,9 +140,30 @@ impl Scratch {
     /// the spawned `wf` to `claude`, and the shell that parses the quoted
     /// command is a genuine one rather than this test's idea of one.
     fn write_shims(&self) {
+        // **Appended, one record per invocation**, rather than a file each
+        // shim overwrites. A shim is called more than once per run — `wf` asks
+        // `dl --version` before it will trust it with a launch — and the
+        // resume test calls `claude` once per `wf`. Truncating made "the
+        // report" mean "whichever invocation happened to be last", which is
+        // how this test came to assert against the version probe instead of
+        // the launch and fail claiming `wf` had lost the workspace. Selecting
+        // the invocation is now the reader's job: see `invocations`.
+        //
+        // Assembled first and appended **once**, which is the part that makes
+        // sharing one file safe. `wf` reads the listing on a background task
+        // while the main thread is asking `dl --version` and later staging the
+        // launch, so two `dl` shims can overlap — and a record written as six
+        // separate `O_APPEND` writes interleaves with the other's under
+        // exactly that overlap, leaving one record holding two `argv=` lines
+        // and another none. `field` takes the first match, so the failure is
+        // an intermittent red pointing at `wf` having lost the launch. A
+        // single small `O_APPEND` write is atomic; six are not. src/probe.rs
+        // reached the same conclusion for the same reason.
         let record = |report: &Path| {
             format!(
-                "{{ echo \"pid=$$\"; echo \"cwd=$PWD\"; echo \"argv=$*\"; stty -a; }} > {} 2>&1\n",
+                "line=$({{ echo \"{INVOCATION}\"; echo \"pid=$$\"; echo \"cwd=$PWD\"; \
+                 echo \"argv=$*\"; stty -a; }} 2>&1)\n\
+                 printf '%s\\n' \"$line\" >> {}\n",
                 report.display()
             )
         };
@@ -141,8 +173,19 @@ impl Scratch {
         );
         // `dl <owner/repo@branch> -- <command>`: $1 is the workspace spec,
         // $3 the shell command.
+        //
+        // The `--version` arm is what keeps this test on the path it is about.
+        // `wf` holds `dl` to a version floor and reads a `dl` it cannot place
+        // as one that is not there — so a shim that stayed silent got the
+        // launch quietly downgraded to the host, and every claim below about
+        // per-node workspaces became vacuous rather than false. The number is
+        // deliberately far above any floor `wf` will plausibly set: the floor's
+        // own rule is what `Devlaunch::from_version_output`'s unit tests are
+        // for, and this test should not have to be edited every time it moves.
         let dl = format!(
-            "#!/usr/bin/env bash\n{}exec bash -c \"exec $3\"\n",
+            "#!/usr/bin/env bash\n{}\
+             if [ \"$1\" = \"--version\" ]; then printf 'dl {DL_SHIM_VERSION}\\n'; exit 0; fi\n\
+             exec bash -c \"exec $3\"\n",
             record(&self.dl_report())
         );
         for (name, script) in [("claude", claude), ("dl", dl)] {
@@ -164,12 +207,77 @@ impl Drop for Scratch {
     }
 }
 
-/// One `key=value` line out of a shim's report.
-fn field<'a>(report: &'a str, key: &str) -> &'a str {
-    report
+/// One `key=value` line out of a **single invocation's** record.
+///
+/// Takes a record rather than a whole report on purpose: a report holds every
+/// invocation of its shim, and `find_map` over the lot would silently answer
+/// with the first one — which is the failure this file already had once.
+fn field<'a>(record: &'a str, key: &str) -> &'a str {
+    record
         .lines()
         .find_map(|l| l.strip_prefix(key))
-        .unwrap_or_else(|| panic!("the shim records {key:?}\n{report}"))
+        .unwrap_or_else(|| panic!("the shim records {key:?}\n{record}"))
+}
+
+/// Every invocation a shim recorded, oldest first.
+fn invocations(report: &str) -> Vec<&str> {
+    report.split(INVOCATION).skip(1).collect()
+}
+
+/// The `n`th invocation of `who`, of exactly `expected` in the whole report.
+///
+/// The count is not a sanity check bolted onto an index — it is the reason the
+/// index means anything. "The invocation" was what this file used to say when
+/// there were three, and a reader that takes the first or the last of an
+/// unknown number cannot tell a run that did the right thing once from a run
+/// that did it twice, or from a run whose second attempt overwrote the first.
+fn invocation<'a>(report: &'a str, who: &str, n: usize, expected: usize) -> &'a str {
+    let all = invocations(report);
+    assert_eq!(
+        all.len(),
+        expected,
+        "{who} ran {} times, not {expected}\n{report}",
+        all.len()
+    );
+    all[n]
+}
+
+/// Every invocation where `dl` was asked to **run** something, told apart from
+/// the `--version` probe `wf` makes before it will trust `dl` at all.
+///
+/// `dl <workspace> -- <command>`, so a bare ` -- ` is the whole distinction —
+/// and the assertions at the call sites are the ones that check the halves
+/// either side of it are the right halves.
+fn dl_launches(report: &str) -> Vec<&str> {
+    invocations(report)
+        .into_iter()
+        .filter(|record| field(record, "argv=").contains(" -- "))
+        .collect()
+}
+
+/// The one invocation where `dl` was asked to run something.
+///
+/// Insisting on exactly one is part of the claim: a launch is a single handover
+/// to a single container, and a `wf` that shelled out to `dl` twice on its way
+/// to one agent would be doing something this test has never described.
+fn dl_launch(report: &str) -> &str {
+    let launches = dl_launches(report);
+    assert_eq!(
+        launches.len(),
+        1,
+        "one launch means one `dl <ws> -- <cmd>`; the report holds {}\n{report}",
+        launches.len()
+    );
+    launches[0]
+}
+
+/// The workspace spec `dl` was pointed at — everything before the first space
+/// of `dl <workspace> -- <command>`.
+fn dl_workspace(launch: &str) -> &str {
+    field(launch, "argv=")
+        .split(' ')
+        .next()
+        .expect("`split` yields at least one field")
 }
 
 /// A pty pair with a real window size.
@@ -227,6 +335,73 @@ fn spawn_reader(master: OwnedFd) -> Arc<Mutex<Vec<u8>>> {
         }
     });
     seen
+}
+
+/// What counts as quiet, and for how long, before the list counts as settled.
+///
+/// Measured rather than guessed. Once every map has landed, `wf` writes one
+/// empty frame per redraw — 25 bytes of escape sequence, four times a second,
+/// and no content at all. A map arriving rewrites the body: the two windows
+/// spanning the last two arrivals measured 850 and 551 bytes. [`SETTLED_BYTES`]
+/// sits between the two with room on both sides, so neither a slow runner nor
+/// an extra idle frame can make an arriving map look like silence.
+///
+/// [`SETTLED_WINDOWS`] is the part a single threshold cannot do. One quiet
+/// window says "no map landed in the last half second", which is *also* true
+/// in the gap between two maps — a slow fourth map behind a fast first three
+/// would be read as a settled list, which is the whole race back again with a
+/// narrower mouth. Consecutive windows turn it into "no map landed in the last
+/// second and a half", which is longer than a full four-map load takes.
+const SETTLED_WINDOW: Duration = Duration::from_millis(500);
+const SETTLED_BYTES: usize = 200;
+const SETTLED_WINDOWS: u32 = 3;
+
+/// Wait until the list has stopped rearranging itself under the cursor.
+///
+/// `wf` streams (#27): the first cluster is drawn as soon as one map lands and
+/// the list re-sorts as the others arrive. [`launch_the_first_ticket`]
+/// navigates by *position* — two `→` from the project row — so pressing keys
+/// the instant a header appears takes whichever node happens to lead at that
+/// moment. For the launch test that is merely arbitrary. For the resume test
+/// it is a race it can lose: its two runs press the same keys twelve seconds
+/// apart and have to reach the *same* node, or the second one finds no resume
+/// row and the run being returned to is not the run that was started.
+///
+/// It is the kind of race that looks like a passing test. Three runs in a row
+/// went green while this was being written, and the fourth did not.
+///
+/// Settled is read as "the terminal has gone quiet" because there is nothing
+/// on screen that says it: the `loading maps X/Y` segment *vanishes* when the
+/// last map lands rather than announcing itself, and ratatui writes frames as
+/// diffs, so no later frame redraws the count line to show it gone. What is
+/// observable is volume — see [`SETTLED_BYTES`].
+fn wait_until_the_list_settles(seen: &Arc<Mutex<Vec<u8>>>) {
+    // Bounded well above the 60s the map itself is given, because this waits
+    // for quiet rather than for an event: a `wf` that never stopped drawing
+    // should fail here loudly rather than hang the suite.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut last = seen.lock().expect("reader mutex").len();
+    let mut quiet = 0;
+    loop {
+        std::thread::sleep(SETTLED_WINDOW);
+        let now = seen.lock().expect("reader mutex").len();
+        // Reset rather than decrement: the run of quiet has to be unbroken, so
+        // one map landing in the middle of it starts the count again.
+        quiet = if now - last <= SETTLED_BYTES {
+            quiet + 1
+        } else {
+            0
+        };
+        if quiet >= SETTLED_WINDOWS {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the list never stopped changing: still {} bytes per {SETTLED_WINDOW:?} after 90s",
+            now - last
+        );
+        last = now;
+    }
 }
 
 /// Wait for `needle` to appear in the child's output, or fail with everything
@@ -324,45 +499,18 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     drop(slave);
     let seen = spawn_reader(master);
 
-    // A *cluster header* cannot be drawn until a map has landed. Waiting on
-    // `▶` alone would not do it any more: since #135 the cursor starts on the
-    // project row, which is drawn from the local cache on the very first frame
-    // and so says nothing about the fetch. The needle is one contiguous write
-    // — ratatui emits diffs, so `" #"` before a ticket number is split by the
-    // cursor-positioning escape between them and never appears in the stream.
-    // Generous, because a cold cache pays for the map search before the fetch.
-    wait_for(
-        &seen,
-        "▌ wayfinder · ",
-        Duration::from_secs(60),
-        "the map to load",
-    );
-
-    // Down onto a *ticket*. `wf` opens standing on the project row (#135) —
-    // where `enter` means "start something new in this repo" — and this test
-    // is about launching an agent on a node the tracker already knows. `→`
-    // steps forward one stop at a time, so two of them go project → cluster
-    // header → its first ticket.
-    for _ in 0..2 {
-        keys.write_all(b"\x1b[C").expect("send right");
-    }
-    keys.flush().expect("flush the descent");
-
-    // First enter stages the launch: the picker opens over the list, titled
-    // with the node and cursored on the interactive row. The second enter
-    // takes that row — today's default. (Nothing has been launched on this
-    // node from this cache before, so there is no resume row above it: the
-    // cache is the test's own, and this run is the first.)
-    keys.write_all(b"\r").expect("send enter");
-    keys.flush().expect("flush enter");
-    wait_for(
-        &seen,
-        "▶ interactive",
-        Duration::from_secs(10),
-        "the launch picker",
-    );
-    keys.write_all(b"\r").expect("send the second enter");
-    keys.flush().expect("flush the second enter");
+    // The same descent the resume test makes, through the same helper: wait
+    // for the list, let it settle, two `→` onto the first ticket, `enter` to
+    // stage and `enter` to take the leading row. Nothing has been launched on
+    // this node from this cache before — the cache is the test's own and this
+    // run is the first — so the row it opens on is `interactive`, today's
+    // default, rather than a way back.
+    //
+    // Shared rather than spelled out twice. The two tests have to press the
+    // *same* keys against the *same* screen or they are not driving one
+    // product, and this navigation has already grown a settle wait and a
+    // two-step launch since it was written.
+    launch_the_first_ticket(&mut keys, &seen, "▶ interactive");
 
     let stream = wait_for(&seen, RAN, Duration::from_secs(30), "the agent to run");
     let screen = String::from_utf8_lossy(&stream).into_owned();
@@ -371,7 +519,10 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     let status = child.wait().expect("wait for the exec'd agent");
     assert!(status.success(), "the agent exited {status}\n{screen}");
 
-    let report = std::fs::read_to_string(scratch.report()).expect("the claude shim's report");
+    let claude_report =
+        std::fs::read_to_string(scratch.report()).expect("the claude shim's report");
+    // One `wf`, one agent.
+    let report = invocation(&claude_report, "claude", 0, 1);
     let dl_report = std::fs::read_to_string(scratch.dl_report()).expect("the dl shim's report");
 
     // Claim 0: `wf` handed the whole agent command to `dl`, as one shell
@@ -381,7 +532,17 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     // what keeps every agent out of the human's tree. The prompt is the
     // argument that has to survive a shell, so it is the one that has to be
     // quoted.
-    let dl_argv = field(&dl_report, "argv=");
+    //
+    // That `dl` got the launch at all is the version floor's doing, and it is
+    // asserted *here* — by there being a launch to read — rather than by
+    // looking for a `--version` record. The probe is memoized and the startup
+    // listing fires it, so a `--version` in this report says nothing about
+    // whether the launch path consulted it: a `wf` with the floor check
+    // deleted writes exactly the same record. The floor's own two-sided rule
+    // is pinned hermetically, where both versions can be driven —
+    // `the_version_floor_is_what_decides_whether_a_launch_is_isolated` in
+    // src/picker.rs.
+    let dl_argv = field(dl_launch(&dl_report), "argv=");
     let (workspace, rest) = dl_argv.split_once(' ').expect("a workspace and a command");
     let workspace_ticket = workspace
         .strip_prefix("blooop/wayfinder@wayfinder/wayfinder-")
@@ -406,7 +567,7 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     // spawn-and-wait `wf` would have waited for it and exited 0 too, so a
     // status check passes without distinguishing the two designs at all.
     assert_eq!(
-        field(&report, "pid=").parse::<u32>().ok(),
+        field(report, "pid=").parse::<u32>().ok(),
         Some(wf_pid),
         "the agent must be the same process as wf, not a child of it"
     );
@@ -415,8 +576,8 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     // checkout because that is where `wf` chdir'd before the exec — in a real
     // launch `dl` re-homes the agent into the workspace clone; the shim runs
     // it where it stands, so what is observable here is the chdir.
-    let cwd = field(&report, "cwd=");
-    let argv = field(&report, "argv=");
+    let cwd = field(report, "cwd=");
+    let argv = field(report, "argv=");
     assert_eq!(
         Path::new(cwd).canonicalize().ok(),
         repo.canonicalize().ok(),
@@ -510,7 +671,7 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     // Claim 3a: the tty itself came back. `wf` runs raw the whole time it is
     // up, so an agent that finds a raw tty here is one that would have found a
     // dead keyboard in daily use.
-    let stty = flags(&report);
+    let stty = flags(report);
     for flag in COOKED {
         assert!(
             stty.contains(&flag),
@@ -607,9 +768,26 @@ fn spawn_wf(
 }
 
 /// Walk from the project row down to the first cluster's first ticket, stage
-/// it, and take the picker's leading row. The same keys both times, so the two
-/// runs land on the same node — which is what makes the second one a *return*
-/// to the first rather than a fresh launch somewhere else.
+/// it, and take the picker's leading row.
+///
+/// Every launch in this file goes through here, so the same keys reach the same
+/// screen in all three runs. For the resume test that is load-bearing twice
+/// over: its two runs have to land on the same node, or the second is a fresh
+/// launch somewhere else rather than a *return* to the first.
+///
+/// A *cluster header* cannot be drawn until a map has landed, which is what the
+/// first wait is for. Waiting on `▶` alone would not do it any more: since #135
+/// the cursor starts on the project row, which is drawn from the local cache on
+/// the very first frame and so says nothing about the fetch. The needle is one
+/// contiguous write — ratatui emits diffs, so `" #"` before a ticket number is
+/// split by the cursor-positioning escape between them and never appears in the
+/// stream. Generous, because a cold cache pays for the map search before the
+/// fetch.
+///
+/// Then [`wait_until_the_list_settles`], because `wf` opens standing on the
+/// project row (#135) and `→` steps forward one stop at a time — two of them go
+/// project → cluster header → its first ticket, and that counting only holds
+/// against a list that has stopped moving.
 fn launch_the_first_ticket(keys: &mut std::fs::File, seen: &Arc<Mutex<Vec<u8>>>, leading: &str) {
     wait_for(
         seen,
@@ -617,6 +795,7 @@ fn launch_the_first_ticket(keys: &mut std::fs::File, seen: &Arc<Mutex<Vec<u8>>>,
         Duration::from_secs(60),
         "the map to load",
     );
+    wait_until_the_list_settles(seen);
     for _ in 0..2 {
         keys.write_all(b"\x1b[C").expect("send right");
     }
@@ -655,7 +834,7 @@ fn coming_back_to_a_node_rejoins_the_conversation_the_first_launch_started() {
     wait_for(&seen, RAN, Duration::from_secs(30), "the agent to run");
     assert!(child.wait().expect("wait").success());
     let first = std::fs::read_to_string(scratch.report()).expect("the first run's report");
-    let launched = field(&first, "argv=").to_string();
+    let launched = field(invocation(&first, "claude", 0, 1), "argv=").to_string();
     assert!(
         launched.contains("/wf"),
         "the first run must be a fresh skill launch: {launched}"
@@ -668,8 +847,11 @@ fn coming_back_to_a_node_rejoins_the_conversation_the_first_launch_started() {
     wait_for(&seen, RAN, Duration::from_secs(30), "the agent to run");
     assert!(child.wait().expect("wait").success());
 
+    // Both runs append to the one report, so "the second run's argv" is the
+    // second of exactly two records — the count is itself the claim that the
+    // resume ran the agent again, once.
     let second = std::fs::read_to_string(scratch.report()).expect("the second run's report");
-    let resumed = field(&second, "argv=");
+    let resumed = field(invocation(&second, "claude", 1, 2), "argv=");
     // The agent's own way back, and *only* that: no skill, and no `ctx:` block
     // — the conversation being rejoined worked all of that out already.
     assert_eq!(
@@ -680,14 +862,27 @@ fn coming_back_to_a_node_rejoins_the_conversation_the_first_launch_started() {
     // And it went back into the same container the first launch ran in, which
     // is what makes it the same conversation: both agents key their history by
     // cwd, and that cwd is inside this workspace.
+    //
+    // Asserted as an *equality between the two launches* rather than as a
+    // prefix match on the second. The prefix is satisfied by any node's
+    // workspace, so on its own it would let the resume re-enter the wrong
+    // container and still pass — and re-entering the wrong container is
+    // precisely the way this feature breaks while looking like it works.
     let dl = std::fs::read_to_string(scratch.dl_report()).expect("the dl shim's report");
-    let workspace = field(&dl, "argv=")
-        .split(' ')
-        .next()
-        .expect("a workspace")
-        .to_string();
+    let handovers = dl_launches(&dl);
+    assert_eq!(
+        handovers.len(),
+        2,
+        "two runs reached the agent, so two handovers to `dl`; got {}\n{dl}",
+        handovers.len()
+    );
+    let (first_ws, resumed_ws) = (dl_workspace(handovers[0]), dl_workspace(handovers[1]));
     assert!(
-        workspace.starts_with("blooop/wayfinder@wayfinder/wayfinder-"),
-        "the resume must re-enter the node's own workspace, got {workspace:?}"
+        resumed_ws.starts_with("blooop/wayfinder@wayfinder/wayfinder-"),
+        "the resume must re-enter a per-node workspace, got {resumed_ws:?}"
+    );
+    assert_eq!(
+        resumed_ws, first_ws,
+        "the resume must re-enter the *same* workspace the first launch ran in"
     );
 }
