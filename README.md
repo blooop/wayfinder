@@ -994,10 +994,12 @@ evidence too weak to act on:
   unassigned ticket is unclaimed by `wf`'s own convention, and that one bit is
   what keeps this from firing on every ticket someone is mid-way through.
 
-A stale claim therefore keeps a workspace: an agent that died leaves its ticket
-assigned, and reap does not overrule a person's stated intent. `wf` says only
-what it observed — it does not know whether anyone ever entered a container,
-and does not claim to.
+A stale claim therefore keeps a workspace *that nothing has come of*: an agent
+that died before opening a PR leaves its ticket assigned, and reap does not
+overrule a person's stated intent on no other evidence. It is the tie-breaker
+for the second case above and nothing more — a claim beside a merged PR, or on a
+closed ticket, is not read at all. `wf` says only what it observed — it does not
+know whether anyone ever entered a container, and does not claim to.
 
 This is the same division of labour the launch draws: **`dl` owns the
 containers, `wf` owns the tickets.** `dl` deliberately does not decide what is

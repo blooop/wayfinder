@@ -213,8 +213,55 @@ pub(crate) fn parse_pr(pr: &PrNode) -> Option<PrLink> {
     })
 }
 
+/// What the tracker's `state` string says about whether a ticket is finished
+/// with — the issue-side mirror of [`parse_pr`], and the reason an unrecognised
+/// state cannot reach a deleting arm.
+///
+/// A two-value type rather than the `bool` this used to be. The bool was read
+/// as "is it open", which made **not open** the finished condition, so every
+/// state GitHub adds after this binary shipped would have arrived as a reason
+/// to call a ticket done — and on [`reap`](crate::reap)'s side, a reason to
+/// delete a workspace. Two named values force each reading to say which it is,
+/// and make the inversion that caused it a compile error rather than a `!`.
+///
+/// Here in `fetch` and not in `reap`, because the whole point is that there is
+/// **one** reading of this wire field. `reap` deriving "finished" from the same
+/// fields the badge is drawn from is a stated invariant of that module; a
+/// second copy of this rule living next to the reaper is how the screen and the
+/// reaper come to disagree about the same ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketState {
+    /// The tracker said `CLOSED`, in those letters. The only reading that may
+    /// reach `NodeFact::Closed`, which is a deleting arm.
+    Closed,
+    /// Open — or a state this binary does not recognise, which is held to the
+    /// same standard the PR reading is: the arm that stays true whatever the
+    /// new value turns out to mean is the one that keeps the workspace and
+    /// leaves the ticket on the screen. An unknown state therefore costs a
+    /// ticket that stays, never one that silently goes.
+    Live,
+}
+
+impl TicketState {
+    /// Read the tracker's `state`. Positive about *closed*, and not the
+    /// negation of "open": the two differ exactly on the values neither list
+    /// names, and that difference is whether a workspace survives them.
+    pub fn read(state: &str) -> TicketState {
+        if state == "CLOSED" {
+            TicketState::Closed
+        } else {
+            TicketState::Live
+        }
+    }
+}
+
+/// Whether a ticket is still live, for the readers that want it as a `bool`.
+///
+/// Delegates rather than restating, so the screen and the reaper cannot drift:
+/// [`model::classify`](crate::model::classify) turns `false` into
+/// `Status::Done`, which is the display-side twin of reap's deleting arm.
 pub(crate) fn is_open(state: &str) -> bool {
-    state == "OPEN"
+    TicketState::read(state) == TicketState::Live
 }
 
 /// Fetch one map live: the map issue named by `id`, its sub-issues, and their
@@ -459,6 +506,77 @@ mod tests {
              "blockedBy": {"nodes": [{"number": 18, "state": "CLOSED"}, {"number": 3, "state": "OPEN"}]}}
         ]}
     }}}}"#;
+
+    /// One map whose sub-issue and whose blocker both carry a `state` this
+    /// binary was never taught. `TRANSFERRED` is GitHub's own third issue
+    /// state; the point is that it stands for whatever the fourth turns out
+    /// to be.
+    const UNREADABLE_STATE_RESPONSE: &str = r#"{"data": {"repository": {"issue": {
+        "title": "Map: wf",
+        "state": "OPEN",
+        "labels": {"nodes": [{"name": "wayfinder:map"}]},
+        "subIssues": {"nodes": [
+            {"number": 19, "title": "Build 6", "state": "TRANSFERRED",
+             "labels": {"nodes": [{"name": "wayfinder:task"}]},
+             "assignees": {"nodes": []},
+             "blockedBy": {"nodes": []}},
+            {"number": 21, "title": "Blocked on it", "state": "OPEN",
+             "labels": {"nodes": [{"name": "wayfinder:task"}]},
+             "assignees": {"nodes": []},
+             "blockedBy": {"nodes": [{"number": 19, "state": "TRANSFERRED"}]}}
+        ]}
+    }}}}"#;
+
+    #[test]
+    fn only_the_word_closed_reads_as_closed() {
+        // The one place the tracker's `state` is turned into a fact, for the
+        // screen and for the reaper alike. `Closed` routes to `Status::Done`
+        // here and to `NodeFact::Closed` — a deletion — there, so what may
+        // produce it is a closed list of one string rather than "anything that
+        // is not the word OPEN". The states below are the shapes an answer can
+        // actually take that this binary was never taught: GitHub's own third
+        // issue state, a plausible future one, the empty string a defaulted
+        // field would leave, and a lowercasing of the real value.
+        assert_eq!(TicketState::read("CLOSED"), TicketState::Closed);
+        for unknown in ["OPEN", "TRANSFERRED", "DUPLICATE", "", "closed", "Closed"] {
+            assert_eq!(
+                TicketState::read(unknown),
+                TicketState::Live,
+                "state {unknown:?} must not read as closed"
+            );
+            assert!(
+                is_open(unknown),
+                "state {unknown:?} must still read as live"
+            );
+        }
+        assert!(!is_open("CLOSED"));
+    }
+
+    #[test]
+    fn a_state_this_binary_cannot_read_neither_finishes_a_ticket_nor_unblocks_one() {
+        // The screen's half of the same rule, and the reason the reading lives
+        // in this module rather than beside the reaper. Both directions are
+        // silent failures: a ticket wrongly shown Done drops out of the
+        // frontier and is never offered, and a blocker wrongly read as settled
+        // offers work that cannot actually be started. Neither prints an
+        // error, and until this test nothing looked at either.
+        let map = parse_map(UNREADABLE_STATE_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
+
+        let unreadable = map.tickets.iter().find(|t| t.number == 19).expect("#19");
+        assert_ne!(
+            unreadable.status,
+            Status::Done,
+            "a state this binary cannot read is not evidence the ticket is finished"
+        );
+        assert_eq!(unreadable.status, Status::Frontier);
+
+        let blocked = map.tickets.iter().find(|t| t.number == 21).expect("#21");
+        assert_eq!(
+            blocked.status,
+            Status::Blocked { needs: vec![19] },
+            "an unreadable blocker still blocks"
+        );
+    }
 
     fn wf_map_id() -> MapId {
         MapId::new("blooop/wayfinder", 1)
