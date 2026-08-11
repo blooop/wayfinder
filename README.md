@@ -994,10 +994,12 @@ evidence too weak to act on:
   unassigned ticket is unclaimed by `wf`'s own convention, and that one bit is
   what keeps this from firing on every ticket someone is mid-way through.
 
-A stale claim therefore keeps a workspace: an agent that died leaves its ticket
-assigned, and reap does not overrule a person's stated intent. `wf` says only
-what it observed — it does not know whether anyone ever entered a container,
-and does not claim to.
+A stale claim therefore keeps a workspace *that nothing has come of*: an agent
+that died before opening a PR leaves its ticket assigned, and reap does not
+overrule a person's stated intent on no other evidence. It is the tie-breaker
+for the second case above and nothing more — a claim beside a merged PR, or on a
+closed ticket, is not read at all. `wf` says only what it observed — it does not
+know whether anyone ever entered a container, and does not claim to.
 
 This is the same division of labour the launch draws: **`dl` owns the
 containers, `wf` owns the tickets.** `dl` deliberately does not decide what is
@@ -1010,8 +1012,12 @@ decides. Needs `dl` **0.0.21 or newer** for the JSON listing.
 Kept, always: workspaces `dl` did not create (they are not `wf`'s, whatever
 their branch looks like), branches that are not `wayfinder/<repo>-<n>` for that
 repo, tickets with an open or draft PR (in review is where review fixes happen),
-tickets someone has claimed, and anything **running** — a ticket closing is no
-evidence that the session in the container ended.
+tickets someone has claimed that no PR has come of, and anything **running** — a
+ticket closing is no evidence that the session in the container ended.
+
+The claim is the *last* thing read, not the first: it settles a ticket nothing
+has come of yet, and it does not outrank the PRs. A claimed ticket whose PR
+merged is finished work, and reap collects it like any other.
 
 **A `dl` that says nothing is not a `dl` saying nothing is at risk.** From
 devlaunch **0.0.24** the listing answers `unsaved` for every clone `dl` made,

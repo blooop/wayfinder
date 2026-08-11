@@ -42,7 +42,10 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use tokio::process::Command;
 
-use crate::fetch::{is_open, parse_pr, Assignee, GraphQlResponse, Nodes, PrNode};
+/// Re-exported because `node_fact` takes one: the reading itself belongs to
+/// [`fetch`](crate::fetch), where the screen reads it too.
+pub use crate::fetch::TicketState;
+use crate::fetch::{parse_pr, Assignee, GraphQlResponse, Nodes, PrNode};
 use crate::launch::devlaunch_answers_unsaved;
 use crate::model::PrStatus;
 
@@ -433,9 +436,22 @@ impl PrOutcome {
 ///
 /// Derived at every read from the batch the tracker just answered — never
 /// stored, so it cannot go stale, be orphaned, or outlive the workspace it
-/// describes. `Unstarted` in particular is a *positive observation* (open, no
-/// PRs, nobody assigned) and is never reachable from a lookup that failed: a
-/// node the batch did not answer for is an error, not an `Unstarted` node.
+/// describes. `Unstarted` in particular is never reachable from a lookup that
+/// *failed*: a node the batch did not answer for is an error, not an
+/// `Unstarted` node.
+///
+/// It is a reading of an answer that arrived, then — not quite the "positive
+/// observation" this said before [`TicketState`] existed. A ticket whose state
+/// this binary cannot read, with no PRs and nobody assigned, lands here too,
+/// because `Live` is where an unrecognised state deliberately goes and this is
+/// where a live ticket with no other evidence ends up. That is the intended
+/// resolution and not a gap — every alternative is worse. An arm of its own
+/// would owe an answer at every match site for a case that has never occurred;
+/// the deleting arm is the hazard #132 exists to close; and `Warn` is where a
+/// node this binary is *unsure* about belongs. The cost is that the row says
+/// "unclaimed and no PR" about a ticket that might be closed, which overstates
+/// what was observed by one word — and it is a row that advises rather than
+/// acts, which is the arm that can afford to be wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeFact {
     /// The ticket is closed.
@@ -462,8 +478,8 @@ pub enum NodeFact {
 /// merged sibling (a multi-PR ticket between merges is still being worked), a
 /// merge outranks the closed PRs beside it, and only a node with no PR
 /// evidence at all falls through to the claim.
-pub fn node_fact(is_open: bool, is_assigned: bool, prs: &[PrOutcome]) -> NodeFact {
-    if !is_open {
+pub fn node_fact(state: TicketState, is_assigned: bool, prs: &[PrOutcome]) -> NodeFact {
+    if state == TicketState::Closed {
         return NodeFact::Closed;
     }
     let earliest = |pick: fn(&PrOutcome) -> Option<u64>| prs.iter().filter_map(pick).min();
@@ -868,7 +884,7 @@ fn parse_node_facts(body: &[u8], repo: &str, numbers: &[u64]) -> Result<BTreeMap
                 number,
             },
             node_fact(
-                is_open(&issue.state),
+                TicketState::read(&issue.state),
                 !issue.assignees.nodes.is_empty(),
                 &prs,
             ),
@@ -1141,25 +1157,83 @@ mod tests {
                 NodeFact::InFlight { pr: 44 },
                 NodeFact::InFlight { pr: 44 },
             ),
+            (
+                // The rollup the table used to have no row for, and the one the
+                // precedence rule is entirely about: a merge and a rejection on
+                // the same node. Every other row has one kind of PR in it, so
+                // every other row reads the same whichever of the two arms is
+                // tried first. #132's second mutation — swapping them — lived
+                // in that gap, and it is a live difference rather than a
+                // cosmetic one: `DoneByMerge` reaps and `Superseded` only warns.
+                "a merged PR beside a closed-unmerged one",
+                vec![
+                    PrOutcome::project(33, Some(&PrStatus::Merged)),
+                    PrOutcome::project(43, Some(&PrStatus::Closed)),
+                ],
+                NodeFact::DoneByMerge { pr: 33 },
+                NodeFact::DoneByMerge { pr: 33 },
+            ),
         ];
         for (name, prs, claimed, unclaimed) in cases {
             assert_eq!(
-                node_fact(true, true, &prs),
+                node_fact(TicketState::Live, true, &prs),
                 claimed,
                 "open, assigned, {name}"
             );
             assert_eq!(
-                node_fact(true, false, &prs),
+                node_fact(TicketState::Live, false, &prs),
                 unclaimed,
                 "open, unassigned, {name}"
             );
             for assigned in [true, false] {
                 assert_eq!(
-                    node_fact(false, assigned, &prs),
+                    node_fact(TicketState::Closed, assigned, &prs),
                     NodeFact::Closed,
                     "closed, assigned={assigned}, {name}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_state_this_binary_cannot_read_is_decided_by_the_prs_and_the_claim() {
+        // The reading itself belongs to `fetch`, where `only_the_word_closed_
+        // reads_as_closed` pins it for the screen and the reaper together. What
+        // is reap's own is what an unrecognised state then *derives to*, and
+        // that is stated as literal facts rather than as equality with the
+        // `TicketState::Live` call — the two are the same call, so an assertion
+        // written that way holds under every possible mutation of `node_fact`
+        // and pins nothing at all.
+        //
+        // Every arm the derivation has, none of them `Closed`: an unknown state
+        // must fall all the way through to the reading an open ticket gets, or
+        // it would need an arm of its own and every match site would owe it an
+        // answer.
+        let unknown = TicketState::read("TRANSFERRED");
+        for (prs, claimed, unclaimed) in [
+            (vec![], NodeFact::Claimed, NodeFact::Unstarted),
+            (
+                vec![PrOutcome::project(40, Some(&open_pr()))],
+                NodeFact::InFlight { pr: 40 },
+                NodeFact::InFlight { pr: 40 },
+            ),
+            (
+                vec![PrOutcome::project(33, Some(&PrStatus::Merged))],
+                NodeFact::DoneByMerge { pr: 33 },
+                NodeFact::DoneByMerge { pr: 33 },
+            ),
+            (
+                vec![PrOutcome::project(43, Some(&PrStatus::Closed))],
+                NodeFact::Superseded { pr: 43 },
+                NodeFact::Superseded { pr: 43 },
+            ),
+        ] {
+            assert_eq!(node_fact(unknown, true, &prs), claimed, "assigned, {prs:?}");
+            assert_eq!(
+                node_fact(unknown, false, &prs),
+                unclaimed,
+                "unassigned, {prs:?}"
+            );
         }
     }
 
@@ -1174,7 +1248,7 @@ mod tests {
             PrOutcome::project(37, Some(&PrStatus::Draft)),
         ];
         assert_eq!(
-            node_fact(true, false, &in_flight),
+            node_fact(TicketState::Live, false, &in_flight),
             NodeFact::InFlight { pr: 37 }
         );
         let merged = [
@@ -1182,7 +1256,7 @@ mod tests {
             PrOutcome::project(91, Some(&PrStatus::Merged)),
         ];
         assert_eq!(
-            node_fact(true, false, &merged),
+            node_fact(TicketState::Live, false, &merged),
             NodeFact::DoneByMerge { pr: 91 }
         );
         let superseded = [
@@ -1190,7 +1264,7 @@ mod tests {
             PrOutcome::project(97, Some(&PrStatus::Closed)),
         ];
         assert_eq!(
-            node_fact(true, false, &superseded),
+            node_fact(TicketState::Live, false, &superseded),
             NodeFact::Superseded { pr: 97 }
         );
     }
@@ -1966,8 +2040,10 @@ mod tests {
         );
     }
 
-    /// One repo's batch, shaped exactly like the live one: five aliased
-    /// issues covering every arm the fact derivation can land on.
+    /// One repo's batch, shaped exactly like the live one: seven aliased
+    /// issues covering every arm the fact derivation can land on, plus the two
+    /// answers #132 found nothing reading — a state this binary was never
+    /// taught, and a node carrying both a merge and a rejection.
     const BATCH_RESPONSE: &str = r#"{"data": {"repository": {
         "i80": {"state": "OPEN", "assignees": {"nodes": []},
                 "closedByPullRequestsReferences": {"nodes": [
@@ -1984,6 +2060,16 @@ mod tests {
                 "closedByPullRequestsReferences": {"nodes": [
                   {"number": 44, "state": "SOMETHING_NEW", "isDraft": false,
                    "reviewDecision": null, "statusCheckRollup": null,
+                   "repository": {"nameWithOwner": "blooop/devlaunch"}}]}},
+        "i85": {"state": "TRANSFERRED", "assignees": {"nodes": []},
+                "closedByPullRequestsReferences": {"nodes": []}},
+        "i86": {"state": "OPEN", "assignees": {"nodes": []},
+                "closedByPullRequestsReferences": {"nodes": [
+                  {"number": 33, "state": "MERGED", "isDraft": false,
+                   "reviewDecision": null, "statusCheckRollup": {"state": "SUCCESS"},
+                   "repository": {"nameWithOwner": "blooop/devlaunch"}},
+                  {"number": 43, "state": "CLOSED", "isDraft": false,
+                   "reviewDecision": null, "statusCheckRollup": null,
                    "repository": {"nameWithOwner": "blooop/devlaunch"}}]}}
     }}}"#;
 
@@ -1992,7 +2078,7 @@ mod tests {
         let facts = parse_node_facts(
             BATCH_RESPONSE.as_bytes(),
             "blooop/devlaunch",
-            &[80, 81, 82, 83, 84],
+            &[80, 81, 82, 83, 84, 85, 86],
         )
         .expect("the batch parses");
         assert_eq!(
@@ -2009,7 +2095,83 @@ mod tests {
                 // fact as a PR in flight rather than being dropped on the floor
                 // and leaving #84 looking like a node nothing came of.
                 (node("blooop/devlaunch", 84), NodeFact::InFlight { pr: 44 }),
+                // A state this binary was never taught reads as the open
+                // ticket it might be, not as a closed one.
+                (node("blooop/devlaunch", 85), NodeFact::Unstarted),
+                // A merge outranks the rejection beside it.
+                (
+                    node("blooop/devlaunch", 86),
+                    NodeFact::DoneByMerge { pr: 33 }
+                ),
             ])
+        );
+    }
+
+    #[test]
+    fn what_the_tracker_says_decides_deletion_all_the_way_from_the_wire() {
+        // #132's two invisible mutations, asserted where they are dangerous
+        // rather than where they are convenient. Every test above this one
+        // hands `plan` a `NodeFact` that a test author wrote down, which is
+        // precisely why both mutations survived: the derivation was covered and
+        // the *reading* was not, so nothing connected a tracker answer to a
+        // workspace being deleted.
+        //
+        // So this one starts at the bytes `gh` would print and ends at
+        // `doomed`, the single definition of what gets destroyed. Under the
+        // unknown-state hazard, #85 joins the deletion set on a word this
+        // binary cannot read; under the swapped precedence, #86 leaves it
+        // despite a merged PR. Both are one assertion here.
+        let numbers = [80, 83, 84, 85, 86];
+        let known = parse_node_facts(BATCH_RESPONSE.as_bytes(), "blooop/devlaunch", &numbers)
+            .expect("the batch parses");
+        let mut workspaces: Vec<Workspace> = numbers
+            .iter()
+            .map(|n| {
+                workspace(
+                    &format!("wf-{n}"),
+                    "blooop/devlaunch",
+                    &format!("wayfinder/devlaunch-{n}"),
+                )
+            })
+            .collect();
+
+        // `-f` too, because the question is what may be destroyed at all: a
+        // hazard that only the unsaved-work guard was hiding is still a hazard
+        // the moment someone types the flag that waives it.
+        //
+        // That means one of these has to *hold* unsaved work, or the flag is
+        // read on no workspace and the second pass is the first one again:
+        // `plan` consults `insist` only inside `match (&workspace.unsaved, …)`,
+        // so with every clone clean both iterations compute the same list and
+        // the loop is decoration. #85 carries it — the unreadable state, so the
+        // waiver is being applied to precisely the node this test is about.
+        let dirty = "1 uncommitted change(s) (pixi.lock)";
+        workspaces[3].unsaved = Some(Unsaved::WouldLose(dirty.to_string()));
+
+        for insist in [false, true] {
+            let verdicts = plan(&workspaces, &known, insist);
+            let reaped: Vec<&str> = doomed(&verdicts).into_iter().map(Verdict::id).collect();
+            assert_eq!(
+                reaped,
+                vec!["wf-80", "wf-83", "wf-86"],
+                "insist={insist}: the closed ticket and the two merged nodes go, \
+                 and nothing else does"
+            );
+        }
+
+        // And the flag really did reach the node, rather than the loop above
+        // passing because nothing consulted it: under `-f` the dirty clone's
+        // row names what a by-hand reap would discard, and under neither flag
+        // it is the refusal instead. Either way #85 is not in the doomed set.
+        let forced = plan(&workspaces, &known, true);
+        let row = forced
+            .iter()
+            .find(|v| v.id() == "wf-85")
+            .expect("the unreadable node is planned");
+        assert!(
+            row.reason().contains(dirty),
+            "-f did not reach the unsaved arm: {}",
+            row.reason()
         );
     }
 
@@ -2061,11 +2223,433 @@ mod tests {
         assert!(query.contains("includeClosedPrs: true"), "{query}");
     }
 
+    /// Collapse every run of whitespace to one space, so two spellings of the
+    /// same selection at two indentation depths compare equal.
+    fn flattened(selection: &str) -> String {
+        selection.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The `closedByPullRequestsReferences(…) { … }` block of a query, brace
+    /// balanced out of it, flattened. `None` if the query has no such block.
+    fn pr_selection(query: &str) -> Option<String> {
+        let from = query.find("closedByPullRequestsReferences")?;
+        let mut depth = 0usize;
+        let mut seen_one = false;
+        for (offset, ch) in query[from..].char_indices() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    seen_one = true;
+                }
+                '}' => {
+                    // `checked_sub` rather than `-=`: on a `}` before any `{`
+                    // — what a `closedByPullRequestsReferences` reduced to a
+                    // leaf leaves behind, inside its enclosing block — a
+                    // `usize` decrement panics with "attempt to subtract with
+                    // overflow", and whoever caused that drift would get an
+                    // arithmetic panic in a test helper instead of the message
+                    // this helper exists to give them.
+                    depth = depth
+                        .checked_sub(1)
+                        .unwrap_or_else(|| panic!("unbalanced braces in {query}"));
+                    if depth == 0 {
+                        return Some(flattened(&query[from..=from + offset]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(!seen_one, "unbalanced braces in {query}");
+        None
+    }
+
+    #[test]
+    fn both_queries_ask_for_a_linked_pr_in_exactly_the_same_words() {
+        // #132's third item. `fetch::parse_pr` and `fetch::PrNode` are one
+        // vocabulary — reap projects the badge reading rather than repeating
+        // it — but the *query text* that feeds them was copied, and a copy with
+        // nothing holding it can lose a field silently. What goes wrong is
+        // quiet in both directions: drop `statusCheckRollup` here and every
+        // reap-side PR reads as having no checks configured, which is a badge
+        // this side would never show; drop it there and the screen does the
+        // same. Neither parse fails, because both fields are nullable with
+        // meaning.
+        //
+        // Byte equality after flattening, not containment: containment would
+        // let reap's copy shrink, which is exactly the drift being forbidden.
+        let map = pr_selection(crate::fetch::MAP_QUERY).expect("the map query selects linked PRs");
+        let batch = pr_selection(NODE_FACT_SELECTION).expect("the batch selects linked PRs");
+        assert_eq!(
+            batch, map,
+            "reap's linked-PR selection has drifted from the map query's"
+        );
+    }
+
+    /// A selection text as the tree of fields it is: each name mapped to what
+    /// is selected under it, empty for a leaf. The shape a GraphQL answer to
+    /// that selection has, which is what makes it a filter.
+    #[derive(Default, Debug)]
+    struct Selected(BTreeMap<String, Selected>);
+
+    /// Read the subset of GraphQL selection syntax these two queries use:
+    /// names, optional `(arguments)`, optional nested `{ blocks }`.
+    fn parse_selection(text: &str) -> Selected {
+        let mut root = Selected::default();
+        let mut path: Vec<String> = Vec::new();
+        let mut last: Option<String> = None;
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '{' => path.push(last.take().expect("a block follows the field it selects")),
+                '}' => {
+                    path.pop().expect("a block was opened before it closed");
+                    last = None;
+                }
+                // Arguments say nothing about the shape of the answer.
+                '(' => {
+                    for skipped in chars.by_ref() {
+                        if skipped == ')' {
+                            break;
+                        }
+                    }
+                }
+                ch if ch.is_alphanumeric() || ch == '_' => {
+                    let mut name = String::from(ch);
+                    while chars
+                        .peek()
+                        .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+                    {
+                        name.push(chars.next().expect("peeked"));
+                    }
+                    let mut at = &mut root;
+                    for step in &path {
+                        at = at.0.entry(step.clone()).or_default();
+                    }
+                    at.0.entry(name.clone()).or_default();
+                    last = Some(name);
+                }
+                _ => {}
+            }
+        }
+        assert!(path.is_empty(), "unbalanced braces in {text}");
+        root
+    }
+
+    /// Drop from `value` every field `selection` did not ask for, at the depth
+    /// it did not ask for it — the answer a server honouring that selection
+    /// would have sent back.
+    fn prune(value: &mut serde_json::Value, selection: &Selected) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                fields.retain(|name, _| selection.0.contains_key(name.as_str()));
+                for (name, field) in fields.iter_mut() {
+                    prune(field, &selection.0[name]);
+                }
+            }
+            // A connection's `nodes` list: the selection under `nodes` applies
+            // to each element rather than to the list.
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    prune(item, selection);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_linked_pr_selection_asks_for_every_field_the_badge_reads() {
+        // The hole the two tests above leave between them. `both_queries_ask…`
+        // catches a field dropped from *one* copy of the PR selection, and the
+        // prune test below catches a field the reap parse cannot survive losing
+        // — but the badge fields are neither. `PrOutcome::project` collapses
+        // Draft, Open and unreadable into `InFlight`, so `statusCheckRollup`
+        // and `reviewDecision` are invisible to any assertion made in
+        // `NodeFact`s, and dropping either one from *both* queries at once left
+        // all 388 tests green.
+        //
+        // What reads them is `fetch::parse_pr`, so that is what this asserts
+        // against: a PR whose badge depends on every nullable field, pruned to
+        // the selection, must still produce the same badge. Both fields are
+        // nullable *with meaning* — absent is a real answer, not a parse error
+        // — which is exactly why nothing else notices them going missing, and
+        // what goes wrong is quiet: the screen draws every open PR as having
+        // no checks configured, and the reviewer trusts a green CI that was
+        // never asked about.
+        const A_PR: &str = r#"{"number": 40, "state": "OPEN", "isDraft": false,
+            "reviewDecision": "CHANGES_REQUESTED",
+            "statusCheckRollup": {"state": "FAILURE"},
+            "repository": {"nameWithOwner": "blooop/wayfinder"}}"#;
+        let full: PrNode = serde_json::from_str(A_PR).expect("the fixture is a PR node");
+        let badge = parse_pr(&full).expect("the fixture is a PR the badge parse can read");
+        assert_eq!(
+            badge.status,
+            PrStatus::Open {
+                checks: Checks::Failing,
+                review: Review::ChangesRequested,
+            },
+            "the fixture has to depend on both nullable fields, or this proves nothing"
+        );
+
+        let asked = parse_selection(NODE_FACT_SELECTION);
+        let pr_fields = &asked.0["closedByPullRequestsReferences"].0["nodes"];
+        let mut answered: serde_json::Value =
+            serde_json::from_str(A_PR).expect("the fixture is json");
+        prune(&mut answered, pr_fields);
+        let selected: PrNode = serde_json::from_value(answered)
+            .expect("a PR carrying exactly the selected fields still parses");
+
+        assert_eq!(
+            parse_pr(&selected).map(|link| link.status),
+            Some(badge.status),
+            "the selection no longer asks for a field the badge is drawn from"
+        );
+    }
+
+    #[test]
+    fn the_batch_parse_reads_no_field_the_batch_forgot_to_ask_for() {
+        // The other half of #132's items 2 and 3: gutting `NODE_FACT_SELECTION`
+        // stayed green, because every fixture in this file is written by hand
+        // and so carries fields the query may no longer be requesting. A test
+        // whose input is independent of the query cannot notice the query
+        // losing a field — it just keeps parsing a response the server would
+        // never have sent.
+        //
+        // So the input is derived from the query instead: the fixture is
+        // filtered down to the fields `NODE_FACT_SELECTION` actually names,
+        // which is the answer a server honouring that selection would return.
+        // Take `state` out of the selection and the issue arrives without one;
+        // take the linked-PR block out and #80 arrives looking like a node
+        // nothing came of. Both are this assertion going red.
+        let asked = parse_selection(NODE_FACT_SELECTION);
+        // The filter has to be by *path*, not by field name: `state` is a field
+        // of the issue and also a field of `statusCheckRollup`, so a name-set
+        // filter keeps the issue's `state` on the strength of the rollup's and
+        // the one mutation that matters most goes unseen. Asserted rather than
+        // commented, since it is the property the whole test rests on.
+        for field in ["state", "assignees", "closedByPullRequestsReferences"] {
+            assert!(
+                asked.0.contains_key(field),
+                "the selection parse did not read the issue's {field}: {asked:?}"
+            );
+        }
+        assert!(asked.0["assignees"].0.contains_key("nodes"));
+        // The property the filter rests on, and the one a *name*-keyed filter
+        // would fail: `state` is a field of the issue and also a field of
+        // `statusCheckRollup`, so the two must be at their own depths and the
+        // rollup's must not be visible at the issue's. Asserted rather than
+        // commented, since it is what makes dropping the issue's `state` — the
+        // field that decides deletion — a red test.
+        //
+        // Presence and not an exact key set: this is a check on the parser, and
+        // a legitimate new field in the selection (`title` for a better reason
+        // line, `updatedAt` for staleness) should not fail with a message that
+        // sends its author looking for a bug in `parse_selection`.
+        let rollup = &asked.0["closedByPullRequestsReferences"].0["nodes"].0["statusCheckRollup"];
+        assert!(rollup.0.contains_key("state"), "{asked:?}");
+
+        let mut body: serde_json::Value =
+            serde_json::from_str(BATCH_RESPONSE).expect("the fixture is json");
+        let issues = body["data"]["repository"]
+            .as_object_mut()
+            .expect("the fixture answers for a repo");
+        for issue in issues.values_mut() {
+            prune(issue, &asked);
+        }
+
+        let numbers = [80, 81, 82, 83, 84, 85, 86];
+        let from_the_selection =
+            parse_node_facts(body.to_string().as_bytes(), "blooop/devlaunch", &numbers)
+                .expect("a response carrying exactly the selected fields parses");
+        let from_the_fixture =
+            parse_node_facts(BATCH_RESPONSE.as_bytes(), "blooop/devlaunch", &numbers)
+                .expect("the fixture parses");
+        assert_eq!(
+            from_the_selection, from_the_fixture,
+            "the selection no longer asks for everything the parse reads"
+        );
+    }
+
     #[test]
     fn an_unreadable_listing_is_an_error_rather_than_an_empty_plan() {
         // Empty would mean "nothing to reap", which is indistinguishable from
         // success and would hide a broken or too-old `dl`.
         assert!(parse_workspaces(b"not json").is_err());
         assert!(parse_workspaces(b"").is_err());
+    }
+
+    #[test]
+    fn the_readme_states_the_keep_rule_the_derivation_implements() {
+        // #132's fourth item. The list of what reap keeps *always* named
+        // "tickets someone has claimed" without qualification, and that is not
+        // a rule this code has: the claim is read only after every PR arm has
+        // declined, so a claimed ticket whose PR merged is `DoneByMerge` and is
+        // collected. `AGENTS.md` makes the README part of `wf`'s interface, so
+        // a keep rule that overstates what is kept is a defect of the same kind
+        // as a wrong reason line — and a worse one to be wrong about, since it
+        // is what someone reads before deciding to trust `wf reap` with a
+        // machine.
+        //
+        // Two halves, and the pairing is the test: the derivation fact that
+        // makes the qualification necessary, and the sentence that has to carry
+        // it. The sentence is matched exactly, so rewording it fails here and
+        // whoever rewords it re-reads the rule above before saying so again.
+        let claimed_and_merged = [PrOutcome::project(33, Some(&PrStatus::Merged))];
+        assert_eq!(
+            node_fact(TicketState::Live, true, &claimed_and_merged),
+            NodeFact::DoneByMerge { pr: 33 },
+            "a claim does not outrank a merge"
+        );
+        assert_eq!(
+            node_fact(TicketState::Live, true, &[]),
+            NodeFact::Claimed,
+            "and it does settle a ticket nothing has come of"
+        );
+
+        let always = include_str!("../README.md")
+            .split_once("Kept, always:")
+            .expect("the README lists what a reap keeps unconditionally")
+            .1
+            .split_once("\n\n")
+            .expect("that list is one paragraph")
+            .0;
+        assert!(
+            always.contains("tickets someone has claimed that no PR has come of"),
+            "the keep list must qualify the claim it names: {always}"
+        );
+    }
+
+    /// `wf reap -y` taken for real, in a child process whose `dl` and `gh` are
+    /// the fixtures the parent hands it and whose every invocation is written
+    /// down. The `#[ignore]` is what keeps it out of an ordinary run: without
+    /// the shims on `PATH` this is `wf reap -y` against the machine running
+    /// the suite, and it is the one path in this crate that deletes.
+    ///
+    /// `-y` and not `-f`: the prompt is a human's, so a recorded run has to
+    /// skip it, but the unsaved-work waiver is a separate decision and the
+    /// tests below say which of them they are asking about.
+    #[tokio::test]
+    #[ignore = "run by `probe::record` from the two tests below, under recording shims"]
+    async fn reap_run_probe() {
+        if !crate::probe::is_child() {
+            return;
+        }
+        let said = match run(true, false).await {
+            Ok(()) => "the reap finished".to_string(),
+            Err(e) => format!("the reap failed: {e}"),
+        };
+        println!("{}{said}", crate::probe::MARK);
+    }
+
+    /// Every call of a recorded run that could destroy a workspace.
+    ///
+    /// The same four tokens [`probe::Recording::destroyed_nothing`] forbids,
+    /// and for the same reason: what matters is not how the deletion was spelt
+    /// in Rust but that *something* on this path reached for a destructive
+    /// command. The reaping probe cannot use that assertion — one `<rm>` is
+    /// the feature it exists to watch — so it uses this and then says exactly
+    /// which calls it expected. Filtering on `<rm>` alone would have let a
+    /// `devpod delete <id>` or a `dl <id> remove` through unremarked, which is
+    /// precisely the substitution the recording exists to catch.
+    fn destructive(run: &crate::probe::Recording) -> Vec<&str> {
+        run.argv
+            .iter()
+            .filter(|call| {
+                ["<rm>", "<--force>", "<remove>", "<delete>"]
+                    .iter()
+                    .any(|token| call.contains(token))
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn a_reap_hands_dl_the_workspaces_its_plan_doomed_and_no_others() {
+        // The deleting path as a fact about a run. Every other test of this
+        // module stops at a `Verdict`, which is a value in this process — and
+        // a plan that is right about what should go is not the same claim as a
+        // run that destroys only that. Between the two sits `run`: the loop
+        // over `doomed`, the id it passes, and the flag it does or does not
+        // add. This is the only place any of that is observed.
+        //
+        // The four workspaces in the listing are laid out as directories in the
+        // child's scratch home, so `wf` naming the wrong one would show up
+        // here as an id, and `wf` deleting one itself would show up as a
+        // disturbed path.
+        let run = crate::probe::record(
+            "reap::tests::reap_run_probe",
+            crate::probe::DL_LISTING,
+            crate::probe::GH_FACTS,
+        );
+        assert_eq!(
+            run.printed(),
+            ["the reap finished"],
+            "the run reached the end: {}",
+            run.stdout
+        );
+        // Everything this run did that could destroy anything, as one list. A
+        // single `dl <id> rm`, no `--force` beside it — `--force` is `dl`'s own
+        // waiver of its uncommitted-work guard, and a `wf` that passed it
+        // unasked would be overriding a guard belonging to the other program —
+        // and no second spelling of a deletion anywhere.
+        assert_eq!(
+            destructive(&run),
+            ["dl <wf-129-closed> <rm>"],
+            "the closed ticket's workspace goes, alone and by id: {:?}",
+            run.argv
+        );
+        run.touched_no_files();
+    }
+
+    #[test]
+    fn a_ticket_state_this_binary_cannot_read_costs_no_workspace() {
+        // #132's first item, at the far end: not "the derivation keeps it" but
+        // "the run deletes nothing". The same fixtures as above with one word
+        // changed — the state of the one ticket whose workspace the run above
+        // removes — so the difference between the two recordings is exactly
+        // the difference between `CLOSED` and a word this binary was never
+        // taught. Before the fix this run removed `wf-129-closed` on the
+        // strength of that word.
+        let unreadable = crate::probe::GH_FACTS.replace(
+            r#""i129":{"state":"CLOSED""#,
+            r#""i129":{"state":"TRANSFERRED""#,
+        );
+        assert_ne!(
+            unreadable,
+            crate::probe::GH_FACTS,
+            "the fixture no longer says what this test edits"
+        );
+        let run = crate::probe::record(
+            "reap::tests::reap_run_probe",
+            crate::probe::DL_LISTING,
+            &unreadable,
+        );
+        run.destroyed_nothing();
+
+        // Not `stdout.contains("nothing to reap")` on its own: `run`'s
+        // no-workspaces-at-all early return prints "no wayfinder workspaces on
+        // this machine — nothing to reap", which contains that phrase too, and
+        // `destroyed_nothing` is trivially satisfied by a run that saw nothing.
+        // So a `wf reap` gone blind to every workspace on the machine would
+        // read as a pass here, which is the opposite of what this test is for.
+        //
+        // The plan rows say which it was. The workspace the sibling test above
+        // removes has to appear, and appear as a row that keeps it.
+        let rows: Vec<&str> = run
+            .stdout
+            .lines()
+            .filter(|line| line.contains("wf-129-closed"))
+            .collect();
+        assert_eq!(
+            rows,
+            ["  warn  wf-129-closed  (wayfinder#129 unclaimed and no PR — an abandoned stage? reap by hand if so)"],
+            "the run saw the workspace and kept it, rather than never seeing it: {}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("nothing to reap"),
+            "and nothing was left to delete: {}",
+            run.stdout
+        );
     }
 }
