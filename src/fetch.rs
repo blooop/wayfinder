@@ -214,8 +214,8 @@ pub(crate) fn parse_pr(pr: &PrNode) -> Option<PrLink> {
 }
 
 /// What the tracker's `state` string says about whether a ticket is finished
-/// with — the issue-side mirror of [`parse_pr`], and the reason an unrecognised
-/// state cannot reach a deleting arm.
+/// with — the issue-side mirror of `parse_pr` below, and the reason an
+/// unrecognised state cannot reach a deleting arm.
 ///
 /// A two-value type rather than the `bool` this used to be. The bool was read
 /// as "is it open", which made **not open** the finished condition, so every
