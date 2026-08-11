@@ -777,6 +777,17 @@ mod tests {
     ///
     /// The checkout path is in the probe's own scratch directory rather than
     /// under `HOME`, because `HOME` is what is being watched for changes.
+    ///
+    /// The checkout carries a `devcontainer.json`, so the launch this drives is
+    /// an **isolated** one — `dl`, not `claude`. That is deliberate and it is
+    /// the more interesting of the two arms: isolation is conditional on a
+    /// subprocess answer (`dl --version`, against [`DEVLAUNCH_FLOOR`]), and a
+    /// condition met by asking another program is the kind that degrades
+    /// silently. A `wf` that stopped asking, asked with a different flag, or
+    /// misread the answer would go on launching perfectly well — on the host,
+    /// with no container and no per-node branch, which is a different product.
+    /// Nothing in the library could see that: the probe is where the question
+    /// is actually asked, so this is where the answer can be held to.
     #[test]
     #[ignore = "run by `probe::record` from the tests below, under recording shims"]
     fn picker_launch_probe() {
@@ -784,8 +795,12 @@ mod tests {
             return;
         }
         let repo = "blooop/wayfinder";
+        let checkout = probe::child_scratch().join("checkout");
+        std::fs::create_dir_all(checkout.join(".devcontainer")).expect("the scratch checkout");
+        std::fs::write(checkout.join(".devcontainer/devcontainer.json"), "{}\n")
+            .expect("the checkout's devcontainer");
         let mut app = App::empty().with_checkouts(vec![projects::Checkout::new(
-            probe::child_scratch().join("checkout"),
+            checkout.clone(),
             repo.to_string(),
         )]);
         app.enter(repo);
@@ -798,11 +813,28 @@ mod tests {
             ],
         );
         match ending {
-            Ending::Handover(launch) => assert_eq!(
-                launch.cwd(),
-                probe::child_scratch().join("checkout"),
-                "the launch resolves to the one registered checkout"
-            ),
+            Ending::Handover(launch) => {
+                assert_eq!(
+                    launch.cwd(),
+                    checkout,
+                    "the launch resolves to the one registered checkout"
+                );
+                assert_eq!(
+                    launch.isolation(),
+                    wf::launch::Isolation::Devlaunch,
+                    "a checkout with a devcontainer, and a `dl` at the floor, is an isolated launch"
+                );
+                // The argv and not merely the enum: `Isolation::Devlaunch` is a
+                // decision, and what reaches `execvp` is the thing that either
+                // does or does not put the agent in a container. They are
+                // produced by different code and this is the only place both
+                // exist at once.
+                assert_eq!(
+                    launch.agent_argv().first().map(String::as_str),
+                    Some("dl"),
+                    "an isolated launch execs `dl`, which carries the agent in"
+                );
+            }
             Ending::Quit => {
                 panic!("the launch arm was never entered — the plan ran out and the fallback quit")
             }
@@ -926,6 +958,48 @@ mod tests {
             run.argv.len(),
             3,
             "the one reading this session takes, and nothing the launch added: {:?}",
+            run.argv
+        );
+    }
+
+    #[test]
+    fn an_isolated_launch_asks_dl_its_version_before_trusting_it_with_one() {
+        // The positive half of the arm above, and the half nothing had. Every
+        // other assertion here is a bound on what a run may do; this one says
+        // what it must, because the failure being guarded is an *absence*.
+        //
+        // `Isolation::detect` will only hand a launch to `dl` if `dl` answers
+        // `--version` at or above `DEVLAUNCH_FLOOR`. Read the two ends
+        // together and the contract is a fact about a real run: the probe body
+        // asserts the launch came out isolated, and this asserts the question
+        // that entitles it to be. Neither alone is enough — a `wf` that
+        // isolated without asking would satisfy the child, and a `wf` that
+        // asked and then ignored the answer would satisfy the parent.
+        //
+        // It is worth its own test rather than a line in the one above because
+        // it fails for the opposite reason: that test goes red when a run does
+        // something new, this one when it stops doing something. A run that
+        // asked nothing at all passes every `for argv in &run.argv` loop in
+        // this module vacuously.
+        let run = a_launching_session();
+        assert!(
+            run.argv.iter().any(|argv| argv == "dl <--version>"),
+            "isolation is conditional on `dl`'s version, so the launch must ask for it: {:?}",
+            run.argv
+        );
+        // Once, and the memo is the reason. `Isolation::detect` runs per
+        // candidate checkout and the probe costs a Python interpreter, so the
+        // answer is cached in a `OnceLock`; a second `--version` in this log
+        // means the cache stopped being reached and every launch on a machine
+        // with several checkouts of a repo just got slower by one interpreter
+        // start each. That is invisible in every other way.
+        assert_eq!(
+            run.argv
+                .iter()
+                .filter(|argv| *argv == "dl <--version>")
+                .count(),
+            1,
+            "the version is asked once per process and memoized: {:?}",
             run.argv
         );
     }
