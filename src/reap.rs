@@ -699,6 +699,21 @@ pub async fn workspaces() -> Result<Vec<Workspace>> {
     Ok(workspaces)
 }
 
+/// What `wf` hands `dl` to destroy one workspace, as a value.
+///
+/// Named rather than built inline at the call site so that
+/// `tests/live_devlaunch.rs` can hand *this* to a real `dl` instead of
+/// re-typing it. An argv a contract test spells out for itself is an argv the
+/// test agrees with the test about; the point is to run the one the binary
+/// actually sends.
+pub fn removal_argv(id: &str, insist: bool) -> Vec<String> {
+    let mut args = vec![id.to_string(), "rm".to_string()];
+    if insist {
+        args.push("--force".to_string());
+    }
+    args
+}
+
 /// The parse boundary for `dl`'s listing, kept apart from the process call so
 /// it is testable without devlaunch installed.
 ///
@@ -934,10 +949,7 @@ fn parse_node_facts(body: &[u8], repo: &str, numbers: &[u64]) -> Result<BTreeMap
 /// No `dl` on PATH, or a `dl <ws> rm` that failed — including the refusal
 /// above, which is a failure `wf` reports rather than quietly overrides.
 async fn remove(id: &str, insist: bool) -> Result<()> {
-    let mut args = vec![id, "rm"];
-    if insist {
-        args.push("--force");
-    }
+    let args = removal_argv(id, insist);
     let output = Command::new("dl")
         .args(&args)
         .stdin(Stdio::null())

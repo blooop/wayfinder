@@ -26,6 +26,12 @@
 # installed devlaunch the questions `wf` asks it, and holds the answers against
 # what `wf` believes.
 #
+# `devpod` arrives with devlaunch rather than being listed here — it is
+# devlaunch's own dependency and pinning it separately would only give the two
+# constraints a chance to disagree. `dl --ls --json` really does run it; the two
+# calls that would build a container run against a recording shim instead, so no
+# daemon is needed and nothing here creates one.
+#
 # ## The environments
 #
 # | environment | `dl`     | what it is for                                        |

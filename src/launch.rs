@@ -1126,6 +1126,44 @@ fn has_devcontainer(checkout: &Path) -> bool {
 /// nothing is ever run at is a floor nobody has checked.
 pub const DEVLAUNCH_FLOOR: DlVersion = DlVersion(0, 0, 24);
 
+/// What `wf` execs to carry an agent into a container: `dl <ws> -- <command>`.
+///
+/// The workspace spec is a plain argv entry and needs no quoting; the agent
+/// command after `--` does, because `dl` runs it through a shell, and it is one
+/// entry rather than several because "a shell command" is exactly what `dl`
+/// documents it to be.
+///
+/// Named rather than built inline so `tests/live_devlaunch.rs` can hand *this*
+/// to a real `dl`. An argv a contract test spells out for itself only proves
+/// the test agrees with the test.
+pub fn isolated_argv(workspace: &str, agent: &[String]) -> Vec<String> {
+    vec![
+        DEVLAUNCH.to_string(),
+        workspace.to_string(),
+        "--".to_string(),
+        agent
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" "),
+    ]
+}
+
+/// What [`prewarm`] spawns to build the container ahead of the launch.
+///
+/// `up` is the verb that made [`DEVLAUNCH_FLOOR`] necessary: it arrived in
+/// devlaunch 0.0.24, and a `wf` that sent it to 0.0.23 got
+/// `Unknown command 'up'` from inside a detached process nobody was watching.
+/// Named here for the same reason as [`isolated_argv`], and the contract test
+/// sends it to a real 0.0.23 to watch exactly that happen.
+pub fn prewarm_argv(workspace: &str) -> Vec<String> {
+    vec![
+        DEVLAUNCH.to_string(),
+        workspace.to_string(),
+        "up".to_string(),
+    ]
+}
+
 /// A `dl` version, ordered by the three numbers `dl --version` prints.
 ///
 /// A tuple struct rather than three fields because the derived [`Ord`] is
@@ -1626,16 +1664,7 @@ impl Launch {
         let agent = self.agent_argv_inner();
         match self.isolation {
             Isolation::Host => agent,
-            Isolation::Devlaunch => vec![
-                DEVLAUNCH.to_string(),
-                self.workspace(),
-                "--".to_string(),
-                agent
-                    .iter()
-                    .map(|arg| shell_quote(arg))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            ],
+            Isolation::Devlaunch => isolated_argv(&self.workspace(), &agent),
         }
     }
 
@@ -1846,7 +1875,7 @@ pub fn prewarm(checkouts: &[Checkout], staged: &Staged) -> Option<Vec<String>> {
     let isolated = candidate_checkouts(checkouts, &staged.repo)
         .into_iter()
         .any(|c| Isolation::detect(&c.path, Agent::default()) == Isolation::Devlaunch);
-    isolated.then(|| vec![DEVLAUNCH.to_string(), workspace, "up".to_string()])
+    isolated.then(|| prewarm_argv(&workspace))
 }
 
 /// Run `argv` in the background, detached from this process and its terminal.

@@ -52,15 +52,32 @@
 //! that read it and the file still reported seven passes. Anything unrecognised
 //! is a panic now, and [`Contract::read`] is the one place that decides.
 //!
-//! # What it cannot reach
+//! # The calls that change the machine
 //!
-//! `dl <id> rm` and `dl <ws> up` change the machine and need a devpod daemon, so
-//! neither is run — only that this `dl` still names them is checked, in
-//! [`the_verbs_wf_hands_dl_are_ones_it_still_knows`]. Everything else here is
-//! read-only, under a scratch `HOME`, so it cannot see or touch a real
-//! workspace. The scratch home matters for a second reason: a listing read from
-//! the developer's own machine would assert against whatever they happen to
-//! have cloned.
+//! `dl <id> rm` and `dl <ws> up` build and destroy containers, so they cannot
+//! simply be run. They are not left unchecked either: `dl`'s only devpod spawn
+//! is `subprocess.run(["devpod", ...])` — a bare name on PATH — so a recording
+//! `devpod` in front of the **real** `dl` runs devlaunch's own argument
+//! parsing, its own workspace resolution and its own decision about what to ask
+//! devpod, and stops where the container would begin.
+//!
+//! That is the inverse of the shim this file exists to escape. `src/probe.rs`
+//! shims `dl` itself, which is how its fixtures were able to drift; here the
+//! real `dl` is the subject and the shim stands one layer below it, in for the
+//! daemon rather than for the program under test. The argvs come from
+//! [`wf::reap::removal_argv`], [`wf::launch::prewarm_argv`] and
+//! [`wf::launch::isolated_argv`] rather than being typed out here — an argv a
+//! contract test spells out for itself only proves the test agrees with the
+//! test.
+//!
+//! It is worth what it costs: [`the_prewarm_wf_sends_is_the_verb_the_floor_exists_for`]
+//! sends `wf`'s own prewarm argv to a real devlaunch 0.0.23 and watches it come
+//! back `Unknown command 'up'`, which is the 0.14.0 regression itself, running.
+//!
+//! Everything else here is read-only, and all of it runs under a scratch `HOME`
+//! so it cannot see or touch a real workspace. The scratch home matters for a
+//! second reason: a listing read from the developer's own machine would assert
+//! against whatever they happen to have cloned.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -845,5 +862,315 @@ fn a_reap_with_no_dl_refuses_instead_of_guessing() {
     assert!(
         !said.contains("nothing to reap"),
         "`wf` reported an empty plan when it simply could not see: {said}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The two calls that change the machine, run for real with `devpod` shimmed.
+//
+// `dl <ws> rm` and `dl <ws> up` need a devpod daemon and a container, so this
+// file used to check only that `dl --help` still named them. It does not have
+// to stop there. `dl`'s single devpod spawn is `subprocess.run(["devpod", ...])`
+// — a bare name, resolved on PATH — so putting a recording `devpod` in front of
+// the *real* `dl` runs devlaunch's own argument parsing, its own workspace
+// resolution and its own decision about what to ask devpod, and stops at the
+// point where a container would be built.
+//
+// That is the opposite of the shim this whole file exists to get away from.
+// `src/probe.rs` shims `dl` itself, which is why its fixtures could drift; here
+// the real `dl` is the subject and the shim is one layer *below* it, standing in
+// for the daemon rather than for the program under test.
+// ---------------------------------------------------------------------------
+
+/// The workspace the shimmed devpod claims to have.
+///
+/// Shaped like one `wf` makes, because `dl` derives things from the name.
+const SHIMMED_WORKSPACE: &str = "devlaunch-wayfinder-wayfinder-137-abcdefgh";
+
+/// What the real `dl` asked devpod to do, and what it said while doing it.
+#[derive(Debug)]
+struct Asked {
+    /// One line per devpod invocation: the program and each argument in angle
+    /// brackets, so an argument containing a space cannot read as two.
+    devpod: Vec<String>,
+    status: std::process::ExitStatus,
+    said: String,
+}
+
+impl Asked {
+    /// The one devpod call whose first argument is `verb`, or `None`.
+    fn call(&self, verb: &str) -> Option<&String> {
+        self.devpod
+            .iter()
+            .find(|line| line.starts_with(&format!("devpod <{verb}>")))
+    }
+}
+
+/// Run the real `dl` with a recording `devpod` in front of it.
+///
+/// `argv` is what `wf` itself builds — `reap::removal_argv`,
+/// `launch::prewarm_argv`, `launch::isolated_argv` — with a leading `dl`
+/// stripped if it carries one. Nothing here spells an argument out.
+fn dl_over_a_shimmed_devpod(argv: &[String], what: &str) -> Asked {
+    let program = dl();
+    let dir = scratch(&format!("devpod-{what}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).expect("a scratch home");
+    let log = dir.join("devpod.log");
+    std::fs::write(&log, "").expect("the log");
+
+    // Records and answers; runs nothing. `dl <ws> up` hands devpod a
+    // `--command` carrying a shell script that would install tooling — this
+    // shim must never be the thing that executes it, which is why every arm
+    // below either echoes a fixture or does nothing at all.
+    let shim = dir.join("devpod");
+    std::fs::write(
+        &shim,
+        format!(
+            r#"#!/bin/sh
+printf 'devpod' >> "$DP_LOG"
+for a in "$@"; do printf ' <%s>' "$a" >> "$DP_LOG"; done
+echo >> "$DP_LOG"
+case "$1" in
+  version) echo "v0.26.1" ;;
+  list) echo '[{{"id":"{SHIMMED_WORKSPACE}","source":{{"localFolder":"/nonexistent"}},"provider":{{"name":"docker"}},"ide":{{"name":"none"}},"lastUsed":"2026-08-08T11:43:27Z"}}]' ;;
+  status) echo '{{"state":"Stopped"}}' ;;
+  context) echo '{{}}' ;;
+esac
+exit 0
+"#
+        ),
+    )
+    .expect("the devpod shim");
+    let mut perms = std::fs::metadata(&shim).expect("the shim").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&shim, perms).expect("an executable shim");
+
+    let after_program: Vec<&String> = argv
+        .iter()
+        .skip(usize::from(argv.first().is_some_and(|a| a == "dl")))
+        .collect();
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(&program)
+        .args(&after_program)
+        .env("PATH", path)
+        .env("HOME", &home)
+        .env("DP_LOG", &log)
+        // Cleared, not inherited. With a token in the environment `dl` forwards
+        // it to devpod as `--init-env GH_TOKEN=...`, which would put a real
+        // credential into the recording below — and this test prints that
+        // recording when it fails.
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .unwrap_or_else(|e| panic!("could not run {}: {e}", program.display()));
+
+    Asked {
+        devpod: std::fs::read_to_string(&log)
+            .expect("the log")
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+        status: out.status,
+        said: format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    }
+}
+
+#[test]
+fn the_removal_wf_sends_reaches_devpod_as_a_delete() {
+    // `wf reap`'s argv, run by the real `dl`, on every release: reap deletes
+    // through whichever `dl` is on PATH, so this has to hold below the floor
+    // too.
+    let contract = Contract::read();
+    if contract.installed().is_none() {
+        return;
+    }
+    let argv = wf::reap::removal_argv(SHIMMED_WORKSPACE, true);
+    let asked = dl_over_a_shimmed_devpod(&argv, "rm");
+    assert!(
+        asked.status.success(),
+        "`dl {}` failed ({}):\n{}",
+        argv.join(" "),
+        asked.status,
+        asked.said
+    );
+    let deleted = asked.call("delete").unwrap_or_else(|| {
+        panic!(
+            "`dl {}` never asked devpod to delete anything. It asked:\n{:#?}\n{}",
+            argv.join(" "),
+            asked.devpod,
+            asked.said
+        )
+    });
+    assert!(
+        deleted.contains(&format!("<{SHIMMED_WORKSPACE}>")),
+        "the delete names a different workspace: {deleted}"
+    );
+}
+
+#[test]
+fn the_prewarm_wf_sends_is_the_verb_the_floor_exists_for() {
+    // The 0.14.0 regression, as a test.
+    //
+    // `wf` 0.14.0 shipped `dl <workspace> up` while the released devlaunch was
+    // 0.0.23, which had no `up`. It failed inside a detached prewarm nobody was
+    // watching, and neither repository's CI noticed. `DEVLAUNCH_FLOOR` exists
+    // because of it. Here the same argv goes to a real 0.0.23 and a real
+    // 0.0.24, and the two answers are asserted apart: one reaches `devpod up`,
+    // the other is refused by `dl`'s own argument parsing before devpod is
+    // asked anything at all.
+    let contract = Contract::read();
+    let Some(installed) = contract.installed() else {
+        return;
+    };
+    let argv = wf::launch::prewarm_argv(SHIMMED_WORKSPACE);
+    let asked = dl_over_a_shimmed_devpod(&argv, "up");
+    match installed.expect {
+        Expect::Usable => {
+            assert!(
+                asked.status.success(),
+                "`{}` failed on a dl at or above the floor ({}):\n{}",
+                argv.join(" "),
+                asked.status,
+                asked.said
+            );
+            let up = asked.call("up").unwrap_or_else(|| {
+                panic!(
+                    "`{}` never reached `devpod up`. It asked:\n{:#?}\n{}",
+                    argv.join(" "),
+                    asked.devpod,
+                    asked.said
+                )
+            });
+            assert!(
+                up.contains(&format!("<{SHIMMED_WORKSPACE}>")),
+                "the prewarm brought up a different workspace: {up}"
+            );
+        }
+        Expect::TooOld => {
+            assert!(
+                !asked.status.success(),
+                "`{}` succeeded on a dl below the {DEVLAUNCH_FLOOR} floor, so \
+                 either `up` predates it and the floor is wrong, or this dl \
+                 accepted a verb it does not have:\n{}",
+                argv.join(" "),
+                asked.said
+            );
+            assert!(
+                asked.call("up").is_none(),
+                "a dl below the floor still reached `devpod up`: {:#?}",
+                asked.devpod
+            );
+        }
+    }
+}
+
+#[test]
+fn an_isolated_launch_arrives_as_one_shell_command() {
+    // `wf`'s quoting against `dl`'s shell, with nothing between them.
+    //
+    // `dl <ws> -- <cmd>` joins everything after `--` and runs it through a
+    // shell inside the container, so `wf` single-quotes each argument and sends
+    // one entry. An unquoted prompt arrives as several arguments and the agent
+    // is launched with the wrong argv — and a prompt is the one thing here that
+    // always contains spaces. This is checked against the real `dl` because the
+    // splitting happens on its side of the boundary.
+    let contract = Contract::read();
+    if contract.installed().map(|i| i.expect) != Some(Expect::Usable) {
+        return;
+    }
+    let agent = [
+        "claude".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "/wf-one blooop/wayfinder 137".to_string(),
+    ];
+    let argv = wf::launch::isolated_argv(SHIMMED_WORKSPACE, &agent);
+    let asked = dl_over_a_shimmed_devpod(&argv, "exec");
+    assert!(
+        asked.status.success(),
+        "`{}` failed ({}):\n{}",
+        argv.join(" "),
+        asked.status,
+        asked.said
+    );
+    // The last `devpod ssh --command` is the agent; the earlier ones are
+    // devlaunch's own tool probes.
+    let ran = asked
+        .devpod
+        .iter()
+        .rfind(|line| line.starts_with("devpod <ssh>"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the launch never reached the container. It asked:\n{:#?}\n{}",
+                asked.devpod, asked.said
+            )
+        });
+    let command = ran
+        .rsplit_once("<--command> <")
+        .and_then(|(_, rest)| rest.strip_suffix('>'))
+        .unwrap_or_else(|| panic!("no `--command` in the ssh call: {ran}"));
+
+    // Not asserted as a string. How `dl` escapes this for its own shell is
+    // `dl`'s business and it re-quotes what `wf` already quoted; pinning the
+    // spelling would fail on a change that is none of `wf`'s concern. What `wf`
+    // depends on is what the *agent* ends up being called with, so the command
+    // is run — in a real shell, with `claude` replaced by something that writes
+    // its argv down. This is the only place the quoting can actually be
+    // checked, and it is checked on the far side of `dl`.
+    let bin = scratch("agent-argv");
+    let _ = std::fs::remove_dir_all(&bin);
+    std::fs::create_dir_all(&bin).expect("a scratch bin");
+    let seen = bin.join("argv");
+    let claude = bin.join("claude");
+    std::fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '<%s>' \"$a\" >> '{}'; done\n",
+            seen.display()
+        ),
+    )
+    .expect("the claude recorder");
+    let mut perms = std::fs::metadata(&claude)
+        .expect("the recorder")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&claude, perms).expect("an executable recorder");
+
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("HOME", &bin)
+        .output()
+        .expect("a shell");
+    assert!(
+        out.status.success(),
+        "the command `dl` would run in the container is not one a shell \
+         accepts ({}): {command}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let got = std::fs::read_to_string(&seen).unwrap_or_default();
+    assert_eq!(
+        got, "<--dangerously-skip-permissions></wf-one blooop/wayfinder 137>",
+        "the agent was called with the wrong argv. The prompt has to arrive as \
+         one argument; three is what an unquoted join produces.\nfrom: {command}"
     );
 }

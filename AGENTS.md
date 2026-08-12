@@ -172,11 +172,14 @@ Three things follow for anyone editing here:
 - **`pixi run suite` failing is not the contract breaking.** It is a test in
   `src/` that reached the ambient `dl`, which means it passes on your machine
   for a reason that has nothing to do with what it claims to check.
-- **Two of the four calls are only checked by name.** `dl <id> rm` and
-  `dl <ws> up` change the machine and need a devpod daemon, so the contract test
-  runs neither — it asserts only that `dl --help` still names them, which
-  catches a removal or a rename (the failure that actually happened) and nothing
-  about what they do. `--version` and `--ls --json` are exercised for real.
+- **All four calls are run, two of them over a shimmed `devpod`.** `--version`
+  and `--ls --json` go straight to the installed `dl`. `dl <id> rm` and
+  `dl <ws> up` would build or destroy a container, so they run against a
+  recording `devpod` on PATH — devlaunch's only devpod spawn is a bare name, so
+  the real `dl` does its real argument parsing and workspace resolution and
+  stops where the daemon would start. The argvs come from `reap::removal_argv`,
+  `launch::prewarm_argv` and `launch::isolated_argv`, so the test sends what the
+  binary sends. No daemon is needed and nothing creates a container.
 
 `.github/workflows/devlaunch-contract.yml` runs all four environments on every
 pull request, and once a week re-solves devlaunch first — that scheduled run is
