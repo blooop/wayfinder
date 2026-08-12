@@ -147,20 +147,31 @@ pixi run -e latest contract  # whatever pixi.lock resolved
 pixi run -e stale  contract  # 0.0.23 — below the floor, where wf must degrade
 ```
 
-Two things follow for anyone editing here:
+Three things follow for anyone editing here:
 
 - **Raising `DEVLAUNCH_FLOOR` means editing `pixi.toml` in the same commit.**
-  The `floor` environment pins the exact version that constant names, and the
-  test asserts the two agree — a floor nothing is ever run at is a floor nobody
-  has checked.
+  The `floor` environment pins the exact version that constant names, and
+  `the_floor_environment_is_pinned_to_the_floor` compares them unconditionally —
+  a floor nothing is ever run at is a floor nobody has checked. Note what it
+  deliberately does *not* assert: that `DEVLAUNCH_FLOOR` equals
+  `UNSAVED_IS_AN_OBJECT`. Those are two facts about two different questions and a
+  floor bump has to be able to part them; a draft of this test tied them
+  together, and the only way to satisfy that after a bump would have been to
+  raise `UNSAVED_IS_AN_OBJECT` too, which walks `wf reap` straight back into
+  devlaunch#171.
 - **`pixi run suite` failing is not the contract breaking.** It is a test in
   `src/` that reached the ambient `dl`, which means it passes on your machine
   for a reason that has nothing to do with what it claims to check.
+- **Two of the four calls are only checked by name.** `dl <id> rm` and
+  `dl <ws> up` change the machine and need a devpod daemon, so the contract test
+  runs neither — it asserts only that `dl --help` still names them, which
+  catches a removal or a rename (the failure that actually happened) and nothing
+  about what they do. `--version` and `--ls --json` are exercised for real.
 
-`.github/workflows/devlaunch-contract.yml` runs all four on every pull request,
-and once a week re-solves devlaunch first — that scheduled run is the only thing
-that can discover a release published since the lock, and a red one means the
-other repo moved rather than that this one is broken.
+`.github/workflows/devlaunch-contract.yml` runs all four environments on every
+pull request, and once a week re-solves devlaunch first — that scheduled run is
+the only thing that can discover a release published since the lock, and a red
+one means the other repo moved rather than that this one is broken.
 
 ## House style
 

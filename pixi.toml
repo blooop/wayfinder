@@ -71,14 +71,19 @@ wf = "scripts/without-dl.sh cargo run --locked --bin wf --"
 [feature.contract.tasks]
 # One `--test-threads=1`: the tests here each spawn `dl`, and a real devlaunch
 # start is ~90 ms of Python. Serial keeps the failure output in an order a human
-# can read, and there are six of them.
+# can read.
 contract = "cargo test --locked --test live_devlaunch -- --test-threads=1"
 
 [feature.floor.dependencies]
 devlaunch = "==0.0.24"
 [feature.floor.activation.env]
-# Asserted against `launch::DEVLAUNCH_FLOOR`, so this pin and that constant
-# cannot drift apart unnoticed.
+# `role` decides which assertions apply and carries no facts of its own; the
+# other three are facts about the release, stated here so the test never has to
+# derive one from an environment name. All four are required and all four are
+# checked against a closed set — an unrecognised value is a panic, not a skip.
+WF_CONTRACT_ROLE = "floor"
+# Asserted equal to `launch::DEVLAUNCH_FLOOR`, unconditionally: whichever of the
+# two moves, the other has to move with it.
 WF_CONTRACT_DL = "0.0.24"
 WF_CONTRACT_EXPECT = "usable"
 WF_CONTRACT_UNSAVED = "object"
@@ -86,15 +91,17 @@ WF_CONTRACT_UNSAVED = "object"
 [feature.latest.dependencies]
 devlaunch = "*"
 [feature.latest.activation.env]
-# No `WF_CONTRACT_DL`: whatever `pixi.lock` resolved is the subject, and writing
-# the number here as well would mean updating the lock could leave a stale
-# assertion passing against the version it no longer installs.
+# No `WF_CONTRACT_DL`, and the test rejects one here: whatever `pixi.lock`
+# resolved is the subject, and a number written beside it is one nobody updates
+# when the lock moves.
+WF_CONTRACT_ROLE = "latest"
 WF_CONTRACT_EXPECT = "usable"
 WF_CONTRACT_UNSAVED = "object"
 
 [feature.stale.dependencies]
 devlaunch = "==0.0.23"
 [feature.stale.activation.env]
+WF_CONTRACT_ROLE = "stale"
 WF_CONTRACT_DL = "0.0.23"
 WF_CONTRACT_EXPECT = "too-old"
 # The release before `unsaved` became an object. `wf` still has to read this

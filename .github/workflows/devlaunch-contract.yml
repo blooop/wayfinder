@@ -31,8 +31,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: devlaunch-contract-${{ github.ref }}
-  cancel-in-progress: true
+  # Keyed on the event as well as the ref, which matters for exactly one pair:
+  # on a scheduled run `github.ref` is `refs/heads/main`, identical to a push to
+  # main. Keyed on the ref alone they share a group, so a PR merged during the
+  # weekly run cancels it — and a cancelled workflow is neither red nor a failed
+  # check, so the one trigger that can discover a new devlaunch release would
+  # disappear without a word.
+  group: devlaunch-contract-${{ github.event_name }}-${{ github.ref }}
+  # Never for the scheduled run, for the same reason: there is nothing newer
+  # coming along to supersede it.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 env:
   RUSTFLAGS: -D warnings
