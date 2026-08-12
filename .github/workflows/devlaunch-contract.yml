@@ -1,0 +1,104 @@
+name: devlaunch contract
+
+# The half of the test suite that needs a real `devlaunch` — see `pixi.toml`
+# for why it exists at all, and `tests/live_devlaunch.rs` for what it asks.
+#
+# A workflow of its own rather than a job in `ci.yml`, for two reasons that
+# both come down to "a failure here means something different". It needs a
+# toolchain `ci.yml` does not (a conda solve and three Python prefixes), and
+# when it goes red the thing that moved is usually in *another repository* —
+# so a contributor reading a failed run should not have to work out which of
+# nine steps was about their patch. `ci.yml` stays the fast, self-contained
+# answer to "is this commit sound".
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Weekly, and this is the trigger that earns the `latest` environment.
+  #
+  # `pixi.lock` pins what `latest` installs, so on a pull request that
+  # environment is only ever "a second fixed version" — useful, but it cannot
+  # discover anything. The scheduled run below re-solves devlaunch first, so a
+  # release published in between is tested here before anybody upgrades into
+  # it. A red scheduled run therefore means devlaunch changed under `wf`, not
+  # that anything in this repository is wrong: fix it by taking the change and
+  # committing the lock, or by raising the floor.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devlaunch-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTFLAGS: -D warnings
+  CARGO_TERM_COLOR: always
+
+jobs:
+  contract:
+    name: wf against a real dl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The compiler comes from rustup, exactly as in `ci.yml`. pixi supplies
+      # `dl` and nothing else — see the header of `pixi.toml`.
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo's registry and the target directory
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: devlaunch-contract
+
+      - uses: prefix-dev/setup-pixi@v0
+        with:
+          # Named rather than `all`, so an environment added to `pixi.toml`
+          # without a step below is a missing install rather than a silently
+          # unrun check.
+          environments: >-
+            default floor latest stale
+          # Only on the scheduled run: everywhere else the committed lock is
+          # the point, and a workflow that quietly re-solved it would mean a
+          # pull request never tested the versions it shipped with.
+          locked: ${{ github.event_name != 'schedule' }}
+
+      - name: Take any devlaunch published since the lock
+        if: github.event_name == 'schedule'
+        run: pixi update devlaunch
+
+      # Before anything is run, because the script below is what decides
+      # whether the next step tested anything at all.
+      - name: Lint the PATH scrubber
+        run: pixi run lint
+
+      # First of the test steps, because it is the only one that can fail for a
+      # reason inside this repository. A test that reaches the ambient `dl`
+      # passes on every developer's machine and means nothing; this is where it
+      # is caught.
+      - name: The suite is hermetic with no dl installed
+        run: pixi run suite
+
+      - name: The floor — devlaunch == launch::DEVLAUNCH_FLOOR
+        run: pixi run -e floor contract
+
+      - name: Whatever devlaunch a user gets today
+        run: pixi run -e latest contract
+
+      # Below the floor, and still `wf`'s problem: `reap` reads a listing from
+      # whichever `dl` is on PATH, floor or no floor, so the degradation is a
+      # supported path rather than an unsupported one.
+      - name: Below the floor — the degradation, not the happy path
+        run: pixi run -e stale contract
+
+      - name: What was actually installed
+        if: always()
+        run: |
+          for env in floor latest stale; do
+            printf '%-8s ' "$env"
+            pixi run -e "$env" dl --version
+          done

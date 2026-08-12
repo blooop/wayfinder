@@ -125,6 +125,43 @@ changed is what they cover. `tests/skill_docs.rs` is the exception under
 `tests/` — offline shape checks on the skill docs' snippets, so it runs in the
 chain (and in CI) like any unit test.
 
+## The devlaunch contract
+
+`wf` shells out to `dl` four ways — `--version`, `--ls --json`, `<id> rm`, and
+`<ws> up` / `<ws> -- <cmd>` — and every one of them is exercised in `src/` and
+in `tests/live_launch_exec.rs` against a *recording shim*. That is the right
+call for those tests (a machine with devlaunch installed and one without must
+not take different paths through the same test) and it leaves the fixtures
+unchecked against the program they describe. They have been wrong twice.
+
+`pixi.toml` is here for that and nothing else: it installs a chosen `devlaunch`
+and `tests/live_devlaunch.rs` asks it the questions `wf` asks it. **Pixi does
+not build this crate** — the compiler is still rustup's, and adding `rust` to
+those environments would give the repo two toolchains to keep in step for no
+gain.
+
+```
+pixi run    suite            # the ordinary suite with no `dl` anywhere on PATH
+pixi run -e floor  contract  # devlaunch pinned to exactly launch::DEVLAUNCH_FLOOR
+pixi run -e latest contract  # whatever pixi.lock resolved
+pixi run -e stale  contract  # 0.0.23 — below the floor, where wf must degrade
+```
+
+Two things follow for anyone editing here:
+
+- **Raising `DEVLAUNCH_FLOOR` means editing `pixi.toml` in the same commit.**
+  The `floor` environment pins the exact version that constant names, and the
+  test asserts the two agree — a floor nothing is ever run at is a floor nobody
+  has checked.
+- **`pixi run suite` failing is not the contract breaking.** It is a test in
+  `src/` that reached the ambient `dl`, which means it passes on your machine
+  for a reason that has nothing to do with what it claims to check.
+
+`.github/workflows/devlaunch-contract.yml` runs all four on every pull request,
+and once a week re-solves devlaunch first — that scheduled run is the only thing
+that can discover a release published since the lock, and a red one means the
+other repo moved rather than that this one is broken.
+
 ## House style
 
 The code explains *why*, not *what*, and the doc comments carry the design

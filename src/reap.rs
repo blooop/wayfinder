@@ -701,7 +701,17 @@ pub async fn workspaces() -> Result<Vec<Workspace>> {
 
 /// The parse boundary for `dl`'s listing, kept apart from the process call so
 /// it is testable without devlaunch installed.
-fn parse_workspaces(body: &[u8]) -> Result<Vec<Workspace>> {
+///
+/// Public so `tests/live_devlaunch.rs` can feed it the bytes a *real* `dl`
+/// wrote. Every other caller of this function in the repo hands it a fixture
+/// transcribed from devlaunch's documentation by hand, which is a check that
+/// this repo agrees with itself.
+///
+/// # Errors
+///
+/// The body is not JSON, or not an array of objects this binary can read as
+/// workspaces. All-or-nothing on purpose — see [`Unsaved::Unrecognized`].
+pub fn parse_workspaces(body: &[u8]) -> Result<Vec<Workspace>> {
     serde_json::from_slice(body).context("unparseable workspace listing from `dl --ls --json`")
 }
 
