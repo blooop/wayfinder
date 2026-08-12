@@ -181,6 +181,17 @@ Three things follow for anyone editing here:
   `launch::prewarm_argv` and `launch::isolated_argv`, so the test sends what the
   binary sends. No daemon is needed and nothing creates a container.
 
+- **Nothing there inherits your environment.** The contract test records every
+  argument `dl` hands devpod and prints that recording when an assertion fails,
+  so a credential reaching argv would reach a CI log. `hermetic` is the only
+  function in the file allowed to start a process; it clears the environment and
+  gives back three variables, one of which is devlaunch's own
+  `DEVLAUNCH_NO_GH_TOKEN`. Two guards keep that true rather than merely written
+  down: one reads a real child's environment and compares it to the whole
+  allowlist, and one refuses any capture holding a token-shaped string or a
+  `NAME=value` whose name looks like a secret — matched on shape, so a variable
+  neither repo has invented yet is still caught, and reported by name only.
+
 `.github/workflows/devlaunch-contract.yml` runs all four environments on every
 pull request, and once a week re-solves devlaunch first — that scheduled run is
 the only thing that can discover a release published since the lock, and a red

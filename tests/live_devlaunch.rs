@@ -282,9 +282,8 @@ fn scratch(what: &str) -> PathBuf {
 /// Run the `dl` under test and return its stdout, or panic with its stderr.
 fn ask_dl(args: &[&str], what: &str) -> String {
     let program = dl();
-    let out = Command::new(&program)
+    let out = hermetic(&program, &scratch(what))
         .args(args)
-        .env("HOME", scratch(what))
         .output()
         .unwrap_or_else(|e| panic!("could not run {}: {e}", program.display()));
     assert!(
@@ -331,7 +330,7 @@ fn python_of(program: &Path) -> PathBuf {
 fn ask_devlaunch(snippet: &str, args: &[&str], why: &str) -> String {
     let program = dl();
     let python = python_of(&program);
-    let out = Command::new(&python)
+    let out = hermetic(&python, &scratch("devlaunch-ask"))
         .arg("-c")
         .arg(snippet)
         .args(args)
@@ -702,7 +701,7 @@ fn whether_wf_trusts_a_missing_unsaved_follows_the_release() {
 /// does not), and a `commit` that fails for that reason would look like the
 /// clone being unreadable.
 fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
+    let out = hermetic(Path::new("git"), dir)
         .arg("-C")
         .arg(dir)
         .args(["-c", "user.email=contract@example.invalid"])
@@ -838,9 +837,8 @@ fn a_reap_with_no_dl_refuses_instead_of_guessing() {
         return;
     }
     let home = scratch("reap-home");
-    let out = Command::new(env!("CARGO_BIN_EXE_wf"))
+    let out = hermetic(Path::new(env!("CARGO_BIN_EXE_wf")), &home)
         .args(["reap", "-y"])
-        .env("HOME", &home)
         .output()
         .expect("the wf binary");
     let said = format!(
@@ -906,6 +904,132 @@ impl Asked {
     }
 }
 
+/// Every subprocess this file starts, with an environment **built rather than
+/// inherited**.
+///
+/// The inheriting version of this was two `env_remove` calls, `GH_TOKEN` and
+/// `GITHUB_TOKEN`, which is a denylist of the two names that happened to be
+/// true when it was written. Three things are wrong with that shape and all of
+/// them are drift:
+///
+/// * devlaunch reads `HOST_TOKEN_VARS` *first* and falls back to running
+///   `gh auth token`, so the credential need never be in the environment at
+///   all — it can come from `gh`'s config or keyring.
+/// * a variable added on either side is admitted by default.
+/// * nothing notices when the list stops being complete.
+///
+/// So the environment is allowlisted: cleared, then given back the four things
+/// a run needs. Anything new is excluded because it was never let in.
+/// `DEVLAUNCH_NO_GH_TOKEN` is devlaunch's own documented opt-out and covers the
+/// sources clearing the environment cannot reach; the scratch `HOME` covers
+/// `gh`'s config directory. Neither is trusted on its own — see
+/// [`refuse_secrets`], which is the part that keeps working when both of these
+/// stop being the right names.
+fn hermetic(program: &Path, home: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_clear()
+        .env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        )
+        .env("HOME", home)
+        // devlaunch's `DISABLE_VAR`. Set so that no credential is *fetched*,
+        // rather than hoping none is *inherited*.
+        .env("DEVLAUNCH_NO_GH_TOKEN", "1");
+    cmd
+}
+
+/// Names whose value is nobody's business, matched on shape rather than spelled
+/// out — the point is to catch the variable that does not exist yet.
+fn looks_secret(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "AUTH",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle))
+        || name.ends_with("_KEY")
+}
+
+/// Token shapes, for a credential that arrives without a name attached.
+const TOKEN_PREFIXES: [&str; 6] = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
+
+/// Fail if anything captured here looks like a credential — before it can be
+/// printed.
+///
+/// This is the durable half of the mitigation. devlaunch **deliberately** keeps
+/// the token off the command line today: `gh_auth.up_args` writes it to a
+/// private file and passes `--workspace-env-file`, and its docstring says why —
+/// `devpod up` runs for minutes and its argv is visible to anyone who can run
+/// `ps`. So there is nothing to redact right now. That is a decision in another
+/// repository, and the reason this exists is that a change to it must surface
+/// as a failed test here rather than as a token in a CI log.
+///
+/// Shape, not name: a rename on devlaunch's side leaves this working. The
+/// message names only the key, never the value — a guard that prints what it
+/// caught is the leak it was guarding against.
+fn refuse_secrets(what: &str, lines: &[String]) {
+    for line in lines {
+        for prefix in TOKEN_PREFIXES {
+            assert!(
+                !line.contains(prefix),
+                "{what} contains something shaped like a GitHub token \
+                 (a `{prefix}` string). The value is deliberately not shown. \
+                 devlaunch used to keep credentials off argv; if that changed, \
+                 this test has to stop capturing them before it can run again."
+            );
+        }
+        for field in line.split(['<', '>']) {
+            let Some((name, value)) = field.split_once('=') else {
+                continue;
+            };
+            assert!(
+                !looks_secret(name) || value.is_empty(),
+                "{what} carries `{name}=...` — a name shaped like a secret, \
+                 with a value. The value is deliberately not shown. Either \
+                 devlaunch has started putting credentials on the command line, \
+                 or this needs to learn why that one is harmless."
+            );
+        }
+    }
+}
+
+/// Blank the value of every `NAME=VALUE` argument.
+///
+/// Belt and braces behind [`refuse_secrets`], for the credential whose name and
+/// shape are both ones nobody thought of: the assertions in this file never
+/// need the *value* of an environment assignment, only that it was passed and
+/// under what name, so nothing is lost by never holding one.
+fn redact(line: &str) -> String {
+    // Only a field whose left side is a plausible *variable name* is treated as
+    // an assignment. `bash -lc 'FOO=1 ...'` is a command, not an environment
+    // entry, and blanking the right of its first `=` would quietly rewrite the
+    // thing `an_isolated_launch_arrives_as_one_shell_command` is asserting.
+    let is_name = |name: &str| {
+        !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+    };
+    line.split_inclusive('>')
+        .map(|field| {
+            let bare = field.trim_start_matches([' ', '<']);
+            match bare.split_once('=') {
+                Some((name, _)) if is_name(name) => {
+                    format!(" <{name}=…>")
+                }
+                _ => field.to_string(),
+            }
+        })
+        .collect::<String>()
+        .trim_start()
+        .to_string()
+}
+
 /// Run the real `dl` with a recording `devpod` in front of it.
 ///
 /// `argv` is what `wf` itself builds — `reap::removal_argv`,
@@ -956,33 +1080,34 @@ exit 0
         dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let out = Command::new(&program)
+    let out = hermetic(&program, &home)
         .args(&after_program)
         .env("PATH", path)
-        .env("HOME", &home)
         .env("DP_LOG", &log)
-        // Cleared, not inherited. With a token in the environment `dl` forwards
-        // it to devpod as `--init-env GH_TOKEN=...`, which would put a real
-        // credential into the recording below — and this test prints that
-        // recording when it fails.
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
         .output()
         .unwrap_or_else(|e| panic!("could not run {}: {e}", program.display()));
 
+    let raw: Vec<String> = std::fs::read_to_string(&log)
+        .expect("the log")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Checked on the raw capture and stored redacted, in that order. Redacting
+    // first would leave the guard nothing to find; storing raw would leave a
+    // credential in something every assertion below prints on failure.
+    refuse_secrets("the devpod recording", &raw);
+    refuse_secrets("what dl said", std::slice::from_ref(&said));
+
     Asked {
-        devpod: std::fs::read_to_string(&log)
-            .expect("the log")
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect(),
+        devpod: raw.iter().map(|line| redact(line)).collect(),
         status: out.status,
-        said: format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ),
+        said,
     }
 }
 
@@ -1146,7 +1271,7 @@ fn an_isolated_launch_arrives_as_one_shell_command() {
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     std::fs::set_permissions(&claude, perms).expect("an executable recorder");
 
-    let out = Command::new("sh")
+    let out = hermetic(Path::new("sh"), &bin)
         .arg("-c")
         .arg(command)
         .env(
@@ -1157,7 +1282,6 @@ fn an_isolated_launch_arrives_as_one_shell_command() {
                 std::env::var("PATH").unwrap_or_default()
             ),
         )
-        .env("HOME", &bin)
         .output()
         .expect("a shell");
     assert!(
@@ -1172,5 +1296,94 @@ fn an_isolated_launch_arrives_as_one_shell_command() {
         got, "<--dangerously-skip-permissions></wf-one blooop/wayfinder 137>",
         "the agent was called with the wrong argv. The prompt has to arrive as \
          one argument; three is what an unquoted join produces.\nfrom: {command}"
+    );
+}
+
+#[test]
+fn every_subprocess_here_is_started_by_the_one_function_that_sanitises() {
+    // A guard on this file's own source, because the mitigation it protects is
+    // the kind that decays by addition rather than by edit: nothing about
+    // writing a new test here reminds anybody that the environment has to be
+    // built rather than inherited, and a run that inherits one is
+    // indistinguishable from a run that does not until the day it prints a
+    // token. `hermetic` is the only place allowed to start a process, so
+    // "did you sanitise?" becomes "does this compile", and the answer is
+    // checked rather than remembered.
+    //
+    // The needle is assembled rather than written, so that this test does not
+    // count itself.
+    let needle = concat!("Command", "::new");
+    let source = include_str!("live_devlaunch.rs");
+
+    assert_eq!(
+        source.matches(needle).count(),
+        1,
+        "something in this file starts a subprocess without going through \
+         `hermetic`, so it inherits the developer's whole environment — \
+         including whatever credential is in it. Route it through `hermetic`, \
+         or, if it genuinely must inherit, say why here and change this count."
+    );
+
+    let at = source.find(needle).expect("the one spawn");
+    let opens = source
+        .find("fn hermetic(")
+        .expect("the sanitising spawn is called `hermetic`");
+    let closes = source[opens..]
+        .find("\nfn ")
+        .map_or(source.len(), |rel| opens + rel);
+    assert!(
+        (opens..closes).contains(&at),
+        "the one subprocess spawn has moved out of `hermetic`. Counting it is \
+         not the point; being inside the function that clears the environment is."
+    );
+}
+
+#[test]
+fn the_sanitised_spawn_hands_on_nothing_it_was_not_given() {
+    // The allowlist, read off a real child rather than off the source.
+    //
+    // `hermetic` is only worth anything if it actually clears, and nothing else
+    // here would notice if it stopped: every test would go on passing, quietly
+    // inheriting the developer's environment again. So a child is asked what it
+    // received and the answer is compared to the whole intended list — an
+    // equality, not a "contains", because the failure being guarded against is
+    // a variable arriving that nobody meant to send.
+    //
+    // `CARGO_MANIFEST_DIR` is in this process's environment (cargo puts it
+    // there) and must not be in the child's. It is the canary: no variable has
+    // to be planted, because the point is precisely that ambient ones do not
+    // travel.
+    assert!(
+        std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+        "this test's canary is gone — it assumed cargo sets CARGO_MANIFEST_DIR \
+         in the test process, and something else is needed if it no longer does"
+    );
+    let home = scratch("hermetic-env");
+    let out = hermetic(Path::new("sh"), &home)
+        .args(["-c", "env"])
+        .output()
+        .expect("a shell");
+    assert!(
+        out.status.success(),
+        "could not read the child's environment"
+    );
+
+    let printed = String::from_utf8_lossy(&out.stdout);
+    let mut got: Vec<&str> = printed
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, _)| name)
+        // Set by the shell itself, not passed in: `sh` defines these on start
+        // whatever it was handed, so they are not evidence of inheritance.
+        .filter(|name| !matches!(*name, "PWD" | "SHLVL" | "_"))
+        .collect();
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(
+        got,
+        ["DEVLAUNCH_NO_GH_TOKEN", "HOME", "PATH"],
+        "the sanitised spawn passed on a variable it was not given. Anything \
+         beyond the allowlist reached the child by inheritance, which is the \
+         one thing `hermetic` exists to prevent."
     );
 }
