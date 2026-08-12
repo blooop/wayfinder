@@ -1136,6 +1136,10 @@ pub const DEVLAUNCH_FLOOR: DlVersion = DlVersion(0, 0, 24);
 /// Named rather than built inline so `tests/live_devlaunch.rs` can hand *this*
 /// to a real `dl`. An argv a contract test spells out for itself only proves
 /// the test agrees with the test.
+///
+/// The `workspace` that test passes is its own — a devpod id rather than the
+/// `owner/repo@branch` spec every real caller here builds, because the spec
+/// form makes `dl` clone. What comes from here is the shape after it.
 pub fn isolated_argv(workspace: &str, agent: &[String]) -> Vec<String> {
     vec![
         DEVLAUNCH.to_string(),

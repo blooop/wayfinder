@@ -177,20 +177,35 @@ Three things follow for anyone editing here:
   `dl <ws> up` would build or destroy a container, so they run against a
   recording `devpod` on PATH — devlaunch's only devpod spawn is a bare name, so
   the real `dl` does its real argument parsing and workspace resolution and
-  stops where the daemon would start. The argvs come from `reap::removal_argv`,
-  `launch::prewarm_argv` and `launch::isolated_argv`, so the test sends what the
-  binary sends. No daemon is needed and nothing creates a container.
+  stops where the daemon would start. The verbs and flags come from
+  `reap::removal_argv`, `launch::prewarm_argv` and `launch::isolated_argv`, so
+  the test sends what the binary sends — with one limit worth knowing: the
+  *workspace argument* is a devpod id, not the `owner/repo@wayfinder/<repo>-<n>`
+  spec a real launch passes, because the spec form makes `dl` clone. A devlaunch
+  change to how that spec is parsed or cloned is therefore not caught here. No
+  daemon is needed and nothing creates a container.
 
-- **Nothing there inherits your environment.** The contract test records every
-  argument `dl` hands devpod and prints that recording when an assertion fails,
-  so a credential reaching argv would reach a CI log. `hermetic` is the only
-  function in the file allowed to start a process; it clears the environment and
-  gives back three variables, one of which is devlaunch's own
-  `DEVLAUNCH_NO_GH_TOKEN`. Two guards keep that true rather than merely written
-  down: one reads a real child's environment and compares it to the whole
-  allowlist, and one refuses any capture holding a token-shaped string or a
-  `NAME=value` whose name looks like a secret — matched on shape, so a variable
-  neither repo has invented yet is still caught, and reported by name only.
+- **Nothing whose output is captured inherits your environment.** The contract
+  test records every argument `dl` hands devpod and prints that recording when
+  an assertion fails, so a credential reaching argv would reach a CI log.
+  `hermetic` is the only function in the file that starts a subprocess; it
+  clears the environment and gives back three variables, one of which is
+  devlaunch's own `DEVLAUNCH_NO_GH_TOKEN`.
+
+  The qualifier is exact and was once missing. Two tests reach a real `dl`
+  *without* going through `hermetic` — `Isolation::detect` and the launch-notice
+  check both spawn `dl --version` from inside `src/launch.rs`, with the whole
+  ambient environment — and they are meant to, because driving the production
+  path is what they are for. `--version` consults no credential, prints none,
+  and nothing captured from it is printed. Anything that *is* captured and
+  printed goes through `hermetic`.
+
+  Three guards keep that true rather than merely written down: one reads a real
+  child's environment and compares it to the whole allowlist, one reads this
+  file's own source and requires the single spawn to sit inside `hermetic`, and
+  one refuses any capture holding a token-shaped string or a `NAME=value` whose
+  name looks like a secret — matched on shape, so a variable neither repo has
+  invented yet is still caught, and reported by name only.
 
 `.github/workflows/devlaunch-contract.yml` runs all four environments on every
 pull request, and once a week re-solves devlaunch first — that scheduled run is

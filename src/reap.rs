@@ -704,8 +704,11 @@ pub async fn workspaces() -> Result<Vec<Workspace>> {
 /// Named rather than built inline at the call site so that
 /// `tests/live_devlaunch.rs` can hand *this* to a real `dl` instead of
 /// re-typing it. An argv a contract test spells out for itself is an argv the
-/// test agrees with the test about; the point is to run the one the binary
-/// actually sends.
+/// test agrees with the test about.
+///
+/// The `id` that test passes is its own — a devpod workspace id its shimmed
+/// devpod reports as existing. What comes from here is the verb and the flag,
+/// which is what a devlaunch release can take away.
 pub fn removal_argv(id: &str, insist: bool) -> Vec<String> {
     let mut args = vec![id.to_string(), "rm".to_string()];
     if insist {

@@ -41,8 +41,11 @@
 //! # Everything here fails closed
 //!
 //! It is not runnable outside those environments and does not try to be: with
-//! no `WF_CONTRACT_*` in the environment **every** test here panics saying so,
-//! rather than quietly testing whichever `dl` the developer happens to have.
+//! no `WF_CONTRACT_*` in the environment every test that goes near a `dl`
+//! panics saying so, rather than quietly testing whichever one the developer
+//! happens to have. (The two guards at the bottom of the file are the
+//! exception, and are meant to be: one reads this file's source and one reads a
+//! child's environment, and neither needs a devlaunch to be right about.)
 //! That distinction is the whole point — a contract test that silently accepts
 //! the ambient install is the shim again, wearing a different hat.
 //!
@@ -73,6 +76,14 @@
 //! It is worth what it costs: [`the_prewarm_wf_sends_is_the_verb_the_floor_exists_for`]
 //! sends `wf`'s own prewarm argv to a real devlaunch 0.0.23 and watches it come
 //! back `Unknown command 'up'`, which is the 0.14.0 regression itself, running.
+//!
+//! One limit, because the argv is only half `wf`'s: the *verbs* and flags come
+//! from `wf`'s own builders, but the workspace argument is a devpod id rather
+//! than the `owner/repo@wayfinder/<repo>-<n>` spec a real launch passes. The id
+//! sends `dl` down its resolve-an-existing-workspace branch; the spec form
+//! would have it clone, which needs a network and a credential and is
+//! devlaunch's own e2e suite's business. So a devlaunch release that changed
+//! how it *parses or clones* a `repo@branch` spec is not caught here.
 //!
 //! Everything else here is read-only, and all of it runs under a scratch `HOME`
 //! so it cannot see or touch a real workspace. The scratch home matters for a
@@ -286,14 +297,21 @@ fn ask_dl(args: &[&str], what: &str) -> String {
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("could not run {}: {e}", program.display()));
+    // Everything captured from a real `dl` is checked before it can be
+    // printed, not only the shimmed recording: these panics quote stderr
+    // verbatim and they run in a public CI log.
+    let printed = String::from_utf8_lossy(&out.stdout).into_owned();
+    let complained = String::from_utf8_lossy(&out.stderr).into_owned();
+    refuse_tokens("what dl printed", &printed);
+    refuse_tokens("what dl said", &complained);
     assert!(
         out.status.success(),
         "`dl {}` failed ({}): {}",
         args.join(" "),
         out.status,
-        String::from_utf8_lossy(&out.stderr).trim()
+        complained.trim()
     );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    printed
 }
 
 /// What `wf` makes of the installed `dl`.
@@ -336,12 +354,12 @@ fn ask_devlaunch(snippet: &str, args: &[&str], why: &str) -> String {
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("could not run {}: {e}", python.display()));
-    assert!(
-        out.status.success(),
-        "{why}:\n{}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    let printed = String::from_utf8_lossy(&out.stdout).into_owned();
+    let complained = String::from_utf8_lossy(&out.stderr).into_owned();
+    refuse_tokens("what devlaunch printed", &printed);
+    refuse_tokens("what devlaunch said", &complained);
+    assert!(out.status.success(), "{why}:\n{}", complained.trim());
+    printed
 }
 
 /// One row of a listing, carrying `unsaved` exactly as devlaunch wrote it.
@@ -618,60 +636,6 @@ print(json.dumps({
 }
 
 #[test]
-fn the_verbs_wf_hands_dl_are_ones_it_still_knows() {
-    // `wf` builds two argvs it never gets to try here: `dl <ws> up` (prewarm)
-    // and `dl <id> rm [--force]` (reap). Both change the machine and both need
-    // a devpod daemon, so running them is devlaunch's own e2e suite's job — but
-    // *not checking them at all* is how the 0.14.0 incident happened, where
-    // `wf` shipped a call to an `up` the installed release had never heard of.
-    //
-    // `dl <bogus> up` cannot stand in for it: `dl` resolves the workspace
-    // before it looks at the verb, so an unknown workspace and an unknown verb
-    // produce the same error. What is left is the vocabulary — `dl --help` is
-    // where devlaunch documents its own subcommands, and a verb that is removed
-    // stops being named there. It catches a deletion or a rename, which is the
-    // failure that has actually happened, and it does not pretend to catch a
-    // change in what the verb does.
-    // The two verbs are not asked for on the same terms, and the difference is
-    // the floor's whole justification. `rm` is wanted from every release: reap
-    // reads and deletes through whichever `dl` is on PATH, floor or no floor.
-    // `up` is wanted only at or above the floor — it *arrived* in 0.0.24, which
-    // is why `DEVLAUNCH_FLOOR` is that number. Below the floor its absence is
-    // therefore asserted rather than tolerated, and that assertion is the only
-    // place in this repo where the reason the floor exists is evidence instead
-    // of a sentence in a doc comment. (It also caught a first draft of this very
-    // test, which demanded `up` of 0.0.23 and was wrong to.)
-    let contract = Contract::read();
-    let Some(installed) = contract.installed() else {
-        return;
-    };
-    let help = ask_dl(&["--help"], "help");
-    let names = |verb: &str| {
-        help.split_whitespace()
-            .any(|word| word.trim_matches(',') == verb)
-    };
-    assert!(
-        names("rm"),
-        "`dl --help` no longer names `rm`, which `src/reap.rs` hands it on \
-         every release:\n{help}"
-    );
-    match installed.expect {
-        Expect::Usable => assert!(
-            names("up"),
-            "`dl --help` no longer names `up`, which `src/launch.rs` hands it \
-             for every prewarm. That verb is the {DEVLAUNCH_FLOOR} floor's \
-             subject: a `dl` clearing the floor must carry it.\n{help}"
-        ),
-        Expect::TooOld => assert!(
-            !names("up"),
-            "this `dl` is below the {DEVLAUNCH_FLOOR} floor and yet names \
-             `up`, so the floor is not where `up` arrived and the number is \
-             wrong:\n{help}"
-        ),
-    }
-}
-
-#[test]
 fn whether_wf_trusts_a_missing_unsaved_follows_the_release() {
     // The decision `answers_unsaved` exists for, and the most dangerous one in
     // the pair: on a release that answers for every clone of its own, a `null`
@@ -885,27 +849,105 @@ fn a_reap_with_no_dl_refuses_instead_of_guessing() {
 /// Shaped like one `wf` makes, because `dl` derives things from the name.
 const SHIMMED_WORKSPACE: &str = "devlaunch-wayfinder-wayfinder-137-abcdefgh";
 
+/// One recorded devpod invocation, parsed into arguments.
+///
+/// Parsed rather than kept as a line, because everything that reads a recording
+/// wants a *field*: the guard below asks whether any argument is an assignment,
+/// the isolated-launch test asks for the value of `--command`. Both used to do
+/// it by string surgery on the whole line, and both were wrong in the same way
+/// — one treated `dl`'s entire output as a single `NAME=value`, the other
+/// assumed `--command` was the last argument. A parse costs four lines and
+/// removes the class.
+#[derive(Debug, Clone)]
+struct Call {
+    args: Vec<String>,
+}
+
+impl Call {
+    /// `devpod <a> <b>` → `["a", "b"]`.
+    fn parse(line: &str) -> Option<Call> {
+        let rest = line.strip_prefix("devpod")?;
+        Some(Call {
+            args: rest
+                .split('<')
+                .skip(1)
+                .filter_map(|field| field.rsplit_once('>').map(|(arg, _)| arg.to_string()))
+                .collect(),
+        })
+    }
+
+    fn verb(&self) -> Option<&str> {
+        self.args.first().map(String::as_str)
+    }
+
+    /// The argument after `flag`, or `None` if it was not passed.
+    fn value_of(&self, flag: &str) -> Option<&str> {
+        let at = self.args.iter().position(|arg| arg == flag)?;
+        self.args.get(at + 1).map(String::as_str)
+    }
+
+    fn mentions(&self, needle: &str) -> bool {
+        self.args.iter().any(|arg| arg.contains(needle))
+    }
+
+    /// How this call reads in a failure message: every `NAME=VALUE` argument
+    /// with its value elided.
+    ///
+    /// Display only. The assertions read [`Call::args`], which is untouched —
+    /// an earlier version rewrote the recording itself and could therefore
+    /// change what a test was asserting on, which is a strange way to keep a
+    /// secret.
+    fn shown(&self) -> String {
+        let shown: Vec<String> = self
+            .args
+            .iter()
+            .map(|arg| match arg.split_once('=') {
+                Some((name, _)) if is_variable_name(name) => format!("{name}=…"),
+                _ => arg.clone(),
+            })
+            .collect();
+        format!("devpod {}", shown.join(" "))
+    }
+}
+
+/// A plausible environment-variable name, and nothing else.
+///
+/// The distinction matters twice: `NAME=VALUE` is an assignment worth hiding,
+/// while `bash -lc 'FOO=1 …'` is a command and rewriting it would corrupt the
+/// thing under assertion.
+fn is_variable_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+}
+
 /// What the real `dl` asked devpod to do, and what it said while doing it.
 #[derive(Debug)]
 struct Asked {
-    /// One line per devpod invocation: the program and each argument in angle
-    /// brackets, so an argument containing a space cannot read as two.
-    devpod: Vec<String>,
+    calls: Vec<Call>,
     status: std::process::ExitStatus,
     said: String,
 }
 
 impl Asked {
-    /// The one devpod call whose first argument is `verb`, or `None`.
-    fn call(&self, verb: &str) -> Option<&String> {
-        self.devpod
-            .iter()
-            .find(|line| line.starts_with(&format!("devpod <{verb}>")))
+    /// The one devpod call whose verb is `verb`, or `None`.
+    fn call(&self, verb: &str) -> Option<&Call> {
+        self.calls.iter().find(|call| call.verb() == Some(verb))
+    }
+
+    /// Every call, rendered for a failure message with assignment values gone.
+    fn shown(&self) -> String {
+        self.calls.iter().fold(String::new(), |mut out, call| {
+            out.push_str("  ");
+            out.push_str(&call.shown());
+            out.push('\n');
+            out
+        })
     }
 }
 
-/// Every subprocess this file starts, with an environment **built rather than
-/// inherited**.
+/// Every subprocess this file starts **directly**, with an environment built
+/// rather than inherited.
 ///
 /// The inheriting version of this was two `env_remove` calls, `GH_TOKEN` and
 /// `GITHUB_TOKEN`, which is a denylist of the two names that happened to be
@@ -918,13 +960,23 @@ impl Asked {
 /// * a variable added on either side is admitted by default.
 /// * nothing notices when the list stops being complete.
 ///
-/// So the environment is allowlisted: cleared, then given back the four things
-/// a run needs. Anything new is excluded because it was never let in.
-/// `DEVLAUNCH_NO_GH_TOKEN` is devlaunch's own documented opt-out and covers the
-/// sources clearing the environment cannot reach; the scratch `HOME` covers
-/// `gh`'s config directory. Neither is trusted on its own — see
-/// [`refuse_secrets`], which is the part that keeps working when both of these
-/// stop being the right names.
+/// So the environment is allowlisted: cleared, then given back the three things
+/// a run needs — `PATH`, `HOME`, and devlaunch's own `DEVLAUNCH_NO_GH_TOKEN`.
+/// Anything new is excluded because it was never let in. The opt-out covers the
+/// sources clearing cannot reach; the scratch `HOME` covers `gh`'s config
+/// directory. Neither is trusted on its own — see [`refuse_secrets`].
+///
+/// **Directly** is load-bearing and was once wrong here. Two tests reach `dl`
+/// without going through this function, and both are meant to:
+/// [`a_devcontainer_repo_is_isolated_only_when_a_real_dl_can_carry_it`] calls
+/// `Isolation::detect`, and [`a_launch_that_fell_back_says_why_and_names_the_version`]
+/// reads the version through the same path — each of which spawns
+/// `dl --version` from inside `src/launch.rs`, with this process's whole
+/// environment, because *that is what `wf` does in production* and the point of
+/// those tests is the production path. `--version` is also the one `dl` call
+/// that consults no credential and prints none. What must not happen is a
+/// *capture* being taken from an inherited environment, and that is what this
+/// function and the guard below are for.
 fn hermetic(program: &Path, home: &Path) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_clear()
@@ -959,75 +1011,61 @@ fn looks_secret(name: &str) -> bool {
 /// Token shapes, for a credential that arrives without a name attached.
 const TOKEN_PREFIXES: [&str; 6] = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
 
-/// Fail if anything captured here looks like a credential — before it can be
+/// Fail if any *recorded argument* looks like a credential — before it can be
 /// printed.
 ///
 /// This is the durable half of the mitigation. devlaunch **deliberately** keeps
 /// the token off the command line today: `gh_auth.up_args` writes it to a
 /// private file and passes `--workspace-env-file`, and its docstring says why —
 /// `devpod up` runs for minutes and its argv is visible to anyone who can run
-/// `ps`. So there is nothing to redact right now. That is a decision in another
+/// `ps`. So there is nothing to catch right now. That is a decision in another
 /// repository, and the reason this exists is that a change to it must surface
 /// as a failed test here rather than as a token in a CI log.
 ///
 /// Shape, not name: a rename on devlaunch's side leaves this working. The
-/// message names only the key, never the value — a guard that prints what it
-/// caught is the leak it was guarding against.
-fn refuse_secrets(what: &str, lines: &[String]) {
-    for line in lines {
-        for prefix in TOKEN_PREFIXES {
-            assert!(
-                !line.contains(prefix),
-                "{what} contains something shaped like a GitHub token \
-                 (a `{prefix}` string). The value is deliberately not shown. \
-                 devlaunch used to keep credentials off argv; if that changed, \
-                 this test has to stop capturing them before it can run again."
-            );
-        }
-        for field in line.split(['<', '>']) {
-            let Some((name, value)) = field.split_once('=') else {
+/// message names only the key, never the value.
+///
+/// It takes parsed arguments rather than a line. The version that took the line
+/// was also handed `dl`'s combined stdout and stderr, which contains no angle
+/// brackets — so the whole blob became one field, "the name" became every byte
+/// before the first `=`, and the guard would both accuse innocent output and
+/// print the entire capture it exists to withhold. Free text is [`refuse_tokens`]'s
+/// job and is checked for shapes only, because free text has no fields.
+fn refuse_secrets(what: &str, calls: &[Call]) {
+    for call in calls {
+        for arg in &call.args {
+            refuse_tokens(what, arg);
+            let Some((name, value)) = arg.split_once('=') else {
                 continue;
             };
             assert!(
-                !looks_secret(name) || value.is_empty(),
-                "{what} carries `{name}=...` — a name shaped like a secret, \
-                 with a value. The value is deliberately not shown. Either \
-                 devlaunch has started putting credentials on the command line, \
-                 or this needs to learn why that one is harmless."
+                !is_variable_name(name) || !looks_secret(name) || value.is_empty(),
+                "{what} carries `{name}=…` — a name shaped like a secret, with a \
+                 value. The value is deliberately not shown. Either devlaunch \
+                 has started putting credentials on the command line, or this \
+                 needs to learn why that one is harmless."
             );
         }
     }
 }
 
-/// Blank the value of every `NAME=VALUE` argument.
+/// Fail if free text holds something shaped like a token.
 ///
-/// Belt and braces behind [`refuse_secrets`], for the credential whose name and
-/// shape are both ones nobody thought of: the assertions in this file never
-/// need the *value* of an environment assignment, only that it was passed and
-/// under what name, so nothing is lost by never holding one.
-fn redact(line: &str) -> String {
-    // Only a field whose left side is a plausible *variable name* is treated as
-    // an assignment. `bash -lc 'FOO=1 ...'` is a command, not an environment
-    // entry, and blanking the right of its first `=` would quietly rewrite the
-    // thing `an_isolated_launch_arrives_as_one_shell_command` is asserting.
-    let is_name = |name: &str| {
-        !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && !name.starts_with(|c: char| c.is_ascii_digit())
-    };
-    line.split_inclusive('>')
-        .map(|field| {
-            let bare = field.trim_start_matches([' ', '<']);
-            match bare.split_once('=') {
-                Some((name, _)) if is_name(name) => {
-                    format!(" <{name}=…>")
-                }
-                _ => field.to_string(),
-            }
-        })
-        .collect::<String>()
-        .trim_start()
-        .to_string()
+/// The half that applies to anything captured from a real `dl` — its stderr on
+/// a failed call, a listing body, a Python traceback — all of which end up in
+/// a panic message and therefore in a CI log. No field parsing is possible
+/// here, so this is prefixes only, and the message names the prefix rather than
+/// quoting what it found.
+fn refuse_tokens(what: &str, text: &str) {
+    for prefix in TOKEN_PREFIXES {
+        assert!(
+            !text.contains(prefix),
+            "{what} contains something shaped like a GitHub token (a `{prefix}` \
+             string). It is deliberately not shown. This test prints what it \
+             captures when it fails, so it must stop capturing this before it \
+             can run again."
+        );
+    }
 }
 
 /// Run the real `dl` with a recording `devpod` in front of it.
@@ -1087,25 +1125,20 @@ exit 0
         .output()
         .unwrap_or_else(|e| panic!("could not run {}: {e}", program.display()));
 
-    let raw: Vec<String> = std::fs::read_to_string(&log)
-        .expect("the log")
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect();
+    let raw = std::fs::read_to_string(&log).expect("the log");
+    let calls: Vec<Call> = raw.lines().filter_map(Call::parse).collect();
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    // Checked on the raw capture and stored redacted, in that order. Redacting
-    // first would leave the guard nothing to find; storing raw would leave a
-    // credential in something every assertion below prints on failure.
-    refuse_secrets("the devpod recording", &raw);
-    refuse_secrets("what dl said", std::slice::from_ref(&said));
+    // Both channels, each by the rule that suits it: the recording has fields,
+    // so it gets the full check; `dl`'s own output does not, so it gets shapes.
+    refuse_secrets("the devpod recording", &calls);
+    refuse_tokens("what dl said", &said);
 
     Asked {
-        devpod: raw.iter().map(|line| redact(line)).collect(),
+        calls,
         status: out.status,
         said,
     }
@@ -1131,15 +1164,16 @@ fn the_removal_wf_sends_reaches_devpod_as_a_delete() {
     );
     let deleted = asked.call("delete").unwrap_or_else(|| {
         panic!(
-            "`dl {}` never asked devpod to delete anything. It asked:\n{:#?}\n{}",
+            "`dl {}` never asked devpod to delete anything. It asked:\n{}{}",
             argv.join(" "),
-            asked.devpod,
+            asked.shown(),
             asked.said
         )
     });
     assert!(
-        deleted.contains(&format!("<{SHIMMED_WORKSPACE}>")),
-        "the delete names a different workspace: {deleted}"
+        deleted.mentions(SHIMMED_WORKSPACE),
+        "the delete names a different workspace: {}",
+        deleted.shown()
     );
 }
 
@@ -1171,15 +1205,16 @@ fn the_prewarm_wf_sends_is_the_verb_the_floor_exists_for() {
             );
             let up = asked.call("up").unwrap_or_else(|| {
                 panic!(
-                    "`{}` never reached `devpod up`. It asked:\n{:#?}\n{}",
+                    "`{}` never reached `devpod up`. It asked:\n{}{}",
                     argv.join(" "),
-                    asked.devpod,
+                    asked.shown(),
                     asked.said
                 )
             });
             assert!(
-                up.contains(&format!("<{SHIMMED_WORKSPACE}>")),
-                "the prewarm brought up a different workspace: {up}"
+                up.mentions(SHIMMED_WORKSPACE),
+                "the prewarm brought up a different workspace: {}",
+                up.shown()
             );
         }
         Expect::TooOld => {
@@ -1193,8 +1228,19 @@ fn the_prewarm_wf_sends_is_the_verb_the_floor_exists_for() {
             );
             assert!(
                 asked.call("up").is_none(),
-                "a dl below the floor still reached `devpod up`: {:#?}",
-                asked.devpod
+                "a dl below the floor still reached `devpod up`:\n{}",
+                asked.shown()
+            );
+            // *Why* it failed, not merely that it did. Without this the test
+            // passes on any failure at all — a shim fixture that stopped
+            // parsing, a resolution error under the scratch HOME — while the
+            // regression it exists to reproduce quietly stops being reproduced.
+            assert!(
+                asked.said.contains("Unknown command"),
+                "a dl below the floor refused the prewarm, but not by saying it \
+                 does not have the verb — so this is no longer the 0.14.0 \
+                 failure being reproduced:\n{}",
+                asked.said
             );
         }
     }
@@ -1228,22 +1274,34 @@ fn an_isolated_launch_arrives_as_one_shell_command() {
         asked.status,
         asked.said
     );
-    // The last `devpod ssh --command` is the agent; the earlier ones are
-    // devlaunch's own tool probes.
-    let ran = asked
-        .devpod
+    // Selected by what it carries, not by where it sits.
+    //
+    // The first version took the *last* `devpod ssh` call, on a comment-level
+    // assumption that devlaunch puts its tool probes before the agent. That
+    // payload is then executed, so a reordering or an extra post-launch step on
+    // devlaunch's side would have run its container bootstrap — which pipes
+    // `curl` into `bash` — on this machine. It is named instead, and required
+    // to be the only match.
+    let agent_program = &agent[0];
+    let carried: Vec<&Call> = asked
+        .calls
         .iter()
-        .rfind(|line| line.starts_with("devpod <ssh>"))
-        .unwrap_or_else(|| {
-            panic!(
-                "the launch never reached the container. It asked:\n{:#?}\n{}",
-                asked.devpod, asked.said
-            )
-        });
-    let command = ran
-        .rsplit_once("<--command> <")
-        .and_then(|(_, rest)| rest.strip_suffix('>'))
-        .unwrap_or_else(|| panic!("no `--command` in the ssh call: {ran}"));
+        .filter(|call| {
+            call.verb() == Some("ssh")
+                && call
+                    .value_of("--command")
+                    .is_some_and(|command| command.contains(agent_program.as_str()))
+        })
+        .collect();
+    assert_eq!(
+        carried.len(),
+        1,
+        "expected exactly one devpod call carrying `{agent_program}`, and this \
+         test runs the one it finds — so anything but one call means it does \
+         not know what it would be running:\n{}",
+        asked.shown()
+    );
+    let command = carried[0].value_of("--command").expect("matched above");
 
     // Not asserted as a string. How `dl` escapes this for its own shell is
     // `dl`'s business and it re-quotes what `wf` already quoted; pinning the
@@ -1256,7 +1314,7 @@ fn an_isolated_launch_arrives_as_one_shell_command() {
     let _ = std::fs::remove_dir_all(&bin);
     std::fs::create_dir_all(&bin).expect("a scratch bin");
     let seen = bin.join("argv");
-    let claude = bin.join("claude");
+    let claude = bin.join(agent_program);
     std::fs::write(
         &claude,
         format!(
@@ -1264,24 +1322,29 @@ fn an_isolated_launch_arrives_as_one_shell_command() {
             seen.display()
         ),
     )
-    .expect("the claude recorder");
+    .expect("the agent recorder");
     let mut perms = std::fs::metadata(&claude)
         .expect("the recorder")
         .permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     std::fs::set_permissions(&claude, perms).expect("an executable recorder");
 
-    let out = hermetic(Path::new("sh"), &bin)
+    // The command runs with a PATH holding only what it may legitimately need:
+    // the recorder, and the shell `dl` asked for. Belt and braces behind the
+    // selection above — if that ever picks the wrong call anyway, devlaunch's
+    // bootstrap finds no `curl`, no `pixi` and no `gh`, and does nothing to
+    // this machine.
+    for tool in ["bash", "sh"] {
+        let real = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join(tool))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("no `{tool}` on PATH to run the agent command with"));
+        std::os::unix::fs::symlink(real, bin.join(tool)).expect("link the shell");
+    }
+    let out = hermetic(&bin.join("sh"), &bin)
         .arg("-c")
         .arg(command)
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", &bin)
         .output()
         .expect("a shell");
     assert!(
@@ -1300,8 +1363,19 @@ fn an_isolated_launch_arrives_as_one_shell_command() {
 }
 
 #[test]
-fn every_subprocess_here_is_started_by_the_one_function_that_sanitises() {
-    // A guard on this file's own source, because the mitigation it protects is
+fn every_subprocess_this_file_starts_itself_goes_through_hermetic() {
+    // A guard on this file's own source — and only on this file's own source,
+    // which is a real limit rather than an oversight. `Isolation::detect` and
+    // `Devlaunch::from_version_output`'s caller both spawn `dl --version` from
+    // inside `src/launch.rs`, with this process's whole environment, and they
+    // are *supposed* to: those two tests exist to drive the production path,
+    // and `--version` is the one `dl` call that consults no credential and
+    // prints none. Nothing captured from them is printed either. What this
+    // guard covers is the thing that would put a credential in a log — a
+    // capture taken from an inherited environment — and that only happens
+    // through a spawn written here.
+    //
+    // It is a guard at all because the mitigation it protects is
     // the kind that decays by addition rather than by edit: nothing about
     // writing a new test here reminds anybody that the environment has to be
     // built rather than inherited, and a run that inherits one is
@@ -1320,8 +1394,9 @@ fn every_subprocess_here_is_started_by_the_one_function_that_sanitises() {
         1,
         "something in this file starts a subprocess without going through \
          `hermetic`, so it inherits the developer's whole environment — \
-         including whatever credential is in it. Route it through `hermetic`, \
-         or, if it genuinely must inherit, say why here and change this count."
+         including whatever credential is in it, in something whose output \
+         this file prints when it fails. Route it through `hermetic`, or, if \
+         it genuinely must inherit, say why here and change this count."
     );
 
     let at = source.find(needle).expect("the one spawn");
