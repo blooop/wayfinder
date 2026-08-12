@@ -1226,7 +1226,7 @@ impl Devlaunch {
     ///
     /// [`Usable`]: Devlaunch::Usable
     /// [`Absent`]: Devlaunch::Absent
-    fn shortfall(self) -> Option<String> {
+    pub fn shortfall(self) -> Option<String> {
         match self {
             Devlaunch::Absent | Devlaunch::Usable => None,
             Devlaunch::TooOld(found) => Some(format!(

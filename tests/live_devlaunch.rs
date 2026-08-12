@@ -19,10 +19,24 @@
 //! asks it.
 //!
 //! ```text
-//! pixi run -e floor  contract   # devlaunch == launch::DEVLAUNCH_FLOOR
-//! pixi run -e latest contract   # whatever pixi.lock resolved
-//! pixi run -e stale  contract   # 0.0.23, below the floor
+//! pixi run -e default contract  # no devlaunch at all
+//! pixi run -e floor   contract  # devlaunch == launch::DEVLAUNCH_FLOOR
+//! pixi run -e latest  contract  # whatever pixi.lock resolved
+//! pixi run -e stale   contract  # 0.0.23, below the floor
 //! ```
+//!
+//! # Reading a weaker `dl`, and then behaving
+//!
+//! Two different claims, and both are made here. Most of the tests are about
+//! what `wf` *reads* — the version, the listing, the `unsaved` field. Three are
+//! about what it then *does*, which is the half that reaches a user:
+//! [`a_devcontainer_repo_is_isolated_only_when_a_real_dl_can_carry_it`] asks
+//! `Isolation::detect` in a checkout that really carries a devcontainer (this
+//! one) and requires a host launch when `dl` is absent or below the floor,
+//! [`a_launch_that_fell_back_says_why_and_names_the_version`] requires the
+//! notice that says so, and [`a_reap_with_no_dl_refuses_instead_of_guessing`]
+//! runs the real binary and requires it to fail rather than mistake "cannot
+//! see the workspaces" for "there are none".
 //!
 //! # Everything here fails closed
 //!
@@ -51,7 +65,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use wf::launch::{Devlaunch, DEVLAUNCH_FLOOR, UNSAVED_IS_AN_OBJECT};
+use wf::launch::{Agent, Devlaunch, Isolation, DEVLAUNCH_FLOOR, UNSAVED_IS_AN_OBJECT};
 use wf::reap::{parse_workspaces, Unsaved};
 
 /// How `pixi.toml` tells this file what environment it is in.
@@ -66,9 +80,12 @@ const EXPECT: &str = "WF_CONTRACT_EXPECT";
 const VERSION: &str = "WF_CONTRACT_DL";
 const UNSAVED: &str = "WF_CONTRACT_UNSAVED";
 
-/// Which of the three environments this is.
+/// Which of the four environments this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
+    /// No devlaunch at all, and `scripts/without-dl.sh` has taken away any the
+    /// developer had. The environment `wf` has to keep working in.
+    None,
     /// Pinned to exactly [`DEVLAUNCH_FLOOR`].
     Floor,
     /// Whatever `pixi.lock` resolved — no version is written down for it.
@@ -98,6 +115,13 @@ enum Shape {
 #[derive(Debug)]
 struct Contract {
     role: Role,
+    /// `None` for [`Role::None`], which has no `dl` to make claims about.
+    installed: Option<Installed>,
+}
+
+/// What the environment says about the devlaunch it put on PATH.
+#[derive(Debug)]
+struct Installed {
     expect: Expect,
     unsaved: Shape,
     /// The exact version `pixi.toml` pinned. `None` only for [`Role::Latest`],
@@ -115,11 +139,29 @@ impl Contract {
     /// be a number nobody updates when the lock moves.
     fn read() -> Contract {
         let role = match promised(ROLE).as_str() {
+            "none" => Role::None,
             "floor" => Role::Floor,
             "latest" => Role::Latest,
             "stale" => Role::Stale,
             other => panic!("{ROLE} says {other:?}, which is not an environment in pixi.toml"),
         };
+        if role == Role::None {
+            // The absent case is declared by *silence*, and the silence is
+            // checked: an environment that inherited another's activation block
+            // would set these, and every assertion below would then be about a
+            // machine that does not exist.
+            for var in [EXPECT, VERSION, UNSAVED] {
+                assert!(
+                    std::env::var_os(var).is_none(),
+                    "the `none` environment set {var}, but it installs no `dl` \
+                     for that to be true of"
+                );
+            }
+            return Contract {
+                role,
+                installed: None,
+            };
+        }
         let expect = match promised(EXPECT).as_str() {
             "usable" => Expect::Usable,
             "too-old" => Expect::TooOld,
@@ -146,10 +188,24 @@ impl Contract {
         }
         Contract {
             role,
-            expect,
-            unsaved,
-            pinned,
+            installed: Some(Installed {
+                expect,
+                unsaved,
+                pinned,
+            }),
         }
+    }
+
+    /// The installed devlaunch, or `None` in the environment that has none.
+    ///
+    /// Tests that need a `dl` bail on `None`. That is a skip, and skips are
+    /// what this file spent a review round removing — the difference is that
+    /// the value skipped on is a validated enum rather than a string nobody
+    /// checked, `Role::None` is itself asserted (no `dl` is reachable, see
+    /// [`the_environment_without_devlaunch_really_has_none`]), and every test
+    /// below does real work in at least one of the other three.
+    fn installed(&self) -> Option<&Installed> {
+        self.installed.as_ref()
     }
 }
 
@@ -297,7 +353,10 @@ fn the_dl_under_test_is_the_one_the_environment_installed() {
     // would carry on happily against the host's install and report a verdict
     // about a version nobody selected. This is the assertion that makes the
     // pin mean something.
-    let _ = Contract::read();
+    let contract = Contract::read();
+    if contract.installed().is_none() {
+        return;
+    }
     let program = dl();
     let prefix = std::env::var("CONDA_PREFIX")
         .unwrap_or_else(|_| panic!("{}", only_under_pixi("CONDA_PREFIX")));
@@ -316,6 +375,9 @@ fn wf_can_read_the_version_this_dl_prints() {
     // reached by anything but a string written in this repository. A devlaunch
     // that reformatted its version banner would land here and nowhere else.
     let contract = Contract::read();
+    let Some(installed) = contract.installed() else {
+        return;
+    };
     let printed = ask_dl(&["--version"], "version");
     assert_ne!(
         Devlaunch::from_version_output(&printed),
@@ -324,7 +386,7 @@ fn wf_can_read_the_version_this_dl_prints() {
     );
 
     let got = verdict();
-    match contract.expect {
+    match installed.expect {
         Expect::Usable => assert_eq!(
             got,
             Devlaunch::Usable,
@@ -359,7 +421,10 @@ fn the_floor_environment_is_pinned_to_the_floor() {
     // `answers_unsaved` false for a real 0.0.24 and walks `wf reap` straight
     // back into devlaunch#171.
     let contract = Contract::read();
-    let Some(pinned) = contract.pinned else {
+    let Some(installed) = contract.installed() else {
+        return;
+    };
+    let Some(pinned) = installed.pinned.as_deref() else {
         assert_eq!(contract.role, Role::Latest, "only `latest` may omit a pin");
         return;
     };
@@ -391,7 +456,10 @@ fn a_listing_from_a_real_dl_is_one_wf_can_read() {
     // zero without a daemon, and still answers with a JSON array rather than a
     // banner, a wrapper object, or a line of prose. The rows themselves are
     // reached below, from the emitter rather than from an instance.
-    let _ = Contract::read();
+    let contract = Contract::read();
+    if contract.installed().is_none() {
+        return;
+    }
     let body = ask_dl(&["--ls", "--json"], "listing");
     let parsed = parse_workspaces(body.as_bytes())
         .unwrap_or_else(|e| panic!("`wf` could not read this dl's listing ({e:#}): {body:?}"));
@@ -412,7 +480,7 @@ fn every_unsaved_answer_this_dl_can_give_is_one_wf_reads() {
     // failure here rather than a `wf reap` that silently refuses every
     // workspace on every machine.
     let contract = Contract::read();
-    if contract.unsaved != Shape::Object {
+    if contract.installed().map(|i| i.unsaved) != Some(Shape::Object) {
         return;
     }
     let emitted = ask_devlaunch(
@@ -470,6 +538,9 @@ fn what_this_dl_says_about_a_clone_holding_work_is_what_wf_reads() {
     // prefix or the package — a test that passes for reasons unrelated to its
     // subject. The shape is now read off a value the release actually produced.
     let contract = Contract::read();
+    let Some(installed) = contract.installed() else {
+        return;
+    };
     let clone = scratch("dirty-clone");
     let _ = std::fs::remove_dir_all(&clone);
     std::fs::create_dir_all(&clone).expect("a clone directory");
@@ -508,10 +579,10 @@ print(json.dumps({
         other => panic!("devlaunch reported an unknown shape: {other:?}"),
     };
     assert_eq!(
-        shape, contract.unsaved,
+        shape, installed.unsaved,
         "this devlaunch writes `unsaved` as a {shape:?}, but {UNSAVED} in \
          pixi.toml says {:?}. {} is where `wf` believes the object form began.",
-        contract.unsaved, UNSAVED_IS_AN_OBJECT
+        installed.unsaved, UNSAVED_IS_AN_OBJECT
     );
 
     let wire = reported["wire"].to_string();
@@ -555,6 +626,9 @@ fn the_verbs_wf_hands_dl_are_ones_it_still_knows() {
     // of a sentence in a doc comment. (It also caught a first draft of this very
     // test, which demanded `up` of 0.0.23 and was wrong to.)
     let contract = Contract::read();
+    let Some(installed) = contract.installed() else {
+        return;
+    };
     let help = ask_dl(&["--help"], "help");
     let names = |verb: &str| {
         help.split_whitespace()
@@ -565,7 +639,7 @@ fn the_verbs_wf_hands_dl_are_ones_it_still_knows() {
         "`dl --help` no longer names `rm`, which `src/reap.rs` hands it on \
          every release:\n{help}"
     );
-    match contract.expect {
+    match installed.expect {
         Expect::Usable => assert!(
             names("up"),
             "`dl --help` no longer names `up`, which `src/launch.rs` hands it \
@@ -591,7 +665,10 @@ fn whether_wf_trusts_a_missing_unsaved_follows_the_release() {
     // entirely. Nothing but the version can tell them apart, so the two facts
     // are asserted against each other here rather than each against a fixture.
     let contract = Contract::read();
-    let object = contract.unsaved == Shape::Object;
+    let Some(installed) = contract.installed() else {
+        return;
+    };
+    let object = installed.unsaved == Shape::Object;
     assert_eq!(
         verdict().answers_unsaved(),
         object,
@@ -621,5 +698,152 @@ fn git(dir: &Path, args: &[&str]) {
         "git {}: {}",
         args.join(" "),
         String::from_utf8_lossy(&out.stderr).trim()
+    );
+}
+
+#[test]
+fn the_environment_without_devlaunch_really_has_none() {
+    // The premise every assertion in the `none` environment rests on, and the
+    // one that is easiest to lose: `pixi run` prepends its prefix to the
+    // *inherited* PATH, so an environment that installs no devlaunch still sees
+    // the developer's own. `scripts/without-dl.sh` is what takes it away, and
+    // this is where its failure would surface as a failed test rather than as
+    // every check below quietly passing against a `dl` nobody chose.
+    if Contract::read().role != Role::None {
+        return;
+    }
+    let path = std::env::var_os("PATH").expect("a PATH");
+    let found: Vec<PathBuf> = std::env::split_paths(&path)
+        .map(|dir| dir.join("dl"))
+        .filter(|candidate| candidate.is_file())
+        .collect();
+    assert!(
+        found.is_empty(),
+        "the `none` environment still has a `dl` on PATH: {found:?}. Either the \
+         task is not going through scripts/without-dl.sh, or the scrubber has \
+         stopped working."
+    );
+}
+
+#[test]
+fn a_devcontainer_repo_is_isolated_only_when_a_real_dl_can_carry_it() {
+    // The fallback itself, rather than the reading that decides it.
+    //
+    // `Isolation::detect` is the function that answers "does this launch go
+    // into a container or stay on the host", and until now it had only ever
+    // been asked on a machine whose `dl` was a shell script this repo wrote.
+    // This asks it in a checkout that really does carry a
+    // `.devcontainer/devcontainer.json` — this one — against a `dl` that really
+    // is absent, really is 0.0.23, or really is the floor.
+    //
+    // The two `Host` answers are the point. A `dl` that is missing, and a `dl`
+    // that is too old, both have to end in an ordinary host launch: #80's rule
+    // is that a repo may carry a devcontainer for its editor users without that
+    // conscripting `wf` into a container it cannot actually produce.
+    let contract = Contract::read();
+    let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        here.join(".devcontainer/devcontainer.json").is_file(),
+        "this test is only meaningful in a checkout that declares a \
+         devcontainer, and {} no longer does",
+        here.display()
+    );
+    let got = Isolation::detect(here, Agent::Claude);
+    let want = match contract.installed().map(|i| i.expect) {
+        Some(Expect::Usable) => Isolation::Devlaunch,
+        // Absent, or on PATH and below the floor.
+        None | Some(Expect::TooOld) => Isolation::Host,
+    };
+    assert_eq!(
+        got,
+        want,
+        "a devcontainer checkout with {} resolved to {got:?}",
+        match contract.role {
+            Role::None => "no dl at all".to_string(),
+            _ => format!("dl {}", ask_dl(&["--version"], "version").trim()),
+        }
+    );
+}
+
+#[test]
+fn a_launch_that_fell_back_says_why_and_names_the_version() {
+    // The half of a degradation a missing `(devlaunch)` suffix cannot carry.
+    //
+    // A `wf` that silently runs on the host looks exactly like a `wf` that
+    // ignored the devcontainer, and the difference is a fixable install. The
+    // sentence is built from the version `dl` actually printed, so this is
+    // where it is checked against one.
+    let contract = Contract::read();
+    let Some(installed) = contract.installed() else {
+        // Absent is deliberately silent — #80 again: a line on every launch
+        // would be noise about a tool the user never asked for. That arm is
+        // asserted in `src/launch.rs`, where no `dl` is needed to state it.
+        return;
+    };
+    let said = verdict().shortfall();
+    match installed.expect {
+        Expect::Usable => assert_eq!(
+            said, None,
+            "a usable dl has nothing to explain, but the notice would say: {said:?}"
+        ),
+        Expect::TooOld => {
+            let said = said.expect(
+                "a dl below the floor sends the launch to the host, and the \
+                 notice is the only thing that says so",
+            );
+            let printed = ask_dl(&["--version"], "version");
+            let version = printed.split_whitespace().nth(1).unwrap_or_default();
+            assert!(
+                said.contains(version) && said.contains(&DEVLAUNCH_FLOOR.to_string()),
+                "the notice should name both the version found and the floor \
+                 it missed, and says: {said:?}"
+            );
+            assert!(
+                said.contains("ran on the host"),
+                "the notice should say what happened instead: {said:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_reap_with_no_dl_refuses_instead_of_guessing() {
+    // `wf reap` is the one path in this crate that deletes, and it decides what
+    // to delete from what `dl --ls --json` told it. With no `dl` there is no
+    // listing, and the only safe reading of "no listing" is *stop* — an empty
+    // one would mean "no workspaces exist", which is the same bytes and the
+    // opposite fact.
+    //
+    // The real binary, because that is the only way to see the exit status and
+    // the message a user gets; `reap::workspaces` returning an `Err` in-process
+    // says nothing about whether `main` treats it as fatal.
+    if Contract::read().role != Role::None {
+        return;
+    }
+    let home = scratch("reap-home");
+    let out = Command::new(env!("CARGO_BIN_EXE_wf"))
+        .args(["reap", "-y"])
+        .env("HOME", &home)
+        .output()
+        .expect("the wf binary");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "`wf reap -y` with no devlaunch exited {} — a reap that cannot see the \
+         workspaces must fail rather than report success over an empty plan:\n{said}",
+        out.status
+    );
+    assert!(
+        said.contains("devlaunch") && said.contains("PATH"),
+        "the failure should say what is missing and where it was looked for, \
+         and says:\n{said}"
+    );
+    assert!(
+        !said.contains("nothing to reap"),
+        "`wf` reported an empty plan when it simply could not see: {said}"
     );
 }

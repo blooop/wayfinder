@@ -30,7 +30,7 @@
 #
 # | environment | `dl`     | what it is for                                        |
 # |-------------|----------|-------------------------------------------------------|
-# | `default`   | none     | the ordinary suite, with no `dl` anywhere on PATH      |
+# | `default`   | none     | the suite *and* the contract, no `dl` anywhere on PATH |
 # | `floor`     | 0.0.24   | exactly `launch::DEVLAUNCH_FLOOR` — the required one   |
 # | `latest`    | newest   | the release a user gets today                          |
 # | `stale`     | 0.0.23   | below the floor: the degradation, not the happy path   |
@@ -67,6 +67,20 @@ suite = "scripts/without-dl.sh cargo test --locked --lib --bins --examples"
 # `wf` itself, with no devlaunch installed, for driving the degradation by hand:
 # an isolated launch has to fall back to the host and say nothing about it (#80).
 wf = "scripts/without-dl.sh cargo run --locked --bin wf --"
+
+# The environment with no `dl` at all is a role like any other, and its
+# contract run goes through the scrubber — otherwise `pixi run` hands it the
+# developer's own devlaunch and the "absent" case is a fiction. Its own task
+# rather than the shared one below, for exactly that reason.
+[feature.none.tasks]
+contract = "scripts/without-dl.sh cargo test --locked --test live_devlaunch -- --test-threads=1"
+
+[feature.none.activation.env]
+# Only the role. The absent case is declared by the *silence* of the other
+# three, and `Contract::read` asserts that silence — an environment that
+# inherited another's activation block would be making claims about a `dl` it
+# does not have.
+WF_CONTRACT_ROLE = "none"
 
 [feature.contract.tasks]
 # One `--test-threads=1`: the tests here each spawn `dl`, and a real devlaunch
@@ -109,6 +123,7 @@ WF_CONTRACT_EXPECT = "too-old"
 WF_CONTRACT_UNSAVED = "sentence"
 
 [environments]
+default = ["none"]
 floor = ["contract", "floor"]
 latest = ["contract", "latest"]
 stale = ["contract", "stale"]

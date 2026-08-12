@@ -141,11 +141,21 @@ those environments would give the repo two toolchains to keep in step for no
 gain.
 
 ```
-pixi run    suite            # the ordinary suite with no `dl` anywhere on PATH
-pixi run -e floor  contract  # devlaunch pinned to exactly launch::DEVLAUNCH_FLOOR
-pixi run -e latest contract  # whatever pixi.lock resolved
-pixi run -e stale  contract  # 0.0.23 — below the floor, where wf must degrade
+pixi run    suite             # the ordinary suite with no `dl` anywhere on PATH
+pixi run -e default contract  # no devlaunch: the fallbacks
+pixi run -e floor   contract  # devlaunch pinned to exactly launch::DEVLAUNCH_FLOOR
+pixi run -e latest  contract  # whatever pixi.lock resolved
+pixi run -e stale   contract  # 0.0.23 — below the floor, where wf must degrade
 ```
+
+The contract test makes two kinds of claim. Most of it is about what `wf`
+**reads** from a `dl` — the version, the listing, the `unsaved` field. Three
+tests are about what it then **does**, and those are the ones that answer "is
+the fallback real": `Isolation::detect` must return `Host` in a checkout that
+really carries a devcontainer whenever `dl` is absent or below the floor, the
+launch notice must say why, and `wf reap` with no `dl` must fail rather than
+mistake "cannot see the workspaces" for "there are none". All three are checked
+against a real absent-or-old devlaunch rather than a shim.
 
 Three things follow for anyone editing here:
 

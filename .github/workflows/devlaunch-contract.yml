@@ -91,6 +91,12 @@ jobs:
       - name: The suite is hermetic with no dl installed
         run: pixi run suite
 
+      # The fallbacks, which are the half of this a user actually meets: a host
+      # launch instead of an isolated one, and a `wf reap` that refuses rather
+      # than reading "cannot see the workspaces" as "there are none".
+      - name: No devlaunch at all — the fallbacks
+        run: pixi run -e default contract
+
       - name: The floor — devlaunch == launch::DEVLAUNCH_FLOOR
         run: pixi run -e floor contract
 
