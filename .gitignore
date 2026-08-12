@@ -16,3 +16,7 @@
 # a shell that inherits the crate root) still drops one here, and this file was
 # once committed to a public repo that way.
 /pwned
+
+# The pixi environments (`pixi.toml`). Three prefixes with a Python and a
+# devpod in each; `pixi.lock` is what is committed, not what it unpacks to.
+/.pixi/

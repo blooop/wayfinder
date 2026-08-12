@@ -1,0 +1,135 @@
+# Pixi is here for one job: to put a *real* `dl` of a *chosen* version in front
+# of the tests, and to take it away again.
+#
+# `wf` does not build with pixi and this file deliberately does not try to make
+# it. The compiler comes from the same rustup toolchain `cargo` and CI already
+# use; the only thing these environments contribute is which `devlaunch` — if
+# any — is on PATH. Adding `rust` here would give the repo two ways to build
+# itself and two toolchains to keep in step, for no gain: the Rust side of the
+# contract is already covered by `cargo test`, and it is the *other* side that
+# has never been run.
+#
+# ## Why it was needed
+#
+# Every one of `wf`'s four calls into `dl` — `--version`, `--ls --json`,
+# `<id> rm`, `<ws> up` / `<ws> -- <cmd>` — is exercised in this repo against a
+# recording shim (`src/probe.rs`), including in `tests/live_launch_exec.rs`,
+# which shims `dl` on purpose so that a machine with devlaunch installed and a
+# machine without one take the same path. Devlaunch, for its part, has no test
+# that names `wf`. The agreement between the two repositories is therefore two
+# independent transcriptions of the same prose, and it has already been wrong
+# once: `dl <workspace> up` shipped in `wf` 0.14.0 before devlaunch 0.0.24
+# carried it, and neither repository's CI noticed. `unsaved` changing from a
+# string to a one-key object was the same class of event.
+#
+# `tests/live_devlaunch.rs` is what these environments exist to run. It asks the
+# installed devlaunch the questions `wf` asks it, and holds the answers against
+# what `wf` believes.
+#
+# `devpod` arrives with devlaunch rather than being listed here — it is
+# devlaunch's own dependency and pinning it separately would only give the two
+# constraints a chance to disagree. `dl --ls --json` really does run it; the two
+# calls that would build a container run against a recording shim instead, so no
+# daemon is needed and nothing here creates one.
+#
+# ## The environments
+#
+# | environment | `dl`     | what it is for                                        |
+# |-------------|----------|-------------------------------------------------------|
+# | `default`   | none     | the suite *and* the contract, no `dl` anywhere on PATH |
+# | `floor`     | 0.0.24   | exactly `launch::DEVLAUNCH_FLOOR` — the required one   |
+# | `latest`    | newest   | the release a user gets today                          |
+# | `stale`     | 0.0.23   | below the floor: the degradation, not the happy path   |
+#
+# `floor` and `stale` are pinned to an exact version because a constant in
+# `src/launch.rs` names that release and the test asserts the two agree.
+# `latest` is deliberately unpinned in *this* file — `pixi.lock` is what fixes
+# it, so taking a newer devlaunch is a reviewable lockfile change rather than
+# something that happens silently on a Tuesday.
+
+[workspace]
+name = "wayfinder"
+channels = ["https://prefix.dev/blooop", "conda-forge"]
+# Only where devlaunch is published, and only where CI runs. The contract test
+# is not portable in principle, it is unbuilt elsewhere in practice.
+platforms = ["linux-64"]
+
+# No devlaunch, on purpose: the default environment is the "no `dl` installed"
+# case, and the only way to be sure of that is for it to contain nothing that
+# could pull one in. `shellcheck` is here because `scripts/without-dl.sh` is the
+# thing that makes this environment mean anything, and this repo denies warnings
+# in every other language it is written in.
+[dependencies]
+shellcheck = ">=0.10,<0.11"
+
+[tasks]
+lint = "shellcheck --shell=sh --severity=style scripts/without-dl.sh"
+# The ordinary offline suite, run with every directory holding a `dl` stripped
+# out of PATH. Not a contract check — a *hermeticity* check. A test that reaches
+# the ambient `dl` passes on a developer's machine and means nothing, and the
+# only way to see that is to take the `dl` away.
+suite = "scripts/without-dl.sh cargo test --locked --lib --bins --examples"
+
+# `wf` itself, with no devlaunch installed, for driving the degradation by hand:
+# an isolated launch has to fall back to the host and say nothing about it (#80).
+wf = "scripts/without-dl.sh cargo run --locked --bin wf --"
+
+# The environment with no `dl` at all is a role like any other, and its
+# contract run goes through the scrubber — otherwise `pixi run` hands it the
+# developer's own devlaunch and the "absent" case is a fiction. Its own task
+# rather than the shared one below, for exactly that reason.
+[feature.none.tasks]
+contract = "scripts/without-dl.sh cargo test --locked --test live_devlaunch -- --test-threads=1"
+
+[feature.none.activation.env]
+# Only the role. The absent case is declared by the *silence* of the other
+# three, and `Contract::read` asserts that silence — an environment that
+# inherited another's activation block would be making claims about a `dl` it
+# does not have.
+WF_CONTRACT_ROLE = "none"
+
+[feature.contract.tasks]
+# One `--test-threads=1`: the tests here each spawn `dl`, and a real devlaunch
+# start is ~90 ms of Python. Serial keeps the failure output in an order a human
+# can read.
+contract = "cargo test --locked --test live_devlaunch -- --test-threads=1"
+
+[feature.floor.dependencies]
+devlaunch = "==0.0.24"
+[feature.floor.activation.env]
+# `role` decides which assertions apply and carries no facts of its own; the
+# other three are facts about the release, stated here so the test never has to
+# derive one from an environment name. All four are required and all four are
+# checked against a closed set — an unrecognised value is a panic, not a skip.
+WF_CONTRACT_ROLE = "floor"
+# Asserted equal to `launch::DEVLAUNCH_FLOOR`, unconditionally: whichever of the
+# two moves, the other has to move with it.
+WF_CONTRACT_DL = "0.0.24"
+WF_CONTRACT_EXPECT = "usable"
+WF_CONTRACT_UNSAVED = "object"
+
+[feature.latest.dependencies]
+devlaunch = "*"
+[feature.latest.activation.env]
+# No `WF_CONTRACT_DL`, and the test rejects one here: whatever `pixi.lock`
+# resolved is the subject, and a number written beside it is one nobody updates
+# when the lock moves.
+WF_CONTRACT_ROLE = "latest"
+WF_CONTRACT_EXPECT = "usable"
+WF_CONTRACT_UNSAVED = "object"
+
+[feature.stale.dependencies]
+devlaunch = "==0.0.23"
+[feature.stale.activation.env]
+WF_CONTRACT_ROLE = "stale"
+WF_CONTRACT_DL = "0.0.23"
+WF_CONTRACT_EXPECT = "too-old"
+# The release before `unsaved` became an object. `wf` still has to read this
+# one's listings — `reap` reads whatever `dl` is on PATH, floor or no floor.
+WF_CONTRACT_UNSAVED = "sentence"
+
+[environments]
+default = ["none"]
+floor = ["contract", "floor"]
+latest = ["contract", "latest"]
+stale = ["contract", "stale"]

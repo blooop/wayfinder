@@ -125,6 +125,93 @@ changed is what they cover. `tests/skill_docs.rs` is the exception under
 `tests/` — offline shape checks on the skill docs' snippets, so it runs in the
 chain (and in CI) like any unit test.
 
+## The devlaunch contract
+
+`wf` shells out to `dl` four ways — `--version`, `--ls --json`, `<id> rm`, and
+`<ws> up` / `<ws> -- <cmd>` — and every one of them is exercised in `src/` and
+in `tests/live_launch_exec.rs` against a *recording shim*. That is the right
+call for those tests (a machine with devlaunch installed and one without must
+not take different paths through the same test) and it leaves the fixtures
+unchecked against the program they describe. They have been wrong twice.
+
+`pixi.toml` is here for that and nothing else: it installs a chosen `devlaunch`
+and `tests/live_devlaunch.rs` asks it the questions `wf` asks it. **Pixi does
+not build this crate** — the compiler is still rustup's, and adding `rust` to
+those environments would give the repo two toolchains to keep in step for no
+gain.
+
+```
+pixi run    suite             # the ordinary suite with no `dl` anywhere on PATH
+pixi run -e default contract  # no devlaunch: the fallbacks
+pixi run -e floor   contract  # devlaunch pinned to exactly launch::DEVLAUNCH_FLOOR
+pixi run -e latest  contract  # whatever pixi.lock resolved
+pixi run -e stale   contract  # 0.0.23 — below the floor, where wf must degrade
+```
+
+The contract test makes two kinds of claim. Most of it is about what `wf`
+**reads** from a `dl` — the version, the listing, the `unsaved` field. Three
+tests are about what it then **does**, and those are the ones that answer "is
+the fallback real": `Isolation::detect` must return `Host` in a checkout that
+really carries a devcontainer whenever `dl` is absent or below the floor, the
+launch notice must say why, and `wf reap` with no `dl` must fail rather than
+mistake "cannot see the workspaces" for "there are none". All three are checked
+against a real absent-or-old devlaunch rather than a shim.
+
+Three things follow for anyone editing here:
+
+- **Raising `DEVLAUNCH_FLOOR` means editing `pixi.toml` in the same commit.**
+  The `floor` environment pins the exact version that constant names, and
+  `the_floor_environment_is_pinned_to_the_floor` compares them unconditionally —
+  a floor nothing is ever run at is a floor nobody has checked. Note what it
+  deliberately does *not* assert: that `DEVLAUNCH_FLOOR` equals
+  `UNSAVED_IS_AN_OBJECT`. Those are two facts about two different questions and a
+  floor bump has to be able to part them; a draft of this test tied them
+  together, and the only way to satisfy that after a bump would have been to
+  raise `UNSAVED_IS_AN_OBJECT` too, which walks `wf reap` straight back into
+  devlaunch#171.
+- **`pixi run suite` failing is not the contract breaking.** It is a test in
+  `src/` that reached the ambient `dl`, which means it passes on your machine
+  for a reason that has nothing to do with what it claims to check.
+- **All four calls are run, two of them over a shimmed `devpod`.** `--version`
+  and `--ls --json` go straight to the installed `dl`. `dl <id> rm` and
+  `dl <ws> up` would build or destroy a container, so they run against a
+  recording `devpod` on PATH — devlaunch's only devpod spawn is a bare name, so
+  the real `dl` does its real argument parsing and workspace resolution and
+  stops where the daemon would start. The verbs and flags come from
+  `reap::removal_argv`, `launch::prewarm_argv` and `launch::isolated_argv`, so
+  the test sends what the binary sends — with one limit worth knowing: the
+  *workspace argument* is a devpod id, not the `owner/repo@wayfinder/<repo>-<n>`
+  spec a real launch passes, because the spec form makes `dl` clone. A devlaunch
+  change to how that spec is parsed or cloned is therefore not caught here. No
+  daemon is needed and nothing creates a container.
+
+- **Nothing whose output is captured inherits your environment.** The contract
+  test records every argument `dl` hands devpod and prints that recording when
+  an assertion fails, so a credential reaching argv would reach a CI log.
+  `hermetic` is the only function in the file that starts a subprocess; it
+  clears the environment and gives back three variables, one of which is
+  devlaunch's own `DEVLAUNCH_NO_GH_TOKEN`.
+
+  The qualifier is exact and was once missing. Two tests reach a real `dl`
+  *without* going through `hermetic` — `Isolation::detect` and the launch-notice
+  check both spawn `dl --version` from inside `src/launch.rs`, with the whole
+  ambient environment — and they are meant to, because driving the production
+  path is what they are for. `--version` consults no credential, prints none,
+  and nothing captured from it is printed. Anything that *is* captured and
+  printed goes through `hermetic`.
+
+  Three guards keep that true rather than merely written down: one reads a real
+  child's environment and compares it to the whole allowlist, one reads this
+  file's own source and requires the single spawn to sit inside `hermetic`, and
+  one refuses any capture holding a token-shaped string or a `NAME=value` whose
+  name looks like a secret — matched on shape, so a variable neither repo has
+  invented yet is still caught, and reported by name only.
+
+`.github/workflows/devlaunch-contract.yml` runs all four environments on every
+pull request, and once a week re-solves devlaunch first — that scheduled run is
+the only thing that can discover a release published since the lock, and a red
+one means the other repo moved rather than that this one is broken.
+
 ## House style
 
 The code explains *why*, not *what*, and the doc comments carry the design

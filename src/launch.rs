@@ -1119,7 +1119,54 @@ fn has_devcontainer(checkout: &Path) -> bool {
 /// A floor is the honest expression of a subprocess dependency: `wf` cannot
 /// pin `dl`'s version the way a linked crate would (devlaunch#53), so it
 /// checks what it found and degrades when the answer is too old.
-const DEVLAUNCH_FLOOR: DlVersion = DlVersion(0, 0, 24);
+/// Public because it is half of a contract with another repository, and
+/// `tests/live_devlaunch.rs` holds the two halves against each other: the pixi
+/// `floor` environment pins `devlaunch` to exactly this number, and the test
+/// fails if the pin and this constant ever name different releases. A floor
+/// nothing is ever run at is a floor nobody has checked.
+pub const DEVLAUNCH_FLOOR: DlVersion = DlVersion(0, 0, 24);
+
+/// What `wf` execs to carry an agent into a container: `dl <ws> -- <command>`.
+///
+/// The workspace spec is a plain argv entry and needs no quoting; the agent
+/// command after `--` does, because `dl` runs it through a shell, and it is one
+/// entry rather than several because "a shell command" is exactly what `dl`
+/// documents it to be.
+///
+/// Named rather than built inline so `tests/live_devlaunch.rs` can hand *this*
+/// to a real `dl`. An argv a contract test spells out for itself only proves
+/// the test agrees with the test.
+///
+/// The `workspace` that test passes is its own — a devpod id rather than the
+/// `owner/repo@branch` spec every real caller here builds, because the spec
+/// form makes `dl` clone. What comes from here is the shape after it.
+pub fn isolated_argv(workspace: &str, agent: &[String]) -> Vec<String> {
+    vec![
+        DEVLAUNCH.to_string(),
+        workspace.to_string(),
+        "--".to_string(),
+        agent
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" "),
+    ]
+}
+
+/// What [`prewarm`] spawns to build the container ahead of the launch.
+///
+/// `up` is the verb that made [`DEVLAUNCH_FLOOR`] necessary: it arrived in
+/// devlaunch 0.0.24, and a `wf` that sent it to 0.0.23 got
+/// `Unknown command 'up'` from inside a detached process nobody was watching.
+/// Named here for the same reason as [`isolated_argv`], and the contract test
+/// sends it to a real 0.0.23 to watch exactly that happen.
+pub fn prewarm_argv(workspace: &str) -> Vec<String> {
+    vec![
+        DEVLAUNCH.to_string(),
+        workspace.to_string(),
+        "up".to_string(),
+    ]
+}
 
 /// A `dl` version, ordered by the three numbers `dl --version` prints.
 ///
@@ -1127,7 +1174,7 @@ const DEVLAUNCH_FLOOR: DlVersion = DlVersion(0, 0, 24);
 /// exactly the comparison wanted — major, then minor, then patch — and there
 /// is nothing else to say about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct DlVersion(u32, u32, u32);
+pub struct DlVersion(u32, u32, u32);
 
 impl std::fmt::Display for DlVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1176,8 +1223,12 @@ impl DlVersion {
 /// worth explaining to anybody. [`Isolation`] stays two-state about the
 /// *outcome* — what will actually happen — and this is the type that carries
 /// why, so neither has to pretend the other's job is simple.
+///
+/// Public for `tests/live_devlaunch.rs`, which is the only place this
+/// classification is ever applied to a `dl` that actually exists. Every other
+/// test of it — and every shimmed probe — hands it a string this repo wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Devlaunch {
+pub enum Devlaunch {
     /// Not on PATH, or on PATH and not runnable. The ordinary state of a
     /// machine that never installed it, and there is no version to report.
     Absent,
@@ -1195,9 +1246,9 @@ impl Devlaunch {
     /// Read `dl --version`'s answer.
     ///
     /// Split from the probe so the rule is testable without a `dl` on the
-    /// machine running the tests — the same split [`enabled_from`] makes for
+    /// machine running the tests — the same split `enabled_from` below makes for
     /// `WF_PREWARM`.
-    fn from_version_output(stdout: &str) -> Devlaunch {
+    pub fn from_version_output(stdout: &str) -> Devlaunch {
         match DlVersion::parse(stdout) {
             None => Devlaunch::Unreadable,
             Some(found) if found < DEVLAUNCH_FLOOR => Devlaunch::TooOld(found),
@@ -1217,7 +1268,7 @@ impl Devlaunch {
     ///
     /// [`Usable`]: Devlaunch::Usable
     /// [`Absent`]: Devlaunch::Absent
-    fn shortfall(self) -> Option<String> {
+    pub fn shortfall(self) -> Option<String> {
         match self {
             Devlaunch::Absent | Devlaunch::Usable => None,
             Devlaunch::TooOld(found) => Some(format!(
@@ -1244,7 +1295,7 @@ impl Devlaunch {
     /// this binary cannot place reads the old, permissive way. The failure mode
     /// is then "behaves as it did before the floor existed" rather than
     /// "refuses every workspace on a machine `wf` could not probe".
-    fn answers_unsaved(self) -> bool {
+    pub fn answers_unsaved(self) -> bool {
         match self {
             Devlaunch::Usable => true,
             // Too old for the *floor* is not too old for this question: a `dl`
@@ -1297,7 +1348,7 @@ fn devlaunch_on_path() -> Devlaunch {
 /// from whatever `dl` is on PATH rather than only from one a launch would
 /// accept. Collapsing them would make a future floor bump silently restate a
 /// fact about a past release.
-const UNSAVED_IS_AN_OBJECT: DlVersion = DlVersion(0, 0, 24);
+pub const UNSAVED_IS_AN_OBJECT: DlVersion = DlVersion(0, 0, 24);
 
 /// Does the `dl` on this machine say what every clone it made would lose?
 ///
@@ -1617,16 +1668,7 @@ impl Launch {
         let agent = self.agent_argv_inner();
         match self.isolation {
             Isolation::Host => agent,
-            Isolation::Devlaunch => vec![
-                DEVLAUNCH.to_string(),
-                self.workspace(),
-                "--".to_string(),
-                agent
-                    .iter()
-                    .map(|arg| shell_quote(arg))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            ],
+            Isolation::Devlaunch => isolated_argv(&self.workspace(), &agent),
         }
     }
 
@@ -1837,7 +1879,7 @@ pub fn prewarm(checkouts: &[Checkout], staged: &Staged) -> Option<Vec<String>> {
     let isolated = candidate_checkouts(checkouts, &staged.repo)
         .into_iter()
         .any(|c| Isolation::detect(&c.path, Agent::default()) == Isolation::Devlaunch);
-    isolated.then(|| vec![DEVLAUNCH.to_string(), workspace, "up".to_string()])
+    isolated.then(|| prewarm_argv(&workspace))
 }
 
 /// Run `argv` in the background, detached from this process and its terminal.

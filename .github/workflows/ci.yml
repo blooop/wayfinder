@@ -1,10 +1,13 @@
 name: CI
 
-# Formatting, lints, tests and docs — everything that can be judged without
-# building a package. `package.yml` is the other half: it proves the recipe
-# still installs and runs. Kept apart on purpose. A rattler build takes minutes
-# and downloads a toolchain of its own, so folding `cargo fmt` into it would
-# make the cheapest possible failure the slowest one to hear about.
+# Formatting, lints, tests and docs — everything that can be judged with
+# nothing but a compiler and this checkout. Two other workflows cover what
+# cannot: `package.yml` proves the recipe still installs and runs, and
+# `devlaunch-contract.yml` runs `wf` against a real `dl` at three chosen
+# versions. All three are kept apart on purpose, and for one reason — a rattler
+# build and a conda solve each take minutes and download a toolchain of their
+# own, so folding `cargo fmt` into either would make the cheapest possible
+# failure the slowest one to hear about.
 on:
   pull_request:
   push:
@@ -74,10 +77,13 @@ jobs:
         run: cargo clippy --all-targets --all-features --locked
 
       # The unit tests, the ones that need nothing but a compiler. The `live_*`
-      # integration tests under `tests/` — a real `gh`, real network, and
-      # assertions against this project's own tracker as it stands today — are
-      # excluded, because running them here would make CI fail whenever the map
-      # moves on. They are compiled below instead of run.
+      # integration tests under `tests/` are excluded: most of them want a real
+      # `gh`, real network, and assertions against this project's own tracker as
+      # it stands today, so running them here would make CI fail whenever the
+      # map moves on. `live_devlaunch.rs` is excluded for a different reason —
+      # it wants a real `dl` at a chosen version, which is a pixi environment
+      # and therefore `devlaunch-contract.yml`'s job, not this one's. All of
+      # them are compiled below instead of run.
       - name: Unit tests
         run: cargo test --locked --lib --bins --examples
 
