@@ -53,13 +53,6 @@ cast_possible_truncation = "allow"
 cast_possible_wrap = "allow"
 cast_sign_loss = "allow"
 
-# Wants `Duration::from_mins(1)` where a test writes `from_secs(60)`. The
-# timeouts in tests/live_launch_exec.rs are meant to be compared with each other
-# at a glance — `from_secs(60)` beside `from_secs(30)` says more than one of each
-# unit does — and the suggested constructor is newer than the toolchain the
-# recipe asks for anyway.
-duration_suboptimal_units = "allow"
-
 # `dbg!` survives a review far too easily.
 dbg_macro = "warn"
 
