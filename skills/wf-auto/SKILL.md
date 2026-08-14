@@ -114,7 +114,7 @@ Name every ticket this run closed, in full, owner included. The scope is the who
 
 Report what it removed and what it kept, both, in the closing summary. The kept lines are the ones worth reading: a workspace stays when its branch never reached a remote, and that line is the only notice anyone gets that the work exists in one place only. A workspace whose container is still up stays too — including, ordinarily, the one this run is sitting in.
 
-It can also stop having deleted nothing, and say why: a node it read as something other than finished, or a `dl` that will not say what a clone holds. That is a report, not an obstacle — put it in the summary and leave the workspaces where they are. **Never** reach past it: not `-f`, which waives the guard the whole step rests on and is never automatic in any mode, and not an unscoped `wf reap -y`, which is the sweep this deliberately is not.
+It can also stop having deleted nothing, and say why: a node it read as something other than finished — a ticket the tracker still has open is the commonest, and it means this run and the tracker disagree about a node this run vouched for — or a `dl` that will not say what a clone holds. That is a report, not an obstacle — put it in the summary and leave the workspaces where they are. **Never** reach past it: not `-f`, which waives the guard the whole step rests on and is never automatic in any mode, and not an unscoped `wf reap -y`, which is the sweep this deliberately is not.
 
 ## Where it stops
 

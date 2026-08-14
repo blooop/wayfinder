@@ -1130,9 +1130,18 @@ are different, and each of them is what removing the reader costs:
   answer for every clone it made, or one `wf` could not ask, collects nothing
   and says so. That single asymmetry is also the version gate.
 - **A surprise stops the whole step.** A node it reads as anything other than
-  finished — a `warn` row, a ticket state this binary cannot place — and nothing
-  is deleted at all, not even the rows it did understand. It exits non-zero
-  saying which workspace and why, and points at `wf reap`.
+  finished — a ticket the tracker still has open, a `warn` row, a state this
+  binary cannot place — and nothing is deleted at all, not even the rows it did
+  understand. The run's whole authority here is that it drove these nodes to
+  done, so the tracker contradicting it about one of them puts the rest of the
+  same command in doubt. It exits non-zero saying which workspace and why, and
+  points at `wf reap`.
+
+  A workspace *kept* is not a surprise: `dl` saying a clone holds work that
+  exists nowhere else, or devpod saying the container is still up, is the step
+  working. Those rows are printed, the finished workspaces beside them are still
+  collected, and the run ends green — a last push that failed is a thing to
+  report, not a thing to stop for.
 
 There is **no `-f`**, in any spelling: the argv that reaches this command has no
 field a waiver could be set in. `-f` waives the guard the recoverability floor

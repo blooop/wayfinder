@@ -723,7 +723,12 @@ fn cleanup_of(wire: &str) -> Cleanup {
     };
     let known: BTreeMap<Node, NodeFact> = [(node.clone(), NodeFact::Closed)].into_iter().collect();
     let scope: BTreeSet<Node> = [node].into_iter().collect();
-    decide(&workspaces, &plan(&workspaces, &known, false), &scope)
+    decide(
+        &workspaces,
+        &plan(&workspaces, &known, false),
+        &known,
+        &scope,
+    )
 }
 
 /// The ids a cleanup cleared for deletion — and nothing, spelt as nothing,
