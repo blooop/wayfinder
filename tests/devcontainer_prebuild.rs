@@ -299,25 +299,50 @@ fn only_the_publishing_job_can_write_a_package() {
     );
 }
 
-/// Every reference to the devcontainer package anywhere in the workflow, as
-/// `repository:tag` pairs.
-fn published_references(workflow: &str) -> std::collections::BTreeSet<String> {
-    let (repository, _) = PUBLISHED_IMAGE
-        .rsplit_once(':')
-        .expect("the published image names a tag");
+/// Every argument to `docker push` in the workflow, in order. Collected by
+/// what the command *does*, not by what the reference is expected to look
+/// like: a push target renamed to anything at all — another repository,
+/// another registry, a bare local tag — still lands here, where a filter on
+/// the expected name would let it vanish from the comparison entirely.
+fn pushed_references(workflow: &str) -> Vec<String> {
     workflow
         .split_whitespace()
-        .flat_map(|token| token.split(['"', '\'', '=', ',', '(', ')']))
-        .filter(|token| token.starts_with(repository))
-        .map(str::to_string)
+        .collect::<Vec<_>>()
+        .windows(3)
+        .filter(|window| window[0] == "docker" && window[1] == "push")
+        .map(|window| window[2].trim_matches(['"', '\'']).to_string())
         .collect()
+}
+
+/// Every reference to a container image anywhere in the workflow: each
+/// `docker push` argument, each tag handed to `docker build -t`, and any
+/// `ghcr.io/`-prefixed token besides (a login line, a second tag, a stray
+/// env value). Unfiltered on purpose — see `pushed_references`.
+fn published_references(workflow: &str) -> std::collections::BTreeSet<String> {
+    let mut references: std::collections::BTreeSet<String> =
+        pushed_references(workflow).into_iter().collect();
+    let tokens: Vec<&str> = workflow.split_whitespace().collect();
+    for (index, token) in tokens.iter().enumerate() {
+        if index > 0 && (tokens[index - 1] == "-t" || tokens[index - 1] == "--tag") {
+            references.insert(token.trim_matches(['"', '\'']).to_string());
+        }
+        for subtoken in token.split(['"', '\'', '=', ',', '(', ')']) {
+            if subtoken.starts_with("ghcr.io/") {
+                references.insert(subtoken.to_string());
+            }
+        }
+    }
+    references
 }
 
 /// The one contract that spans both files, and the failure it exists to catch:
 /// renaming the registry, the repository or the tag in one place and not the
 /// other. That mistake publishes an image nothing boots and leaves every
 /// workspace pulling a tag nothing publishes — and both halves look correct on
-/// their own.
+/// their own. Both directions are held: the config renamed away from the
+/// workflow, and the workflow's own push renamed (or deleted) away from the
+/// config — the second is what the first review of #152 mutation-checked
+/// straight through a prefix-filtered version of this test.
 #[test]
 fn the_workflow_publishes_exactly_the_reference_the_default_config_boots_from() {
     let workflow = publishing_workflow();
@@ -327,15 +352,18 @@ fn the_workflow_publishes_exactly_the_reference_the_default_config_boots_from() 
         .to_string();
 
     assert_eq!(
+        pushed_references(&workflow),
+        vec![booted.clone()],
+        "naming the reference is not publishing it: the workflow must `docker \
+         push` exactly the reference the default config boots from ({booted}), \
+         exactly once"
+    );
+    assert_eq!(
         published_references(&workflow),
         std::collections::BTreeSet::from([booted.clone()]),
         "the workflow must name exactly the reference the default config boots \
          from ({booted}) and no other — one mutable tag, `latest`, per the \
          decision on #150"
-    );
-    assert!(
-        workflow.contains("packages: write"),
-        "naming the reference is not publishing it"
     );
 }
 
