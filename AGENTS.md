@@ -113,6 +113,7 @@ RUSTFLAGS=-D\ warnings RUSTDOCFLAGS=-D\ warnings sh -c '
   cargo clippy --all-targets --all-features --locked &&
   cargo test --locked --lib --bins --examples &&
   cargo test --locked --test skill_docs &&
+  cargo test --locked --test devcontainer_prebuild &&
   cargo doc --no-deps --all-features --locked'
 ```
 
@@ -121,9 +122,12 @@ fails the build before any of the interesting checks get a chance to run.
 
 The `tests/live_*.rs` files are excluded from that test command on purpose: they
 talk to real GitHub and drive a real pty. Run them by name when the thing you
-changed is what they cover. `tests/skill_docs.rs` is the exception under
-`tests/` — offline shape checks on the skill docs' snippets, so it runs in the
-chain (and in CI) like any unit test.
+changed is what they cover. Two binaries under `tests/` are exceptions and run
+in the chain (and in CI) like any unit test, because both are offline checks on
+files-as-behavior: `tests/skill_docs.rs` (shape checks on the skill docs'
+snippets) and `tests/devcontainer_prebuild.rs` (the contract between the
+devcontainer configs and the workflow that publishes the prebuilt image to
+GHCR — see the comments in `.devcontainer/devcontainer.json`).
 
 ## The devlaunch contract
 

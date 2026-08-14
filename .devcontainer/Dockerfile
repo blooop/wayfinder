@@ -16,9 +16,18 @@
 FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
 
 # Pinned rather than "latest" so an image rebuild is a deliberate version bump
-# and not a silent one. Both are plain static binaries with no build step.
+# and not a silent one. `gh` and `zellij` are plain static binaries with no build
+# step; the agent CLI arrives through its own installer, which turns out to
+# accept a version (`install.sh [stable|latest|VERSION]`) — so it is pinned here
+# too rather than left to drift, which matters more now that this image is
+# published and shared than it did when every workspace built its own.
+#
+# It is a floor and not a ceiling: the agent CLI updates itself in place, so a
+# long-lived container will run something newer than this. What the pin buys is
+# that two workspaces created from the same image *start* from the same version.
 ARG GH_VERSION=2.97.0
 ARG ZELLIJ_VERSION=0.44.3
+ARG CLAUDE_VERSION=2.1.223
 
 # One layer, and the tarballs are deleted in it: an unpacked tarball left behind
 # in an earlier layer stays in the image however thoroughly a later layer removes
@@ -46,9 +55,20 @@ RUN set -eux; \
 # user that will run it. `~/.claude` is a bind mount from the host (see
 # devcontainer.json) and is deliberately *not* what this writes to — the binary
 # lives in the image, the credentials and settings come from the host at runtime.
+#
+# The pin is an argument to a third-party installer, so it is compared, not
+# trusted: `gh` and `zellij` above carry their versions in the download URL and
+# a wrong version cannot resolve, but an installer that silently ignored its
+# argument would leave this pin buying nothing with the build still green. The
+# comparison also backstops the unpiped `curl | bash` — a truncated script that
+# installed something else fails here.
 USER vscode
 RUN set -eux; \
-    curl -fsSL https://claude.ai/install.sh | bash; \
-    /home/vscode/.local/bin/claude --version
+    curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_VERSION"; \
+    installed="$(/home/vscode/.local/bin/claude --version)"; \
+    case "$installed" in \
+      *"$CLAUDE_VERSION"*) ;; \
+      *) echo "pinned CLAUDE_VERSION=$CLAUDE_VERSION but installed: $installed" >&2; exit 1 ;; \
+    esac
 ENV PATH=/home/vscode/.local/bin:$PATH
 USER root

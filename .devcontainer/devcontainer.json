@@ -1,23 +1,33 @@
 {
   "name": "wayfinder",
 
-  // Built from this repo's own Dockerfile rather than a prebuilt image. A cold
-  // `cargo build` here is 9 seconds (see blooop/wayfinder#39), so the thing a
-  // prebuilt image would save is the *image* build, not the crate build —
-  // whether that is worth a registry and a publishing workflow is
-  // blooop/wayfinder#43, still open. Until then, local build.
-  // `context` is this directory, NOT the repo root. The Dockerfile copies nothing
-  // out of the context — it only downloads pinned binaries — so a repo-root
-  // context would buy nothing and costs a great deal: devpod hashes the build
-  // context and gives up past 5000 files, and `target/` alone is far beyond that
-  // ("failed to compute context hash: exceeded limit of 5000 files"). If a future
-  // change needs Cargo.toml/Cargo.lock in the image (e.g. baking compiled deps),
-  // widen this to ".." and add a .dockerignore excluding target/ in the same
-  // commit.
-  "build": {
-    "dockerfile": "Dockerfile",
-    "context": "."
-  },
+  // A prebuilt image, not a build from `Dockerfile` — blooop/wayfinder#43 is
+  // settled and this is its answer (blooop/wayfinder#150). What a prebuild saves
+  // was never the crate build: a cold `cargo build` here is 9 seconds
+  // (blooop/wayfinder#39). It is the *image* build — the pinned `gh`, `zellij`
+  // and agent-CLI downloads in `Dockerfile`, which every branch's first `dl`
+  // paid for again. `devcontainer.yml` publishes this tag on any push to `main`
+  // that touches this directory.
+  //
+  // `image:` rather than the `build:` block plus `cacheFrom`, which is what #43
+  // expected, and the difference is a probed fact rather than a preference:
+  // **devpod does not honor `build.cacheFrom`**. Measured on 2026-08-14 against
+  // devpod v0.26.1 with a marker layer costing a fixed 25 s, pushed to a
+  // registry with inline cache metadata and absent from the builder's local
+  // cache — the layer rebuilt in full, and devpod's own log of the
+  // `docker buildx build` it shells out to carries no cache flag at all. Both
+  // spellings the spec allows (string and array) were ignored. So `cacheFrom`
+  // here would look like a cache and never be one.
+  //
+  // To build from source instead — a `Dockerfile` change, a host whose
+  // architecture the published tag does not cover, or the pull was denied
+  // (GHCR packages are private by default until made public, and the tag does
+  // not exist at all before `devcontainer.yml`'s first run on `main`) — use
+  // the variant beside this file:
+  // `dl blooop/wayfinder@<branch> --devcontainer local`. It carries the
+  // `build:` block, and a test holds the two configs to the same settings so
+  // this one cannot drift away from it.
+  "image": "ghcr.io/blooop/wayfinder-devcontainer:latest",
 
   // Note what is NOT here: `"runArgs": ["--network=host"]`. python_template sets
   // it, and copying it would defeat one of the three reasons this container

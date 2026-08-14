@@ -1,0 +1,59 @@
+{
+  "name": "wayfinder (local build)",
+
+  // The build-from-source variant, selected by name:
+  //
+  //     dl blooop/wayfinder@<branch> --devcontainer local
+  //
+  // Reach for it when the published image is not what you want to run: you are
+  // changing `Dockerfile` itself and want the change before it is merged and
+  // published, or you are on an architecture the published tag does not carry.
+  // Everything else should use the default config beside this one, which pulls
+  // the prebuilt image instead (blooop/wayfinder#150).
+  //
+  // A separate file rather than `cacheFrom` on the default, because devpod does
+  // not honor `build.cacheFrom` — probed, not assumed; the default config's
+  // header records the measurement.
+  //
+  // Paths are relative to *this* file, so both point one level up: one
+  // `Dockerfile`, shared with the image the workflow publishes, so a local build
+  // and a published image can never be built from different instructions. Why
+  // the context is the parent and not the repo root is not stylistic — devpod
+  // hashes the build context and gives up past 5000 files, which `target/` alone
+  // exceeds. If a future change needs Cargo.toml/Cargo.lock in the image (e.g.
+  // baking compiled deps), widen it and add a .dockerignore excluding `target/`
+  // in the same commit.
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": ".."
+  },
+
+  // Everything below is deliberately identical to the default config, and a test
+  // holds it that way (tests/devcontainer_prebuild.rs): these two files may
+  // differ in *how the image is obtained* and in nothing else, because a variant
+  // that quietly stopped mounting the agent's credentials would be a confusing
+  // way to find out. The reasoning for each setting lives in the default config
+  // and is not duplicated here — read it there.
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
+  },
+
+  "mounts": [
+    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind"
+  ],
+
+  "initializeCommand": "mkdir -p \"$HOME/.claude\"",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "mhutchie.git-graph",
+        "anthropic.claude-code"
+      ]
+    }
+  },
+
+  "remoteUser": "vscode"
+}

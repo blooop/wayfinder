@@ -847,6 +847,15 @@ keeping an editor from opening over the terminal. `wf` builds no flags, reads no
 `devcontainer.json` and writes none: **the repo's own config is the entire
 opt-in**, and there is nothing to configure on the `wf` side.
 
+This repo's own devcontainer is that opt-in put to work, and it boots from a
+**prebuilt image** rather than building: the default config names
+`ghcr.io/blooop/wayfinder-devcontainer:latest`, published by
+`.github/workflows/devcontainer.yml` on any push to `main` that touches
+`.devcontainer/`. If the pull is denied — GHCR packages are private by default
+until made public, and the tag does not exist before that workflow's first run
+on `main` — build from source instead with
+`dl blooop/wayfinder@<branch> --devcontainer local`.
+
 Each launched node gets a **workspace of its own**:
 `owner/repo@wayfinder/<repo>-<n>`, where `n` is the ticket's number (the map's,
 for a whole-map session). `dl` creates that branch off the default branch if it
