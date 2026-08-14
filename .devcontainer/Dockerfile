@@ -55,9 +55,20 @@ RUN set -eux; \
 # user that will run it. `~/.claude` is a bind mount from the host (see
 # devcontainer.json) and is deliberately *not* what this writes to — the binary
 # lives in the image, the credentials and settings come from the host at runtime.
+#
+# The pin is an argument to a third-party installer, so it is compared, not
+# trusted: `gh` and `zellij` above carry their versions in the download URL and
+# a wrong version cannot resolve, but an installer that silently ignored its
+# argument would leave this pin buying nothing with the build still green. The
+# comparison also backstops the unpiped `curl | bash` — a truncated script that
+# installed something else fails here.
 USER vscode
 RUN set -eux; \
     curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_VERSION"; \
-    /home/vscode/.local/bin/claude --version
+    installed="$(/home/vscode/.local/bin/claude --version)"; \
+    case "$installed" in \
+      *"$CLAUDE_VERSION"*) ;; \
+      *) echo "pinned CLAUDE_VERSION=$CLAUDE_VERSION but installed: $installed" >&2; exit 1 ;; \
+    esac
 ENV PATH=/home/vscode/.local/bin:$PATH
 USER root
