@@ -16,9 +16,18 @@
 FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
 
 # Pinned rather than "latest" so an image rebuild is a deliberate version bump
-# and not a silent one. Both are plain static binaries with no build step.
+# and not a silent one. `gh` and `zellij` are plain static binaries with no build
+# step; the agent CLI arrives through its own installer, which turns out to
+# accept a version (`install.sh [stable|latest|VERSION]`) — so it is pinned here
+# too rather than left to drift, which matters more now that this image is
+# published and shared than it did when every workspace built its own.
+#
+# It is a floor and not a ceiling: the agent CLI updates itself in place, so a
+# long-lived container will run something newer than this. What the pin buys is
+# that two workspaces created from the same image *start* from the same version.
 ARG GH_VERSION=2.97.0
 ARG ZELLIJ_VERSION=0.44.3
+ARG CLAUDE_VERSION=2.1.223
 
 # One layer, and the tarballs are deleted in it: an unpacked tarball left behind
 # in an earlier layer stays in the image however thoroughly a later layer removes
@@ -48,7 +57,7 @@ RUN set -eux; \
 # lives in the image, the credentials and settings come from the host at runtime.
 USER vscode
 RUN set -eux; \
-    curl -fsSL https://claude.ai/install.sh | bash; \
+    curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_VERSION"; \
     /home/vscode/.local/bin/claude --version
 ENV PATH=/home/vscode/.local/bin:$PATH
 USER root
