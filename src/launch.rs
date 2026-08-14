@@ -3999,27 +3999,31 @@ mod tests {
             std::process::id(),
             NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&scratch).expect("a scratch directory for the shell");
-        let script = format!(
-            "set -- {}\nfor arg; do printf '%s\\0' \"$arg\"; done",
-            argv[3]
-        );
+        recovered_in(&scratch, &argv[3])
+    }
+
+    /// The recovery itself, in a scratch directory named by the caller —
+    /// created here, and removed here on **every** exit, the refusal panic
+    /// included: a long-lived host must not accumulate `wf-seam-*` litter
+    /// because one command was refused (#133).
+    fn recovered_in(scratch: &Path, command: &str) -> Vec<String> {
+        std::fs::create_dir_all(scratch).expect("a scratch directory for the shell");
+        let script = format!("set -- {command}\nfor arg; do printf '%s\\0' \"$arg\"; done");
         let out = Command::new("sh")
             .arg("-c")
             .arg(&script)
-            .current_dir(&scratch)
+            .current_dir(scratch)
             .output()
             .expect("a POSIX shell");
-        assert!(
-            out.status.success(),
-            "the container's shell refused the command {:?}",
-            argv[3]
-        );
-        let spilled: Vec<_> = std::fs::read_dir(&scratch)
+        let spilled: Vec<_> = std::fs::read_dir(scratch)
             .expect("the scratch directory outlives the shell")
             .map(|entry| entry.expect("a readable entry").file_name())
             .collect();
-        std::fs::remove_dir_all(&scratch).expect("the scratch directory is ours to remove");
+        std::fs::remove_dir_all(scratch).expect("the scratch directory is ours to remove");
+        assert!(
+            out.status.success(),
+            "the container's shell refused the command {command:?}"
+        );
         assert!(
             spilled.is_empty(),
             "the shell executed something the quoting should have made inert, \
@@ -4033,6 +4037,21 @@ mod tests {
             "every argument is NUL-terminated"
         );
         words
+    }
+
+    #[test]
+    fn a_refused_command_leaves_no_scratch_behind() {
+        // The normal path already asserts its scratch is empty and removes
+        // it; this is the other path. A refused command panics — that is the
+        // canary doing its job — but the panic must not be the reason a
+        // long-lived host collects `wf-seam-*` directories in $TMPDIR.
+        let scratch = std::env::temp_dir().join(format!("wf-seam-{}-refused", std::process::id()));
+        let refused = std::panic::catch_unwind(|| recovered_in(&scratch, "'unterminated"));
+        assert!(refused.is_err(), "an unterminated quote is refused by sh");
+        assert!(
+            !scratch.exists(),
+            "the refusal path must clean its scratch too: {scratch:?}"
+        );
     }
 
     #[test]
