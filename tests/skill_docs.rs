@@ -86,6 +86,144 @@ fn frontier_mirrors_the_binary_map_query() {
     );
 }
 
+/// The manager protocol doc — the handoff contract #126 decided lives here.
+fn lifecycle_doc() -> String {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/skills/wf/LIFECYCLE.md"
+    ))
+    .expect("the lifecycle doc ships in this repo")
+}
+
+/// The fenced handoff list in the lifecycle doc's step 1 — the exact list of
+/// what a manager hands a stage subagent, one entry per line, extraction seam
+/// shared with `frontier_snippet()`.
+fn handoff_snippet() -> String {
+    lifecycle_doc()
+        .split("```handoff")
+        .nth(1)
+        .expect("the lifecycle doc's handoff list is a fenced, extractable block")
+        .split("```")
+        .next()
+        .expect("split always yields a first piece")
+        .to_string()
+}
+
+/// Every field name a serialized block contains, at any depth — including the
+/// tag keys the enums write (`ticket`, `open`). Same walk as the launch
+/// module's own `keys_of`; duplicated here because that one is a private test
+/// helper.
+fn keys_of(value: &Value) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    let mut stack = vec![value];
+    while let Some(node) = stack.pop() {
+        match node {
+            Value::Object(fields) => {
+                for (key, child) in fields {
+                    keys.insert(key.clone());
+                    stack.push(child);
+                }
+            }
+            Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    keys
+}
+
+/// Everything the manager hands a stage subagent is something a launch's
+/// `ctx:` block already carries — pointers, never readings (#126, #134).
+///
+/// Every identifier in the doc's fenced handoff list must be a field name of a
+/// block a **real launch** writes, so the list cannot quietly grow a `ticket_body`
+/// entry: documented ⊆ serialized. The two entries with no ctx counterpart —
+/// the stage `skill` and the human's `steer` line — are named here explicitly,
+/// never waved through, and must themselves appear in the list (they are the
+/// whole of what a manager adds beyond the block).
+#[test]
+fn the_manager_hands_only_what_ctx_carries() {
+    let (ticket, map) = documented_example_node();
+    let block = launched_block(&ticket, &map, Stage::InReview);
+    let serialized = keys_of(
+        &serde_json::from_str(&block)
+            .unwrap_or_else(|e| panic!("the block is JSON: {block} ({e})")),
+    );
+    let beyond_ctx = ["skill", "steer"];
+    let entries: Vec<String> = handoff_snippet()
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "the handoff list names what a stage subagent is handed"
+    );
+    for entry in &entries {
+        assert!(
+            serialized.contains(entry) || beyond_ctx.contains(&entry.as_str()),
+            "`{entry}` is in the documented handoff but no launch serializes it, \
+             and it is not one of the two named non-ctx entries {beyond_ctx:?} — \
+             the manager hands pointers, never readings"
+        );
+    }
+    for named in beyond_ctx {
+        assert!(
+            entries.iter().any(|e| e == named),
+            "`{named}` is handed beyond the ctx block and the list must own \
+             that explicitly"
+        );
+    }
+}
+
+/// The ticket body, its trail, and the map's Decisions-so-far are live reads
+/// the stage subagent makes itself — and the manager *names* those reads
+/// rather than making them, as copy-pasteable commands pinned to the explicit
+/// `$REPO` like every snippet in the bundle (modeled on
+/// `frontier_mirrors_the_binary_map_query`).
+///
+/// The `--comments` flag on the ticket read is behavioral, not cosmetic: a
+/// body-only read drops the trail, and trails carry spec amendments written
+/// after the manager last read the ticket (#129's amendment to a recorded
+/// resolution lived in a breadcrumb).
+#[test]
+fn the_manager_names_the_reads_it_does_not_make() {
+    let doc = lifecycle_doc();
+    let ticket_read = r#"gh issue view <n> --repo "$REPO" --comments"#;
+    let map_read = r#"gh issue view <map> --repo "$REPO""#;
+    assert!(
+        doc.contains(ticket_read),
+        "the lifecycle doc must name the ticket read verbatim, body and whole \
+         trail in one call: {ticket_read}"
+    );
+    assert!(
+        doc.contains(map_read),
+        "the lifecycle doc must name the map read verbatim: {map_read}"
+    );
+}
+
+/// The review stage gets the PR pointer and nothing about the PR — no diff
+/// summary, no gate result, no earlier axis report; anything already asserted
+/// on the PR is a lead to reproduce, never a finding to carry (#126).
+///
+/// **This is the weak seam, and deliberately named no stronger than it is:**
+/// a phrase check detects doc drift and nothing else. A substring assertion
+/// can be satisfied by a sentence that says the opposite (#131's review
+/// proved exactly that), and no test in this repo can assert that a manager
+/// *obeyed* the sentence — obedience stays unverified, checked only by a
+/// human watching a stage subagent's opening tracker calls.
+#[test]
+fn the_review_stage_is_handed_no_account_of_the_pr() {
+    let doc = lifecycle_doc();
+    for phrase in [
+        "the PR pointer and nothing about the PR",
+        "lead to reproduce, never a finding to carry",
+    ] {
+        assert!(
+            doc.contains(phrase),
+            "the review-stage paragraph must say {phrase:?}"
+        );
+    }
+}
+
 /// One skill doc's whole text.
 fn skill_doc(name: &str) -> String {
     let path = format!("{}/skills/{name}/SKILL.md", env!("CARGO_MANIFEST_DIR"));
