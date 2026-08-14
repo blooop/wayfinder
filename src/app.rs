@@ -1599,6 +1599,37 @@ mod tests {
     }
 
     #[test]
+    fn a_key_over_an_empty_list_is_not_a_selection() {
+        // The sift has emptied the screen, so `↓` has nothing to land on. If
+        // that keypress were written down as a choice, the rows arriving next
+        // would find the cursor pinned to position 0 — the map header a sifted
+        // screen leads with — and `enter` there would stage the whole map
+        // rather than the row the query was typed for.
+        let mut app = fixture_app();
+        type_str(&mut app, "zzz");
+        assert!(app.stops().is_empty(), "the query should match nothing");
+
+        app.handle_key(key(KeyCode::Down));
+
+        let mut fresher = app.clusters.clone();
+        fresher.insert(
+            MapId::new(PROJECT, 99),
+            Map {
+                title: "Map: late arrival".to_string(),
+                last_activity: None,
+                tickets: vec![ticket(PROJECT, 200, "zzz sleeper", true, false, vec![])],
+            },
+        );
+        app.replace_clusters(fresher);
+
+        assert_eq!(
+            app.cursor_ticket().map(|t| t.number),
+            Some(200),
+            "nothing was chosen over the empty list, so the cursor means the top row"
+        );
+    }
+
+    #[test]
     fn typing_filters_and_cursor_lands_on_first_visible_row() {
         let mut app = fixture_app();
         app.handle_key(key(KeyCode::Down)); // move off row 0 first
