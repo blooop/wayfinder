@@ -101,7 +101,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use wf::app::{App, Outcome};
-use wf::launch::{Agent, Launch};
+use wf::launch::{Agent, Handoff, Launch};
 use wf::model::{Map, MapId};
 use wf::projects::{self, ProjectsCache};
 use wf::refresh::{LoadEvent, Loaders, MapFetch, Startup, Survey};
@@ -165,8 +165,9 @@ impl Keys for Typed {
 enum Ending {
     /// The user quit.
     Quit,
-    /// A ticket was picked. `wf`'s last act is to become its agent.
-    Handover(Box<Launch>),
+    /// A ticket was picked. `wf`'s last act is to become its agent, carrying
+    /// the stamps of what `wf` itself did on the way here (#160).
+    Handover(Box<Launch>, Handoff),
 }
 
 /// Everything the screen is drawn from, and the arrivals that change it.
@@ -393,9 +394,19 @@ async fn run<B: Backend, K: Keys>(
             // outlives the `exec` otherwise, and the agent inherits it
             // as a zombie holding the terminal it just took over.
             Outcome::Launch(launch) => {
+                // **The keystroke is stamped here, first, before anything is
+                // waited on** (#160). This is the instant a human's part in
+                // the launch ends: `handle_key` has just turned a keypress
+                // into a launch, and everything from this line to the agent's
+                // first frame is machine time — the shutdowns below, the cache
+                // write, the exec, and `dl`'s own start. Taking it any later
+                // would quietly drop `wf`'s own hand-over cost out of the one
+                // measurement that spans the exec; taking it any earlier would
+                // fold in the human, who was still choosing a mode.
+                let handoff = Handoff::now(picker.app.prewarm_fired(&launch));
                 picker.loaders.shutdown().await;
                 stop_background(discovery, survey).await;
-                return Ok(Ending::Handover(launch));
+                return Ok(Ending::Handover(launch, handoff));
             }
             Outcome::Continue => {}
         }
@@ -501,7 +512,7 @@ pub async fn run_picker() -> Result<()> {
     ratatui::restore();
     match ending? {
         Ending::Quit => Ok(()),
-        Ending::Handover(launch) => {
+        Ending::Handover(launch, handoff) => {
             // The launch is a use of this project, and the last chance to say
             // so: after the exec there is no `wf` left to write anything. This
             // is what keeps the project list ordered for someone who reaches
@@ -548,7 +559,7 @@ pub async fn run_picker() -> Result<()> {
             // ahead by even one release.
             refresh_skills(launch.agent());
             // Only ever returns an error: on success this process *is* the agent.
-            Err(launch.exec())
+            Err(launch.exec(&handoff))
         }
     }
 }
@@ -801,7 +812,7 @@ mod tests {
         }
         let (checkout, ending) = drive_a_launch_from_a_devcontainer_checkout();
         match ending {
-            Ending::Handover(launch) => {
+            Ending::Handover(launch, handoff) => {
                 assert_eq!(
                     launch.cwd(),
                     checkout,
@@ -812,6 +823,28 @@ mod tests {
                     wf::launch::Isolation::Devlaunch,
                     "a devcontainer and a `dl` above the floor is an isolated launch"
                 );
+                // And it carries the keystroke it came from (#160). Taken from
+                // the run rather than from a fixture: the claim is that the
+                // loop stamps the launch arm at all, which is a fact about
+                // this assembly and about no value a test could hand it.
+                let [(_, t0), (_, prewarm_fired)] = launch.stamps(&handoff);
+                let stamped: f64 = t0
+                    .expect("a handover to `dl` stamps its keystroke")
+                    .parse()
+                    .expect("the stamp is epoch seconds");
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .expect("this machine's clock is past 1970")
+                    .as_secs_f64();
+                assert!(
+                    (0.0..60.0).contains(&(now - stamped)),
+                    "the stamp is this keystroke's instant, not some other run's: \
+                     {stamped} against {now}"
+                );
+                // Nothing was warmed — the prewarm is opt-in and this run did
+                // not ask — so the second variable says nothing rather than
+                // saying zero.
+                assert_eq!(prewarm_fired, None);
                 // The enum and not also the argv. An earlier draft asserted
                 // `agent_argv()[0] == "dl"` beside this, on the theory that a
                 // decision and what reaches `execvp` are different things —
@@ -844,11 +877,23 @@ mod tests {
         }
         let (_, ending) = drive_a_launch_from_a_devcontainer_checkout();
         match ending {
-            Ending::Handover(launch) => {
+            Ending::Handover(launch, handoff) => {
                 assert_eq!(
                     launch.isolation(),
                     wf::launch::Isolation::Host,
                     "a `dl` below the floor is a `dl` `wf` will not launch into"
+                );
+                // And the seam is empty with it (#160): the stamps are for the
+                // `dl` this launch is no longer going to become, and one left
+                // in the agent's environment would be read by whatever `dl`
+                // that session ran next.
+                assert!(
+                    launch
+                        .stamps(&handoff)
+                        .iter()
+                        .all(|(_, stamp)| stamp.is_none()),
+                    "a host launch hands the seam nothing: {:?}",
+                    launch.stamps(&handoff)
                 );
             }
             Ending::Quit => {

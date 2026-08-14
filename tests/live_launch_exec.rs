@@ -8,7 +8,7 @@
 //! actually be wrong is what happens between the keypress and the agent's first
 //! frame, and that only happens once, in `main`.
 //!
-//! It pins down six claims, in the order they can fail:
+//! It pins down seven claims, in the order they can fail:
 //!
 //! 0. **The container carries the agent, in a workspace of the ticket's
 //!    own.** This repo has a `.devcontainer/devcontainer.json`, so its
@@ -51,6 +51,12 @@
 //!    `enter enter` returns to that conversation instead of starting another.
 //!    This is the one seam no unit test can reach: `resume_launch` is checked
 //!    exhaustively in the library, but only against a record a test handed it.
+//! 6. **The launch tells `dl` what `wf` did on the way to it** (#160): the
+//!    keystroke that resolved to this exec, and the prewarm this run fired for
+//!    the node, both as environment stamps on the `dl` invocation — and on
+//!    nothing else `wf` ran. The environment is the one thing an argv
+//!    assertion cannot see, and the exec is where it is written, so this is the
+//!    only place the seam is observable end to end.
 //!
 //! Needs network, an authenticated `gh`, and a `blooop/wayfinder` checkout with
 //! at least one ticket on its map — i.e. this repo.
@@ -87,6 +93,17 @@ const INVOCATION: &str = "--- shim invocation ---";
 
 /// What the `dl` shim answers `--version` with. See `write_shims`.
 const DL_SHIM_VERSION: &str = "9999.0.0";
+
+/// A seam stamp from **somebody else's launch**, exported into `wf`'s own
+/// environment before it starts (#160).
+///
+/// This is not a hypothetical: `dl` sets these for the session it launches, so
+/// an agent that runs `wf` inside its own workspace runs it with both already
+/// set. Every `dl` child `wf` starts inherits that environment, so the claim
+/// "only a launch is stamped" is a claim about a *dirty* environment or it is
+/// only a claim about the test rig. The instant is a real one from long before
+/// any run of this test, so a leak reads as a handoff that began last year.
+const INHERITED_STAMP: &str = "1755194037.000000000";
 
 /// A scratch tree of this test's own: `claude` and `dl` shims on PATH and a
 /// cache directory, so neither the user's PATH nor their real projects cache is
@@ -159,10 +176,17 @@ impl Scratch {
         // an intermittent red pointing at `wf` having lost the launch. A
         // single small `O_APPEND` write is atomic; six are not. src/probe.rs
         // reached the same conclusion for the same reason.
+        //
+        // The two seam stamps are recorded beside the argv because the
+        // environment is where they travel (#160) — a launch that set them on
+        // the wrong child, or left an inherited one on a probe, is invisible in
+        // an argv. Always written, empty when unset, so "the variable is not
+        // here" is a value this file can read rather than a missing line.
         let record = |report: &Path| {
             format!(
                 "line=$({{ echo \"{INVOCATION}\"; echo \"pid=$$\"; echo \"cwd=$PWD\"; \
-                 echo \"argv=$*\"; stty -a; }} 2>&1)\n\
+                 echo \"argv=$*\"; echo \"handoff=$DEVLAUNCH_HANDOFF_T0\"; \
+                 echo \"prewarm=$DEVLAUNCH_PREWARM_FIRED_AT\"; stty -a; }} 2>&1)\n\
                  printf '%s\\n' \"$line\" >> {}\n",
                 report.display()
             )
@@ -292,6 +316,32 @@ fn dl_launch(report: &str) -> &str {
         launches.len()
     );
     launches[0]
+}
+
+/// Every invocation that is *not* a handover — the `--version` probe and the
+/// prewarm's `dl <ws> up`. Neither is a launch, so neither may carry a stamp
+/// (#160): a `wf` that stamped its probes would have `dl` reporting a hand-over
+/// for a question `wf` asked itself.
+fn dl_asides(report: &str) -> Vec<&str> {
+    invocations(report)
+        .into_iter()
+        .filter(|record| !field(record, "argv=").contains(" -- "))
+        .collect()
+}
+
+/// This machine's clock as the seam spells it, for comparing against a stamp.
+fn epoch_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .expect("this machine's clock is past 1970")
+        .as_secs_f64()
+}
+
+/// One stamp out of a record, as the number it claims to be.
+fn stamp(record: &str, key: &str) -> f64 {
+    let raw = field(record, key);
+    raw.parse()
+        .unwrap_or_else(|e| panic!("{key} carries Unix epoch seconds, got {raw:?} ({e})\n{record}"))
 }
 
 /// The workspace spec `dl` was pointed at — everything before the first space
@@ -490,6 +540,13 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
         std::env::var("PATH").unwrap_or_default()
     );
 
+    // Claim 6's floor: every stamp this run reads has to be an instant inside
+    // it, and this is where it starts.
+    let started = epoch_now();
+    // Read off the binary rather than spelled again, so a renamed variable
+    // cannot leave this test polluting the environment with a name nothing
+    // reads — which would pass while proving nothing.
+    let [t0_var, prewarm_var] = wf::launch::Handoff::variables();
     let mut child = unsafe {
         Command::new(env!("CARGO_BIN_EXE_wf"))
             .current_dir(repo)
@@ -498,6 +555,17 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
             // registers a checkout and writes a map seed.
             .env("XDG_CACHE_HOME", scratch.cache())
             .env("CLAUDE_CONFIG_DIR", scratch.claude())
+            // Opt into the prewarm, so claim 6's *second* stamp has something
+            // to describe: the first enter fires `dl <ws> up` at the shim, and
+            // the launch that follows is the only thing that can tell `dl`
+            // when that happened. No container is built — the `up` reaches the
+            // same recording shim as everything else here.
+            .env("WF_PREWARM", "1")
+            // Start `wf` inside a launch that is not this one — see
+            // `INHERITED_STAMP`. Every `dl` this run starts that is not the
+            // exec has to clear these rather than pass them on.
+            .env(t0_var, INHERITED_STAMP)
+            .env(prewarm_var, INHERITED_STAMP)
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave.try_clone().expect("dup slave")))
             .stdout(Stdio::from(slave.try_clone().expect("dup slave")))
@@ -787,6 +855,54 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
         std::fs::read_to_string(repo.join("skills/wf-tdd/SKILL.md")).ok(),
         "the launch must refresh the prompt it is about to exec"
     );
+
+    // Claim 6: the launch told `dl` when the keystroke that resolved to it
+    // landed, and when this node's prewarm went out (#160). Read off the
+    // *environment* the shim was handed, which is the only place this can be
+    // observed at all: the stamps are not in the argv, and the exec is where
+    // they are applied.
+    let launch = dl_launch(&dl_report);
+    let t0 = stamp(launch, "handoff=");
+    let fired = stamp(launch, "prewarm=");
+    let now = epoch_now();
+    assert!(
+        (started..=now).contains(&t0),
+        "the keystroke stamp must be an instant inside this run: \
+         {t0} against {started}..={now}"
+    );
+    // The prewarm went out at the *first* enter and the keystroke stamp is the
+    // second, so this ordering is the two halves of the two-step launch,
+    // observed from the far side of the exec. It is also what makes the pair
+    // worth sending: `dl` subtracts them to see how much head start it had.
+    assert!(
+        (started..=t0).contains(&fired),
+        "the prewarm fired before the keystroke that resolved to the launch: \
+         {fired} against {started}..={t0}"
+    );
+    // And nothing that is not a launch carries either stamp. `wf` asks `dl` its
+    // version and fires the prewarm's `dl <ws> up` from the same process with
+    // the same environment; a stamp on those would have `dl` report a hand-over
+    // for a question `wf` asked itself, or for the warm-up the stamp is *about*.
+    //
+    // This `wf` was started with both stamps already set (`INHERITED_STAMP`),
+    // which is what makes the assertion a claim about `wf` rather than about
+    // the test rig: inheriting is the default, so a `wf` that merely declines
+    // to *set* a stamp on its asides passes this only in a clean environment,
+    // and an agent's shell inside a workspace is not one. Empty here means
+    // every such child was scrubbed on the way out.
+    let asides = dl_asides(&dl_report);
+    assert!(
+        asides.len() >= 2,
+        "this run probes `dl --version` and fires a prewarm, so there are \
+         asides to check\n{dl_report}"
+    );
+    for aside in asides {
+        assert_eq!(
+            (field(aside, "handoff="), field(aside, "prewarm=")),
+            ("", ""),
+            "only a launch is stamped, and this is not one:\n{aside}"
+        );
+    }
 }
 
 /// Spawn `wf` under a fresh pty in `scratch`, returning the child, a handle to

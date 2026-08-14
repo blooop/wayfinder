@@ -36,6 +36,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -1350,7 +1351,7 @@ fn devlaunch_on_path() -> Devlaunch {
         let Ok(program) = resolve_on_path(DEVLAUNCH) else {
             return Devlaunch::Absent;
         };
-        match Command::new(program).arg("--version").output() {
+        match unstamped(program).arg("--version").output() {
             Ok(answer) => Devlaunch::from_version_output(&String::from_utf8_lossy(&answer.stdout)),
             // On PATH but it would not run — a file that is not executable, or
             // not a program. There is no version to report, so this is the same
@@ -1400,6 +1401,104 @@ pub(crate) fn devlaunch_answers_unsaved() -> bool {
 /// ones that "need" it keeps this total — there is no predicate to get wrong.
 fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+/// The instant the keystroke that resolved to an exec landed, and the instant
+/// `wf` fired a prewarm for that node, if it fired one (#160).
+///
+/// Two stamps of things **`wf` itself did**, and nothing else. Neither is a
+/// claim about how the launch went: whether the prewarm was still running, was
+/// already finished, or saved this launch nothing at all is visible only to the
+/// process that then had to run the launch, and `dl` decides it from the arm it
+/// takes. A `wf` that reported a "prewarm hit" would be reporting on a
+/// container it fired and forgot and never saw again.
+///
+/// They travel in the **environment of the exec'd process**, not in the `ctx:`
+/// block: `ctx:` is addressed to the agent, and these are addressed to the
+/// timing reader inside `dl`, which reads them at the top of its own `main`.
+/// The variable names and the spelling of the values are `dl`'s to mint
+/// (blooop/devlaunch#194); `wf` is the writer, and a writer that invented its
+/// own names would be handing the reader nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Handoff {
+    /// The last keystroke before the exec — the one whose meaning was "run it",
+    /// after which nothing waits on a human. `dl` reports the gap from here to
+    /// its own start as the one stage that measures the exec itself.
+    t0: SystemTime,
+    /// When staging fired `dl <workspace> up` for the node being launched, if
+    /// staging fired one. Absent is the ordinary case and says exactly that:
+    /// nothing was warmed, so there is nothing for `dl` to weigh its launch
+    /// against.
+    prewarm_fired: Option<SystemTime>,
+}
+
+impl Handoff {
+    /// Stamp the keystroke that has just resolved to an exec.
+    ///
+    /// The only public constructor, so a handoff always carries the clock at
+    /// the moment it was taken — never one assembled after the fact, which
+    /// would silently fold whatever came between into the gap `dl` measures.
+    /// The prewarm's instant is passed in because it happened earlier, and
+    /// only the session that fired it knows when.
+    pub fn now(prewarm_fired: Option<SystemTime>) -> Handoff {
+        Handoff {
+            t0: SystemTime::now(),
+            prewarm_fired,
+        }
+    }
+
+    /// The variables this seam owns, in the order the docs publish them.
+    ///
+    /// One list, read by both the exec path and the docs guard, so the names a
+    /// launch sets and the names the README teaches cannot drift apart.
+    pub fn variables() -> [&'static str; 2] {
+        [HANDOFF_T0_VAR, PREWARM_FIRED_VAR]
+    }
+}
+
+/// The keystroke stamp's variable: see [`Handoff`].
+const HANDOFF_T0_VAR: &str = "DEVLAUNCH_HANDOFF_T0";
+
+/// The prewarm stamp's variable: see [`Handoff`].
+const PREWARM_FIRED_VAR: &str = "DEVLAUNCH_PREWARM_FIRED_AT";
+
+/// A child `wf` starts and does **not** become, with the seam's stamps
+/// (#160) stripped out of its environment.
+///
+/// Every `dl` `wf` runs except the launch itself is one of these — the
+/// `--version` probe, the prewarm's `dl <ws> up`, and `wf reap`'s listing and
+/// removals — and none of them is a hand-over, so none may arrive carrying a
+/// keystroke stamp. Declining to *set* one is not enough, because a child
+/// inherits `wf`'s own environment and `wf` is routinely run from inside a
+/// workspace whose environment `dl` stamped for the launch that created it: an
+/// agent doing that would have every `dl` it ran report a hand-over from a
+/// keystroke hours old, indistinguishable on the far side from a real one.
+/// This is the same reason [`Launch::stamps`] hands `exec` a *removal* rather
+/// than a skip.
+///
+/// One constructor rather than a removal remembered at each site, so a `dl`
+/// child added later cannot quietly reopen it — and it takes the program name
+/// rather than a whole argv because one caller runs `dl` and another runs the
+/// `sh` that backgrounds it ([`spawn_detached`]), which is the same seam and a
+/// different program.
+pub fn unstamped(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    for var in Handoff::variables() {
+        command.env_remove(var);
+    }
+    command
+}
+
+/// One stamp as the seam spells it: seconds since the Unix epoch, to nine
+/// decimal places — the string `date +%s.%N` prints, which is the format the
+/// reader on the other side parses.
+///
+/// `None` for an instant before the epoch, which is a clock this side has no
+/// business describing: the far side would read it as a handoff that began
+/// decades ago, and a fiction in a trend is worse than a stage nobody reported.
+fn epoch_seconds(at: SystemTime) -> Option<String> {
+    let since = at.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    Some(format!("{}.{:09}", since.as_secs(), since.subsec_nanos()))
 }
 
 /// A fully-resolved launch: which checkout the agent runs in, which ticket of
@@ -1528,7 +1627,12 @@ impl Launch {
     /// A creation has no number, so no per-ticket branch exists to name: it
     /// gets the bare `owner/repo` — the default workspace — and the launched
     /// skill files its own issues and makes its own branches (#114).
-    fn workspace(&self) -> String {
+    ///
+    /// Public because it is also the key a session's prewarm record is kept
+    /// under ([`crate::app::App::prewarm_fired`]): asking "was *this* launch's
+    /// container warmed" is asking about this name, and computing it a second
+    /// way at the asking site is how the two would come to disagree.
+    pub fn workspace(&self) -> String {
         match self.job.number() {
             Some(number) => node_workspace_name(&self.repo, number),
             None => self.repo.clone(),
@@ -1698,6 +1802,31 @@ impl Launch {
         }
     }
 
+    /// What this launch tells the process it is about to become about the
+    /// keystroke it came from ([`Handoff`]) — one entry per seam variable, in
+    /// the published order, and `None` for one this launch has nothing to say
+    /// with.
+    ///
+    /// **A stamp is set only where the exec *is* the `dl` that reads it.** A
+    /// host launch execs the agent itself: nothing there parses these, and one
+    /// left sitting in an agent session's environment would be picked up by
+    /// every unrelated `dl` that session goes on to run — each reporting a
+    /// handoff measured from a keystroke hours old. So the host arm says
+    /// nothing, and `None` is applied as a *removal* rather than a skip
+    /// ([`Launch::exec`]), which is what keeps a stamp `wf` inherited from
+    /// travelling on under `wf`'s name.
+    pub fn stamps(&self, handoff: &Handoff) -> [(&'static str, Option<String>); 2] {
+        let carried = |at: Option<SystemTime>| match self.isolation {
+            Isolation::Devlaunch => at.and_then(epoch_seconds),
+            Isolation::Host => None,
+        };
+        let [t0, prewarm_fired] = Handoff::variables();
+        [
+            (t0, carried(Some(handoff.t0))),
+            (prewarm_fired, carried(handoff.prewarm_fired)),
+        ]
+    }
+
     /// Become the selected agent: replace `wf`'s process image with it — or,
     /// for an isolated Claude launch, with the `dl` that carries it into the
     /// container — in the checkout.
@@ -1714,12 +1843,17 @@ impl Launch {
     /// chance after the image is replaced, so that ordering lives in `main`,
     /// where it is one statement above the call, rather than in here.
     ///
+    /// The [`Handoff`] is an argument for the same reason: its `t0` is the
+    /// keystroke, not this moment, and everything between the two — the
+    /// shutdowns, the cache write, the skill refresh — is part of what the far
+    /// side measures. A stamp taken here would quietly leave all of it out.
+    ///
     /// # Panics
     ///
     /// Never in practice: [`agent_argv`](Self::agent_argv) builds the vector
     /// literally and always starts it with the program name, so the split below
     /// cannot come up empty. The `expect` is there to say so.
-    pub fn exec(&self) -> anyhow::Error {
+    pub fn exec(&self, handoff: &Handoff) -> anyhow::Error {
         let argv = self.agent_argv();
         let (program, rest) = argv.split_first().expect("agent argv is never empty");
 
@@ -1746,11 +1880,20 @@ impl Launch {
             );
         }
 
+        let mut command = Command::new(&program);
+        command.args(rest).current_dir(&self.cwd);
+        // The seam (#160). Written onto the child rather than into `wf`'s own
+        // environment, so nothing here can be read back by anything but the
+        // process this is about to become — and removed, not skipped, where
+        // this launch has no stamp of its own to hand over.
+        for (var, stamp) in self.stamps(handoff) {
+            match stamp {
+                Some(value) => command.env(var, value),
+                None => command.env_remove(var),
+            };
+        }
         // `CommandExt::exec` only ever returns on failure.
-        let err = Command::new(&program)
-            .args(rest)
-            .current_dir(&self.cwd)
-            .exec();
+        let err = command.exec();
         // Quoted, so the prompt reads as the single argument it is — the whole
         // invariant `agent_argv` exists to hold.
         let quoted: Vec<String> = std::iter::once(program.display().to_string())
@@ -1952,7 +2095,7 @@ pub fn spawn_detached(argv: &[String]) {
         .join(" ");
     command.push_str(" >/dev/null 2>&1 &");
 
-    let spawned = Command::new("sh")
+    let spawned = unstamped("sh")
         .arg("-c")
         .arg(&command)
         .stdin(std::process::Stdio::null())
@@ -3916,6 +4059,164 @@ mod tests {
         let staged = Staged::ticket(&node, &map_ref(67), Stage::Ready).expect("launchable");
         assert_eq!(prewarm(&cache(), &staged), None);
         assert_eq!(prewarm(&[], &staged), None);
+    }
+
+    /// A handoff with both stamps chosen, rather than read off this machine's
+    /// clock: the values below are literals, so what the seam *spells* is
+    /// checkable and not merely self-consistent.
+    fn handoff(t0: SystemTime, prewarm_fired: Option<SystemTime>) -> Handoff {
+        Handoff { t0, prewarm_fired }
+    }
+
+    /// A wall-clock instant, epoch seconds and nanoseconds.
+    fn instant(secs: u64, nanos: u32) -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::new(secs, nanos)
+    }
+
+    /// The same launch on the host — the arm that execs the agent directly,
+    /// with no `dl` between `wf` and it.
+    fn on_the_host(route: Route, mode: LaunchMode) -> Launch {
+        Launch {
+            isolation: Isolation::Host,
+            ..isolated(route, mode)
+        }
+    }
+
+    #[test]
+    fn the_launch_hands_dl_the_keystroke_it_resolved_from() {
+        // The variable names and the spelling of the value are `dl`'s to mint
+        // (blooop/devlaunch#194) and are quoted here as the literals they are:
+        // Unix epoch seconds, exactly what `date +%s.%N` prints, so a reader
+        // that parses one parses the other.
+        assert_eq!(
+            isolated(Route::Tdd, interactive(""))
+                .stamps(&handoff(instant(1_755_194_037, 123_456_789), None)),
+            [
+                (
+                    "DEVLAUNCH_HANDOFF_T0",
+                    Some("1755194037.123456789".to_string())
+                ),
+                ("DEVLAUNCH_PREWARM_FIRED_AT", None),
+            ],
+            "the keystroke travels; a prewarm nobody fired does not"
+        );
+    }
+
+    #[test]
+    fn a_prewarm_that_fired_travels_beside_it_as_the_instant_it_fired() {
+        // The second variable carries *when `wf` fired*, never how the launch
+        // turned out: hit, partial and miss are `dl`'s to observe from the arm
+        // it takes, and a stamp that claimed one would be `wf` reporting on a
+        // container it never saw.
+        let stamps = isolated(Route::Tdd, interactive("")).stamps(&handoff(
+            instant(1_755_194_037, 500_000_000),
+            Some(instant(1_755_194_030, 0)),
+        ));
+        assert_eq!(
+            stamps,
+            [
+                (
+                    "DEVLAUNCH_HANDOFF_T0",
+                    Some("1755194037.500000000".to_string())
+                ),
+                (
+                    "DEVLAUNCH_PREWARM_FIRED_AT",
+                    Some("1755194030.000000000".to_string())
+                ),
+            ]
+        );
+        for (var, value) in stamps {
+            let value = value.expect("both stamps are set here");
+            assert!(
+                value.parse::<f64>().is_ok(),
+                "{var} carries an instant and nothing else, not {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_that_is_not_a_handover_to_dl_carries_no_stamp() {
+        // The seam is `wf` → `dl`, and a host launch execs the agent itself:
+        // there is no reader for a stamp there, and one left in an agent's
+        // environment would be read by every unrelated `dl` that session goes
+        // on to run — a handoff measured from a keystroke hours old. `None` is
+        // *removed*, not merely unset, so an inherited stamp cannot ride out
+        // on a launch that never minted one.
+        assert_eq!(
+            on_the_host(Route::Tdd, interactive("")).stamps(&handoff(
+                instant(1_755_194_037, 0),
+                Some(instant(1_755_194_030, 0))
+            )),
+            [
+                ("DEVLAUNCH_HANDOFF_T0", None),
+                ("DEVLAUNCH_PREWARM_FIRED_AT", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dl_wf_starts_and_does_not_become_clears_the_stamps_it_inherited() {
+        // The other half of the rule above, and the one a clean environment
+        // hides: the probe, the prewarm's `dl <ws> up` and `wf reap`'s listing
+        // and removals are children, not execs, so they inherit `wf`'s
+        // environment — and `wf` run inside a workspace has both stamps in it
+        // already, set by the `dl` that launched the agent running it. Every
+        // one of those children would then report a hand-over from a keystroke
+        // in another session, which the reader cannot tell from a real one.
+        //
+        // Asserted on the command as built rather than on a child's
+        // environment, because the machine running this need not have a `dl`
+        // at all; the end-to-end version is claim 6 of
+        // `tests/live_launch_exec.rs`, which starts `wf` with both already set.
+        let command = unstamped(DEVLAUNCH);
+        let changed: BTreeSet<(&str, Option<&str>)> = command
+            .get_envs()
+            .map(|(var, value)| {
+                (
+                    var.to_str().expect("ascii"),
+                    value.map(|v| v.to_str().expect("ascii")),
+                )
+            })
+            .collect();
+        // The whole environment delta, not merely "the two are in it": a `None`
+        // is a removal and a `Some` is a stamp, so this is also the assertion
+        // that no child of `wf`'s is quietly *given* one.
+        let expected: BTreeSet<(&str, Option<&str>)> = Handoff::variables()
+            .into_iter()
+            .map(|var| (var, None))
+            .collect();
+        assert_eq!(
+            changed, expected,
+            "a `dl` that is not the launch clears both stamps and sets neither"
+        );
+    }
+
+    #[test]
+    fn the_seam_owns_exactly_two_variables() {
+        // The published list, which the docs guard reads: two, in the order
+        // they are documented, and every stamp a launch sets is one of them.
+        assert_eq!(
+            Handoff::variables(),
+            ["DEVLAUNCH_HANDOFF_T0", "DEVLAUNCH_PREWARM_FIRED_AT"]
+        );
+        let set: Vec<&str> = isolated(Route::Tdd, interactive(""))
+            .stamps(&handoff(instant(1_755_194_037, 0), None))
+            .into_iter()
+            .map(|(var, _)| var)
+            .collect();
+        assert_eq!(set, Handoff::variables());
+    }
+
+    #[test]
+    fn the_keystroke_is_stamped_when_the_handoff_is_taken() {
+        // `now` is the whole production constructor: there is no way to build a
+        // handoff carrying an instant that is not this machine's clock at the
+        // moment it was taken.
+        let before = SystemTime::now();
+        let taken = Handoff::now(None);
+        let after = SystemTime::now();
+        assert!(taken.t0 >= before && taken.t0 <= after);
+        assert_eq!(taken.prewarm_fired, None);
     }
 
     #[test]

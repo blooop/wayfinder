@@ -138,6 +138,19 @@ call for those tests (a machine with devlaunch installed and one without must
 not take different paths through the same test) and it leaves the fixtures
 unchecked against the program they describe. They have been wrong twice.
 
+There is a fifth thing `wf` hands `dl`, and it is not an argument: the launch
+`exec` sets two environment stamps of what `wf` itself did — the keystroke that
+resolved to the exec, and when this node's prewarm fired, if one did (#160,
+names and format minted by devlaunch#194). Two rules go with them. They are set
+only where the exec *is* a `dl`, so a host launch carries neither and clears
+both rather than leaving an inherited one in an agent's environment — as does
+every other `dl` `wf` starts, which is what `launch::unstamped` is for; and neither
+is ever a claim about how the launch went — a hit, a partial and a miss are
+`dl`'s to observe from the arm it takes, and `wf` is gone by then. The seam is
+observable only through a real exec, so its end-to-end guard is claim 6 of
+`tests/live_launch_exec.rs`, and the variable names the README publishes are
+compared to the ones the binary sets in `tests/skill_docs.rs`.
+
 `pixi.toml` is here for that and nothing else: it installs a chosen `devlaunch`
 and `tests/live_devlaunch.rs` asks it the questions `wf` asks it. **Pixi does
 not build this crate** — the compiler is still rustup's, and adding `rust` to
