@@ -807,6 +807,14 @@ impl App {
     /// finding no launchable stage — stage, not ticket state, so a merged PR
     /// on a still-open ticket refuses too. Neither can arise on a map: a map
     /// has no blockers and no stage, and a finished one is not drawn.
+    ///
+    /// Staging **chooses the stop it acts on** (#148): every arm that opens
+    /// the picker records the cursor as [`Cursor::Chosen`] there. To the human
+    /// the launch *is* a selection of that row, however the cursor arrived on
+    /// it — an untouched cursor sitting on the first match is enough — and
+    /// without the write a refresh would re-derive "the top" and carry the
+    /// cursor off the very row whose launch is being picked. The refusals do
+    /// not write: nothing was staged, so nothing was chosen.
     fn request_launch(&mut self) -> Outcome {
         match self.cursor_stop() {
             // On a group line there is no agent to run, and exactly one thing
@@ -825,6 +833,7 @@ impl App {
                 // resumable as a build one — and rather more worth resuming.
                 let staged = self.resumable(staged, id.number);
                 self.prewarm(&staged);
+                self.cursor = Cursor::Chosen(self.cursor_pos());
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
                     staged,
@@ -849,6 +858,7 @@ impl App {
                     return Outcome::Continue;
                 }
                 let staged = Staged::project(&repo);
+                self.cursor = Cursor::Chosen(self.cursor_pos());
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
                     staged,
@@ -890,6 +900,7 @@ impl App {
             Some(staged) => {
                 let staged = self.resumable(staged, ticket.number);
                 self.prewarm(&staged);
+                self.cursor = Cursor::Chosen(self.cursor_pos());
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
                     staged,
@@ -1626,6 +1637,41 @@ mod tests {
             app.cursor_ticket().map(|t| t.number),
             Some(200),
             "nothing was chosen over the empty list, so the cursor means the top row"
+        );
+    }
+
+    #[test]
+    fn staging_a_launch_chooses_the_row_it_acts_on() {
+        // `enter` on a row the cursor merely defaulted to is still an act *on
+        // that row*: the human launched from it. If staging left the cursor
+        // untouched, the next refresh would re-derive "the top", and a fresher
+        // map sorting above would carry the cursor off the very row whose
+        // launch was just staged — the launch and the choice drifting apart.
+        let mut app = fixture_app();
+        type_str(&mut app, "bread"); // one match: #6, reached by default, not by `↓`
+        assert_eq!(app.cursor_ticket().map(|t| t.number), Some(6));
+
+        app.handle_key(key(KeyCode::Enter)); // stage a launch of #6
+        assert!(matches!(app.overlay, Overlay::PickLaunch { .. }));
+        app.handle_key(key(KeyCode::Esc)); // back to the list, nothing picked
+
+        let mut fresher = app.clusters.clone();
+        fresher.insert(
+            MapId::new(PROJECT, 99),
+            Map {
+                title: "Map: fresher".to_string(),
+                last_activity: Some(
+                    Activity::parse("2026-08-07T00:00:00Z").expect("fixture stamp parses"),
+                ),
+                tickets: vec![ticket(PROJECT, 200, "breadwinner", true, false, vec![])],
+            },
+        );
+        app.replace_clusters(fresher);
+
+        assert_eq!(
+            app.cursor_ticket().map(|t| t.number),
+            Some(6),
+            "the launch was staged from #6, so the refresh keeps the cursor on it"
         );
     }
 
