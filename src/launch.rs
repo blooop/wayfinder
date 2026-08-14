@@ -602,7 +602,7 @@ pub enum Launchable {
 
 impl Launchable {
     /// Every launchable stage, compiler-complete
-    /// ([`crate::model::every_variant`]): the iteration the launch matrix and
+    /// (`every_variant` (src/model.rs)): the iteration the launch matrix and
     /// the doc vocabulary run over, so a stage cannot exist unlaunched (#133).
     pub fn every() -> Vec<Launchable> {
         crate::model::every_variant!(Launchable: Ready, Building, InReview, NeedsAttention)
@@ -662,7 +662,7 @@ pub enum Aim {
 
 impl Aim {
     /// One value of every arm, compiler-complete
-    /// ([`crate::model::every_variant`]) — the wire only ever sees the tag,
+    /// (`every_variant` (src/model.rs)) — the wire only ever sees the tag,
     /// so the ticket representative's payload is the doc guards' business to
     /// vary, not this list's.
     pub fn every_arm() -> Vec<Aim> {

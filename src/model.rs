@@ -286,7 +286,7 @@ pub enum TicketType {
 
 impl TicketType {
     /// Every type, in declaration order, with the compiler holding the list
-    /// complete — see [`every_variant`]. What the launch matrix and the doc
+    /// complete — see `every_variant`. What the launch matrix and the doc
     /// vocabulary iterate, so a new type cannot exist unlaunched (#133).
     pub fn every() -> Vec<TicketType> {
         every_variant!(TicketType: Build, Research, Task, Grilling, Prototype, Untyped)
@@ -402,7 +402,7 @@ pub enum PrStatus {
 }
 
 impl PrStatus {
-    /// One value of every arm, compiler-complete ([`every_variant`]). `Open`
+    /// One value of every arm, compiler-complete (`every_variant`). `Open`
     /// carries data, so a representative stands for it; a caller after the
     /// full signal grid expands it over [`Checks::every`] × [`Review::every`].
     pub fn every_arm() -> Vec<PrStatus> {
@@ -431,7 +431,7 @@ pub enum Checks {
 }
 
 impl Checks {
-    /// Every rollup, compiler-complete ([`every_variant`]).
+    /// Every rollup, compiler-complete (`every_variant`).
     pub fn every() -> Vec<Checks> {
         every_variant!(Checks: Absent, Pending, Passing, Failing)
     }
@@ -450,7 +450,7 @@ pub enum Review {
 }
 
 impl Review {
-    /// Every decision, compiler-complete ([`every_variant`]).
+    /// Every decision, compiler-complete (`every_variant`).
     pub fn every() -> Vec<Review> {
         every_variant!(Review: NotRequired, Required, Approved, ChangesRequested)
     }

@@ -322,7 +322,9 @@ fn the_contract_sentences_read_exactly_as_the_contract_rules() {
         section
             .lines()
             .find(|line| line.starts_with(lead))
-            .unwrap_or_else(|| panic!("the context section must keep the sentence opening {lead:?}"))
+            .unwrap_or_else(|| {
+                panic!("the context section must keep the sentence opening {lead:?}")
+            })
             .to_string()
     };
     assert_eq!(
