@@ -19,9 +19,12 @@
   // spellings the spec allows (string and array) were ignored. So `cacheFrom`
   // here would look like a cache and never be one.
   //
-  // To build from source instead — a `Dockerfile` change, or a host whose
-  // architecture the published tag does not cover — use the variant beside this
-  // file: `dl blooop/wayfinder@<branch> --devcontainer local`. It carries the
+  // To build from source instead — a `Dockerfile` change, a host whose
+  // architecture the published tag does not cover, or the pull was denied
+  // (GHCR packages are private by default until made public, and the tag does
+  // not exist at all before `devcontainer.yml`'s first run on `main`) — use
+  // the variant beside this file:
+  // `dl blooop/wayfinder@<branch> --devcontainer local`. It carries the
   // `build:` block, and a test holds the two configs to the same settings so
   // this one cannot drift away from it.
   "image": "ghcr.io/blooop/wayfinder-devcontainer:latest",
