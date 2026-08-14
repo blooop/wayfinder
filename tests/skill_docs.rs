@@ -304,6 +304,45 @@ fn the_documented_vocabularies_are_the_words_the_types_serialize() {
     }
 }
 
+/// The contract prose itself, pinned whole rather than phrase-sampled.
+///
+/// The other tests bind the schema — field names, vocabularies, the worked
+/// example. This binds the *rule* those fields exist to serve: orient from
+/// the block, verify live before any write, and your arguments win. Mutation
+/// showed that rule could be inverted wholesale ("the block beats your
+/// arguments") with every schema test green (#133), because the phrase
+/// checks below sample words an inverted sentence still contains. Equality
+/// on the two normative sentences leaves an editor free to move them, not to
+/// reverse them: changing the contract now means changing this literal in
+/// the same diff, which is the two-sided edit a contract change owes.
+#[test]
+fn the_contract_sentences_read_exactly_as_the_contract_rules() {
+    let section = context_section();
+    let sentence = |lead: &str| {
+        section
+            .lines()
+            .find(|line| line.starts_with(lead))
+            .unwrap_or_else(|| panic!("the context section must keep the sentence opening {lead:?}"))
+            .to_string()
+    };
+    assert_eq!(
+        sentence("A launch line may carry"),
+        "A launch line may carry `ctx: <json>` — a snapshot of what `wf` knew at exec time. \
+         It is an accelerator, never a precondition: use it to skip discovery reads (which \
+         map, which PR, what type and stage); never let it substitute for a live read before \
+         any write — claiming, commenting, closing, gating. If it is absent, does not parse, \
+         has a `v` you don't recognise, or names a repo or ticket other than the one your \
+         arguments and pinned `$REPO` name, ignore it entirely and discover via the commands \
+         below, as a hand-invoked session always does."
+    );
+    assert_eq!(
+        sentence("**Precedence:"),
+        "**Precedence: your arguments beat the block, and the tracker beats both.** The \
+         ticket number in your invocation is the assignment; a block naming a different \
+         number or repo is discarded whole, never merged field by field."
+    );
+}
+
 /// The contract is *accelerator, never precondition*, and every failure mode
 /// resolves to the same move — discard the block whole and discover as a
 /// hand-invoked session always has.
