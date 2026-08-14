@@ -384,82 +384,23 @@ fn vocabulary<T: Serialize>(values: &[T]) -> BTreeSet<String> {
     values.iter().map(wire_word).collect()
 }
 
-/// One value of every arm of the aim sum — the wire only ever sees the tag.
-fn every_aim() -> Vec<Aim> {
-    vec![
-        Aim::Map,
-        Aim::Ticket {
-            number: 1,
-            title: String::new(),
-            ticket_type: TicketType::Build,
-            stage: Launchable::Ready,
-            prs: vec![],
-        },
-    ]
-}
-
-/// One value of every arm of the PR-status sum, likewise.
-fn every_pr_status() -> Vec<PrStatus> {
-    vec![
-        PrStatus::Draft,
-        PrStatus::Open {
-            checks: Checks::Absent,
-            review: Review::NotRequired,
-        },
-        PrStatus::Merged,
-        PrStatus::Closed,
-    ]
-}
-
 /// Every value each enumerated field of the block can hold, as serde spells
 /// it — the answer coming from the same serializer the launch itself runs, so
 /// a `rename_all` change moves this side without anyone editing it.
 ///
-/// Adding a variant to any of these types is already a compile error in
-/// `src/launch.rs`, where each word is pinned to a golden literal by an
-/// exhaustive `match`; this side is what then forces the docs to learn it.
+/// The value lists are the types' own (`every`/`every_arm`, #133), where the
+/// compiler holds each list complete — not restatements of them, which a new
+/// variant would silently sit out of. Adding a variant therefore cannot green
+/// until the doc publishes its word, on top of the compile error in
+/// `src/launch.rs` where the word itself gets pinned.
 fn emitted_vocabularies() -> Vec<(&'static str, BTreeSet<String>)> {
     vec![
-        ("aim", vocabulary(&every_aim())),
-        (
-            "ticket_type",
-            vocabulary(&[
-                TicketType::Build,
-                TicketType::Research,
-                TicketType::Task,
-                TicketType::Grilling,
-                TicketType::Prototype,
-                TicketType::Untyped,
-            ]),
-        ),
-        (
-            "stage",
-            vocabulary(&[
-                Launchable::Ready,
-                Launchable::Building,
-                Launchable::InReview,
-                Launchable::NeedsAttention,
-            ]),
-        ),
-        ("status", vocabulary(&every_pr_status())),
-        (
-            "checks",
-            vocabulary(&[
-                Checks::Absent,
-                Checks::Pending,
-                Checks::Passing,
-                Checks::Failing,
-            ]),
-        ),
-        (
-            "review",
-            vocabulary(&[
-                Review::NotRequired,
-                Review::Required,
-                Review::Approved,
-                Review::ChangesRequested,
-            ]),
-        ),
+        ("aim", vocabulary(&Aim::every_arm())),
+        ("ticket_type", vocabulary(&TicketType::every())),
+        ("stage", vocabulary(&Launchable::every())),
+        ("status", vocabulary(&PrStatus::every_arm())),
+        ("checks", vocabulary(&Checks::every())),
+        ("review", vocabulary(&Review::every())),
     ]
 }
 
@@ -499,6 +440,96 @@ fn the_documented_vocabularies_are_the_words_the_types_serialize() {
             "`{field}`'s documented vocabulary and its serialized one disagree"
         );
     }
+}
+
+/// The contract prose itself, pinned whole rather than phrase-sampled.
+///
+/// The other tests bind the schema — field names, vocabularies, the worked
+/// example. This binds the *rule* those fields exist to serve: orient from
+/// the block, verify live before any write, and your arguments win. Mutation
+/// showed that rule could be inverted wholesale ("the block beats your
+/// arguments") with every schema test green (#133), because the phrase
+/// checks below sample words an inverted sentence still contains. Equality
+/// on the two normative sentences leaves an editor free to move them, not to
+/// reverse them: changing the contract now means changing this literal in
+/// the same diff, which is the two-sided edit a contract change owes.
+#[test]
+fn the_contract_sentences_read_exactly_as_the_contract_rules() {
+    let section = context_section();
+    let sentence = |lead: &str| {
+        section
+            .lines()
+            .find(|line| line.starts_with(lead))
+            .unwrap_or_else(|| {
+                panic!("the context section must keep the sentence opening {lead:?}")
+            })
+            .to_string()
+    };
+    assert_eq!(
+        sentence("A launch line may carry"),
+        "A launch line may carry `ctx: <json>` — a snapshot of what `wf` knew at exec time. \
+         It is an accelerator, never a precondition: use it to skip discovery reads (which \
+         map, which PR, what type and stage); never let it substitute for a live read before \
+         any write — claiming, commenting, closing, gating. If it is absent, does not parse, \
+         has a `v` you don't recognise, or names a repo or ticket other than the one your \
+         arguments and pinned `$REPO` name, ignore it entirely and discover via the commands \
+         below, as a hand-invoked session always does."
+    );
+    assert_eq!(
+        sentence("**Precedence:"),
+        "**Precedence: your arguments beat the block, and the tracker beats both.** The \
+         ticket number in your invocation is the assignment; a block naming a different \
+         number or repo is discarded whole, never merged field by field."
+    );
+}
+
+/// One README paragraph, unwrapped: the lines from the one opening with
+/// `lead` to the next blank line, joined the way a reader reads them.
+fn readme_paragraph(lead: &str) -> String {
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+        .expect("the README ships in this repo");
+    let from = readme
+        .lines()
+        .skip_while(|line| !line.starts_with(lead))
+        .take_while(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        !from.is_empty(),
+        "the README must keep the paragraph opening {lead:?}"
+    );
+    from.join(" ")
+}
+
+/// The README promises the block only where a skill receives it.
+///
+/// It said "Every launch of a node", which reads as including the plain
+/// mode — a mode whose whole point is that no skill runs, so there is nobody
+/// to address a block to and none is emitted (the binary's own test,
+/// `nothing_that_has_no_skill_to_address_is_handed_context`). A reader
+/// following the README would expect a block where none arrives. Pinned by
+/// equality like the contract sentences above, so contradicting the
+/// plain-mode statement — or quietly widening the promise again — turns this
+/// red rather than surviving on sampled phrases (#133).
+#[test]
+fn the_readme_promises_the_block_only_where_a_skill_receives_it() {
+    assert_eq!(
+        readme_paragraph("**Every skill launch of a node"),
+        "**Every skill launch of a node also hands the agent what `wf` already knew**, as a \
+         `ctx: <json>` block between the skill's arguments and any steering suffix:"
+    );
+    assert_eq!(
+        readme_paragraph("That is the parent map"),
+        "That is the parent map, the ticket's type and stage, and its linked PRs — the \
+         three serial `gh` calls a launched skill used to open with, answered before it \
+         starts. It is an accelerator and never a precondition: a skill invoked by hand \
+         never went through the picker, finds no block, and discovers exactly as before. \
+         The one thing it deliberately cannot say is whether the ticket is still yours to \
+         take — there is no assignee and no ticket status in the schema, so claiming stays \
+         a live call and a stale block cannot make an agent act on someone else's work. \
+         The creation rows carry no block at all: they name nothing that exists yet, and \
+         the plain rows carry none either — a block is addressed to a skill, and plain \
+         runs none."
+    );
 }
 
 /// The contract is *accelerator, never precondition*, and every failure mode

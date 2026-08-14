@@ -219,6 +219,29 @@ fn field<'a>(record: &'a str, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("the shim records {key:?}\n{record}"))
 }
 
+/// Every field name a serialized context block contains, at any depth —
+/// including the tag keys the enums write (`ticket`, `open`). The same shape
+/// the unit tests assert the claim-free invariant with — a copy of their
+/// helper, since `src`'s test module is not reachable from here, so an edit
+/// to one side is owed to the other by hand.
+fn keys_of(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    let mut stack = vec![value];
+    while let Some(node) = stack.pop() {
+        match node {
+            serde_json::Value::Object(fields) => {
+                for (key, child) in fields {
+                    keys.insert(key.clone());
+                    stack.push(child);
+                }
+            }
+            serde_json::Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    keys
+}
+
 /// Every invocation a shim recorded, oldest first.
 fn invocations(report: &str) -> Vec<&str> {
     report.split(INVOCATION).skip(1).collect()
@@ -608,10 +631,54 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     );
     // The claim is unrepresentable in the schema, which is what makes the
     // block safe to orient from: whatever the live tracker said about this
-    // node, no assignee can have reached the agent.
-    let flat = ctx.to_string();
-    for forbidden in ["assignee", "claim"] {
-        assert!(!flat.contains(forbidden), "{forbidden:?} in {flat}");
+    // node, no assignee can have reached the agent. Asserted on the block's
+    // *field names*, the shape the unit tests use (#133) — the substring scan
+    // this replaces could not tell a key from a value, so a ticket whose live
+    // title happened to contain "claim" failed it spuriously while a field a
+    // blacklist never thought of sailed through. The live node varies, so
+    // instead of the unit tests' pinned set, every key must be one the v1
+    // schema writes and the aim-independent core must be present. One caveat
+    // said plainly rather than implied away: this file is excluded from the
+    // CI chain by design (AGENTS.md) and guards only when run by name.
+    let keys = keys_of(&ctx);
+    let schema: std::collections::BTreeSet<&str> = [
+        "v",
+        "repo",
+        "map",
+        "number",
+        "title",
+        "aim",
+        "ticket",
+        "ticket_type",
+        "stage",
+        "prs",
+        "status",
+        "open",
+        "checks",
+        "review",
+    ]
+    .into();
+    for key in &keys {
+        assert!(
+            schema.contains(key.as_str()),
+            "{key:?} is not a field the v1 schema writes: {ctx}"
+        );
+    }
+    for always in ["v", "repo", "map", "number", "title", "aim"] {
+        assert!(keys.contains(always), "{always:?} missing from {ctx}");
+    }
+    for forbidden in [
+        "assignee",
+        "assignees",
+        "claim",
+        "frontier",
+        "blocked_by",
+        "needs",
+    ] {
+        assert!(
+            !schema.contains(forbidden),
+            "{forbidden:?} must be unrepresentable in the handed context"
+        );
     }
     let (skill, numbers) = invocation.split_once(' ').expect("a skill and arguments");
     let halves: Vec<&str> = match skill {
