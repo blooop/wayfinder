@@ -32,6 +32,8 @@ Routing — what a stage launches: build nodes at ready/building/needs-attention
    skill — no ctx counterpart: the stage skill to follow
    steer — no ctx counterpart: the human's line, verbatim
    ```
+
+   **Content is a live read the subagent makes itself**, and the manager names the reads rather than making them: the ticket body **and its whole comment trail** in one call — `gh issue view <n> --repo "$REPO" --comments` — and the map's Decisions-so-far, `gh issue view <map> --repo "$REPO"`. Those are precisely the two things `ctx:` refuses to carry, and the manager's longer life is a reason to refuse them harder rather than a licence to hand them over: a block is written milliseconds before the exec it rides, while a manager may hold a body for hours across stages that changed the world it describes — and the live claim that guards a launch is already spent, taken by the manager before stage 1. Trails matter most here: breadcrumbs carry spec amendments written *after* the manager last read the ticket, so a subagent that reads the trail builds the amended spec where one handed a snapshot builds the superseded one.
 2. **Gates between stages, checked by the manager from GitHub state alone:**
    - build → review: **PR exists and checks are green** (`gh pr checks <pr> --watch` to wait on a live run).
    - review → done: **the two-axis report is posted on the PR** with a verdict.

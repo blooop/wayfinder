@@ -174,6 +174,32 @@ fn the_manager_hands_only_what_ctx_carries() {
     }
 }
 
+/// The ticket body, its trail, and the map's Decisions-so-far are live reads
+/// the stage subagent makes itself — and the manager *names* those reads
+/// rather than making them, as copy-pasteable commands pinned to the explicit
+/// `$REPO` like every snippet in the bundle (modeled on
+/// `frontier_mirrors_the_binary_map_query`).
+///
+/// The `--comments` flag on the ticket read is behavioral, not cosmetic: a
+/// body-only read drops the trail, and trails carry spec amendments written
+/// after the manager last read the ticket (#129's amendment to a recorded
+/// resolution lived in a breadcrumb).
+#[test]
+fn the_manager_names_the_reads_it_does_not_make() {
+    let doc = lifecycle_doc();
+    let ticket_read = r#"gh issue view <n> --repo "$REPO" --comments"#;
+    let map_read = r#"gh issue view <map> --repo "$REPO""#;
+    assert!(
+        doc.contains(ticket_read),
+        "the lifecycle doc must name the ticket read verbatim, body and whole \
+         trail in one call: {ticket_read}"
+    );
+    assert!(
+        doc.contains(map_read),
+        "the lifecycle doc must name the map read verbatim: {map_read}"
+    );
+}
+
 /// One skill doc's whole text.
 fn skill_doc(name: &str) -> String {
     let path = format!("{}/skills/{name}/SKILL.md", env!("CARGO_MANIFEST_DIR"));
