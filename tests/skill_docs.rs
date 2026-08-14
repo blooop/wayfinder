@@ -200,6 +200,30 @@ fn the_manager_names_the_reads_it_does_not_make() {
     );
 }
 
+/// The review stage gets the PR pointer and nothing about the PR — no diff
+/// summary, no gate result, no earlier axis report; anything already asserted
+/// on the PR is a lead to reproduce, never a finding to carry (#126).
+///
+/// **This is the weak seam, and deliberately named no stronger than it is:**
+/// a phrase check detects doc drift and nothing else. A substring assertion
+/// can be satisfied by a sentence that says the opposite (#131's review
+/// proved exactly that), and no test in this repo can assert that a manager
+/// *obeyed* the sentence — obedience stays unverified, checked only by a
+/// human watching a stage subagent's opening tracker calls.
+#[test]
+fn the_review_stage_is_handed_no_account_of_the_pr() {
+    let doc = lifecycle_doc();
+    for phrase in [
+        "the PR pointer and nothing about the PR",
+        "lead to reproduce, never a finding to carry",
+    ] {
+        assert!(
+            doc.contains(phrase),
+            "the review-stage paragraph must say {phrase:?}"
+        );
+    }
+}
+
 /// One skill doc's whole text.
 fn skill_doc(name: &str) -> String {
     let path = format!("{}/skills/{name}/SKILL.md", env!("CARGO_MANIFEST_DIR"));
