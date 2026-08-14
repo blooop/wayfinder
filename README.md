@@ -752,8 +752,8 @@ through `codex --dangerously-bypass-approvals-and-sandbox`. Both receive one
 prompt argument, so the route, numbers, and steering text cannot be split apart
 by the shell.
 
-**Every launch of a node also hands the agent what `wf` already knew**, as a
-`ctx: <json>` block between the skill's arguments and any steering suffix:
+**Every skill launch of a node also hands the agent what `wf` already knew**,
+as a `ctx: <json>` block between the skill's arguments and any steering suffix:
 
 ```
 /wf-review 124 ctx: {"v":1,"repo":"blooop/wayfinder","map":{…},"aim":{"ticket":{…,"prs":[…]}}} steer: <text>
@@ -766,7 +766,9 @@ never went through the picker, finds no block, and discovers exactly as before.
 The one thing it deliberately cannot say is whether the ticket is still yours to
 take — there is no assignee and no ticket status in the schema, so claiming stays
 a live call and a stale block cannot make an agent act on someone else's work.
-The creation rows carry no block at all: they name nothing that exists yet.
+The creation rows carry no block at all: they name nothing that exists yet, and
+the plain rows carry none either — a block is addressed to a skill, and plain
+runs none.
 
 The auto mode collapses the ticket rows on purpose: the launched session is a
 *manager*, and what it manages is the node's whole remaining lifecycle —
