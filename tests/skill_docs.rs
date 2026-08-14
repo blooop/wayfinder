@@ -86,6 +86,94 @@ fn frontier_mirrors_the_binary_map_query() {
     );
 }
 
+/// The manager protocol doc — the handoff contract #126 decided lives here.
+fn lifecycle_doc() -> String {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/skills/wf/LIFECYCLE.md"
+    ))
+    .expect("the lifecycle doc ships in this repo")
+}
+
+/// The fenced handoff list in the lifecycle doc's step 1 — the exact list of
+/// what a manager hands a stage subagent, one entry per line, extraction seam
+/// shared with `frontier_snippet()`.
+fn handoff_snippet() -> String {
+    lifecycle_doc()
+        .split("```handoff")
+        .nth(1)
+        .expect("the lifecycle doc's handoff list is a fenced, extractable block")
+        .split("```")
+        .next()
+        .expect("split always yields a first piece")
+        .to_string()
+}
+
+/// Every field name a serialized block contains, at any depth — including the
+/// tag keys the enums write (`ticket`, `open`). Same walk as the launch
+/// module's own `keys_of`; duplicated here because that one is a private test
+/// helper.
+fn keys_of(value: &Value) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    let mut stack = vec![value];
+    while let Some(node) = stack.pop() {
+        match node {
+            Value::Object(fields) => {
+                for (key, child) in fields {
+                    keys.insert(key.clone());
+                    stack.push(child);
+                }
+            }
+            Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    keys
+}
+
+/// Everything the manager hands a stage subagent is something a launch's
+/// `ctx:` block already carries — pointers, never readings (#126, #134).
+///
+/// Every identifier in the doc's fenced handoff list must be a field name of a
+/// block a **real launch** writes, so the list cannot quietly grow a `ticket_body`
+/// entry: documented ⊆ serialized. The two entries with no ctx counterpart —
+/// the stage `skill` and the human's `steer` line — are named here explicitly,
+/// never waved through, and must themselves appear in the list (they are the
+/// whole of what a manager adds beyond the block).
+#[test]
+fn the_manager_hands_only_what_ctx_carries() {
+    let (ticket, map) = documented_example_node();
+    let block = launched_block(&ticket, &map, Stage::InReview);
+    let serialized = keys_of(
+        &serde_json::from_str(&block)
+            .unwrap_or_else(|e| panic!("the block is JSON: {block} ({e})")),
+    );
+    let beyond_ctx = ["skill", "steer"];
+    let entries: Vec<String> = handoff_snippet()
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "the handoff list names what a stage subagent is handed"
+    );
+    for entry in &entries {
+        assert!(
+            serialized.contains(entry) || beyond_ctx.contains(&entry.as_str()),
+            "`{entry}` is in the documented handoff but no launch serializes it, \
+             and it is not one of the two named non-ctx entries {beyond_ctx:?} — \
+             the manager hands pointers, never readings"
+        );
+    }
+    for named in beyond_ctx {
+        assert!(
+            entries.iter().any(|e| e == named),
+            "`{named}` is handed beyond the ctx block and the list must own \
+             that explicitly"
+        );
+    }
+}
+
 /// One skill doc's whole text.
 fn skill_doc(name: &str) -> String {
     let path = format!("{}/skills/{name}/SKILL.md", env!("CARGO_MANIFEST_DIR"));

@@ -20,7 +20,18 @@ Routing — what a stage launches: build nodes at ready/building/needs-attention
 
 ## The protocol, per node
 
-1. **Fresh subagent per stage.** The manager never does stage work in its own context. Each stage subagent gets: the ticket body, the map's Decisions-so-far, the branch/PR pointers, and the stage skill to follow. Fresh context is what makes the review stage a real review — the reviewer never saw the code written.
+1. **Fresh subagent per stage — handed pointers, never readings.** The manager never does stage work in its own context, and passing on its own reading of a ticket *is* stage work done in the manager's context. Each stage subagent is handed exactly what a launch's `ctx:` block carries one level down (see **The launch context** in [GITHUB_TRACKER.md](GITHUB_TRACKER.md)) — the repo, the map reference, the ticket's number, type and stage, and its PR links — plus the stage skill to follow and the human's `steer:` line **verbatim** if there is one. Nothing the manager composed: no summary of the ticket, no digest of its trail, no account of the diff or of what an earlier stage claims to have done.
+
+   ```handoff
+   repo — the pinned repo
+   map — the map reference
+   number — the ticket's number
+   ticket_type — the ticket's type
+   stage — the ticket's stage
+   prs — its PR links
+   skill — no ctx counterpart: the stage skill to follow
+   steer — no ctx counterpart: the human's line, verbatim
+   ```
 2. **Gates between stages, checked by the manager from GitHub state alone:**
    - build → review: **PR exists and checks are green** (`gh pr checks <pr> --watch` to wait on a live run).
    - review → done: **the two-axis report is posted on the PR** with a verdict.
