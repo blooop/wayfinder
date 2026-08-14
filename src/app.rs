@@ -208,6 +208,23 @@ enum Cursor {
     Chosen(usize),
 }
 
+/// How a chosen cursor rides out a cluster swap: two different holds, so two
+/// arms (#148). **Identity** is the normal one — the stop under the cursor,
+/// carried with the old position as the fallback should it vanish from the
+/// new order. **Position** is what remains when the cursor is chosen over an
+/// *empty* screen — a swap can empty the list under a choice — where there is
+/// no stop to name. A `None` inside a tuple used to say that by omission,
+/// which let "pinned by identity" and "pinned by position" share one shape
+/// whose halves were told apart by reading the inner option at the use site
+/// rather than by matching.
+enum Pinned {
+    /// Follow this stop wherever the new order puts it; fall back to the old
+    /// position, clamped, if it is gone.
+    Identity(StopKey, usize),
+    /// Nothing to follow: hold the bare position, clamped.
+    Position(usize),
+}
+
 #[derive(Debug)]
 pub struct App {
     /// The clusters on screen: every open map that has arrived, keyed by id.
@@ -780,21 +797,28 @@ impl App {
     pub fn replace_clusters(&mut self, clusters: BTreeMap<MapId, Map>) {
         let pinned = match self.cursor {
             Cursor::Untouched => None,
-            Cursor::Chosen(_) => Some((self.cursor_key(), self.cursor_pos())),
+            Cursor::Chosen(_) => Some(match self.cursor_key() {
+                Some(key) => Pinned::Identity(key, self.cursor_pos()),
+                None => Pinned::Position(self.cursor_pos()),
+            }),
         };
         self.clusters = clusters;
-        if let Some((anchor, old_index)) = pinned {
-            let new_order: Vec<StopKey> = self
-                .stops()
-                .iter()
-                .map(|at| self.stop_key(&at.stop))
-                .collect();
-            self.cursor = Cursor::Chosen(crate::refresh::preserve_cursor(
-                anchor.as_ref(),
-                old_index,
-                &new_order,
-            ));
-        }
+        let Some(pinned) = pinned else {
+            return;
+        };
+        let new_order: Vec<StopKey> = self
+            .stops()
+            .iter()
+            .map(|at| self.stop_key(&at.stop))
+            .collect();
+        self.cursor = Cursor::Chosen(match pinned {
+            Pinned::Identity(key, fallback) => {
+                crate::refresh::preserve_cursor(Some(&key), fallback, &new_order)
+            }
+            Pinned::Position(fallback) => {
+                crate::refresh::preserve_cursor(None, fallback, &new_order)
+            }
+        });
     }
 
     /// The first enter (#62): stage a launch of whatever the cursor is on by
