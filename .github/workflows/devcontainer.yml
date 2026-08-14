@@ -60,9 +60,15 @@ jobs:
       # Before the build, so a credential problem fails in two seconds rather
       # than after the whole image has been built.
       - name: Log in to ghcr.io
+        # Through step `env:` rather than `${{ }}` rendered into the script,
+        # following `package.yml`: the token never appears in a command line or
+        # a process listing (`echo` is a builtin, the login reads stdin).
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
-            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "$GHCR_TOKEN" \
+            | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
       # The context is `.devcontainer`, not the repo root — the Dockerfile copies
       # nothing out of the context, so the root would only send `target/` to the
