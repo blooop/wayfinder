@@ -94,6 +94,17 @@ const INVOCATION: &str = "--- shim invocation ---";
 /// What the `dl` shim answers `--version` with. See `write_shims`.
 const DL_SHIM_VERSION: &str = "9999.0.0";
 
+/// A seam stamp from **somebody else's launch**, exported into `wf`'s own
+/// environment before it starts (#160).
+///
+/// This is not a hypothetical: `dl` sets these for the session it launches, so
+/// an agent that runs `wf` inside its own workspace runs it with both already
+/// set. Every `dl` child `wf` starts inherits that environment, so the claim
+/// "only a launch is stamped" is a claim about a *dirty* environment or it is
+/// only a claim about the test rig. The instant is a real one from long before
+/// any run of this test, so a leak reads as a handoff that began last year.
+const INHERITED_STAMP: &str = "1755194037.000000000";
+
 /// A scratch tree of this test's own: `claude` and `dl` shims on PATH and a
 /// cache directory, so neither the user's PATH nor their real projects cache is
 /// touched. Removed on drop, panic or not.
@@ -532,6 +543,10 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     // Claim 6's floor: every stamp this run reads has to be an instant inside
     // it, and this is where it starts.
     let started = epoch_now();
+    // Read off the binary rather than spelled again, so a renamed variable
+    // cannot leave this test polluting the environment with a name nothing
+    // reads — which would pass while proving nothing.
+    let [t0_var, prewarm_var] = wf::launch::Handoff::variables();
     let mut child = unsafe {
         Command::new(env!("CARGO_BIN_EXE_wf"))
             .current_dir(repo)
@@ -546,6 +561,11 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
             // when that happened. No container is built — the `up` reaches the
             // same recording shim as everything else here.
             .env("WF_PREWARM", "1")
+            // Start `wf` inside a launch that is not this one — see
+            // `INHERITED_STAMP`. Every `dl` this run starts that is not the
+            // exec has to clear these rather than pass them on.
+            .env(t0_var, INHERITED_STAMP)
+            .env(prewarm_var, INHERITED_STAMP)
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave.try_clone().expect("dup slave")))
             .stdout(Stdio::from(slave.try_clone().expect("dup slave")))
@@ -863,6 +883,13 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     // version and fires the prewarm's `dl <ws> up` from the same process with
     // the same environment; a stamp on those would have `dl` report a hand-over
     // for a question `wf` asked itself, or for the warm-up the stamp is *about*.
+    //
+    // This `wf` was started with both stamps already set (`INHERITED_STAMP`),
+    // which is what makes the assertion a claim about `wf` rather than about
+    // the test rig: inheriting is the default, so a `wf` that merely declines
+    // to *set* a stamp on its asides passes this only in a clean environment,
+    // and an agent's shell inside a workspace is not one. Empty here means
+    // every such child was scrubbed on the way out.
     let asides = dl_asides(&dl_report);
     assert!(
         asides.len() >= 2,

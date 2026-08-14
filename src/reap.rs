@@ -46,7 +46,7 @@ use tokio::process::Command;
 /// [`fetch`](crate::fetch), where the screen reads it too.
 pub use crate::fetch::TicketState;
 use crate::fetch::{parse_pr, Assignee, GraphQlResponse, Nodes, PrNode};
-use crate::launch::devlaunch_answers_unsaved;
+use crate::launch::{self, devlaunch_answers_unsaved};
 use crate::model::PrStatus;
 
 /// The branch prefix `wf` mints its workspaces under (#106): the full branch is
@@ -680,7 +680,7 @@ fn short_repo(slug: &str) -> &str {
 /// not parse. All three mean the same thing to the caller — `wf` cannot see the
 /// workspaces, so it must not delete any.
 pub async fn workspaces() -> Result<Vec<Workspace>> {
-    let output = Command::new("dl")
+    let output = Command::from(launch::unstamped("dl"))
         .args(["--ls", "--json"])
         .stdin(Stdio::null())
         .kill_on_drop(true)
@@ -953,7 +953,7 @@ fn parse_node_facts(body: &[u8], repo: &str, numbers: &[u64]) -> Result<BTreeMap
 /// above, which is a failure `wf` reports rather than quietly overrides.
 async fn remove(id: &str, insist: bool) -> Result<()> {
     let args = removal_argv(id, insist);
-    let output = Command::new("dl")
+    let output = Command::from(launch::unstamped("dl"))
         .args(&args)
         .stdin(Stdio::null())
         .kill_on_drop(true)

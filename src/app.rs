@@ -987,7 +987,7 @@ impl App {
     /// `dl <ws> up` that never happened, and the launch would hand `dl` a
     /// prewarm to weigh itself against that nobody fired (#160).
     fn warm(&mut self, staged: &Staged, enabled: bool) -> Option<Prewarmed> {
-        let workspace = self.claim_prewarm(staged, enabled)?;
+        let workspace = self.workspace_to_warm(staged, enabled)?;
         let recorded = match launch::prewarm(&self.checkouts, staged) {
             Some(argv) => {
                 launch::spawn_detached(&argv);
@@ -1003,11 +1003,16 @@ impl App {
     /// to. Split from the spawn deliberately: the gate and the once-per-node
     /// rule are the parts with logic in them.
     ///
-    /// Nothing is claimed while the prewarm is off — `?` short-circuits — so a
+    /// A **question, not a claim** — `&self`, and asking twice answers twice.
+    /// The once-per-node rule is enforced by the insert in [`warm`](Self::warm),
+    /// which is the only writer of `prewarmed`; this names the key that insert
+    /// will land under, and answers `None` where there will be no insert.
+    ///
+    /// Nothing is offered while the prewarm is off — `?` short-circuits — so a
     /// session that exports `WF_PREWARM` and re-stages a node still warms it.
-    /// A stop with no workspace to warm (a project row) claims nothing either,
-    /// because there is nothing to record it under.
-    fn claim_prewarm(&self, staged: &Staged, enabled: bool) -> Option<String> {
+    /// A stop with no workspace to warm (a project row) is offered nothing
+    /// either, because there is nothing to record it under.
+    fn workspace_to_warm(&self, staged: &Staged, enabled: bool) -> Option<String> {
         let workspace = staged.node_workspace()?;
         (enabled && !self.prewarmed.contains_key(&workspace)).then_some(workspace)
     }

@@ -143,7 +143,8 @@ There is a fifth thing `wf` hands `dl`, and it is not an argument: the launch
 resolved to the exec, and when this node's prewarm fired, if one did (#160,
 names and format minted by devlaunch#194). Two rules go with them. They are set
 only where the exec *is* a `dl`, so a host launch carries neither and clears
-both rather than leaving an inherited one in an agent's environment; and neither
+both rather than leaving an inherited one in an agent's environment — as does
+every other `dl` `wf` starts, which is what `launch::unstamped` is for; and neither
 is ever a claim about how the launch went — a hit, a partial and a miss are
 `dl`'s to observe from the arm it takes, and `wf` is gone by then. The seam is
 observable only through a real exec, so its end-to-end guard is claim 6 of

@@ -1351,7 +1351,7 @@ fn devlaunch_on_path() -> Devlaunch {
         let Ok(program) = resolve_on_path(DEVLAUNCH) else {
             return Devlaunch::Absent;
         };
-        match Command::new(program).arg("--version").output() {
+        match unstamped(program).arg("--version").output() {
             Ok(answer) => Devlaunch::from_version_output(&String::from_utf8_lossy(&answer.stdout)),
             // On PATH but it would not run — a file that is not executable, or
             // not a program. There is no version to report, so this is the same
@@ -1461,6 +1461,33 @@ const HANDOFF_T0_VAR: &str = "DEVLAUNCH_HANDOFF_T0";
 
 /// The prewarm stamp's variable: see [`Handoff`].
 const PREWARM_FIRED_VAR: &str = "DEVLAUNCH_PREWARM_FIRED_AT";
+
+/// A child `wf` starts and does **not** become, with the seam's stamps
+/// (#160) stripped out of its environment.
+///
+/// Every `dl` `wf` runs except the launch itself is one of these — the
+/// `--version` probe, the prewarm's `dl <ws> up`, and `wf reap`'s listing and
+/// removals — and none of them is a hand-over, so none may arrive carrying a
+/// keystroke stamp. Declining to *set* one is not enough, because a child
+/// inherits `wf`'s own environment and `wf` is routinely run from inside a
+/// workspace whose environment `dl` stamped for the launch that created it: an
+/// agent doing that would have every `dl` it ran report a hand-over from a
+/// keystroke hours old, indistinguishable on the far side from a real one.
+/// This is the same reason [`Launch::stamps`] hands `exec` a *removal* rather
+/// than a skip.
+///
+/// One constructor rather than a removal remembered at each site, so a `dl`
+/// child added later cannot quietly reopen it — and it takes the program name
+/// rather than a whole argv because one caller runs `dl` and another runs the
+/// `sh` that backgrounds it ([`spawn_detached`]), which is the same seam and a
+/// different program.
+pub fn unstamped(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    for var in Handoff::variables() {
+        command.env_remove(var);
+    }
+    command
+}
 
 /// One stamp as the seam spells it: seconds since the Unix epoch, to nine
 /// decimal places — the string `date +%s.%N` prints, which is the format the
@@ -2068,7 +2095,7 @@ pub fn spawn_detached(argv: &[String]) {
         .join(" ");
     command.push_str(" >/dev/null 2>&1 &");
 
-    let spawned = Command::new("sh")
+    let spawned = unstamped("sh")
         .arg("-c")
         .arg(&command)
         .stdin(std::process::Stdio::null())
@@ -4124,6 +4151,43 @@ mod tests {
                 ("DEVLAUNCH_HANDOFF_T0", None),
                 ("DEVLAUNCH_PREWARM_FIRED_AT", None),
             ]
+        );
+    }
+
+    #[test]
+    fn a_dl_wf_starts_and_does_not_become_clears_the_stamps_it_inherited() {
+        // The other half of the rule above, and the one a clean environment
+        // hides: the probe, the prewarm's `dl <ws> up` and `wf reap`'s listing
+        // and removals are children, not execs, so they inherit `wf`'s
+        // environment — and `wf` run inside a workspace has both stamps in it
+        // already, set by the `dl` that launched the agent running it. Every
+        // one of those children would then report a hand-over from a keystroke
+        // in another session, which the reader cannot tell from a real one.
+        //
+        // Asserted on the command as built rather than on a child's
+        // environment, because the machine running this need not have a `dl`
+        // at all; the end-to-end version is claim 6 of
+        // `tests/live_launch_exec.rs`, which starts `wf` with both already set.
+        let command = unstamped(DEVLAUNCH);
+        let changed: BTreeSet<(&str, Option<&str>)> = command
+            .get_envs()
+            .map(|(var, value)| {
+                (
+                    var.to_str().expect("ascii"),
+                    value.map(|v| v.to_str().expect("ascii")),
+                )
+            })
+            .collect();
+        // The whole environment delta, not merely "the two are in it": a `None`
+        // is a removal and a `Some` is a stamp, so this is also the assertion
+        // that no child of `wf`'s is quietly *given* one.
+        let expected: BTreeSet<(&str, Option<&str>)> = Handoff::variables()
+            .into_iter()
+            .map(|var| (var, None))
+            .collect();
+        assert_eq!(
+            changed, expected,
+            "a `dl` that is not the launch clears both stamps and sets neither"
         );
     }
 

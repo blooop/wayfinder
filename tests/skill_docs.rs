@@ -575,7 +575,10 @@ fn the_seam_paragraph_reads_exactly_as_the_claim_free_rule() {
          inherited. The reader is the `dl` a launch becomes; a host launch becomes the \
          agent instead, and a stamp left standing in an agent session's environment would \
          be picked up by every unrelated `dl` that session went on to run, each reporting \
-         a hand-over measured from a keystroke hours old."
+         a hand-over measured from a keystroke hours old. The same clearing covers every \
+         `dl` `wf` starts and does not become — the version probe, the prewarm's `dl <ws> \
+         up`, and `wf reap`'s listing and removals — because `wf` run inside a workspace \
+         starts with the stamps of the launch that built it already in its environment."
     );
 }
 
