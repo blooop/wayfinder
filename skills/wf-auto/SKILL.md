@@ -102,6 +102,20 @@ Then take the next unblocked ticket. The run ends when the frontier is empty, ev
 
 A ticket found **effectively complete** — overtaken by another decision, or done as a side effect — skips to step 4: comment why, close, index.
 
+## Clean up what this run finished
+
+The run's last act, once the summary is settled: collect the workspaces of the tickets **this run itself closed**, and nothing else.
+
+```
+wf reap --finished <owner/repo#n> [<owner/repo#n> ...]
+```
+
+Name every ticket this run closed, in full, owner included. The scope is the whole of the authority here — the agent that just settled those facts is the only reader there is, and it can vouch for exactly the nodes it drove to done. An unscoped `wf reap` is a person's command over their whole machine; this is one run tidying up after itself, which is why nothing fires on a timer or on startup and why a run that closed nothing runs nothing.
+
+Report what it removed and what it kept, both, in the closing summary. The kept lines are the ones worth reading: a workspace stays when its branch never reached a remote, and that line is the only notice anyone gets that the work exists in one place only. A workspace whose container is still up stays too — including, ordinarily, the one this run is sitting in.
+
+It can also stop having deleted nothing, and say why: a node it read as something other than finished, or a `dl` that will not say what a clone holds. That is a report, not an obstacle — put it in the summary and leave the workspaces where they are. **Never** reach past it: not `-f`, which waives the guard the whole step rests on and is never automatic in any mode, and not an unscoped `wf reap -y`, which is the sweep this deliberately is not.
+
 ## Where it stops
 
 Park a ticket — a `### handoff` comment on it, then carry on with other unblocked work — when resolving it would:
