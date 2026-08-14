@@ -95,6 +95,14 @@ jobs:
       - name: Skill doc shape checks
         run: cargo test --locked --test skill_docs
 
+      # The other config-as-behavior binary, same reasoning: what a workspace
+      # boots from and what `devcontainer.yml` publishes are promises split
+      # across two devcontainer configs and a workflow, and nothing but this
+      # notices when one of them moves. Named here for the same reason as the
+      # step above — the unit-test step stops at `--lib --bins --examples`.
+      - name: Devcontainer prebuild contract
+        run: cargo test --locked --test devcontainer_prebuild
+
       # The one part of `tests/` that needs neither network nor `gh`: the
       # fixture's own diagnostic, which decides what a failing live test tells
       # you about a missing GH_TOKEN. It is split from the environment it reads
