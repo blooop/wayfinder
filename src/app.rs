@@ -208,6 +208,23 @@ enum Cursor {
     Chosen(usize),
 }
 
+/// How a chosen cursor rides out a cluster swap: two different holds, so two
+/// arms (#148). **Identity** is the normal one — the stop under the cursor,
+/// carried with the old position as the fallback should it vanish from the
+/// new order. **Position** is what remains when the cursor is chosen over an
+/// *empty* screen — a swap can empty the list under a choice — where there is
+/// no stop to name. A `None` inside a tuple used to say that by omission,
+/// which let "pinned by identity" and "pinned by position" share one shape
+/// whose halves were told apart by reading the inner option at the use site
+/// rather than by matching.
+enum Pinned {
+    /// Follow this stop wherever the new order puts it; fall back to the old
+    /// position, clamped, if it is gone.
+    Identity(StopKey, usize),
+    /// Nothing to follow: hold the bare position, clamped.
+    Position(usize),
+}
+
 #[derive(Debug)]
 pub struct App {
     /// The clusters on screen: every open map that has arrived, keyed by id.
@@ -780,21 +797,28 @@ impl App {
     pub fn replace_clusters(&mut self, clusters: BTreeMap<MapId, Map>) {
         let pinned = match self.cursor {
             Cursor::Untouched => None,
-            Cursor::Chosen(_) => Some((self.cursor_key(), self.cursor_pos())),
+            Cursor::Chosen(_) => Some(match self.cursor_key() {
+                Some(key) => Pinned::Identity(key, self.cursor_pos()),
+                None => Pinned::Position(self.cursor_pos()),
+            }),
         };
         self.clusters = clusters;
-        if let Some((anchor, old_index)) = pinned {
-            let new_order: Vec<StopKey> = self
-                .stops()
-                .iter()
-                .map(|at| self.stop_key(&at.stop))
-                .collect();
-            self.cursor = Cursor::Chosen(crate::refresh::preserve_cursor(
-                anchor.as_ref(),
-                old_index,
-                &new_order,
-            ));
-        }
+        let Some(pinned) = pinned else {
+            return;
+        };
+        let new_order: Vec<StopKey> = self
+            .stops()
+            .iter()
+            .map(|at| self.stop_key(&at.stop))
+            .collect();
+        self.cursor = Cursor::Chosen(match pinned {
+            Pinned::Identity(key, fallback) => {
+                crate::refresh::preserve_cursor(Some(&key), fallback, &new_order)
+            }
+            Pinned::Position(fallback) => {
+                crate::refresh::preserve_cursor(None, fallback, &new_order)
+            }
+        });
     }
 
     /// The first enter (#62): stage a launch of whatever the cursor is on by
@@ -807,6 +831,14 @@ impl App {
     /// finding no launchable stage — stage, not ticket state, so a merged PR
     /// on a still-open ticket refuses too. Neither can arise on a map: a map
     /// has no blockers and no stage, and a finished one is not drawn.
+    ///
+    /// Staging **chooses the stop it acts on** (#148): every arm that opens
+    /// the picker records the cursor as [`Cursor::Chosen`] there. To the human
+    /// the launch *is* a selection of that row, however the cursor arrived on
+    /// it — an untouched cursor sitting on the first match is enough — and
+    /// without the write a refresh would re-derive "the top" and carry the
+    /// cursor off the very row whose launch is being picked. The refusals do
+    /// not write: nothing was staged, so nothing was chosen.
     fn request_launch(&mut self) -> Outcome {
         match self.cursor_stop() {
             // On a group line there is no agent to run, and exactly one thing
@@ -825,6 +857,7 @@ impl App {
                 // resumable as a build one — and rather more worth resuming.
                 let staged = self.resumable(staged, id.number);
                 self.prewarm(&staged);
+                self.cursor = Cursor::Chosen(self.cursor_pos());
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
                     staged,
@@ -849,6 +882,7 @@ impl App {
                     return Outcome::Continue;
                 }
                 let staged = Staged::project(&repo);
+                self.cursor = Cursor::Chosen(self.cursor_pos());
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
                     staged,
@@ -890,6 +924,7 @@ impl App {
             Some(staged) => {
                 let staged = self.resumable(staged, ticket.number);
                 self.prewarm(&staged);
+                self.cursor = Cursor::Chosen(self.cursor_pos());
                 self.overlay = Overlay::PickLaunch {
                     candidate: staged.default_candidate(),
                     staged,
@@ -1596,6 +1631,72 @@ mod tests {
         for c in s.chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
+    }
+
+    #[test]
+    fn a_key_over_an_empty_list_is_not_a_selection() {
+        // The sift has emptied the screen, so `↓` has nothing to land on. If
+        // that keypress were written down as a choice, the rows arriving next
+        // would find the cursor pinned to position 0 — the map header a sifted
+        // screen leads with — and `enter` there would stage the whole map
+        // rather than the row the query was typed for.
+        let mut app = fixture_app();
+        type_str(&mut app, "zzz");
+        assert!(app.stops().is_empty(), "the query should match nothing");
+
+        app.handle_key(key(KeyCode::Down));
+
+        let mut fresher = app.clusters.clone();
+        fresher.insert(
+            MapId::new(PROJECT, 99),
+            Map {
+                title: "Map: late arrival".to_string(),
+                last_activity: None,
+                tickets: vec![ticket(PROJECT, 200, "zzz sleeper", true, false, vec![])],
+            },
+        );
+        app.replace_clusters(fresher);
+
+        assert_eq!(
+            app.cursor_ticket().map(|t| t.number),
+            Some(200),
+            "nothing was chosen over the empty list, so the cursor means the top row"
+        );
+    }
+
+    #[test]
+    fn staging_a_launch_chooses_the_row_it_acts_on() {
+        // `enter` on a row the cursor merely defaulted to is still an act *on
+        // that row*: the human launched from it. If staging left the cursor
+        // untouched, the next refresh would re-derive "the top", and a fresher
+        // map sorting above would carry the cursor off the very row whose
+        // launch was just staged — the launch and the choice drifting apart.
+        let mut app = fixture_app();
+        type_str(&mut app, "bread"); // one match: #6, reached by default, not by `↓`
+        assert_eq!(app.cursor_ticket().map(|t| t.number), Some(6));
+
+        app.handle_key(key(KeyCode::Enter)); // stage a launch of #6
+        assert!(matches!(app.overlay, Overlay::PickLaunch { .. }));
+        app.handle_key(key(KeyCode::Esc)); // back to the list, nothing picked
+
+        let mut fresher = app.clusters.clone();
+        fresher.insert(
+            MapId::new(PROJECT, 99),
+            Map {
+                title: "Map: fresher".to_string(),
+                last_activity: Some(
+                    Activity::parse("2026-08-07T00:00:00Z").expect("fixture stamp parses"),
+                ),
+                tickets: vec![ticket(PROJECT, 200, "breadwinner", true, false, vec![])],
+            },
+        );
+        app.replace_clusters(fresher);
+
+        assert_eq!(
+            app.cursor_ticket().map(|t| t.number),
+            Some(6),
+            "the launch was staged from #6, so the refresh keeps the cursor on it"
+        );
     }
 
     #[test]
