@@ -246,82 +246,23 @@ fn vocabulary<T: Serialize>(values: &[T]) -> BTreeSet<String> {
     values.iter().map(wire_word).collect()
 }
 
-/// One value of every arm of the aim sum — the wire only ever sees the tag.
-fn every_aim() -> Vec<Aim> {
-    vec![
-        Aim::Map,
-        Aim::Ticket {
-            number: 1,
-            title: String::new(),
-            ticket_type: TicketType::Build,
-            stage: Launchable::Ready,
-            prs: vec![],
-        },
-    ]
-}
-
-/// One value of every arm of the PR-status sum, likewise.
-fn every_pr_status() -> Vec<PrStatus> {
-    vec![
-        PrStatus::Draft,
-        PrStatus::Open {
-            checks: Checks::Absent,
-            review: Review::NotRequired,
-        },
-        PrStatus::Merged,
-        PrStatus::Closed,
-    ]
-}
-
 /// Every value each enumerated field of the block can hold, as serde spells
 /// it — the answer coming from the same serializer the launch itself runs, so
 /// a `rename_all` change moves this side without anyone editing it.
 ///
-/// Adding a variant to any of these types is already a compile error in
-/// `src/launch.rs`, where each word is pinned to a golden literal by an
-/// exhaustive `match`; this side is what then forces the docs to learn it.
+/// The value lists are the types' own (`every`/`every_arm`, #133), where the
+/// compiler holds each list complete — not restatements of them, which a new
+/// variant would silently sit out of. Adding a variant therefore cannot green
+/// until the doc publishes its word, on top of the compile error in
+/// `src/launch.rs` where the word itself gets pinned.
 fn emitted_vocabularies() -> Vec<(&'static str, BTreeSet<String>)> {
     vec![
-        ("aim", vocabulary(&every_aim())),
-        (
-            "ticket_type",
-            vocabulary(&[
-                TicketType::Build,
-                TicketType::Research,
-                TicketType::Task,
-                TicketType::Grilling,
-                TicketType::Prototype,
-                TicketType::Untyped,
-            ]),
-        ),
-        (
-            "stage",
-            vocabulary(&[
-                Launchable::Ready,
-                Launchable::Building,
-                Launchable::InReview,
-                Launchable::NeedsAttention,
-            ]),
-        ),
-        ("status", vocabulary(&every_pr_status())),
-        (
-            "checks",
-            vocabulary(&[
-                Checks::Absent,
-                Checks::Pending,
-                Checks::Passing,
-                Checks::Failing,
-            ]),
-        ),
-        (
-            "review",
-            vocabulary(&[
-                Review::NotRequired,
-                Review::Required,
-                Review::Approved,
-                Review::ChangesRequested,
-            ]),
-        ),
+        ("aim", vocabulary(&Aim::every_arm())),
+        ("ticket_type", vocabulary(&TicketType::every())),
+        ("stage", vocabulary(&Launchable::every())),
+        ("status", vocabulary(&PrStatus::every_arm())),
+        ("checks", vocabulary(&Checks::every())),
+        ("review", vocabulary(&Review::every())),
     ]
 }
 

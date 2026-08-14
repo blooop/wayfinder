@@ -601,6 +601,13 @@ pub enum Launchable {
 }
 
 impl Launchable {
+    /// Every launchable stage, compiler-complete
+    /// ([`crate::model::every_variant`]): the iteration the launch matrix and
+    /// the doc vocabulary run over, so a stage cannot exist unlaunched (#133).
+    pub fn every() -> Vec<Launchable> {
+        crate::model::every_variant!(Launchable: Ready, Building, InReview, NeedsAttention)
+    }
+
     /// Narrow a derived stage to one an agent can be launched on. Exhaustive
     /// on [`Stage`]: a new stage must decide whether it is launchable, or this
     /// stops compiling.
@@ -651,6 +658,25 @@ pub enum Aim {
         stage: Launchable,
         prs: Vec<PrLink>,
     },
+}
+
+impl Aim {
+    /// One value of every arm, compiler-complete
+    /// ([`crate::model::every_variant`]) — the wire only ever sees the tag,
+    /// so the ticket representative's payload is the doc guards' business to
+    /// vary, not this list's.
+    pub fn every_arm() -> Vec<Aim> {
+        crate::model::every_variant!(Aim:
+            Map,
+            Ticket => Aim::Ticket {
+                number: 1,
+                title: String::new(),
+                ticket_type: TicketType::Build,
+                stage: Launchable::Ready,
+                prs: vec![],
+            },
+        )
+    }
 }
 
 /// The map a launch was picked in: its identity *and* its title (#124).
@@ -3157,9 +3183,13 @@ mod tests {
     /// These four are the whole vocabulary the tracker doc publishes, written
     /// as literals traceable to it rather than derived from the types — a
     /// derivation would only prove serde agrees with itself. Being `match`es
-    /// with no wildcard is the other half: adding a type, a stage, a check
-    /// rollup or a review decision stops this module compiling until the new
-    /// word has been decided and pinned here.
+    /// with no wildcard is half of the guarantee: adding a type, a stage, a
+    /// check rollup or a review decision stops this module compiling until
+    /// the new word has been decided and pinned here. The other half is the
+    /// matrix below iterating [`TicketType::every`] and friends rather than
+    /// hand-written arrays, so the new variant is also *launched* — a probe
+    /// variant once compiled and greened with its word pinned while the
+    /// arrays never exercised it (#133).
     fn type_word(ticket_type: TicketType) -> &'static str {
         match ticket_type {
             TicketType::Build => "build",
@@ -3225,25 +3255,16 @@ mod tests {
     /// uses. Before this, only `ready`, `build` and a single open PR were ever
     /// emitted by any test, so every other word the tracker doc publishes
     /// rested on the doc's say-so.
+    ///
+    /// "Whole" is the type's own claim, not this test's: the iteration comes
+    /// from [`TicketType::every`] and friends, where the compiler holds the
+    /// list complete, so a new variant cannot green without a row here (#133).
     #[test]
     fn every_stage_type_and_pr_state_spells_itself_on_the_wire() {
-        let types = [
-            TicketType::Build,
-            TicketType::Research,
-            TicketType::Task,
-            TicketType::Grilling,
-            TicketType::Prototype,
-            TicketType::Untyped,
-        ];
-        let stages = [
-            (Stage::Ready, Launchable::Ready),
-            (Stage::Building, Launchable::Building),
-            (Stage::InReview, Launchable::InReview),
-            (Stage::NeedsAttention, Launchable::NeedsAttention),
-        ];
-        for ticket_type in types {
-            for (stage, launchable) in stages {
-                let ctx = ctx_of(&ticket_prompt(ticket_type, stage, &interactive("")))
+        for ticket_type in TicketType::every() {
+            for launchable in Launchable::every() {
+                let prompt = ticket_prompt(ticket_type, staged_at(launchable), &interactive(""));
+                let ctx = ctx_of(&prompt)
                     .expect("a ticket launch carries context")
                     .to_string();
                 let expected = format!(
@@ -3254,20 +3275,17 @@ mod tests {
                 assert!(ctx.contains(&expected), "expected {expected} in {ctx}");
             }
         }
-        let mut pr_states = vec![PrStatus::Draft, PrStatus::Merged, PrStatus::Closed];
-        for checks in [
-            Checks::Absent,
-            Checks::Pending,
-            Checks::Passing,
-            Checks::Failing,
-        ] {
-            for review in [
-                Review::NotRequired,
-                Review::Required,
-                Review::Approved,
-                Review::ChangesRequested,
-            ] {
-                pr_states.push(PrStatus::Open { checks, review });
+        let mut pr_states = Vec::new();
+        for arm in PrStatus::every_arm() {
+            match arm {
+                PrStatus::Open { .. } => {
+                    for checks in Checks::every() {
+                        for review in Review::every() {
+                            pr_states.push(PrStatus::Open { checks, review });
+                        }
+                    }
+                }
+                settled => pr_states.push(settled),
             }
         }
         for status in pr_states {
@@ -3285,6 +3303,21 @@ mod tests {
         assert!(map.ends_with(r#""aim":"map"}"#), "{map}");
         for absent in ["ticket_type", "stage", "prs"] {
             assert!(!map.contains(absent), "a map aim names no {absent}: {map}");
+        }
+    }
+
+    /// The model stage a launch at this launchable stage is staged from — the
+    /// inverse of [`Launchable::parse`], its own wildcard-free `match` so the
+    /// matrix can iterate [`Launchable::every`] and still hand
+    /// [`Staged::ticket`] the [`Stage`] it wants. A launchable stage no
+    /// [`Stage`] maps to cannot be launched at all, and this is where that
+    /// refuses to compile.
+    fn staged_at(launchable: Launchable) -> Stage {
+        match launchable {
+            Launchable::Ready => Stage::Ready,
+            Launchable::Building => Stage::Building,
+            Launchable::InReview => Stage::InReview,
+            Launchable::NeedsAttention => Stage::NeedsAttention,
         }
     }
 
