@@ -29,6 +29,19 @@
 //! is why [`Verdict::Warn`] exists and why [`doomed`] is the single place that
 //! decides what actually goes.
 //!
+//! Two commands come out of that one decision, and they differ only in who is
+//! reading. [`run`] is `wf reap`: every workspace on the machine, a plan
+//! printed, a prompt. [`cleanup`] is what an autonomous run ends with (#151):
+//! the same [`plan`] and the same [`doomed`], narrowed to the nodes that run
+//! itself drove to done, with no prompt because the agent that just settled
+//! those facts is the reader — and with the guard tightened where losing the
+//! reader costs something. [`decide`] is that narrowing, and everything it does
+//! subtracts: a recoverability floor `dl` has to answer *positively*, and a
+//! full stop on any row the step did not expect. `-f` never reaches the second
+//! one — the binary's scoped argv has no field it could be set in — because it
+//! waives the guard the floor is built on, and that stays a human's to type in
+//! every mode.
+//!
 //! The *deciding* is all here; the *noticing* is [`reclaim`](crate::reclaim),
 //! which calls [`plan`] and [`doomed`] behind the picker so `wf` can say what a
 //! reap would claim without being asked (#137). It adds no deletion path — it
@@ -531,6 +544,28 @@ impl Node {
     pub fn name(&self) -> String {
         format!("{}#{}", short_repo(&self.repo), self.number)
     }
+
+    /// Read a node reference as an autonomous run names one on the command
+    /// line: `owner/repo#number`.
+    ///
+    /// The **owner is required**, unlike [`Node::name`]'s display form, and
+    /// that asymmetry is deliberate: the short name is for a reader who already
+    /// knows which machine they are looking at, while this is what decides
+    /// which repository's tracker is asked and therefore which workspaces are
+    /// eligible to be deleted. A reference the caller has to spell in full
+    /// cannot be resolved against the wrong repo by whatever the cwd happened
+    /// to be.
+    pub fn parse(reference: &str) -> Option<Node> {
+        let (repo, number) = reference.split_once('#')?;
+        let (owner, name) = repo.split_once('/')?;
+        if owner.is_empty() || name.is_empty() || name.contains('/') {
+            return None;
+        }
+        Some(Node {
+            repo: repo.to_string(),
+            number: number.parse().ok()?,
+        })
+    }
 }
 
 /// Which node a workspace is for, or `None` if it is not one of `wf`'s.
@@ -670,6 +705,289 @@ pub fn plan(
 
 fn short_repo(slug: &str) -> &str {
     slug.split('/').next_back().unwrap_or(slug)
+}
+
+/// One workspace the autonomous cleanup has cleared for deletion.
+///
+/// Its fields are private and it has no constructor: the only way to hold one
+/// is to have been handed it by [`decide`], which is the one place the
+/// recoverability floor below is asserted. [`cleanup`] deletes these and
+/// nothing else, so "deleted without the floor being checked" is a value that
+/// cannot be built rather than a rule a reader has to notice was kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cleared {
+    id: String,
+    reason: String,
+}
+
+impl Cleared {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Why it goes — [`plan`]'s own words, carried through unedited, because a
+    /// run reporting a deletion in words of its own would be a second account
+    /// of a decision this module already made.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// What the cleanup step at the end of an autonomous run decided about the
+/// nodes that run drove to done (#151).
+///
+/// Two outcomes and no third, because "some of it" is the shape this must not
+/// have: a step that proceeded with the rows it understood and skipped the one
+/// it did not is a misreading acted on one workspace at a time. Either every
+/// scoped row was one of the two the step expects — a workspace to collect, or
+/// a workspace kept for a reason `dl` or devpod stated — or nothing is deleted
+/// at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cleanup {
+    /// Collect `going`; report `kept` and leave it.
+    ///
+    /// `kept` is [`plan`]'s own `Keep` rows for the run's nodes, unedited. It
+    /// is reported rather than dropped because a workspace the run expected to
+    /// go and that stayed is the thing whoever reads the run's summary most
+    /// needs told — a branch that never reached the remote reads exactly like
+    /// this, and reads like nothing at all if the row is silent.
+    Proceed {
+        going: Vec<Cleared>,
+        kept: Vec<Verdict>,
+    },
+    /// Delete nothing, and say what stopped it.
+    Abort(Unexpected),
+}
+
+/// What the cleanup step saw that it did not expect.
+///
+/// Every arm is the same shape of surprise — the run believed a node was
+/// finished, and this module's own reading of that node, or of its workspace,
+/// says something the step has no authority to interpret unattended. They are
+/// separate arms because they send a reader to different places: the first two
+/// to the tracker, the third to `dl`.
+///
+/// The other two ways an autonomous cleanup can be surprised are not here
+/// because they are already errors: a listing that will not parse and a tracker
+/// that will not answer both fail [`workspaces`] and [`node_facts`], before any
+/// decision exists to be made. Failing there and stopping here are the same
+/// outcome — nothing deleted, and a run that says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unexpected {
+    /// [`plan`] warned about a node this run believed it had just settled.
+    ///
+    /// `Warn` is display-only everywhere in this module (#128), and a warning
+    /// is precisely `wf` unsure. Unattended, the two readings disagreeing is
+    /// the case with nobody present to adjudicate it, so the step stops rather
+    /// than treating its own belief as the tie-break.
+    Warned { id: String, reason: String },
+    /// The tracker does not read this node as finished, and the run said it
+    /// was.
+    ///
+    /// The commonest disagreement there is, and the one with the most riding on
+    /// it: the run's whole authority here is that it drove these nodes to done,
+    /// so a node the tracker still reads as open is that authority failing on
+    /// the very node it was claimed for — which puts the rest of the same argv
+    /// in doubt, and stops the step whole. `said` names the tracker's reading.
+    ///
+    /// Not folded into [`Self::Warned`]: a `Warn` is [`plan`] unsure and this
+    /// is [`plan`] and the run *sure of different things*, and they point a
+    /// reader at different questions.
+    Unfinished { id: String, said: String },
+    /// [`plan`] would collect a workspace `dl` has not said is recoverable.
+    ///
+    /// `said` is the reason in the words the row would have carried.
+    Unrecoverable { id: String, said: String },
+}
+
+impl Unexpected {
+    /// One line naming what stopped the step, for the run's own report.
+    pub fn report(&self) -> String {
+        match self {
+            Self::Warned { id, reason } => {
+                format!("{id} is not a workspace this run may collect: {reason}")
+            }
+            Self::Unfinished { id, said } => {
+                format!("{id} is not a workspace of a node this run finished: {said}")
+            }
+            Self::Unrecoverable { id, said } => {
+                format!("{id} is not established as recoverable: {said}")
+            }
+        }
+    }
+}
+
+/// Why this workspace is not one an autonomous cleanup may delete, or `None`
+/// when `dl` positively said every byte of its clone exists somewhere else.
+///
+/// **The recoverability floor, and the whole of it.** It is a different
+/// question from the one [`plan`] asks, and deliberately stricter in one place:
+/// `plan` keeps a workspace whose `unsaved` *refuses*, and a workspace with no
+/// answer at all therefore passes it. That is right for `wf reap` — a `dl` too
+/// old to answer for every clone it made meant `null` as "clean", and a human
+/// is reading the row either way. It is not right here, where the reader is
+/// gone: the floor wants a fact `dl` **said**, and the absence of a refusal is
+/// not one.
+///
+/// That single asymmetry is also the version gate. A `dl` below
+/// [`UNSAVED_IS_AN_OBJECT`](crate::launch::UNSAVED_IS_AN_OBJECT), or one `wf`
+/// could not probe at all, leaves every clean clone answerless — so a run
+/// against a skewed pair collects nothing and says so, rather than deleting on
+/// a reading whose meaning depends on which release wrote it.
+fn unrecoverable(unsaved: Option<&Unsaved>) -> Option<String> {
+    match unsaved {
+        // The one answer that clears a workspace, and it has to be *that*
+        // answer: this is the floor asserted rather than inferred from nothing
+        // having objected.
+        Some(Unsaved::NothingToLose) => None,
+        // Every other arm already phrases its own refusal for the plan, so the
+        // row reads the same way in both commands. The fallback is unreachable
+        // rather than defensive: it is here so that an arm added to `Unsaved`
+        // which forgot to refuse keeps *this* side closed until somebody means
+        // to open it.
+        Some(other) => Some(
+            other
+                .refusal()
+                .unwrap_or_else(|| format!("dl said something this wf cannot weigh: {other:?}")),
+        ),
+        None => Some("dl did not say what this clone holds".to_string()),
+    }
+}
+
+/// Why the tracker's reading of this node is not one an autonomous cleanup may
+/// have been pointed at, or `None` when the node is finished.
+///
+/// **The scope's own floor**, beside the recoverability one above and asked
+/// first, because it is the earlier question: the run's whole authority here is
+/// that it drove these nodes to done, and a node the tracker still reads as
+/// open is that claim failing on the very node it was made about. `wf reap`
+/// keeps such a workspace and prints a row, which is right with a human reading
+/// the list; unattended there is nobody to weigh "the run says finished, the
+/// tracker says open", so the step stops and hands both readings back.
+///
+/// Finished means the two arms [`plan`] reaps on, and this says so in the same
+/// exhaustive shape: a seventh [`NodeFact`] fails to compile here until
+/// somebody decides what an unattended run does with it. `None` — a scoped node
+/// the tracker was not asked about — is a surprise too, and a louder one than
+/// [`plan`]'s keep for it: the fetch is never partial, so getting here means
+/// this run does not know what it thinks it knows.
+fn unfinished(name: &str, fact: Option<&NodeFact>) -> Option<String> {
+    match fact {
+        Some(NodeFact::Closed | NodeFact::DoneByMerge { .. }) => None,
+        Some(NodeFact::InFlight { pr }) => {
+            Some(format!("{name} is still open, with PR #{pr} in flight"))
+        }
+        Some(NodeFact::Claimed) => Some(format!("{name} is still open, and claimed")),
+        Some(NodeFact::Superseded { pr }) => Some(format!(
+            "{name} is still open, its PR #{pr} closed unmerged"
+        )),
+        Some(NodeFact::Unstarted) => {
+            Some(format!("{name} is still open, unclaimed and with no PR"))
+        }
+        None => Some(format!("the tracker was not asked about {name}")),
+    }
+}
+
+/// Read a plan the way the cleanup step at the end of an autonomous run reads
+/// it: scoped to the nodes that run drove to done, and refusing anything else.
+///
+/// `verdicts` is [`plan`]'s output and `going` is [`doomed`]'s answer over it —
+/// called, never re-derived (#137). This function adds no definition of what is
+/// finished; what it adds is a *narrower* one of what may be deleted with
+/// nobody watching, and it can only ever subtract.
+///
+/// Three rules, in the order they matter:
+///
+/// - **Scope.** A workspace whose node is not one of `scope` is not looked at.
+///   That is #72's no-sweep posture kept by construction rather than by
+///   promising not to schedule anything: the step cannot reach a workspace the
+///   run did not finish, so there is nothing for a timer to fire.
+/// - **The floors.** A scoped workspace [`doomed`] names is cleared only if the
+///   recoverability floor — `unrecoverable`, above — says nothing about it, and
+///   a scoped workspace it does not name is left standing only if the tracker
+///   reads its node as finished — `unfinished`, above. Anything else stops the
+///   step.
+/// - **Surprise stops everything.** A scoped `Warn` — `wf` unsure about a node
+///   this run believed settled — is [`Unexpected::Warned`]; a scoped node the
+///   tracker still reads as open is [`Unexpected::Unfinished`]; and either way
+///   the step deletes nothing at all, not even the rows it did understand.
+///
+/// So the only workspace this reports as kept is one `dl` or devpod spoke about
+/// — work that exists nowhere else, a container still up — on a node the
+/// tracker agrees is done. That is the run's last push having failed, which is
+/// a thing to say in the summary and not a thing to stop for.
+///
+/// `insist` has no counterpart here and never will: `-f` waives the guard that
+/// makes the floor meaningful, and it stays a human's to type.
+pub fn decide(
+    workspaces: &[Workspace],
+    verdicts: &[Verdict],
+    known: &BTreeMap<Node, NodeFact>,
+    scope: &BTreeSet<Node>,
+) -> Cleanup {
+    let mine = |id: &str| -> Option<(&Workspace, Node)> {
+        let workspace = workspaces.iter().find(|w| w.id == id)?;
+        let node = node_of(workspace)?;
+        scope.contains(&node).then_some((workspace, node))
+    };
+    // Asked for rather than re-derived, and asked for once: `doomed` is the one
+    // definition of what goes, so the loop below decides only whether a
+    // workspace it already named may go *unattended*.
+    let condemned: BTreeSet<&str> = doomed(verdicts).into_iter().map(Verdict::id).collect();
+    let mut going = Vec::new();
+    let mut kept = Vec::new();
+    for verdict in verdicts {
+        let Some((workspace, node)) = mine(verdict.id()) else {
+            continue;
+        };
+        // A match rather than a chain ending in `else`, because this is the one
+        // function that authorises an unattended deletion and [`Verdict`] is
+        // three arms precisely so that every such site has to say which of them
+        // it means: a fourth arm must fail to compile here rather than inherit
+        // whichever branch it was written next to.
+        match verdict {
+            // The deleting arm, and it is `doomed`'s answer that puts a row in
+            // it — asked rather than re-derived, so a partition written twice
+            // cannot turn a row this module keeps into a row it deletes.
+            Verdict::Reap { id, reason } if condemned.contains(id.as_str()) => {
+                if let Some(said) = unrecoverable(workspace.unsaved.as_ref()) {
+                    return Cleanup::Abort(Unexpected::Unrecoverable {
+                        id: id.clone(),
+                        said,
+                    });
+                }
+                going.push(Cleared {
+                    id: id.clone(),
+                    reason: reason.clone(),
+                });
+            }
+            // A `Warn` — and a `Reap` `doomed` did not name, which would mean
+            // the one definition of what goes and the row in front of it
+            // disagree about the same listing. Both are `wf` and this run
+            // reading the same workspace differently, with nobody here to say
+            // which is right.
+            Verdict::Warn { id, reason } | Verdict::Reap { id, reason } => {
+                return Cleanup::Abort(Unexpected::Warned {
+                    id: id.clone(),
+                    reason: reason.clone(),
+                })
+            }
+            // Kept — once the node it belongs to is one the tracker agrees
+            // this run finished. A keep is `dl`'s or devpod's fact about the
+            // workspace; the node still being open is the run's own claim
+            // failing, which is not a row to print and go on from.
+            Verdict::Keep { id, .. } => {
+                if let Some(said) = unfinished(&node.name(), known.get(&node)) {
+                    return Cleanup::Abort(Unexpected::Unfinished {
+                        id: id.clone(),
+                        said,
+                    });
+                }
+                kept.push(verdict.clone());
+            }
+        }
+    }
+    Cleanup::Proceed { going, kept }
 }
 
 /// Ask `dl` what workspaces exist and what they hold.
@@ -1064,6 +1382,90 @@ pub async fn run(yes: bool, insist: bool) -> Result<()> {
             Err(e) => {
                 emit(&format!("could not remove {}: {e}\n", verdict.id()));
                 failed.push(verdict.id().to_string());
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!("{} workspace(s) could not be removed", failed.len());
+    }
+    Ok(())
+}
+
+/// `wf reap --finished <node>…`: the cleanup step an autonomous run ends with.
+///
+/// The other half of [`run`], and the halves differ in exactly three things.
+/// It is **scoped** — to the nodes the run itself drove to done, so nothing
+/// else on the machine is looked at and #72's no-sweep posture survives
+/// automation. It **does not ask**, because the agent that just settled those
+/// facts is the reader, and there is nobody else to answer a prompt. And it
+/// **refuses more than it is asked to**: [`decide`] holds every scoped
+/// workspace to a recoverability floor `wf reap` does not apply, and stops the
+/// whole step on anything it did not expect.
+///
+/// There is no `insist` parameter and no argv that produces one. `-f` waives
+/// `dl`'s unsaved-work guard — the guard the floor is built out of — and it
+/// stays a human's to type, in every mode.
+///
+/// The tracker is asked only about the scoped nodes that actually have a
+/// workspace, so a run that finished ten tickets and left one workspace behind
+/// asks about one.
+///
+/// # Errors
+///
+/// A listing or a tracker query that failed, a workspace `dl` would not remove,
+/// and — the arm this command adds — a [`Cleanup::Abort`]. All four are the
+/// same outcome from where the run is standing: nothing was deleted, and the
+/// exit code says so rather than leaving a refusal to be skimmed past in a log.
+pub async fn cleanup(scope: &BTreeSet<Node>) -> Result<()> {
+    use std::fmt::Write;
+
+    use crate::emit;
+
+    let workspaces = workspaces().await?;
+    let wanted: BTreeSet<Node> = workspaces
+        .iter()
+        .filter_map(node_of)
+        .filter(|node| scope.contains(node))
+        .collect();
+    if wanted.is_empty() {
+        emit("nothing this run finished has a workspace left on this machine\n");
+        return Ok(());
+    }
+    let known = node_facts(&wanted).await?;
+    let verdicts = plan(&workspaces, &known, false);
+
+    let (going, kept) = match decide(&workspaces, &verdicts, &known, scope) {
+        Cleanup::Abort(unexpected) => bail!(
+            "cleanup stopped and deleted nothing: {}\n\
+             (run `wf reap` to see every workspace on this machine and decide by hand)",
+            unexpected.report()
+        ),
+        Cleanup::Proceed { going, kept } => (going, kept),
+    };
+
+    // What stayed, before what goes, for the reason [`run`] prints its plan in
+    // that order: the workspace somebody expected to be collected and that was
+    // not is the row worth reading, and here it is the only sign that a branch
+    // never reached the remote.
+    let mut out = String::new();
+    for verdict in &kept {
+        let _ = writeln!(out, "  kept     {}  ({})", verdict.id(), verdict.reason());
+    }
+    emit(&out);
+
+    // One at a time and reported as they go, exactly as [`run`] does it: a
+    // failure part-way through leaves a set the next run has to make sense of.
+    let mut failed = Vec::new();
+    for cleared in &going {
+        match remove(cleared.id(), false).await {
+            Ok(()) => emit(&format!(
+                "  removed  {}  ({})\n",
+                cleared.id(),
+                cleared.reason()
+            )),
+            Err(e) => {
+                emit(&format!("  failed   {}  ({e})\n", cleared.id()));
+                failed.push(cleared.id().to_string());
             }
         }
     }
@@ -2544,6 +2946,503 @@ mod tests {
         );
     }
 
+    // ---- the autonomous cleanup a run ends with (#151) ----
+
+    /// A workspace of this repo whose clone `dl` says is fully pushed — the
+    /// ordinary state the lifecycle's continuous commit-and-push leaves behind,
+    /// and the only one the autonomous cleanup may delete.
+    fn pushed(id: &str, number: u64) -> Workspace {
+        Workspace {
+            unsaved: Some(Unsaved::NothingToLose),
+            ..workspace(
+                id,
+                "blooop/wayfinder",
+                &format!("wayfinder/wayfinder-{number}"),
+            )
+        }
+    }
+
+    /// The nodes a run drove to done, as the cleanup step scopes itself to them.
+    fn finished(numbers: &[u64]) -> BTreeSet<Node> {
+        numbers
+            .iter()
+            .map(|n| node("blooop/wayfinder", *n))
+            .collect()
+    }
+
+    /// The whole step as one call: the plan this repo already makes, read by
+    /// the cleanup. Deliberately built from `plan` rather than from hand-made
+    /// verdicts, so every case below is a claim about what a real reading does.
+    fn cleanup_of(
+        workspaces: &[Workspace],
+        known: &BTreeMap<Node, NodeFact>,
+        scope: &[u64],
+    ) -> Cleanup {
+        decide(
+            workspaces,
+            &plan(workspaces, known, false),
+            known,
+            &finished(scope),
+        )
+    }
+
+    /// The ids the step would hand `dl`, for the cases that only care about
+    /// that. `Abort` is deliberately not "no ids": a step that stopped and a
+    /// step that found nothing are different outcomes and the tests that mean
+    /// the first say so.
+    fn going(cleanup: &Cleanup) -> Vec<&str> {
+        match cleanup {
+            Cleanup::Proceed { going, .. } => going.iter().map(Cleared::id).collect(),
+            Cleanup::Abort(_) => panic!("the step stopped: {cleanup:?}"),
+        }
+    }
+
+    #[test]
+    fn the_run_collects_the_workspace_of_the_ticket_it_finished() {
+        let workspaces = [pushed("wf-151", 151)];
+        let known = facts([(node("blooop/wayfinder", 151), NodeFact::Closed)]);
+        assert_eq!(going(&cleanup_of(&workspaces, &known, &[151])), ["wf-151"]);
+    }
+
+    #[test]
+    fn work_that_exists_nowhere_else_keeps_a_workspace_the_run_believed_finished() {
+        // The recoverability floor, at the arm the spec names: a closed ticket,
+        // no prompt to stop at, and the workspace stays because `dl` says its
+        // clone holds the only copy of something. Kept and *named* — a run that
+        // silently left it would leave nobody to notice the branch never
+        // reached the remote.
+        let mut ws = pushed("wf-151", 151);
+        ws.unsaved = Some(Unsaved::WouldLose("1 unpushed commit(s)".to_string()));
+        let known = facts([(node("blooop/wayfinder", 151), NodeFact::Closed)]);
+        let Cleanup::Proceed { going, kept } = cleanup_of(&[ws], &known, &[151]) else {
+            panic!("an unpushed workspace is kept, not a reason to stop");
+        };
+        assert!(going.is_empty(), "nothing may be deleted here");
+        assert_eq!(
+            kept,
+            [Verdict::Keep {
+                id: "wf-151".to_string(),
+                reason: "holds 1 unpushed commit(s)".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_clone_dl_never_cleared_stops_the_step_even_where_the_plan_would_reap_it() {
+        // The floor asserted rather than assumed, and the version gate with it.
+        // A `dl` too old to answer for every clone it made — or one `wf` could
+        // not ask — leaves no answer at all, and `plan` reaps on that, because
+        // that is what those releases meant by it and a human is reading the
+        // row. Here nobody is: the step wants a fact `dl` *said*, and the
+        // absence of a refusal is not one.
+        //
+        // This is also the guard that survives `plan` changing under it. The
+        // workspace below is one `plan` puts in the doomed set, so the step is
+        // refusing on its own reading rather than inheriting a keep.
+        let mut ws = pushed("wf-151", 151);
+        ws.unsaved = None;
+        let known = facts([(node("blooop/wayfinder", 151), NodeFact::Closed)]);
+        let verdicts = plan(std::slice::from_ref(&ws), &known, false);
+        assert_eq!(
+            doomed(&verdicts).len(),
+            1,
+            "the plan this reads really would have reaped it"
+        );
+        assert_eq!(
+            decide(
+                std::slice::from_ref(&ws),
+                &verdicts,
+                &known,
+                &finished(&[151])
+            ),
+            Cleanup::Abort(Unexpected::Unrecoverable {
+                id: "wf-151".to_string(),
+                said: "dl did not say what this clone holds".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_plan_made_with_the_waiver_in_it_still_collects_nothing_unattended() {
+        // "`-f` is never automatic in any mode", pinned at the decision and not
+        // only at the argv that cannot spell it. `plan(_, _, true)` is the
+        // forced plan a human gets after reading what it would discard, and it
+        // puts a workspace holding unpushed work straight into the doomed set.
+        // The floor asks `dl` about the *workspace* rather than asking the plan
+        // how it was made, so the answer does not change — which is what keeps
+        // this true for a caller that has not been written yet.
+        let mut ws = pushed("wf-151", 151);
+        ws.unsaved = Some(Unsaved::WouldLose("1 unpushed commit(s)".to_string()));
+        let known = facts([(node("blooop/wayfinder", 151), NodeFact::Closed)]);
+        let forced = plan(std::slice::from_ref(&ws), &known, true);
+        assert_eq!(
+            doomed(&forced).len(),
+            1,
+            "the forced plan this reads really would have reaped it"
+        );
+        assert_eq!(
+            decide(
+                std::slice::from_ref(&ws),
+                &forced,
+                &known,
+                &finished(&[151])
+            ),
+            Cleanup::Abort(Unexpected::Unrecoverable {
+                id: "wf-151".to_string(),
+                said: "holds 1 unpushed commit(s)".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_warning_where_the_run_believed_its_node_finished_stops_the_whole_step() {
+        // A `Warn` is `wf` unsure about a node this run thinks it just settled,
+        // and the two readings disagreeing is the case nobody is present to
+        // adjudicate. Everything stops — including the sibling workspace whose
+        // own row was a clean reap, because "proceed with the ones I did
+        // understand" is how a misreading gets acted on one workspace at a time.
+        let workspaces = [pushed("wf-150", 150), pushed("wf-151", 151)];
+        let known = facts([
+            (
+                node("blooop/wayfinder", 150),
+                NodeFact::Superseded { pr: 97 },
+            ),
+            (node("blooop/wayfinder", 151), NodeFact::Closed),
+        ]);
+        assert_eq!(
+            cleanup_of(&workspaces, &known, &[150, 151]),
+            Cleanup::Abort(Unexpected::Warned {
+                id: "wf-150".to_string(),
+                reason: "wayfinder#150's PR #97 closed unmerged — superseded? reap by hand if so"
+                    .to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_node_the_tracker_still_reads_as_open_stops_the_whole_step() {
+        // The other half of the surprise the `Warn` test above pins, and the
+        // commoner half: the run believed it drove this node to done, and the
+        // tracker says the ticket is open with a PR in flight. Two readings of
+        // the same node disagreeing is the case nobody is present to
+        // adjudicate — and a run whose belief about its own node is contradicted
+        // has every other belief in the same argv put in doubt, so the sibling
+        // whose row was a clean reap is not collected either.
+        let workspaces = [pushed("wf-150", 150), pushed("wf-151", 151)];
+        let known = facts([
+            (node("blooop/wayfinder", 150), NodeFact::InFlight { pr: 97 }),
+            (node("blooop/wayfinder", 151), NodeFact::Closed),
+        ]);
+        assert_eq!(
+            cleanup_of(&workspaces, &known, &[150, 151]),
+            Cleanup::Abort(Unexpected::Unfinished {
+                id: "wf-150".to_string(),
+                said: "wayfinder#150 is still open, with PR #97 in flight".to_string(),
+            })
+        );
+        // A claim is the same disagreement without a PR to name.
+        let known = facts([
+            (node("blooop/wayfinder", 150), NodeFact::Claimed),
+            (node("blooop/wayfinder", 151), NodeFact::Closed),
+        ]);
+        assert_eq!(
+            cleanup_of(&workspaces, &known, &[150, 151]),
+            Cleanup::Abort(Unexpected::Unfinished {
+                id: "wf-150".to_string(),
+                said: "wayfinder#150 is still open, and claimed".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn work_that_exists_nowhere_else_is_kept_rather_than_read_as_a_node_left_open() {
+        // The distinction the arm above must not swallow, stated where a
+        // careless "any keep is a surprise" would break it. The ticket is
+        // closed — this run really did finish it — and the workspace stays only
+        // because `dl` says its clone holds the only copy of something. The
+        // floor keeping a workspace is the step working, so the run reports the
+        // row and ends green; the tracker contradicting the run is not.
+        let mut ws = pushed("wf-151", 151);
+        ws.unsaved = Some(Unsaved::WouldLose("1 unpushed commit(s)".to_string()));
+        let known = facts([(node("blooop/wayfinder", 151), NodeFact::Closed)]);
+        assert!(
+            matches!(cleanup_of(&[ws], &known, &[151]), Cleanup::Proceed { .. }),
+            "a finished node whose clone holds work is a keep, not a stop"
+        );
+    }
+
+    #[test]
+    fn the_step_stops_on_exactly_the_facts_the_plan_would_not_reap() {
+        // What "finished" means here, tied to the one definition rather than
+        // restated beside it (#137). The step reads a fact as finished exactly
+        // when `plan` would have reaped a clean workspace of that node, so a
+        // later arm added to one and not the other is a failure here rather
+        // than an unattended deletion.
+        for fact in [
+            NodeFact::Closed,
+            NodeFact::DoneByMerge { pr: 11 },
+            NodeFact::Superseded { pr: 12 },
+            NodeFact::InFlight { pr: 13 },
+            NodeFact::Claimed,
+            NodeFact::Unstarted,
+        ] {
+            let workspaces = [pushed("wf-151", 151)];
+            let known = facts([(node("blooop/wayfinder", 151), fact.clone())]);
+            let reaped = !doomed(&plan(&workspaces, &known, false)).is_empty();
+            let stopped = matches!(cleanup_of(&workspaces, &known, &[151]), Cleanup::Abort(_));
+            assert_eq!(
+                stopped,
+                !reaped,
+                "{fact:?}: the plan would {} it, and the step {}",
+                if reaped { "reap" } else { "not reap" },
+                if stopped { "stopped" } else { "went on" }
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_outside_the_runs_own_nodes_is_collected_or_reported() {
+        // #72's no-sweep posture, kept by construction: the step is scoped to
+        // the nodes the run itself drove to done, so a finished workspace of
+        // somebody else's ticket is not deleted here — and not named either,
+        // because a report about workspaces the run has no business in is the
+        // sweep arriving as advice.
+        let workspaces = [pushed("wf-151", 151), pushed("wf-99", 99)];
+        let known = facts([
+            (node("blooop/wayfinder", 151), NodeFact::Closed),
+            (node("blooop/wayfinder", 99), NodeFact::Closed),
+        ]);
+        let Cleanup::Proceed { going, kept } = cleanup_of(&workspaces, &known, &[151]) else {
+            panic!("a node outside the scope is not a reason to stop");
+        };
+        assert_eq!(
+            going.iter().map(Cleared::id).collect::<Vec<_>>(),
+            ["wf-151"]
+        );
+        assert!(kept.is_empty(), "and it is not reported either: {kept:?}");
+    }
+
+    #[test]
+    fn a_warning_outside_the_runs_own_nodes_does_not_stop_it() {
+        // The same posture pointed the other way. The scope is what makes an
+        // unexpected row unexpected: a superseded ticket nobody in this run
+        // touched is `wf reap`'s business, and stopping on it would make every
+        // run's cleanup hostage to the rest of the machine.
+        let workspaces = [pushed("wf-151", 151), pushed("wf-99", 99)];
+        let known = facts([
+            (node("blooop/wayfinder", 151), NodeFact::Closed),
+            (
+                node("blooop/wayfinder", 99),
+                NodeFact::Superseded { pr: 12 },
+            ),
+        ]);
+        assert_eq!(going(&cleanup_of(&workspaces, &known, &[151])), ["wf-151"]);
+    }
+
+    #[test]
+    fn the_step_deletes_exactly_what_doomed_names_within_the_scope() {
+        // #137's one-vocabulary rule at the deleting end: the set that goes is
+        // `doomed`'s answer narrowed to the run's own nodes, never a second
+        // reading of what "finished" means. Every fact that can reach a
+        // workspace is in the listing, so a partition written twice here would
+        // have to agree with `doomed` on all six to pass.
+        let workspaces: Vec<Workspace> = (1..=6).map(|n| pushed(&format!("wf-{n}"), n)).collect();
+        let known = facts([
+            (node("blooop/wayfinder", 1), NodeFact::Closed),
+            (
+                node("blooop/wayfinder", 2),
+                NodeFact::DoneByMerge { pr: 11 },
+            ),
+            (node("blooop/wayfinder", 3), NodeFact::InFlight { pr: 12 }),
+            (node("blooop/wayfinder", 4), NodeFact::Claimed),
+            (node("blooop/wayfinder", 5), NodeFact::Superseded { pr: 13 }),
+            (node("blooop/wayfinder", 6), NodeFact::Unstarted),
+        ]);
+        // Four of the six facts are the step's abort arm — everything the
+        // tracker does not read as finished — so the scope that compares the
+        // two sets is the one without them. The other four workspaces stay in
+        // the listing, which is what makes this a claim about narrowing rather
+        // than about a fixture with nothing else in it.
+        let scope = [1, 2];
+        let verdicts = plan(&workspaces, &known, false);
+        let by_doomed: Vec<&str> = doomed(&verdicts)
+            .iter()
+            .map(|v| v.id())
+            .filter(|id| scope.iter().any(|n| *id == format!("wf-{n}")))
+            .collect();
+        assert_eq!(going(&cleanup_of(&workspaces, &known, &scope)), by_doomed);
+        assert_eq!(by_doomed, ["wf-1", "wf-2"], "the fixture still bites");
+    }
+
+    /// What the autonomous cleanup does with one node — the three outcomes,
+    /// named, so a table can state them as literals.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Fate {
+        Goes,
+        Stays,
+        Stops,
+    }
+
+    /// Which arm of [`NodeFact`] this is, as an index.
+    ///
+    /// An exhaustive match with no wildcard, so a seventh arm fails to compile
+    /// here — and the table below is then what says somebody decided what the
+    /// *deleting* path does with it, rather than letting it inherit an outcome
+    /// from whichever arm it was written next to. #132's second item found this
+    /// module's pinning thin at exactly this end.
+    fn arm(fact: &NodeFact) -> usize {
+        match fact {
+            NodeFact::Closed => 0,
+            NodeFact::DoneByMerge { .. } => 1,
+            NodeFact::Superseded { .. } => 2,
+            NodeFact::InFlight { .. } => 3,
+            NodeFact::Claimed => 4,
+            NodeFact::Unstarted => 5,
+        }
+    }
+
+    #[test]
+    fn every_state_a_node_can_be_in_has_a_decided_fate_and_only_two_delete() {
+        // Every workspace here is one `dl` says is fully pushed and whose
+        // container is down, so what varies is only the tracker's reading — and
+        // the reading alone never produces a `Stays`. A keep is something `dl`
+        // or devpod said about the *workspace* (unpushed work, a live
+        // container); a node the tracker does not read as finished is the run
+        // being contradicted about its own ticket, and that stops the step.
+        let cases = [
+            (NodeFact::Closed, Fate::Goes),
+            (NodeFact::DoneByMerge { pr: 11 }, Fate::Goes),
+            (NodeFact::Superseded { pr: 12 }, Fate::Stops),
+            (NodeFact::InFlight { pr: 13 }, Fate::Stops),
+            (NodeFact::Claimed, Fate::Stops),
+            (NodeFact::Unstarted, Fate::Stops),
+        ];
+        assert_eq!(
+            cases.iter().map(|(fact, _)| arm(fact)).collect::<Vec<_>>(),
+            (0..6).collect::<Vec<_>>(),
+            "every arm of NodeFact needs a case here, in the order `arm` lists them"
+        );
+        for (fact, expected) in cases {
+            let workspaces = [pushed("wf-151", 151)];
+            let known = facts([(node("blooop/wayfinder", 151), fact.clone())]);
+            let got = match cleanup_of(&workspaces, &known, &[151]) {
+                Cleanup::Abort(_) => Fate::Stops,
+                Cleanup::Proceed { going, .. } if going.is_empty() => Fate::Stays,
+                Cleanup::Proceed { .. } => Fate::Goes,
+            };
+            assert_eq!(got, expected, "{fact:?} reached the wrong arm");
+        }
+    }
+
+    #[test]
+    fn a_ticket_state_this_binary_cannot_read_never_reaches_the_deleting_arm() {
+        // #132's first item, at the autonomous end. The unattended path is the
+        // one #138 held this back for: there is no reader between an unknown
+        // word and a deletion, so the reading has to land on an arm that keeps
+        // whatever the word turns out to mean.
+        let fact = node_fact(TicketState::read("TRANSFERRED"), false, &[]);
+        assert_eq!(fact, NodeFact::Unstarted, "an unreadable state stays live");
+        let workspaces = [pushed("wf-151", 151)];
+        let known = facts([(node("blooop/wayfinder", 151), fact)]);
+        assert!(
+            matches!(cleanup_of(&workspaces, &known, &[151]), Cleanup::Abort(_)),
+            "a state this binary cannot read must cost a workspace nothing"
+        );
+    }
+
+    #[test]
+    fn a_pr_state_this_binary_cannot_read_never_reaches_the_deleting_arm() {
+        // The same claim through the other reading. A PR whose state the badge
+        // parse declines is in flight, which is the tracker saying the node is
+        // still open — so the step stops rather than deleting on a word this
+        // binary was never taught, and the workspace costs the run nothing.
+        let fact = node_fact(TicketState::Live, false, &[PrOutcome::project(9, None)]);
+        assert_eq!(fact, NodeFact::InFlight { pr: 9 });
+        let workspaces = [pushed("wf-151", 151)];
+        let known = facts([(node("blooop/wayfinder", 151), fact)]);
+        assert!(
+            matches!(cleanup_of(&workspaces, &known, &[151]), Cleanup::Abort(_)),
+            "a PR state this binary cannot read must cost a workspace nothing"
+        );
+    }
+
+    #[test]
+    fn a_merge_finishes_a_node_and_the_closed_prs_beside_it_do_not() {
+        // #132's second item: the `DoneByMerge`/`Superseded` precedence, pinned
+        // where getting it backwards costs something. Swap the two arms of
+        // `node_fact` and the first case stops the step instead of collecting,
+        // and the second collects a branch a human said no to.
+        let merged_and_closed = [
+            PrOutcome::project(161, Some(&PrStatus::Merged)),
+            PrOutcome::project(162, Some(&PrStatus::Closed)),
+        ];
+        let workspaces = [pushed("wf-151", 151)];
+        let known = facts([(
+            node("blooop/wayfinder", 151),
+            node_fact(TicketState::Live, false, &merged_and_closed),
+        )]);
+        assert_eq!(going(&cleanup_of(&workspaces, &known, &[151])), ["wf-151"]);
+
+        let closed_only = [PrOutcome::project(162, Some(&PrStatus::Closed))];
+        let known = facts([(
+            node("blooop/wayfinder", 151),
+            node_fact(TicketState::Live, false, &closed_only),
+        )]);
+        assert!(
+            matches!(cleanup_of(&workspaces, &known, &[151]), Cleanup::Abort(_)),
+            "a node whose every PR closed unmerged is never this step's to delete"
+        );
+    }
+
+    #[test]
+    fn a_running_workspace_of_a_finished_ticket_is_kept_rather_than_stopped_for() {
+        // A run's own manager reads as this from inside a workspace: the
+        // container is up because the session is in it. `dl`'s fact, kept as a
+        // keep — nothing about it says the reading went wrong.
+        let mut ws = pushed("wf-151", 151);
+        ws.state = Some("Running".to_string());
+        let known = facts([(node("blooop/wayfinder", 151), NodeFact::Closed)]);
+        let Cleanup::Proceed { going, kept } = cleanup_of(&[ws], &known, &[151]) else {
+            panic!("a running container is an ordinary keep");
+        };
+        assert!(going.is_empty());
+        assert_eq!(kept[0].reason(), "still running — stop it first");
+    }
+
+    #[test]
+    fn a_node_the_run_names_that_has_no_workspace_is_nothing_to_do() {
+        let known = facts([(node("blooop/wayfinder", 151), NodeFact::Closed)]);
+        assert_eq!(
+            cleanup_of(&[], &known, &[151]),
+            Cleanup::Proceed {
+                going: Vec::new(),
+                kept: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn a_node_reference_is_read_back_exactly_as_it_is_written() {
+        assert_eq!(
+            Node::parse("blooop/wayfinder#151"),
+            Some(node("blooop/wayfinder", 151))
+        );
+        // Every rejection is a way of naming something this step must not act
+        // on: without an owner there is no repo to ask the tracker about, and
+        // the rest are not node references at all.
+        for bad in [
+            "wayfinder#151",
+            "blooop/wayfinder",
+            "blooop/wayfinder#",
+            "blooop/wayfinder#-1",
+            "blooop/wayfinder#151#2",
+            "#151",
+            "",
+        ] {
+            assert_eq!(Node::parse(bad), None, "{bad:?} is not a node reference");
+        }
+    }
+
     /// `wf reap -y` taken for real, in a child process whose `dl` and `gh` are
     /// the fixtures the parent hands it and whose every invocation is written
     /// down. The `#[ignore]` is what keeps it out of an ordinary run: without
@@ -2624,6 +3523,222 @@ mod tests {
             run.argv
         );
         run.touched_no_files();
+    }
+
+    /// The autonomous cleanup taken for real, scoped to `wayfinder#129` — the
+    /// one node of [`probe::DL_LISTING`](crate::probe::DL_LISTING) whose ticket
+    /// is closed, standing in for the ticket a run just drove to done.
+    ///
+    /// No flag counterpart to `-y` and none to `-f`: the first is what this
+    /// path *is*, and the second has no spelling anywhere on it.
+    #[tokio::test]
+    #[ignore = "run by `probe::record` from the tests below, under recording shims"]
+    async fn cleanup_probe() {
+        if !crate::probe::is_child() {
+            return;
+        }
+        let said = match cleanup(&finished(&[129])).await {
+            Ok(()) => "the cleanup finished".to_string(),
+            Err(e) => format!("the cleanup stopped: {e}"),
+        };
+        println!("{}{said}", crate::probe::MARK);
+    }
+
+    /// The same run, scoped to one node more: `wayfinder#138`, which the
+    /// tracker fixture says nobody claimed and nothing came of — a `Warn`, and
+    /// therefore a node this run has no business believing it finished.
+    #[tokio::test]
+    #[ignore = "run by `probe::record` from the test below, under recording shims"]
+    async fn cleanup_warned_probe() {
+        if !crate::probe::is_child() {
+            return;
+        }
+        let said = match cleanup(&finished(&[129, 138])).await {
+            Ok(()) => "the cleanup finished".to_string(),
+            Err(e) => format!("the cleanup stopped: {e}"),
+        };
+        println!("{}{said}", crate::probe::MARK);
+    }
+
+    #[test]
+    fn a_cleanup_hands_dl_the_finished_workspace_of_its_own_node_and_no_force() {
+        // The deleting path of the autonomous half as a fact about a run,
+        // beside its interactive sibling above. The listing holds four
+        // workspaces and the tracker answers for all four; what the scope says
+        // is that exactly one of them is this run's to collect.
+        let run = crate::probe::record(
+            "reap::tests::cleanup_probe",
+            crate::probe::DL_LISTING,
+            crate::probe::GH_FACTS,
+        );
+        assert_eq!(
+            run.printed(),
+            ["the cleanup finished"],
+            "the run reached the end: {}",
+            run.stdout
+        );
+        // `--force` is the flag this whole ticket exists to keep out of an
+        // unattended path: it waives `dl`'s own unsaved-work guard, which is
+        // the guard the recoverability floor is built on. One `rm`, by id, and
+        // no second spelling of a deletion.
+        assert_eq!(
+            destructive(&run),
+            ["dl <wf-129-closed> <rm>"],
+            "the run's own finished workspace goes, alone and unforced: {:?}",
+            run.argv
+        );
+        // The three the scope leaves out are not mentioned at all — a report
+        // about workspaces this run has no business in is the sweep #72 refused,
+        // arriving as advice.
+        for other in ["wf-138-unstarted", "wf-137-open", "wf-134-stalled"] {
+            assert!(
+                !run.stdout.contains(other),
+                "{other} is outside the scope and was named anyway: {}",
+                run.stdout
+            );
+        }
+        run.touched_no_files();
+    }
+
+    #[test]
+    fn a_cleanup_that_finds_unpushed_work_keeps_that_workspace_names_it_and_ends_green() {
+        // #151's second verification scenario, at the command rather than at
+        // the decision: the run's own finished node, and a `dl` that says its
+        // clone holds a commit which never left this machine. The workspace
+        // stays, the run *says* it stayed and why, and the run ends green —
+        // this is the ordinary ending of a run whose last push failed, not a
+        // surprise, and a cleanup that treated it as one would turn every such
+        // run red.
+        //
+        // The same fixtures as the sibling test above with one field changed,
+        // so the difference between the two recordings is exactly the
+        // difference between a clone that exists somewhere else and one that
+        // does not.
+        let unpushed = crate::probe::DL_LISTING.replacen(
+            r#""unsaved":{"nothingToLose":true}"#,
+            r#""unsaved":{"wouldLose":"1 unpushed commit(s)"}"#,
+            1,
+        );
+        let holds: Vec<String> = parse_workspaces(unpushed.as_bytes())
+            .expect("the edited fixture is still a listing")
+            .iter()
+            .filter(|w| w.unsaved != Some(Unsaved::NothingToLose))
+            .map(|w| w.id.clone())
+            .collect();
+        assert_eq!(
+            holds,
+            ["wf-129-closed"],
+            "the one clone holding work is the scoped run's own: {unpushed}"
+        );
+
+        let run = crate::probe::record(
+            "reap::tests::cleanup_probe",
+            &unpushed,
+            crate::probe::GH_FACTS,
+        );
+        // Green, and by the arm that says so: `cleanup` returning `Ok` is what
+        // the binary exits 0 on. Deliberately not "nothing was deleted" — a
+        // step that stopped deletes nothing too, and the two are opposite
+        // outcomes for a run reading its own summary.
+        assert_eq!(
+            run.printed(),
+            ["the cleanup finished"],
+            "the run ended green: {}",
+            run.stdout
+        );
+        run.destroyed_nothing();
+        // Named, in `plan`'s own words. A run that kept it silently would leave
+        // nobody to notice that the branch exists in one place only. Once, and
+        // as a keep: the child's own test-harness line mentions the probe, so
+        // this counts mentions of the workspace rather than lines.
+        assert!(
+            run.stdout
+                .contains("kept     wf-129-closed  (holds 1 unpushed commit(s))"),
+            "the run named the workspace it kept and why: {}",
+            run.stdout
+        );
+        assert_eq!(
+            run.stdout.matches("wf-129-closed").count(),
+            1,
+            "and said it once, as that row: {}",
+            run.stdout
+        );
+    }
+
+    #[test]
+    fn a_cleanup_that_meets_a_warning_in_its_own_scope_deletes_nothing_at_all() {
+        // Two scoped nodes, one of them warned. The other is the very workspace
+        // the sibling test above removes, so what this pins is that the step
+        // stops *whole*: a surprise on one node is not a reason to go on and
+        // collect the ones it did understand.
+        let run = crate::probe::record(
+            "reap::tests::cleanup_warned_probe",
+            crate::probe::DL_LISTING,
+            crate::probe::GH_FACTS,
+        );
+        run.destroyed_nothing();
+        // One `printed` entry, because only the marked line is the probe's:
+        // the pointer to `wf reap` is the second line of the same message and
+        // is asserted below, out of the same capture.
+        assert_eq!(
+            run.printed(),
+            ["the cleanup stopped: cleanup stopped and deleted nothing: \
+              wf-138-unstarted is not a workspace this run may collect: \
+              wayfinder#138 unclaimed and no PR — an abandoned stage? reap by hand if so"],
+            "the run said what stopped it: {}",
+            run.stdout
+        );
+        assert!(
+            run.stdout
+                .contains("run `wf reap` to see every workspace on this machine"),
+            "and pointed at the command a human reads the rest with: {}",
+            run.stdout
+        );
+    }
+
+    #[test]
+    fn a_cleanup_that_cannot_read_the_listing_deletes_nothing_and_says_so() {
+        // The third way the step is stopped, and the one that never reaches a
+        // decision at all: a listing this `wf` cannot parse. It is the same
+        // outcome as the two arms above — nothing deleted, a non-zero exit, a
+        // sentence naming the cause — which is why it is an error rather than a
+        // fourth arm of `Unexpected`. An empty plan here would read as "this run
+        // finished nothing", which is indistinguishable from success.
+        let run = crate::probe::record(
+            "reap::tests::cleanup_probe",
+            "{not a listing}",
+            crate::probe::GH_FACTS,
+        );
+        run.destroyed_nothing();
+        assert!(
+            run.printed()[0].starts_with("the cleanup stopped: unparseable workspace listing"),
+            "the run named what it could not read: {}",
+            run.stdout
+        );
+    }
+
+    #[test]
+    fn a_cleanup_reading_a_dl_too_old_to_answer_deletes_nothing() {
+        // The version skew, end to end. devlaunch 0.0.23 wrote `null` for a
+        // clean clone of its own, so this listing says nothing about
+        // `wf-129-closed` — and `wf reap` would collect it on exactly that
+        // silence, because on that release silence *was* the clean answer.
+        // Unattended it is not enough: the floor wants a fact `dl` said.
+        let run = crate::probe::record_as_dl(
+            "reap::tests::cleanup_probe",
+            crate::probe::DL_LISTING_LEGACY,
+            crate::probe::GH_FACTS,
+            "0.0.23",
+        );
+        run.destroyed_nothing();
+        assert_eq!(
+            run.printed(),
+            ["the cleanup stopped: cleanup stopped and deleted nothing: \
+              wf-129-closed is not established as recoverable: \
+              dl did not say what this clone holds"],
+            "the run named the workspace and the reason: {}",
+            run.stdout
+        );
     }
 
     #[test]

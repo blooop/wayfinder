@@ -545,6 +545,29 @@ pub const DL_LISTING_UNSAVED: &str = r#"[
   {"id":"not-ours","devlaunch":false,"state":"Stopped"}
 ]"#;
 
+/// [`DL_LISTING`] as devlaunch **0.0.23** would have written it.
+///
+/// The same four workspaces, the same repo and branches, and one field
+/// different: `unsaved` is `null` on every clone, because that release wrote a
+/// bare sentence when `git` reported something and nothing at all when it did
+/// not. On that `dl`, `null` on a clone of its own *is* the clean answer, which
+/// is why `wf reap` collects on it — and why the autonomous cleanup does not,
+/// since "the release that wrote this meant clean" is a fact about a version
+/// rather than about a clone.
+///
+/// Paired with `record_as_dl(…, "0.0.23")` and only with it: this listing and
+/// [`SHIMMED_DL`] together would be a machine that does not exist.
+pub const DL_LISTING_LEGACY: &str = r#"[
+  {"id":"wf-129-closed","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-129","state":"Stopped","unsaved":null},
+  {"id":"wf-138-unstarted","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-138","state":"Stopped","unsaved":null},
+  {"id":"wf-137-open","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-137","state":"Running","unsaved":null},
+  {"id":"wf-134-stalled","devlaunch":true,"repo":"blooop/wayfinder",
+   "branch":"wayfinder/wayfinder-134","state":"Stopped","unsaved":null}
+]"#;
+
 /// The tracker's answer to the batched question those four nodes raise:
 /// #129 closed (a reap), #138 open with nobody on it and no PR (a warning),
 /// #137 open and claimed (a keep, and — its container being up — a `▣`),

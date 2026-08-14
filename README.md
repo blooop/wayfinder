@@ -38,9 +38,10 @@ This installs the same bundled workflows under `~/.claude/skills` and
 Codex; each agent therefore finds the route it is given without a separate
 manual install.
 
-`wf --version`, `wf --help`, `wf skills [install]` and
-[`wf reap [-y] [-f]`](#wf-reap--clearing-away-finished-tickets) are the only
-arguments; everything else is keys in the TUI.
+`wf --version`, `wf --help`, `wf skills [install]`,
+[`wf reap [-y] [-f]`](#wf-reap--clearing-away-finished-tickets) and
+[`wf reap --finished <owner/repo#n>...`](#wf-reap---finished--the-cleanup-an-autonomous-run-ends-with)
+are the only arguments; everything else is keys in the TUI.
 
 ## The skills ship with the binary
 
@@ -1079,10 +1080,14 @@ One `gh api graphql` call per repo answers all of this, however many workspaces
 that repo has — which is also what makes the picker's background reading cheap
 enough to take on every start.
 
-**Deleting stays yours.** `wf` notices; it never reaps unattended. The plan is
-printed so a reason you disagree with can be caught while "no" is still an
-answer, and the count-line hint is the same reading with the same posture: it
-names what would go and stops there.
+**Deleting stays a decision.** Nothing sweeps, nothing fires on a timer, and no
+workspace of yours is collected because time passed. `wf reap` is yours: the
+plan is printed so a reason you disagree with can be caught while "no" is still
+an answer, and the count-line hint is the same reading with the same posture —
+it names what would go and stops there. The one path that deletes with nobody
+watching is [an autonomous run collecting the tickets it just
+finished](#wf-reap---finished--the-cleanup-an-autonomous-run-ends-with), which
+is scoped to that run's own nodes and is not a sweep either.
 
 Kept by default but waivable: a workspace whose clone holds uncommitted or
 unpushed work. `-f` reaps those too, and the plan says what it is discarding:
@@ -1097,6 +1102,50 @@ unpushed work. `-f` reaps those too, and the plan says what it is discarding:
 waives the unsaved-work guard only — a running container is still kept, because
 that is a session in progress rather than bytes on disk. `-y` skips the prompt.
 Neither flag can turn a `warn` row into a deletion.
+
+### `wf reap --finished` — the cleanup an autonomous run ends with
+
+`wf-auto` walks a map on its own, and a run that works six tickets leaves six
+workspaces. Its last act is to collect the ones it finished:
+
+```
+$ wf reap --finished blooop/wayfinder#151 blooop/wayfinder#160
+  kept     wayfinder-…-160-a  (holds 1 unpushed commit(s))
+  removed  wayfinder-…-151-b  (wayfinder#151 is closed)
+```
+
+Same reading, same `plan`, same one definition of what is finished. Four things
+are different, and each of them is what removing the reader costs:
+
+- **It is scoped, and the scope is the authority.** Only the nodes that run
+  itself drove to done — named in full, owner included. A finished workspace of
+  a ticket the run never touched is not collected and not mentioned, because
+  that is `wf reap`'s business and a person's.
+- **It does not ask.** The agent that just settled those facts is the reader
+  there is; there is nobody left to answer a prompt.
+- **It deletes only what `dl` has *said* is recoverable.** `wf reap` keeps a
+  workspace whose `unsaved` refuses, so one with no answer at all passes it —
+  right for a release that wrote `null` for a clean clone, with a human reading
+  the row. Here the floor wants a fact `dl` said out loud, so a `dl` too old to
+  answer for every clone it made, or one `wf` could not ask, collects nothing
+  and says so. That single asymmetry is also the version gate.
+- **A surprise stops the whole step.** A node it reads as anything other than
+  finished — a ticket the tracker still has open, a `warn` row, a state this
+  binary cannot place — and nothing is deleted at all, not even the rows it did
+  understand. The run's whole authority here is that it drove these nodes to
+  done, so the tracker contradicting it about one of them puts the rest of the
+  same command in doubt. It exits non-zero saying which workspace and why, and
+  points at `wf reap`.
+
+  A workspace *kept* is not a surprise: `dl` saying a clone holds work that
+  exists nowhere else, or devpod saying the container is still up, is the step
+  working. Those rows are printed, the finished workspaces beside them are still
+  collected, and the run ends green — a last push that failed is a thing to
+  report, not a thing to stop for.
+
+There is **no `-f`**, in any spelling: the argv that reaches this command has no
+field a waiver could be set in. `-f` waives the guard the recoverability floor
+is built out of, and it stays yours to type, in every mode.
 
 Your host `~/.claude` is bind-mounted in, which is how the Claude agent arrives
 already logged in — and is the reason `wf skills install` keeps the prompts

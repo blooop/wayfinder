@@ -90,11 +90,12 @@
 //! second reason: a listing read from the developer's own machine would assert
 //! against whatever they happen to have cloned.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use wf::launch::{Agent, Devlaunch, Isolation, DEVLAUNCH_FLOOR, UNSAVED_IS_AN_OBJECT};
-use wf::reap::{parse_workspaces, Unsaved};
+use wf::reap::{decide, parse_workspaces, plan, Cleanup, Cleared, Node, NodeFact, Unsaved};
 
 /// How `pixi.toml` tells this file what environment it is in.
 ///
@@ -368,14 +369,64 @@ fn ask_devlaunch(snippet: &str, args: &[&str], why: &str) -> String {
 /// the field alone: `unsaved` is read as part of a `Workspace`, and a row is
 /// what `dl` actually emits.
 fn read_back(unsaved: &str) -> Option<Unsaved> {
-    let row = format!(
+    let parsed = parse_workspaces(row(unsaved).as_bytes())
+        .unwrap_or_else(|e| panic!("`wf` could not read {unsaved}: {e:#}"));
+    parsed.into_iter().next().expect("one row").unsaved
+}
+
+/// A one-workspace listing carrying `unsaved` exactly as devlaunch wrote it.
+///
+/// One spelling, because two tests read a real `dl`'s answer through it — the
+/// parse on its own, and the whole autonomous cleanup — and a row written twice
+/// is a row that can disagree with itself about which node it belongs to.
+/// `wayfinder#1` is the node its branch names, and the fact the cleanup test
+/// hands the planner is about that same number.
+fn row(unsaved: &str) -> String {
+    format!(
         r#"[{{"id":"ws","devlaunch":true,"repo":"blooop/wayfinder",
               "branch":"wayfinder/wayfinder-1","state":"Stopped",
               "unsaved":{unsaved}}}]"#
+    )
+}
+
+/// What *this* devlaunch says a real clone holds: the JSON its listing would
+/// carry, and the shape it wrote it in.
+///
+/// The import is tried and its absence read as the older release rather than as
+/// a broken install, which is the one thing this can be wrong about and the
+/// reason `WF_CONTRACT_UNSAVED` is compared against the shape rather than
+/// trusted on its own.
+fn what_dl_says_about(clone: &Path) -> (String, Shape) {
+    let reported = ask_devlaunch(
+        r#"
+import json, sys
+from pathlib import Path
+from devlaunch.workspace_state import read_clone
+state = read_clone(Path(sys.argv[1]))
+try:
+    from devlaunch.workspace_state import unsaved_as_json
+    wire = unsaved_as_json(state.unsaved)
+except ImportError:
+    # devlaunch <= 0.0.23: the field was the bare sentence, with no
+    # serialiser between the value and the listing.
+    wire = state.unsaved
+print(json.dumps({
+    "wire": wire,
+    "shape": "object" if isinstance(wire, dict) else "sentence",
+}))
+"#,
+        &[&clone.to_string_lossy()],
+        "devlaunch could not be asked what a clone holds — `read_clone` is the \
+         function whose answer becomes the `unsaved` field",
     );
-    let parsed = parse_workspaces(row.as_bytes())
-        .unwrap_or_else(|e| panic!("`wf` could not read {unsaved}: {e:#}"));
-    parsed.into_iter().next().expect("one row").unsaved
+    let reported: serde_json::Value =
+        serde_json::from_str(reported.trim()).expect("devlaunch's answer as JSON");
+    let shape = match reported["shape"].as_str() {
+        Some("object") => Shape::Object,
+        Some("sentence") => Shape::Sentence,
+        other => panic!("devlaunch reported an unknown shape: {other:?}"),
+    };
+    (reported["wire"].to_string(), shape)
 }
 
 #[test]
@@ -582,36 +633,7 @@ fn what_this_dl_says_about_a_clone_holding_work_is_what_wf_reads() {
     git(&clone, &["commit", "-q", "--allow-empty", "-m", "first"]);
     std::fs::write(clone.join("scratch.txt"), "half-finished\n").expect("uncommitted work");
 
-    let reported = ask_devlaunch(
-        r#"
-import json, sys
-from pathlib import Path
-from devlaunch.workspace_state import read_clone
-state = read_clone(Path(sys.argv[1]))
-try:
-    from devlaunch.workspace_state import unsaved_as_json
-    wire = unsaved_as_json(state.unsaved)
-except ImportError:
-    # devlaunch <= 0.0.23: the field was the bare sentence, with no
-    # serialiser between the value and the listing.
-    wire = state.unsaved
-print(json.dumps({
-    "wire": wire,
-    "shape": "object" if isinstance(wire, dict) else "sentence",
-}))
-"#,
-        &[&clone.to_string_lossy()],
-        "devlaunch could not be asked what a clone holds — `read_clone` is the \
-         function whose answer becomes the `unsaved` field",
-    );
-    let reported: serde_json::Value =
-        serde_json::from_str(reported.trim()).expect("devlaunch's answer as JSON");
-
-    let shape = match reported["shape"].as_str() {
-        Some("object") => Shape::Object,
-        Some("sentence") => Shape::Sentence,
-        other => panic!("devlaunch reported an unknown shape: {other:?}"),
-    };
+    let (wire, shape) = what_dl_says_about(&clone);
     assert_eq!(
         shape, installed.unsaved,
         "this devlaunch writes `unsaved` as a {shape:?}, but {UNSAVED} in \
@@ -619,7 +641,6 @@ print(json.dumps({
         installed.unsaved, UNSAVED_IS_AN_OBJECT
     );
 
-    let wire = reported["wire"].to_string();
     let read = read_back(&wire);
     let Some(Unsaved::WouldLose(said)) = read else {
         panic!(
@@ -656,6 +677,135 @@ fn whether_wf_trusts_a_missing_unsaved_follows_the_release() {
          every clone it made",
         if object { "writes" } else { "predates" },
         if object { "does not expect" } else { "expects" }
+    );
+}
+
+/// A real clone with a real remote to be behind, and nothing behind it yet.
+///
+/// A bare repository beside it and a path remote: no network, and the clone
+/// genuinely has an upstream. That is the difference the recoverability floor
+/// turns on — "committed" and "exists somewhere else" are not the same fact,
+/// and a checkout whose commits have never left it cannot be staged at all
+/// without a remote for it to be ahead of.
+fn a_clone_with_a_remote(what: &str) -> PathBuf {
+    let root = scratch(what);
+    let (origin, clone) = (root.join("origin.git"), root.join("clone"));
+    for dir in [&origin, &clone] {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("a clone directory");
+    }
+    git(&origin, &["init", "-q", "--bare"]);
+    git(&clone, &["init", "-q"]);
+    git(&clone, &["commit", "-q", "--allow-empty", "-m", "first"]);
+    git(
+        &clone,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    );
+    git(
+        &clone,
+        &["push", "-q", "-u", "origin", "HEAD:refs/heads/main"],
+    );
+    clone
+}
+
+/// What the cleanup at the end of an autonomous run would do about one
+/// workspace whose `unsaved` field is `wire` and whose ticket that run closed.
+///
+/// The whole path from the field to the decision: the real parser, the real
+/// plan, and the real narrowing — `wf`'s answer to "may this be deleted with
+/// nobody watching", given what a real `dl` said about a real clone.
+fn cleanup_of(wire: &str) -> Cleanup {
+    let workspaces = parse_workspaces(row(wire).as_bytes())
+        .unwrap_or_else(|e| panic!("`wf` could not read {wire}: {e:#}"));
+    let node = Node {
+        repo: "blooop/wayfinder".to_string(),
+        number: 1,
+    };
+    let known: BTreeMap<Node, NodeFact> = [(node.clone(), NodeFact::Closed)].into_iter().collect();
+    let scope: BTreeSet<Node> = [node].into_iter().collect();
+    decide(
+        &workspaces,
+        &plan(&workspaces, &known, false),
+        &known,
+        &scope,
+    )
+}
+
+/// The ids a cleanup cleared for deletion — and nothing, spelt as nothing,
+/// when it stopped instead.
+fn cleared(cleanup: &Cleanup) -> Vec<&str> {
+    match cleanup {
+        Cleanup::Proceed { going, .. } => going.iter().map(Cleared::id).collect(),
+        Cleanup::Abort(_) => Vec::new(),
+    }
+}
+
+#[test]
+fn what_this_dl_says_about_a_pushed_clone_is_what_an_unattended_cleanup_acts_on() {
+    // The recoverability floor (#151) against a real devlaunch, on both sides
+    // of the answer. `wf reap` prints its plan and waits; the cleanup a run
+    // ends with has no reader between "this ticket is finished" and
+    // `dl <ws> rm`, so this field is the whole of what stands between a branch
+    // that never reached a remote and its deletion — and every other test of it
+    // is `wf` reading a fixture `wf` wrote.
+    //
+    // Two real clones of a real repository with a real remote, one holding a
+    // commit that never left it, both inspected by *this* devlaunch's own
+    // `read_clone` and serialised the way this release serialises it.
+    let contract = Contract::read();
+    let Some(installed) = contract.installed() else {
+        return;
+    };
+    let pushed = a_clone_with_a_remote("pushed-clone");
+    let unpushed = a_clone_with_a_remote("unpushed-clone");
+    git(
+        &unpushed,
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "never left this machine",
+        ],
+    );
+
+    let (held, _) = what_dl_says_about(&unpushed);
+    assert!(
+        cleared(&cleanup_of(&held)).is_empty(),
+        "this dl says a clone holding an unpushed commit is {held}, and `wf` \
+         cleared it for an unattended deletion"
+    );
+
+    let (safe, _) = what_dl_says_about(&pushed);
+    match installed.unsaved {
+        // A release that answers for every clone it made: the clone is cleared,
+        // and this is the only shape in which an unattended deletion happens at
+        // all. If a future `dl` renames the key, this is where the run stops
+        // collecting — the failure direction the floor is pointed in.
+        Shape::Object => assert_eq!(
+            cleared(&cleanup_of(&safe)),
+            ["ws"],
+            "this dl says a fully pushed clone is {safe}, and `wf` would not \
+             collect it — the cleanup would reclaim nothing on this release"
+        ),
+        // The releases before that wrote `null` for a clean clone. `wf reap`
+        // still reads that as clean, because on those releases it was; the
+        // unattended cleanup wants a fact `dl` said, and a version skew is
+        // exactly the case where the meaning of silence is what is in doubt.
+        Shape::Sentence => assert!(
+            cleared(&cleanup_of(&safe)).is_empty(),
+            "this dl predates the object form, so its {safe} is silence rather \
+             than an answer, and an unattended run must not delete on it"
+        ),
+    }
+
+    // The two clones really are different, whichever release read them — a test
+    // where both answers were the same would pass on a `dl` that had stopped
+    // looking.
+    assert_ne!(
+        held, safe,
+        "this dl says the same thing about a clone holding an unpushed commit \
+         and one holding nothing"
     );
 }
 
