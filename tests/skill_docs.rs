@@ -500,6 +500,85 @@ fn readme_paragraph(lead: &str) -> String {
     from.join(" ")
 }
 
+/// The README section documenting the exec seam's stamps (#160) — the shared
+/// contract between `wf`, which writes them, and `dl`, which reads them.
+fn seam_section() -> String {
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+        .expect("the README ships in this repo");
+    readme
+        .split("### What a launch tells `dl` about itself")
+        .nth(1)
+        .expect("the README documents what a launch hands across the exec seam")
+        .split("\n### ")
+        .next()
+        .expect("split always yields a first piece")
+        .to_string()
+}
+
+/// Every `DEVLAUNCH_`-prefixed name the seam section publishes in backticks.
+fn documented_seam_variables() -> BTreeSet<String> {
+    seam_section()
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|word| word.starts_with("DEVLAUNCH_"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The variables the docs publish are the variables a launch sets — both
+/// directions, read off the binary rather than restated (#133's pattern, as
+/// #160's seam asked for).
+///
+/// A one-directional check would let either side drift on its own: a third
+/// variable added to the seam and documented nowhere is as bad for a reader as
+/// a documented one nothing ever sets, and the second failure is worse, since
+/// it is the kind a reader only discovers by finding their field missing.
+#[test]
+fn the_documented_seam_variables_are_the_ones_a_launch_sets() {
+    let published: BTreeSet<String> = wf::launch::Handoff::variables()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        documented_seam_variables(),
+        published,
+        "the seam section and the launch's own variable list have drifted"
+    );
+}
+
+/// The rule the stamps exist to serve, pinned whole rather than phrase-sampled
+/// — the same treatment `ctx:`'s contract sentences get above, and for the same
+/// reason: a sampled phrase survives a sentence that says the opposite.
+///
+/// What may not be reversed here is the claim-free rule. The whole design point
+/// this seam settled is that `wf` sends *when it acted* and never *how the
+/// launch went* — a README that started promising a prewarm hit would be
+/// describing a different product, one where the party that fired and forgot a
+/// container reports on how it turned out.
+#[test]
+fn the_seam_paragraph_reads_exactly_as_the_claim_free_rule() {
+    assert_eq!(
+        readme_paragraph("**Neither stamp is a claim"),
+        "**Neither stamp is a claim about how the launch went.** `wf` fires a prewarm and \
+         forgets it — the process that fired it is gone long before the container is \
+         ready — so whether the warm-up helped, was still running, or saved this launch \
+         nothing is visible only to the `dl` that then had to run the launch, and that is \
+         `dl`'s to report from the arm it took. What `wf` sends is when it acted, twice, \
+         and nothing else. An absent stamp is an absent measurement and never a zero: a \
+         launch nobody prewarmed sets no `DEVLAUNCH_PREWARM_FIRED_AT`, rather than \
+         setting it to something that would read as an instant warm-up."
+    );
+    assert_eq!(
+        readme_paragraph("A **host** launch carries neither"),
+        "A **host** launch carries neither, and clears both rather than passing on one it \
+         inherited. The reader is the `dl` a launch becomes; a host launch becomes the \
+         agent instead, and a stamp left standing in an agent session's environment would \
+         be picked up by every unrelated `dl` that session went on to run, each reporting \
+         a hand-over measured from a keystroke hours old."
+    );
+}
+
 /// The README promises the block only where a skill receives it.
 ///
 /// It said "Every launch of a node", which reads as including the plain

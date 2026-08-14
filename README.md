@@ -967,6 +967,38 @@ Container lifecycle is `dl`'s: `wf` never stops or rebuilds one, and could not
 during a session — it `exec`s and is gone, so there is no `wf` left to observe
 an agent exiting. `dl <ws> stop`, `dl <ws> rm` and `dl --ls` are yours to run.
 
+### What a launch tells `dl` about itself
+
+**An isolated launch hands `dl` two stamps of what `wf` itself did**, in the
+environment of the process it becomes:
+
+| variable | what it stamps |
+| --- | --- |
+| `DEVLAUNCH_HANDOFF_T0` | the keystroke that resolved to this exec — the moment nothing is waiting on a human any more |
+| `DEVLAUNCH_PREWARM_FIRED_AT` | when staging fired this node's `dl <ws> up`, if it fired one |
+
+Both are Unix epoch seconds, spelt the way `date +%s.%N` prints them, and the
+names and the format are `dl`'s to mint rather than `wf`'s — `wf` is the writer,
+and a writer that invented its own names would be handing the reader nothing.
+The gap from `DEVLAUNCH_HANDOFF_T0` to `dl`'s own start is the only measurement
+of the exec there is, since everything either side of it is inside one program
+or the other.
+
+**Neither stamp is a claim about how the launch went.** `wf` fires a prewarm and
+forgets it — the process that fired it is gone long before the container is
+ready — so whether the warm-up helped, was still running, or saved this launch
+nothing is visible only to the `dl` that then had to run the launch, and that is
+`dl`'s to report from the arm it took. What `wf` sends is when it acted, twice,
+and nothing else. An absent stamp is an absent measurement and never a zero: a
+launch nobody prewarmed sets no `DEVLAUNCH_PREWARM_FIRED_AT`, rather than
+setting it to something that would read as an instant warm-up.
+
+A **host** launch carries neither, and clears both rather than passing on one it
+inherited. The reader is the `dl` a launch becomes; a host launch becomes the
+agent instead, and a stamp left standing in an agent session's environment would
+be picked up by every unrelated `dl` that session went on to run, each reporting
+a hand-over measured from a keystroke hours old.
+
 ### `wf reap` — clearing away finished tickets
 
 A workspace per ticket means workspaces accumulate as fast as tickets are

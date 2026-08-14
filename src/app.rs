@@ -9,6 +9,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::SystemTime;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -294,12 +295,34 @@ pub struct App {
     /// toggle — it is a choice about a *map*, not about a frame.
     expanded: Expanded,
     cursor: Cursor,
-    /// Workspaces already prewarmed this session ([`launch::prewarm`]): the
-    /// first enter fires `dl <ws> up` in the background so the container is
-    /// building while the human types steer text, and this is what keeps
-    /// re-staging the same node from firing a second one. Session-scoped on
-    /// purpose — after `wf` execs away, the workspace's own state answers.
-    prewarmed: BTreeSet<String>,
+    /// What staging already did about each workspace this session
+    /// ([`launch::prewarm`]): the first enter fires `dl <ws> up` in the
+    /// background so the container is building while the human types steer
+    /// text, and this is what keeps re-staging the same node from firing a
+    /// second one. Session-scoped on purpose — after `wf` execs away, the
+    /// workspace's own state answers.
+    ///
+    /// A map rather than a set because the launch that follows hands `dl` the
+    /// instant the warm-up fired (#160), and "it fired" without "when" is not
+    /// something a timing reader can weigh a launch against.
+    prewarmed: BTreeMap<String, Prewarmed>,
+}
+
+/// What staging did about one workspace's container — the record a launch of
+/// that workspace then reads.
+///
+/// A sum rather than an `Option<SystemTime>` beside a claim flag, because the
+/// two states answer different questions and both are ordinary: a node was
+/// warmed at an instant, or it was looked at and found to have no container to
+/// warm. Absence from the map is the third state — never staged this session —
+/// and needs no variant of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prewarmed {
+    /// `dl <workspace> up` went out at this instant.
+    At(SystemTime),
+    /// Nothing was fired and nothing would be: this node's launch plans no
+    /// container, so there is no warm-up to stamp.
+    Nothing,
 }
 
 impl App {
@@ -321,7 +344,7 @@ impl App {
             lens: Lens::Leverage,
             expanded: Expanded::new(),
             cursor: Cursor::Untouched,
-            prewarmed: BTreeSet::new(),
+            prewarmed: BTreeMap::new(),
         }
     }
 
@@ -947,32 +970,61 @@ impl App {
     /// fire-and-forget — the launch itself neither depends on it nor waits for
     /// it, beyond `dl`'s own per-workspace serialization.
     fn prewarm(&mut self, staged: &Staged) {
-        if !self.claim_prewarm(staged, launch::prewarm_enabled()) {
-            return;
-        }
-        if let Some(argv) = launch::prewarm(&self.checkouts, staged) {
-            launch::spawn_detached(&argv);
-        }
+        self.warm(staged, launch::prewarm_enabled());
     }
 
-    /// Whether this staging is the one that gets to warm `staged`, recording
-    /// it if so. Split from the spawn deliberately: the gate and the
-    /// once-per-node rule are the parts with logic in them, and this way they
-    /// are testable without a container, a `dl` on `PATH`, or reaching into
-    /// the process environment.
+    /// The whole of it, with the gate passed in rather than read from the
+    /// environment, so the rules below are testable without a container, a
+    /// `dl` on `PATH`, or a mutated process environment. Answers what was
+    /// recorded, and `None` when this staging is not the one that warms
+    /// `staged` at all.
     ///
-    /// Nothing is recorded while the prewarm is off — `&&` short-circuits —
-    /// so a session that exports `WF_PREWARM` and re-stages a node still
-    /// warms it. A stop with no workspace to warm (a project row) is not
-    /// recorded either, because there is nothing to record it under. A node
-    /// whose launch turns out to be host-only *is* recorded: it plans nothing
-    /// now and would plan nothing later, and remembering that saves
-    /// re-walking the checkouts on every re-stage.
-    fn claim_prewarm(&mut self, staged: &Staged, enabled: bool) -> bool {
-        enabled
-            && staged
-                .node_workspace()
-                .is_some_and(|workspace| self.prewarmed.insert(workspace))
+    /// **The instant is taken from the spawn, not from the claim**, because
+    /// only a prewarm that actually went out has one: a node whose launch is
+    /// host-only is claimed all the same — it plans nothing now and would plan
+    /// nothing later, and remembering that saves re-walking the checkouts on
+    /// every re-stage — but recording an instant for it would name a
+    /// `dl <ws> up` that never happened, and the launch would hand `dl` a
+    /// prewarm to weigh itself against that nobody fired (#160).
+    fn warm(&mut self, staged: &Staged, enabled: bool) -> Option<Prewarmed> {
+        let workspace = self.claim_prewarm(staged, enabled)?;
+        let recorded = match launch::prewarm(&self.checkouts, staged) {
+            Some(argv) => {
+                launch::spawn_detached(&argv);
+                Prewarmed::At(SystemTime::now())
+            }
+            None => Prewarmed::Nothing,
+        };
+        self.prewarmed.insert(workspace, recorded);
+        Some(recorded)
+    }
+
+    /// The workspace this staging gets to warm, or `None` if it does not get
+    /// to. Split from the spawn deliberately: the gate and the once-per-node
+    /// rule are the parts with logic in them.
+    ///
+    /// Nothing is claimed while the prewarm is off — `?` short-circuits — so a
+    /// session that exports `WF_PREWARM` and re-stages a node still warms it.
+    /// A stop with no workspace to warm (a project row) claims nothing either,
+    /// because there is nothing to record it under.
+    fn claim_prewarm(&self, staged: &Staged, enabled: bool) -> Option<String> {
+        let workspace = staged.node_workspace()?;
+        (enabled && !self.prewarmed.contains_key(&workspace)).then_some(workspace)
+    }
+
+    /// When this session fired a prewarm for what `launch` is about to attach
+    /// to, if it fired one — the second half of what a launch hands across the
+    /// exec seam ([`launch::Handoff`], #160).
+    ///
+    /// Keyed on the launch's own workspace rather than on whatever was last
+    /// staged: the two are the same node in the ordinary case, and where they
+    /// are not — a creation, whose workspace is the repo's default — the
+    /// answer must be nothing rather than another node's instant.
+    pub fn prewarm_fired(&self, launch: &Launch) -> Option<SystemTime> {
+        match self.prewarmed.get(&launch.workspace()) {
+            Some(Prewarmed::At(fired)) => Some(*fired),
+            Some(Prewarmed::Nothing) | None => None,
+        }
     }
 
     /// The second enter: resolve the staged launch against the projects cache
@@ -2269,10 +2321,10 @@ mod tests {
         // had already looked at.
         let mut app = fixture_app();
         let staged = staged_six(&app);
-        assert!(!app.claim_prewarm(&staged, false));
+        assert_eq!(app.warm(&staged, false), None);
         assert!(app.prewarmed.is_empty());
         // ...and enabling afterwards still gets its turn.
-        assert!(app.claim_prewarm(&staged, true));
+        assert!(app.warm(&staged, true).is_some());
     }
 
     #[test]
@@ -2281,10 +2333,11 @@ mod tests {
         // each visit must not add another `dl up` to the pile.
         let mut app = fixture_app();
         let staged = staged_six(&app);
-        assert!(app.claim_prewarm(&staged, true), "the first staging warms");
+        assert!(app.warm(&staged, true).is_some(), "the first staging warms");
         for _ in 0..3 {
-            assert!(
-                !app.claim_prewarm(&staged, true),
+            assert_eq!(
+                app.warm(&staged, true),
+                None,
                 "a re-stage must not warm again"
             );
         }
@@ -2299,21 +2352,70 @@ mod tests {
         let six = staged_six(&app);
         let map = Staged::map(&MapRef::new(&MapId::new("blooop/wayfinder", 1), "a map"));
         assert_ne!(six.node_workspace(), map.node_workspace());
-        assert!(app.claim_prewarm(&six, true));
-        assert!(app.claim_prewarm(&map, true));
+        assert!(app.warm(&six, true).is_some());
+        assert!(app.warm(&map, true).is_some());
         assert_eq!(app.prewarmed.len(), 2);
     }
 
     #[test]
-    fn staging_a_host_launch_spawns_nothing() {
+    fn staging_a_host_launch_spawns_nothing_and_stamps_nothing() {
         // Even claimed, a launch with no container to start plans no command:
         // the fixture's checkout paths do not exist, so no candidate can
         // declare a devcontainer, which is exactly the host case.
-        let app = fixture_app().with_checkouts(vec![Checkout::new(
+        let mut app = fixture_app().with_checkouts(vec![Checkout::new(
             std::path::PathBuf::from("/data/proj/wayfinder"),
             "blooop/wayfinder".to_string(),
         )]);
-        assert_eq!(launch::prewarm(&app.checkouts, &staged_six(&app)), None);
+        let staged = staged_six(&app);
+        assert_eq!(launch::prewarm(&app.checkouts, &staged), None);
+        // And what staging records says so: claimed, so a re-stage does not
+        // re-walk the checkouts, but with no instant to hand anyone — a stamp
+        // here would name a `dl up` that was never fired (#160).
+        assert_eq!(app.warm(&staged, true), Some(Prewarmed::Nothing));
+    }
+
+    #[test]
+    fn a_launch_carries_the_instant_its_own_workspace_was_warmed() {
+        // The stamp is a fact about this node's container, so it is looked up
+        // by the workspace the launch is about to attach to — the same name
+        // the prewarm used, which is what makes the two halves meet (#160).
+        let mut app = launchable_app();
+        let fired = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_755_194_030);
+        let workspace = staged_six(&app)
+            .node_workspace()
+            .expect("a ticket names a workspace");
+        app.prewarmed.insert(workspace, Prewarmed::At(fired));
+        go_to(&mut app, "#6");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(app.prewarm_fired(&launch), Some(fired));
+    }
+
+    #[test]
+    fn a_launch_of_a_node_nobody_warmed_carries_no_instant() {
+        // Two ways to have nothing to hand on, and both must answer the same:
+        // a session that warmed a *different* node, and one that warmed this
+        // node's workspace but fired nothing into it.
+        let mut app = launchable_app();
+        let workspace = staged_six(&app)
+            .node_workspace()
+            .expect("a ticket names a workspace");
+        app.prewarmed.insert(
+            "blooop/wayfinder@wayfinder/wayfinder-999".to_string(),
+            Prewarmed::At(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_755_194_030)),
+        );
+        go_to(&mut app, "#6");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        let launch = match app.handle_key(key(KeyCode::Enter)) {
+            Outcome::Launch(launch) => launch,
+            other => panic!("expected a launch, got {other:?}"),
+        };
+        assert_eq!(app.prewarm_fired(&launch), None);
+        app.prewarmed.insert(workspace, Prewarmed::Nothing);
+        assert_eq!(app.prewarm_fired(&launch), None);
     }
 
     #[test]
