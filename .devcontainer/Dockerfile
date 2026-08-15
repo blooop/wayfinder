@@ -74,13 +74,19 @@ RUN set -eux; \
 # argument would leave this pin buying nothing with the build still green. The
 # comparison also backstops the unpiped `curl | bash` — a truncated script that
 # installed something else fails here.
+#
+# Matched on a word boundary rather than as a substring, because a substring
+# match accepts a version it was never pinned to: `2.1.2234` contains `2.1.223`,
+# as does `12.1.223`. Boundary matching refuses both while staying agnostic about
+# the shape of the line the version arrives in — the three tools pinned in this
+# file each print a different one (`2.1.223 (Claude Code)`, `gh version 2.97.0
+# https://…`, `zellij 0.44.3`), so parsing a field out would be a fourth thing to
+# keep in step with three upstreams.
 USER vscode
 RUN set -eux; \
     curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_VERSION"; \
     installed="$(/home/vscode/.local/bin/claude --version)"; \
-    case "$installed" in \
-      *"$CLAUDE_VERSION"*) ;; \
-      *) echo "pinned CLAUDE_VERSION=$CLAUDE_VERSION but installed: $installed" >&2; exit 1 ;; \
-    esac
+    printf '%s' "$installed" | grep -qwF "$CLAUDE_VERSION" \
+      || { echo "pinned CLAUDE_VERSION=$CLAUDE_VERSION but installed: $installed" >&2; exit 1; }
 ENV PATH=/home/vscode/.local/bin:$PATH
 USER root

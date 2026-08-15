@@ -301,9 +301,19 @@ fn only_the_publishing_job_can_write_a_package() {
 
 /// Every argument to `docker push` in the workflow, in order. Collected by
 /// what the command *does*, not by what the reference is expected to look
-/// like: a push target renamed to anything at all — another repository,
-/// another registry, a bare local tag — still lands here, where a filter on
-/// the expected name would let it vanish from the comparison entirely.
+/// like: rename the existing push's argument to anything at all — another
+/// repository, another registry, a bare local tag — and it still lands here,
+/// where a filter on the expected name would let it vanish from the comparison
+/// entirely.
+///
+/// That rename is the whole of the scope, and the wording used to claim more
+/// (#158). This matches three whitespace-separated tokens, so it sees a push
+/// only where `docker push <ref>` is written as three tokens: splitting the
+/// command across a line continuation (`docker \` then `push …`) hides it, as
+/// does publishing by some other mechanism entirely — a `build-push-action`
+/// step, `buildx --push`, a `curl` to the registry API. Those are additions
+/// rather than drift, and adding one takes push access to this repository,
+/// which is also enough to edit this file.
 fn pushed_references(workflow: &str) -> Vec<String> {
     workflow
         .split_whitespace()
@@ -316,8 +326,14 @@ fn pushed_references(workflow: &str) -> Vec<String> {
 
 /// Every reference to a container image anywhere in the workflow: each
 /// `docker push` argument, each tag handed to `docker build -t`, and any
-/// `ghcr.io/`-prefixed token besides (a login line, a second tag, a stray
-/// env value). Unfiltered on purpose — see `pushed_references`.
+/// `ghcr.io/`-prefixed token besides (a second tag, a stray env value).
+/// Unfiltered on purpose — see `pushed_references`.
+///
+/// Not the registry login, though this comment used to say so (#158): the
+/// login names the registry host bare, `docker login ghcr.io`, with no
+/// repository path after it — no slash, no prefix match, never collected. It
+/// is not unguarded, it is guarded elsewhere, by
+/// `the_push_authenticates_with_the_runs_own_token`.
 fn published_references(workflow: &str) -> std::collections::BTreeSet<String> {
     let mut references: std::collections::BTreeSet<String> =
         pushed_references(workflow).into_iter().collect();
@@ -363,7 +379,11 @@ fn the_workflow_publishes_exactly_the_reference_the_default_config_boots_from() 
         std::collections::BTreeSet::from([booted.clone()]),
         "the workflow must name exactly the reference the default config boots \
          from ({booted}) and no other — one mutable tag, `latest`, per the \
-         decision on #150"
+         decision on #150. The limit of that claim (#158): this guards \
+         accidental drift of the ghcr publish — a renamed argument, a deleted \
+         step, a second `ghcr.io/` tag. A deliberately added publish to \
+         another registry is outside this tokenizer's sight, and outside what \
+         a test can hold against someone who already has push access"
     );
 }
 
