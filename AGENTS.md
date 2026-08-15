@@ -115,6 +115,7 @@ RUSTFLAGS=-D\ warnings RUSTDOCFLAGS=-D\ warnings sh -c '
   cargo test --locked --test skill_docs &&
   cargo test --locked --test devcontainer_prebuild &&
   cargo test --locked --test offline_green &&
+  cargo test --locked --test live_fetch -- common:: &&
   cargo doc --no-deps --all-features --locked'
 ```
 

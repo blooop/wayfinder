@@ -88,10 +88,10 @@ jobs:
       - name: Unit tests
         run: cargo test --locked --lib --bins --examples
 
-      # An offline resident of `tests/`: shape checks on the doc
-      # snippets agents copy-paste, no network and no `gh` — the seam is the
-      # doc text itself. It has to be named here because the step above stops
-      # at `--lib --bins --examples`, and an assertion no workflow runs is not
+      # An offline resident of `tests/`: shape checks on the doc snippets
+      # agents copy-paste, no network and no `gh` — the seam is the doc text
+      # itself. It has to be named here because the step above stops at
+      # `--lib --bins --examples`, and an assertion no workflow runs is not
       # an assertion.
       - name: Skill doc shape checks
         run: cargo test --locked --test skill_docs
@@ -114,8 +114,8 @@ jobs:
       - name: The live tests are all gated
         run: cargo test --locked --test offline_green
 
-      # The one part of `tests/` that needs neither network nor `gh`: the
-      # fixture's own diagnostic, which decides what a failing live test tells
+      # The live fixture's own diagnostic — offline like its three siblings
+      # above — which decides what a failing live test tells
       # you about a missing GH_TOKEN. It is split from the environment it reads
       # precisely so it can be asserted — and an assertion no workflow runs is
       # not an assertion. Named by filter, so the live tests around it stay
