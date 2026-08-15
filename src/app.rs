@@ -226,6 +226,25 @@ enum Pinned {
     Position(usize),
 }
 
+impl Pinned {
+    /// Where the hold lands once `new_order` is the order on screen.
+    ///
+    /// Each arm answers for itself rather than being taken apart into the
+    /// `Option` it was made to replace: [`crate::refresh::preserve_cursor`] is *told*
+    /// what is pinned here, so the two shapes stay two shapes all the way down
+    /// to the one call that needs them to be one.
+    fn resolve(&self, new_order: &[StopKey]) -> usize {
+        match self {
+            Pinned::Identity(key, fallback) => {
+                crate::refresh::preserve_cursor(Some(key), *fallback, new_order)
+            }
+            Pinned::Position(fallback) => {
+                crate::refresh::preserve_cursor(None, *fallback, new_order)
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     /// The clusters on screen: every open map that has arrived, keyed by id.
@@ -834,14 +853,7 @@ impl App {
             .iter()
             .map(|at| self.stop_key(&at.stop))
             .collect();
-        self.cursor = Cursor::Chosen(match pinned {
-            Pinned::Identity(key, fallback) => {
-                crate::refresh::preserve_cursor(Some(&key), fallback, &new_order)
-            }
-            Pinned::Position(fallback) => {
-                crate::refresh::preserve_cursor(None, fallback, &new_order)
-            }
-        });
+        self.cursor = Cursor::Chosen(pinned.resolve(&new_order));
     }
 
     /// The first enter (#62): stage a launch of whatever the cursor is on by
@@ -855,13 +867,9 @@ impl App {
     /// on a still-open ticket refuses too. Neither can arise on a map: a map
     /// has no blockers and no stage, and a finished one is not drawn.
     ///
-    /// Staging **chooses the stop it acts on** (#148): every arm that opens
-    /// the picker records the cursor as [`Cursor::Chosen`] there. To the human
-    /// the launch *is* a selection of that row, however the cursor arrived on
-    /// it — an untouched cursor sitting on the first match is enough — and
-    /// without the write a refresh would re-derive "the top" and carry the
-    /// cursor off the very row whose launch is being picked. The refusals do
-    /// not write: nothing was staged, so nothing was chosen.
+    /// Staging **chooses the stop it acts on** (#148), and every arm that
+    /// opens the picker goes through [`App::open_picker`] to do it — the
+    /// refusals do not, because nothing was staged, so nothing was chosen.
     fn request_launch(&mut self) -> Outcome {
         match self.cursor_stop() {
             // On a group line there is no agent to run, and exactly one thing
@@ -880,13 +888,7 @@ impl App {
                 // resumable as a build one — and rather more worth resuming.
                 let staged = self.resumable(staged, id.number);
                 self.prewarm(&staged);
-                self.cursor = Cursor::Chosen(self.cursor_pos());
-                self.overlay = Overlay::PickLaunch {
-                    candidate: staged.default_candidate(),
-                    staged,
-                    agent: Agent::default(),
-                    steer: String::new(),
-                };
+                self.open_picker(staged);
                 Outcome::Continue
             }
             // One stop, two screens, and the screen decides — which is the
@@ -904,14 +906,7 @@ impl App {
                     self.enter(&repo);
                     return Outcome::Continue;
                 }
-                let staged = Staged::project(&repo);
-                self.cursor = Cursor::Chosen(self.cursor_pos());
-                self.overlay = Overlay::PickLaunch {
-                    candidate: staged.default_candidate(),
-                    staged,
-                    agent: Agent::default(),
-                    steer: String::new(),
-                };
+                self.open_picker(Staged::project(&repo));
                 Outcome::Continue
             }
             Some(Stop::Ticket(row)) => self.request_ticket_launch(&row),
@@ -947,16 +942,33 @@ impl App {
             Some(staged) => {
                 let staged = self.resumable(staged, ticket.number);
                 self.prewarm(&staged);
-                self.cursor = Cursor::Chosen(self.cursor_pos());
-                self.overlay = Overlay::PickLaunch {
-                    candidate: staged.default_candidate(),
-                    staged,
-                    agent: Agent::default(),
-                    steer: String::new(),
-                };
+                self.open_picker(staged);
                 Outcome::Continue
             }
         }
+    }
+
+    /// Put the launch picker up on `staged` — **the only place it opens**, as
+    /// distinct from the key handler that re-seats one already up, so the
+    /// cursor write below cannot be forgotten by an arm added later.
+    ///
+    /// Staging chooses the stop it acts on (#148): the cursor is recorded as
+    /// [`Cursor::Chosen`] *before* the overlay is set. To the human the launch
+    /// *is* a selection of that row, however the cursor arrived on it — an
+    /// untouched cursor sitting on the first match is enough — and without the
+    /// write a refresh would re-derive "the top" and carry the cursor off the
+    /// very row whose launch is being picked. The write and the overlay are
+    /// one statement pair in one function precisely so that they cannot come
+    /// apart: a new stop worth staging reaches the picker through here, and
+    /// arrives with its row already chosen.
+    fn open_picker(&mut self, staged: Staged) {
+        self.cursor = Cursor::Chosen(self.cursor_pos());
+        self.overlay = Overlay::PickLaunch {
+            candidate: staged.default_candidate(),
+            staged,
+            agent: Agent::default(),
+            steer: String::new(),
+        };
     }
 
     /// Start warming the staged node's container while the launch picker is
