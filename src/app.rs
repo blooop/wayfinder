@@ -228,11 +228,8 @@ enum Pinned {
 
 impl Pinned {
     /// Where the hold lands once `new_order` is the order on screen.
-    ///
-    /// Each arm answers for itself rather than being taken apart into the
-    /// `Option` it was made to replace: [`crate::refresh::preserve_cursor`] is *told*
-    /// what is pinned here, so the two shapes stay two shapes all the way down
-    /// to the one call that needs them to be one.
+    /// Each arm answers for itself, so the two shapes stay two shapes all
+    /// the way down to the one call that needs them to be one.
     fn resolve(&self, new_order: &[StopKey]) -> usize {
         match self {
             Pinned::Identity(key, fallback) => {
@@ -868,7 +865,7 @@ impl App {
     /// has no blockers and no stage, and a finished one is not drawn.
     ///
     /// Staging **chooses the stop it acts on** (#148), and every arm that
-    /// opens the picker goes through [`App::open_picker`] to do it — the
+    /// opens the picker goes through [`App::open_launch_picker`] to do it — the
     /// refusals do not, because nothing was staged, so nothing was chosen.
     fn request_launch(&mut self) -> Outcome {
         match self.cursor_stop() {
@@ -888,7 +885,7 @@ impl App {
                 // resumable as a build one — and rather more worth resuming.
                 let staged = self.resumable(staged, id.number);
                 self.prewarm(&staged);
-                self.open_picker(staged);
+                self.open_launch_picker(staged);
                 Outcome::Continue
             }
             // One stop, two screens, and the screen decides — which is the
@@ -906,7 +903,7 @@ impl App {
                     self.enter(&repo);
                     return Outcome::Continue;
                 }
-                self.open_picker(Staged::project(&repo));
+                self.open_launch_picker(Staged::project(&repo));
                 Outcome::Continue
             }
             Some(Stop::Ticket(row)) => self.request_ticket_launch(&row),
@@ -942,7 +939,7 @@ impl App {
             Some(staged) => {
                 let staged = self.resumable(staged, ticket.number);
                 self.prewarm(&staged);
-                self.open_picker(staged);
+                self.open_launch_picker(staged);
                 Outcome::Continue
             }
         }
@@ -961,7 +958,7 @@ impl App {
     /// one statement pair in one function precisely so that they cannot come
     /// apart: a new stop worth staging reaches the picker through here, and
     /// arrives with its row already chosen.
-    fn open_picker(&mut self, staged: Staged) {
+    fn open_launch_picker(&mut self, staged: Staged) {
         self.cursor = Cursor::Chosen(self.cursor_pos());
         self.overlay = Overlay::PickLaunch {
             candidate: staged.default_candidate(),
