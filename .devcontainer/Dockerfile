@@ -9,10 +9,22 @@
 # could save. If that number ever grows into the minutes, this is the file to
 # revisit — see blooop/wayfinder#39 for the measurements.
 #
-# What it *does* carry is the three binaries `wf` shells out to and discovers on
-# PATH — `gh`, `zellij`, and the agent CLI — because `cargo test` here is not
-# hermetic: tests/live_fetch.rs drives `gh` against the real tracker and
-# tests/live_zellij_launch.rs starts real zellij sessions.
+# What it *does* carry is three binaries, for two different reasons.
+#
+# `gh` and the agent CLI are things `wf` itself shells out to and discovers on
+# PATH, so a workspace without them cannot run `wf` at all. They are not here
+# for the tests: `cargo test` in here is hermetic and stays green with no
+# network, because every test that reaches a real GitHub is `#[ignore]`d with a
+# reason (see the Checks section of README.md). Running that gated set inside a
+# workspace is a thing you can choose to do — `cargo test -- --ignored` — and
+# `gh` being present is what makes the choice available.
+#
+# `zellij` is here for a different reason and it is worth saying so, because
+# this comment used to justify it by a test file that no longer exists: `wf`
+# stopped launching zellij sessions in 9ae2897 and no code or test in this repo
+# names it now. It stays for interactive use — a workspace is somewhere a
+# person works, and splitting the terminal inside one is worth carrying a
+# single static binary for.
 FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
 
 # Pinned rather than "latest" so an image rebuild is a deliberate version bump
