@@ -219,8 +219,7 @@ fn every_test_attribute_in_a_live_source_is_one_this_guard_can_see() {
             .count();
         let paired = tests_in(text).len();
         assert_eq!(
-            paired,
-            written,
+            paired, written,
             "{name} contains {written} test attributes but the scanner in this \
              file paired only {paired} of them with a function. The difference \
              is written in a shape it cannot read — an attribute split across \
