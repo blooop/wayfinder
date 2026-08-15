@@ -54,9 +54,9 @@ async fn discovery_then_every_map_arrives_through_one_channel() {
             // go round and wait for the next event.
             LoadEvent::SearchFailed => {}
             // Named rather than `_`, so a seventh kind of arrival is a compile
-            // error here and a decision someone makes — this file is compiled
-            // but never run by CI, which makes a wildcard in it the least
-            // observed thing in the tree.
+            // error here and a decision someone makes — this file runs only
+            // after a merge (`live.yml`), which would make a wildcard in it
+            // the slowest-observed thing in the tree.
             other @ (LoadEvent::Fetched { .. } | LoadEvent::Surveyed { .. }) => {
                 panic!("expected discovery first, got {other:?}")
             }

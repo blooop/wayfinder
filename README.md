@@ -152,7 +152,8 @@ arguable rather than accumulating.
 
 `cargo test` in a fresh checkout is green with no network, no authenticated
 `gh` and no `devlaunch` installed. Not because the tests that need those are
-missing — there are 25 of them — but because each carries an `#[ignore]`
+missing — there are 25 of them, 25 of the 32 a full run reports ignored, the
+other seven being probe children in `src/` — but because each carries an `#[ignore]`
 naming what it wants, so a default run lists them as skipped instead of
 running them and failing:
 
@@ -175,10 +176,10 @@ any given machine:
   `live_streaming_startup` and `live_launch_exec` want network, an
   authenticated `gh`, a checkout whose `origin` is this repo, and — for the
   launch harness — a real pty. `.github/workflows/live.yml` runs them on every
-  push to `main` and on demand, deliberately not on pull requests: two of them
-  assert this tracker's present contents and one asserts wall-clock budgets, so
-  a red run there means the world moved, which is not a reason to block an
-  unrelated merge. Locally:
+  push to `main` and on demand, deliberately not on pull requests: three of
+  them assert this tracker's present contents and the startup one asserts
+  wall-clock budgets besides, so a red run there means the world moved, which
+  is not a reason to block an unrelated merge. Locally:
 
   ```
   cargo test --test live_fetch --test live_discovery -- --ignored
@@ -187,9 +188,10 @@ any given machine:
 - **The 17 that need a chosen `devlaunch`.** `live_devlaunch` wants a pixi
   environment holding a specific `dl` plus the `WF_CONTRACT_*` facts that
   describe it, and fails closed rather than testing whichever `dl` happens to
-  be installed. `.github/workflows/devlaunch-contract.yml` runs it at four
-  versions; locally that is `pixi run -e floor contract` and its siblings,
-  which pass `--ignored` themselves.
+  be installed. `.github/workflows/devlaunch-contract.yml` runs it in four
+  pixi environments (three pinned versions plus the unpinned `default`);
+  locally that is `pixi run -e floor contract` and its siblings, which pass
+  `--ignored` themselves.
 
 Three things under `tests/` are not gated and run in the default suite like any
 unit test, because all three are offline checks on files-as-behavior:

@@ -100,7 +100,7 @@ in the next session, however you launch.
 
 ## Checks
 
-CI runs four things, in the order they are cheap to fix, with **both**
+CI runs the checks below, in the order they are cheap to fix, with **both**
 `RUSTFLAGS=-D warnings` and `RUSTDOCFLAGS=-D warnings` — so anything that warns
 locally fails there. Set them when you run the checks, or the last one lies to
 you: a doc comment linking to a private item is a warning locally and a failed
@@ -150,9 +150,10 @@ shims. Three consequences worth knowing before you touch any of this:
   gh-live four on push to `main` and on `workflow_dispatch`, not on pull
   requests, because two of them assert the tracker's present contents and a
   third asserts wall-clock budgets — a red run means the world moved.
-  `.github/workflows/devlaunch-contract.yml` runs `live_devlaunch` at four
-  devlaunch versions and does block a pull request, because nothing in it
-  depends on the tracker.
+  `.github/workflows/devlaunch-contract.yml` runs `live_devlaunch` in four
+  pixi environments — three pinned devlaunch versions plus `default`, which
+  pins none — and does block a pull request, because nothing in it depends on
+  the tracker.
 - **A new live test needs the attribute and a workflow line.** Without the
   `#[ignore]` it makes a bare `cargo test` fail on any machine lacking what it
   wants; with it and nothing else, it is a test that never runs anywhere.

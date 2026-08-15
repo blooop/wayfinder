@@ -1,10 +1,11 @@
 name: CI
 
 # Formatting, lints, tests and docs — everything that can be judged with
-# nothing but a compiler and this checkout. Two other workflows cover what
-# cannot: `package.yml` proves the recipe still installs and runs, and
+# nothing but a compiler and this checkout. Three other workflows cover what
+# cannot: `package.yml` proves the recipe still installs and runs,
 # `devlaunch-contract.yml` runs `wf` against a real `dl` at three chosen
-# versions. All three are kept apart on purpose, and for one reason — a rattler
+# versions, and `live.yml` runs the gh-live tests against the real tracker
+# after a merge. All four are kept apart on purpose, and for one reason — a rattler
 # build and a conda solve each take minutes and download a toolchain of their
 # own, so folding `cargo fmt` into either would make the cheapest possible
 # failure the slowest one to hear about.
@@ -116,8 +117,8 @@ jobs:
         run: "cargo test --locked --test live_fetch -- common::"
 
       # Compiled but not run: a test that no longer builds is rot, and this is
-      # what catches it at the commit that caused it rather than the next time
-      # somebody runs them by hand.
+      # what catches it at the commit that caused it rather than at the next
+      # `live.yml` run after a merge.
       - name: The live tests still compile
         run: cargo test --locked --all-targets --no-run
 

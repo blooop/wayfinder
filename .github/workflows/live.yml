@@ -12,13 +12,13 @@ name: live
 #
 # ## Not on pull requests, on purpose
 #
-# This is a non-blocking leg and the trigger list is what makes it one. Two of
-# these tests assert the tracker's present contents — that this repo has more
-# than one open map, that the first one has at least seven tickets — and
-# `live_streaming_startup` asserts wall-clock budgets, which are the first
-# thing to flake on a shared runner under a noisy neighbour. All three are
-# right to assert what they assert (asserting reality is the point of a live
-# test), and none of them is a reason to block an unrelated merge. Running
+# This is a non-blocking leg and the trigger list is what makes it one. Three
+# of these tests assert the tracker's present contents — that this repo has
+# more than one open map, that the first one has at least seven tickets — and
+# `live_streaming_startup` asserts wall-clock budgets besides, which are the
+# first thing to flake on a shared runner under a noisy neighbour. All of them
+# are right to assert what they assert (asserting reality is the point of a
+# live test), and none of them is a reason to block an unrelated merge. Running
 # after the merge instead means a red run here says "the world moved" at a
 # moment when that is information rather than an obstacle.
 on:
@@ -32,6 +32,10 @@ on:
 
 permissions:
   contents: read
+  # The tests read issues and search via GraphQL. Public data likely answers a
+  # bare token anyway, but this leg only fires after a merge — a wrong guess
+  # here surfaces late and red, so the read is granted rather than gambled on.
+  issues: read
 
 concurrency:
   # As in `ci.yml`. A superseded run on `main` has nothing to say that its
