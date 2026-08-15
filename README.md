@@ -134,6 +134,7 @@ cargo clippy --all-targets --all-features --locked
 cargo test --locked --lib --bins --examples
 cargo test --locked --test skill_docs
 cargo test --locked --test devcontainer_prebuild
+cargo test --locked --test offline_green
 cargo test --locked --test live_fetch -- common::
 cargo test --locked --all-targets --no-run
 cargo doc --no-deps --all-features --locked
@@ -193,12 +194,14 @@ any given machine:
   locally that is `pixi run -e floor contract` and its siblings, which pass
   `--ignored` themselves.
 
-Three things under `tests/` are not gated and run in the default suite like any
-unit test, because all three are offline checks on files-as-behavior:
-`tests/skill_docs.rs`, `tests/devcontainer_prebuild.rs`, and `tests/common`'s
-own diagnostic — the part that decides what a failing live test tells you about
-a missing `GH_TOKEN`, which is why `ci.yml` names it by filter above. An
-assertion nothing runs is not an assertion.
+Four things under `tests/` are not gated and run in the default suite like any
+unit test, because all four are offline checks on files-as-behavior:
+`tests/skill_docs.rs`, `tests/devcontainer_prebuild.rs`,
+`tests/offline_green.rs` — which reads `tests/live_*.rs` and fails if a test in
+them is missing its `#[ignore]`, so the green above is checked rather than
+promised — and `tests/common`'s own diagnostic, the part that decides what a
+failing live test tells you about a missing `GH_TOKEN`, which is why `ci.yml`
+names it by filter above. An assertion nothing runs is not an assertion.
 
 ## Releasing
 
