@@ -114,6 +114,7 @@ RUSTFLAGS=-D\ warnings RUSTDOCFLAGS=-D\ warnings sh -c '
   cargo test --locked --lib --bins --examples &&
   cargo test --locked --test skill_docs &&
   cargo test --locked --test devcontainer_prebuild &&
+  cargo test --locked --test offline_green &&
   cargo doc --no-deps --all-features --locked'
 ```
 
@@ -121,13 +122,15 @@ Run the whole chain before pushing, `cargo fmt --all` first — a formatting dif
 fails the build before any of the interesting checks get a chance to run.
 
 The `tests/live_*.rs` files are excluded from that test command on purpose: they
-talk to real GitHub, drive a real pty, or want a chosen `devlaunch`. Two
+talk to real GitHub, drive a real pty, or want a chosen `devlaunch`. Three
 binaries under `tests/` are exceptions and run in the chain (and in CI) like any
-unit test, because both are offline checks on files-as-behavior:
-`tests/skill_docs.rs` (shape checks on the skill docs' snippets) and
+unit test, because all three are offline checks on files-as-behavior:
+`tests/skill_docs.rs` (shape checks on the skill docs' snippets),
 `tests/devcontainer_prebuild.rs` (the contract between the devcontainer configs
 and the workflow that publishes the prebuilt image to GHCR — see the comments in
-`.devcontainer/devcontainer.json`).
+`.devcontainer/devcontainer.json`), and `tests/offline_green.rs` (the guard on
+the exclusion itself: it reads `tests/live_*.rs` and fails if any test in them
+is missing `#[ignore]`).
 
 ### The live tests are gated, not absent
 
@@ -158,7 +161,9 @@ shims. Three consequences worth knowing before you touch any of this:
   `#[ignore]` it makes a bare `cargo test` fail on any machine lacking what it
   wants; with it and nothing else, it is a test that never runs anywhere.
   `live.yml` names its test binaries one by one for that reason — enrolment is
-  a deliberate line, not a side effect.
+  a deliberate line, not a side effect. The attribute half is checked rather
+  than remembered: `tests/offline_green.rs` walks `tests/live_*.rs` and fails
+  on any test that is missing it. The workflow half is still on you.
 
 ## The devlaunch contract
 

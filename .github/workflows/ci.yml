@@ -88,7 +88,7 @@ jobs:
       - name: Unit tests
         run: cargo test --locked --lib --bins --examples
 
-      # The other offline resident of `tests/`: shape checks on the doc
+      # An offline resident of `tests/`: shape checks on the doc
       # snippets agents copy-paste, no network and no `gh` — the seam is the
       # doc text itself. It has to be named here because the step above stops
       # at `--lib --bins --examples`, and an assertion no workflow runs is not
@@ -96,13 +96,23 @@ jobs:
       - name: Skill doc shape checks
         run: cargo test --locked --test skill_docs
 
-      # The other config-as-behavior binary, same reasoning: what a workspace
+      # Another config-as-behavior binary, same reasoning: what a workspace
       # boots from and what `devcontainer.yml` publishes are promises split
       # across two devcontainer configs and a workflow, and nothing but this
       # notices when one of them moves. Named here for the same reason as the
       # step above — the unit-test step stops at `--lib --bins --examples`.
       - name: Devcontainer prebuild contract
         run: cargo test --locked --test devcontainer_prebuild
+
+      # The guard on the exclusion every step around it depends on: the live
+      # binaries are safe to leave out of the unit-test step only because each
+      # of their tests carries `#[ignore]`, and a new one that forgets it is
+      # invisible both here and in `live.yml`, which selects with `--ignored`.
+      # This walks `tests/live_*.rs` and reads the attributes off the source,
+      # which is the only place the omission is visible — running the tests
+      # cannot see it, since running them is the symptom.
+      - name: The live tests are all gated
+        run: cargo test --locked --test offline_green
 
       # The one part of `tests/` that needs neither network nor `gh`: the
       # fixture's own diagnostic, which decides what a failing live test tells
