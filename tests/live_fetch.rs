@@ -12,6 +12,7 @@ use wf::model::{Status, TicketType};
 mod common;
 
 #[tokio::test]
+#[ignore = "live: needs network + an authenticated gh"]
 async fn fetches_the_live_wayfinder_map() {
     let map_id = common::a_live_map().await;
     let map = wf::fetch::fetch_map(&map_id)

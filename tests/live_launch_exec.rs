@@ -516,6 +516,7 @@ fn flags(stty: &str) -> Vec<&str> {
 // launch. Splitting it to satisfy a line count would mean three real starts.
 #[allow(clippy::too_many_lines)]
 #[test]
+#[ignore = "live: needs network, gh, a blooop/wayfinder checkout, and a pty"]
 fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
     let scratch = Scratch::new("exec");
     scratch.write_shims();
@@ -1006,6 +1007,7 @@ fn launch_the_first_ticket(keys: &mut std::fs::File, seen: &Arc<Mutex<Vec<u8>>>,
 /// *started* the work is the one that returns to it — which is the claim the
 /// whole feature is for.
 #[test]
+#[ignore = "live: needs network, gh, a blooop/wayfinder checkout, and a pty"]
 fn coming_back_to_a_node_rejoins_the_conversation_the_first_launch_started() {
     let scratch = Scratch::new("resume");
     scratch.write_shims();

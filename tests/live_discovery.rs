@@ -11,6 +11,7 @@ use wf::projects::{discover_checkout, ProjectsCache};
 mod common;
 
 #[tokio::test]
+#[ignore = "live: needs network, gh, and a blooop/wayfinder checkout with >1 open map"]
 async fn registering_this_checkout_finds_and_fetches_its_map() {
     // Discover: this checkout's toplevel and origin-derived slug.
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
