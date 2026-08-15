@@ -124,14 +124,18 @@ through the picker, and model invocation needs a file on disk with frontmatter.
 
 ## Checks
 
-`.github/workflows/ci.yml` runs four things on every pull request and every push
-to main, in the order they are cheap to fix:
+`.github/workflows/ci.yml` runs everything that can be judged with nothing but a
+compiler and this checkout, on every pull request and every push to main, in the
+order the steps are cheap to fix:
 
 ```
 cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked
 cargo test --locked --lib --bins --examples
+cargo test --locked --test skill_docs
+cargo test --locked --test devcontainer_prebuild
 cargo test --locked --test live_fetch -- common::
+cargo test --locked --all-targets --no-run
 cargo doc --no-deps --all-features --locked
 ```
 
@@ -144,17 +148,55 @@ file-level `allow` and a reason. `rustfmt.toml` and `clippy.toml` hold the rest;
 every lint that is switched off carries a comment saying why, so the list stays
 arguable rather than accumulating.
 
-Everything under `tests/` is a `live_*` integration test — a real `gh`, real
-network, real assertions against this project's own tracker — so CI compiles
-them but does not run them, and a moving map never breaks a build. The one
-exception is the fourth command above: `tests/common`'s diagnostic, which
-decides what a failing live test tells you about a missing `GH_TOKEN`, is pure
-and needs no network, and an assertion nothing runs is not an assertion. Run
-the rest yourself when the fetch or launch path changes:
+### What a default run covers, and what it skips
+
+`cargo test` in a fresh checkout is green with no network, no authenticated
+`gh` and no `devlaunch` installed. Not because the tests that need those are
+missing — there are 25 of them — but because each carries an `#[ignore]`
+naming what it wants, so a default run lists them as skipped instead of
+running them and failing:
 
 ```
-cargo test --test live_fetch --test live_discovery
+cargo test --locked              # the hermetic suite; the live set is reported ignored
+cargo test --locked -- --ignored # the live set instead — but see the split below
 ```
+
+The reason strings appear in the run, so a skipped test says what it was
+waiting for rather than only that it was skipped. `#[ignore]` and not an
+environment-variable skip, because a skip that reports as a pass is a green
+nobody can trust; and not a feature gate, because the compile-only step above
+is what stops these tests bit-rotting and a gated-out test compiles nowhere.
+
+The gated set splits in two, along the line the workflows are drawn on — so
+`-- --ignored` on its own runs both halves and only one of them can succeed on
+any given machine:
+
+- **The eight that need a real GitHub.** `live_fetch`, `live_discovery`,
+  `live_streaming_startup` and `live_launch_exec` want network, an
+  authenticated `gh`, a checkout whose `origin` is this repo, and — for the
+  launch harness — a real pty. `.github/workflows/live.yml` runs them on every
+  push to `main` and on demand, deliberately not on pull requests: two of them
+  assert this tracker's present contents and one asserts wall-clock budgets, so
+  a red run there means the world moved, which is not a reason to block an
+  unrelated merge. Locally:
+
+  ```
+  cargo test --test live_fetch --test live_discovery -- --ignored
+  ```
+
+- **The 17 that need a chosen `devlaunch`.** `live_devlaunch` wants a pixi
+  environment holding a specific `dl` plus the `WF_CONTRACT_*` facts that
+  describe it, and fails closed rather than testing whichever `dl` happens to
+  be installed. `.github/workflows/devlaunch-contract.yml` runs it at four
+  versions; locally that is `pixi run -e floor contract` and its siblings,
+  which pass `--ignored` themselves.
+
+Three things under `tests/` are not gated and run in the default suite like any
+unit test, because all three are offline checks on files-as-behavior:
+`tests/skill_docs.rs`, `tests/devcontainer_prebuild.rs`, and `tests/common`'s
+own diagnostic — the part that decides what a failing live test tells you about
+a missing `GH_TOKEN`, which is why `ci.yml` names it by filter above. An
+assertion nothing runs is not an assertion.
 
 ## Releasing
 

@@ -121,13 +121,43 @@ Run the whole chain before pushing, `cargo fmt --all` first — a formatting dif
 fails the build before any of the interesting checks get a chance to run.
 
 The `tests/live_*.rs` files are excluded from that test command on purpose: they
-talk to real GitHub and drive a real pty. Run them by name when the thing you
-changed is what they cover. Two binaries under `tests/` are exceptions and run
-in the chain (and in CI) like any unit test, because both are offline checks on
-files-as-behavior: `tests/skill_docs.rs` (shape checks on the skill docs'
-snippets) and `tests/devcontainer_prebuild.rs` (the contract between the
-devcontainer configs and the workflow that publishes the prebuilt image to
-GHCR — see the comments in `.devcontainer/devcontainer.json`).
+talk to real GitHub, drive a real pty, or want a chosen `devlaunch`. Two
+binaries under `tests/` are exceptions and run in the chain (and in CI) like any
+unit test, because both are offline checks on files-as-behavior:
+`tests/skill_docs.rs` (shape checks on the skill docs' snippets) and
+`tests/devcontainer_prebuild.rs` (the contract between the devcontainer configs
+and the workflow that publishes the prebuilt image to GHCR — see the comments in
+`.devcontainer/devcontainer.json`).
+
+### The live tests are gated, not absent
+
+All 25 of them carry `#[ignore]` with a reason string saying what they need, so
+a bare `cargo test` is green in a fresh checkout or a fresh devcontainer and
+prints them as skipped — 25 of the 32 a full run reports ignored, the other
+seven being the probe children in `src/` that only mean anything under recording
+shims. Three consequences worth knowing before you touch any of this:
+
+- **`cargo test -- --ignored` runs both halves of the gated set and only one of
+  them can pass.** The eight that need a real GitHub (`live_fetch`,
+  `live_discovery`, `live_streaming_startup`, `live_launch_exec`) want network,
+  an authenticated `gh` and a checkout whose `origin` is `blooop/wayfinder`; the
+  17 in `live_devlaunch` want a pixi environment and the `WF_CONTRACT_*` block,
+  and panic rather than test whatever `dl` is on PATH. Run the first group by
+  name — `cargo test --test live_fetch --test live_discovery -- --ignored` — and
+  the second through `pixi run -e <env> contract`, which supplies the flag
+  itself.
+- **Each group has exactly one workflow.** `.github/workflows/live.yml` runs the
+  gh-live four on push to `main` and on `workflow_dispatch`, not on pull
+  requests, because two of them assert the tracker's present contents and a
+  third asserts wall-clock budgets — a red run means the world moved.
+  `.github/workflows/devlaunch-contract.yml` runs `live_devlaunch` at four
+  devlaunch versions and does block a pull request, because nothing in it
+  depends on the tracker.
+- **A new live test needs the attribute and a workflow line.** Without the
+  `#[ignore]` it makes a bare `cargo test` fail on any machine lacking what it
+  wants; with it and nothing else, it is a test that never runs anywhere.
+  `live.yml` names its test binaries one by one for that reason — enrolment is
+  a deliberate line, not a side effect.
 
 ## The devlaunch contract
 
