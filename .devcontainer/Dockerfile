@@ -77,11 +77,12 @@ RUN set -eux; \
 #
 # Matched on a word boundary rather than as a substring, because a substring
 # match accepts a version it was never pinned to: `2.1.2234` contains `2.1.223`,
-# as does `12.1.223`. Boundary matching refuses both while staying agnostic about
-# the shape of the line the version arrives in — the three tools pinned in this
-# file each print a different one (`2.1.223 (Claude Code)`, `gh version 2.97.0
-# https://…`, `zellij 0.44.3`), so parsing a field out would be a fourth thing to
-# keep in step with three upstreams.
+# as does `12.1.223`. Boundary matching refuses both. It is not fully
+# shape-proof — `.` and `-` are non-word characters, so a `2.1.223-beta` would
+# still match, and a `v`-prefixed `v2.1.223` would be refused (loudly, the safe
+# direction) — but it stays agnostic about the line the version arrives in
+# (today: `2.1.223 (Claude Code)`), where parsing a field out would be one more
+# format to keep in step with the upstream installer.
 USER vscode
 RUN set -eux; \
     curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_VERSION"; \

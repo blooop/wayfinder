@@ -359,6 +359,13 @@ fn published_references(workflow: &str) -> std::collections::BTreeSet<String> {
 /// workflow, and the workflow's own push renamed (or deleted) away from the
 /// config — the second is what the first review of #152 mutation-checked
 /// straight through a prefix-filtered version of this test.
+///
+/// The limit of the claim (#158): this holds every publish the tokenizers can
+/// see — any `docker push <ref>` written as three tokens, whatever the
+/// registry, and any `-t`/`--tag` — but not one added by a mechanism they do
+/// not see (a line continuation, a `build-push-action` step, `buildx --push`,
+/// a `curl` to the registry API). Those are additions rather than drift, and
+/// adding one takes push access, which is also enough to edit this file.
 #[test]
 fn the_workflow_publishes_exactly_the_reference_the_default_config_boots_from() {
     let workflow = publishing_workflow();
@@ -380,10 +387,11 @@ fn the_workflow_publishes_exactly_the_reference_the_default_config_boots_from() 
         "the workflow must name exactly the reference the default config boots \
          from ({booted}) and no other — one mutable tag, `latest`, per the \
          decision on #150. The limit of that claim (#158): this guards \
-         accidental drift of the ghcr publish — a renamed argument, a deleted \
-         step, a second `ghcr.io/` tag. A deliberately added publish to \
-         another registry is outside this tokenizer's sight, and outside what \
-         a test can hold against someone who already has push access"
+         drift of any publish the tokenizers can see — a renamed argument, a \
+         deleted step, a second tag, whatever the registry. A publish added \
+         by a mechanism they do not see (a line continuation, a \
+         build-push-action step) is outside it, and outside what a test can \
+         hold against someone who already has push access"
     );
 }
 
