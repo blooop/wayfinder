@@ -38,6 +38,7 @@ fn scratch_cache(tag: &str) -> PathBuf {
 }
 
 #[tokio::test]
+#[ignore = "live: needs network + gh; asserts wall-clock budgets"]
 async fn discovery_then_every_map_arrives_through_one_channel() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let cache_path = scratch_cache("discovery");
@@ -104,6 +105,7 @@ async fn discovery_then_every_map_arrives_through_one_channel() {
 }
 
 #[tokio::test]
+#[ignore = "live: needs network + gh; asserts wall-clock budgets"]
 async fn a_cached_seed_fetches_the_map_without_waiting_for_the_search() {
     // The #28 claim, end to end: with the map id already in hand, the map
     // itself lands in one round trip — no ~2.5s search in front of it.
@@ -135,6 +137,7 @@ async fn a_cached_seed_fetches_the_map_without_waiting_for_the_search() {
 }
 
 #[tokio::test]
+#[ignore = "live: needs network + gh; asserts wall-clock budgets"]
 async fn a_stale_seed_reports_failure_and_is_replaced_by_the_search() {
     // A cached id that no longer names a map — here `#2`, a closed sub-issue
     // that exists and is not a map, which is refused for either reason alone.
@@ -178,6 +181,7 @@ async fn a_stale_seed_reports_failure_and_is_replaced_by_the_search() {
 }
 
 #[tokio::test]
+#[ignore = "live: needs network + gh; asserts wall-clock budgets"]
 async fn shutdown_leaves_nothing_in_flight() {
     // The launch path awaits this immediately before `exec`. An in-flight `gh`
     // that outlives the exec is inherited by the agent as a zombie holding its

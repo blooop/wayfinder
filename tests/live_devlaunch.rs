@@ -430,6 +430,7 @@ print(json.dumps({
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn the_dl_under_test_is_the_one_the_environment_installed() {
     // `pixi run` prepends its prefix to the *inherited* PATH, so a developer's
     // own `~/.pixi/bin/dl` is still on it, several entries later. If the
@@ -454,6 +455,7 @@ fn the_dl_under_test_is_the_one_the_environment_installed() {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn wf_can_read_the_version_this_dl_prints() {
     // `Devlaunch::Unreadable` is the arm for a `--version` this binary cannot
     // parse, and it sends every isolated launch to the host. It has never been
@@ -488,6 +490,7 @@ fn wf_can_read_the_version_this_dl_prints() {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn the_floor_environment_is_pinned_to_the_floor() {
     // The claim AGENTS.md makes, stated as an assertion rather than as a guard.
     //
@@ -532,6 +535,7 @@ fn the_floor_environment_is_pinned_to_the_floor() {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn a_listing_from_a_real_dl_is_one_wf_can_read() {
     // `parse_workspaces` is all-or-nothing: a listing with one field `wf`
     // cannot read is a listing it reads *none* of, and `wf reap` then collects
@@ -556,6 +560,7 @@ fn a_listing_from_a_real_dl_is_one_wf_can_read() {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn every_unsaved_answer_this_dl_can_give_is_one_wf_reads() {
     // The field that has already broken once, asked of the code that writes it.
     //
@@ -608,6 +613,7 @@ for answer in (
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn what_this_dl_says_about_a_clone_holding_work_is_what_wf_reads() {
     // The whole path, on both sides of the version boundary: a real checkout
     // with a real uncommitted file, inspected by *this* devlaunch's own
@@ -657,6 +663,7 @@ fn what_this_dl_says_about_a_clone_holding_work_is_what_wf_reads() {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn whether_wf_trusts_a_missing_unsaved_follows_the_release() {
     // The decision `answers_unsaved` exists for, and the most dangerous one in
     // the pair: on a release that answers for every clone of its own, a `null`
@@ -741,6 +748,7 @@ fn cleared(cleanup: &Cleanup) -> Vec<&str> {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn what_this_dl_says_about_a_pushed_clone_is_what_an_unattended_cleanup_acts_on() {
     // The recoverability floor (#151) against a real devlaunch, on both sides
     // of the answer. `wf reap` prints its plan and waits; the cleanup a run
@@ -832,6 +840,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn the_environment_without_devlaunch_really_has_none() {
     // The premise every assertion in the `none` environment rests on, and the
     // one that is easiest to lose: `pixi run` prepends its prefix to the
@@ -856,6 +865,7 @@ fn the_environment_without_devlaunch_really_has_none() {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn a_devcontainer_repo_is_isolated_only_when_a_real_dl_can_carry_it() {
     // The fallback itself, rather than the reading that decides it.
     //
@@ -896,6 +906,7 @@ fn a_devcontainer_repo_is_isolated_only_when_a_real_dl_can_carry_it() {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn a_launch_that_fell_back_says_why_and_names_the_version() {
     // The half of a degradation a missing `(devlaunch)` suffix cannot carry.
     //
@@ -937,6 +948,7 @@ fn a_launch_that_fell_back_says_why_and_names_the_version() {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn a_reap_with_no_dl_refuses_instead_of_guessing() {
     // `wf reap` is the one path in this crate that deletes, and it decides what
     // to delete from what `dl --ls --json` told it. With no `dl` there is no
@@ -1295,6 +1307,7 @@ exit 0
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn the_removal_wf_sends_reaches_devpod_as_a_delete() {
     // `wf reap`'s argv, run by the real `dl`, on every release: reap deletes
     // through whichever `dl` is on PATH, so this has to hold below the floor
@@ -1328,6 +1341,7 @@ fn the_removal_wf_sends_reaches_devpod_as_a_delete() {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn the_prewarm_wf_sends_is_the_verb_the_floor_exists_for() {
     // The 0.14.0 regression, as a test.
     //
@@ -1397,6 +1411,7 @@ fn the_prewarm_wf_sends_is_the_verb_the_floor_exists_for() {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn an_isolated_launch_arrives_as_one_shell_command() {
     // `wf`'s quoting against `dl`'s shell, with nothing between them.
     //
@@ -1513,6 +1528,7 @@ fn an_isolated_launch_arrives_as_one_shell_command() {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn every_subprocess_this_file_starts_itself_goes_through_hermetic() {
     // A guard on this file's own source — and only on this file's own source,
     // which is a real limit rather than an oversight. `Isolation::detect` and
@@ -1564,6 +1580,7 @@ fn every_subprocess_this_file_starts_itself_goes_through_hermetic() {
 }
 
 #[test]
+#[ignore = "live: contract run — needs pixi and WF_CONTRACT_* (see pixi contract tasks)"]
 fn the_sanitised_spawn_hands_on_nothing_it_was_not_given() {
     // The allowlist, read off a real child rather than off the source.
     //
