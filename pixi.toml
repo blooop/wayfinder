@@ -77,9 +77,10 @@ wf = "scripts/without-dl.sh cargo run --locked --bin wf --"
 # The environment with no `dl` at all is a role like any other, and its
 # contract run goes through the scrubber — otherwise `pixi run` hands it the
 # developer's own devlaunch and the "absent" case is a fiction. Its own task
-# rather than the shared one below, for exactly that reason.
+# rather than the shared one below, for exactly that reason. `--ignored` carries
+# the same meaning here as it does there.
 [feature.none.tasks]
-contract = "scripts/without-dl.sh cargo test --locked --test live_devlaunch -- --test-threads=1"
+contract = "scripts/without-dl.sh cargo test --locked --test live_devlaunch -- --ignored --test-threads=1"
 
 [feature.none.activation.env]
 # Only the role. The absent case is declared by the *silence* of the other
@@ -89,10 +90,18 @@ contract = "scripts/without-dl.sh cargo test --locked --test live_devlaunch -- -
 WF_CONTRACT_ROLE = "none"
 
 [feature.contract.tasks]
+# `--ignored` because every test in that file carries an `#[ignore]` naming what
+# it needs — pixi and the `WF_CONTRACT_*` block below — so that a bare
+# `cargo test` skips them instead of running them against whatever `dl` happens
+# to be installed. These environments are the ones that supply what they need,
+# so they are the ones that ask for them. Without the flag this task selects
+# nothing and reports `ok` for it, which is the failure mode the gate exists to
+# avoid.
+#
 # One `--test-threads=1`: the tests here each spawn `dl`, and a real devlaunch
 # start is ~90 ms of Python. Serial keeps the failure output in an order a human
 # can read.
-contract = "cargo test --locked --test live_devlaunch -- --test-threads=1"
+contract = "cargo test --locked --test live_devlaunch -- --ignored --test-threads=1"
 
 [feature.floor.dependencies]
 devlaunch = "==0.0.24"
