@@ -1,0 +1,88 @@
+name: live
+
+# The four test binaries that need a real GitHub: `wf`'s fetch, discovery,
+# streaming startup and launch paths, run against this project's own tracker
+# rather than a fixture. `ci.yml` compiles them and never runs them; without
+# this workflow nothing ever did, and the only thing standing behind them was
+# somebody remembering to run them by hand.
+#
+# `tests/live_devlaunch.rs` is the fifth gated binary and is deliberately not
+# here: it wants a chosen `devlaunch` from a pixi environment, which is
+# `devlaunch-contract.yml`'s whole job.
+#
+# ## Not on pull requests, on purpose
+#
+# This is a non-blocking leg and the trigger list is what makes it one. Two of
+# these tests assert the tracker's present contents — that this repo has more
+# than one open map, that the first one has at least seven tickets — and
+# `live_streaming_startup` asserts wall-clock budgets, which are the first
+# thing to flake on a shared runner under a noisy neighbour. All three are
+# right to assert what they assert (asserting reality is the point of a live
+# test), and none of them is a reason to block an unrelated merge. Running
+# after the merge instead means a red run here says "the world moved" at a
+# moment when that is information rather than an obstacle.
+on:
+  push:
+    branches: [main]
+  # The trigger a human pulls after changing the fetch or launch path, when
+  # they want the answer before the merge rather than after it. Same reason
+  # `ci.yml` carries one, plus this one: a leg that only ever fires on `main`
+  # is a leg nobody can aim at a branch.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # As in `ci.yml`. A superseded run on `main` has nothing to say that its
+  # successor will not say better, and the tests here are the slow ones.
+  group: live-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTFLAGS: -D warnings
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live:
+    name: the live tests, against the real tracker
+    runs-on: ubuntu-latest
+    env:
+      # Every `gh` call this repo makes is a read-only API GET, so the token
+      # the workflow is handed anyway is enough and no secret needs to exist
+      # for this to run. `tests/common` turns a missing one into a diagnostic
+      # rather than a confusing failure, which is why that module is the one
+      # part of `tests/` `ci.yml` already runs.
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # The checkout is load-bearing beyond supplying the source:
+      # `live_discovery` and `live_launch_exec` resolve this directory's git
+      # `origin` and require it to be `blooop/wayfinder`, so they are testing
+      # the runner's own checkout as much as anything.
+      - uses: actions/checkout@v7
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo's registry and the target directory
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: live
+
+      # `--ignored` is how the gated set is selected at all: each of these
+      # tests carries an `#[ignore]` naming what it needs, so a bare
+      # `cargo test` skips them and this is the caller that supplies it. Named
+      # binary by binary rather than `--tests`, so adding a live binary is a
+      # deliberate line here instead of a silent enrolment.
+      #
+      # `--test-threads=1` because `live_streaming_startup`'s budgets are
+      # wall-clock: run beside the pty harness on two shared cores they measure
+      # the runner's load rather than `wf`'s startup.
+      - name: The live tests
+        run: >-
+          cargo test --locked
+          --test live_fetch
+          --test live_discovery
+          --test live_streaming_startup
+          --test live_launch_exec
+          -- --ignored --test-threads=1
