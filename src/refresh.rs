@@ -10,7 +10,18 @@
 //! 1. The cached map ids (#28) start their fetches before the first frame.
 //! 2. One `wayfinder:map` label search runs unconditionally alongside them and
 //!    reconciles that set — the cache is a head start, never a skip.
-//! 3. Each map lands on screen as it arrives; `ctrl-r` is how you ask again.
+//! 3. Each map lands on screen as it arrives, and that is the last word on it.
+//!
+//! There is **one load per run**, and no way to ask for a second. The refresh
+//! key refetched everything in place until it was retired; what it cost was a
+//! parallel path — a way to put [`Startup`] back into loading, a
+//! `Loaders::restart` that existed only so a refetch could not be beaten by the
+//! load it replaced, and a generation on the reading below so a withdrawn
+//! answer could be told from a live one. None of that is here now, because
+//! every value in this module is written once and read once. What it gave up is
+//! real and is stated where it is felt: a map that changed after `wf` started
+//! stays as it was fetched, and the only way to see the new one is to run `wf`
+//! again — ~0.6 s warm, at the price of the query, the level and the cursor.
 //!
 //! Everything is keyed by [`MapId`] rather than repo slug (#50): a repo can
 //! hold several open maps, and each is its own load, its own arrival, and its
@@ -20,6 +31,7 @@
 //! failed load leaves the picker up with a notice rather than taking it down.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -29,6 +41,7 @@ use tokio::task::JoinHandle;
 use crate::fetch;
 use crate::model::{Map, MapId, MapSet};
 use crate::projects::ProjectsCache;
+use crate::reclaim::Reading;
 
 /// How long the map search waits before trying again. The only recurring timer
 /// left: nothing polls, but a search that never answers would leave `wf`
@@ -59,6 +72,23 @@ pub enum LoadEvent {
     SearchFailed,
     /// One map's load reported.
     Fetched { id: MapId, outcome: MapFetch },
+    /// The background reading landed (#137) — what a `wf reap` would claim,
+    /// and what is running or has stopped.
+    ///
+    /// Only ever sent when there is something to say: a reading that failed and
+    /// a reading that found nothing are the same silence, because neither is
+    /// anything the screen should draw.
+    ///
+    /// It used to carry a `taken` generation saying *which* reading it was,
+    /// because that silence breaks newest-write-wins: the refresh key cleared
+    /// what it held and asked again, an answer to the *previous* question could
+    /// already be sitting in the channel at that moment, and folding it would
+    /// have put the cleared state back — with nothing able to correct it, since
+    /// a fresh reading that finds nothing sends no event at all. The tag is
+    /// gone with the key. One reading is taken per run and it is never
+    /// withdrawn, so there is no previous question an answer could belong to,
+    /// and the payload can be the reading itself.
+    Surveyed(Reading),
 }
 
 /// Has the `wayfinder:map` label search answered yet?
@@ -136,16 +166,6 @@ impl Startup {
         self.arrived.insert(id.clone());
     }
 
-    /// `ctrl-r`: every map is being fetched again, so nothing has arrived yet.
-    ///
-    /// The same state a load uses, because it is the same question — how many
-    /// of the maps we expect are in — and answering it once means the count
-    /// line reports a manual refresh exactly as it reports a start, instead of
-    /// a refresh being a silent pause with a stale hint.
-    pub fn reloading(&mut self) {
-        self.arrived.clear();
-    }
-
     /// Maps still out.
     fn pending(&self) -> impl Iterator<Item = &MapId> {
         self.expected.difference(&self.arrived)
@@ -187,6 +207,14 @@ impl Startup {
 /// set is reconciled against the truth instead. The id *is* the whole target
 /// — repo and number both — so "same repo, different map number" is simply a
 /// different key, not a number to compare.
+///
+/// Reconciling is now the *only* thing that starts a load. There used to be a
+/// `restart` beside it for the refresh key, and its reason was ordering: a load
+/// started at t₀ and a refetch started at t₁ > t₀ both write the same map's
+/// cluster, and the older one can land second, so a refetch racing the initial
+/// load was silently overwritten by the stale snapshot it was meant to replace.
+/// With the key retired there is never a second write to lose that race, and
+/// the hazard is gone rather than guarded against.
 #[derive(Debug, Default)]
 pub struct Loaders {
     running: BTreeMap<MapId, JoinHandle<()>>,
@@ -222,21 +250,6 @@ impl Loaders {
             let task = spawn_load(id.clone(), tx.clone());
             self.running.insert(id.clone(), task);
         }
-    }
-
-    /// `ctrl-r`: throw every load away and start them all again.
-    ///
-    /// The refetch has to go through *this* rather than fetching alongside it,
-    /// and the reason is ordering. A load started at t₀ and a refetch started
-    /// at t₁ > t₀ both write the same map's cluster, and the load can land
-    /// second — so a refetch racing the initial load used to be overwritten by
-    /// an older snapshot while the screen said `refreshed`. Nothing polls now,
-    /// so that stale map would be final. Restarting means every result reaches
-    /// the UI through one channel, in send order, and the newest write wins by
-    /// construction.
-    pub fn restart(&mut self, want: &MapSet, tx: &mpsc::UnboundedSender<LoadEvent>) {
-        self.abort_all();
-        self.reconcile(want, tx);
     }
 
     /// Stop every load and wait for it to actually be gone.
@@ -287,10 +300,11 @@ fn spawn_load(id: MapId, tx: mpsc::UnboundedSender<LoadEvent>) -> JoinHandle<()>
 /// Find every open `wayfinder:map` across the cached repos, off the path to
 /// the first frame (#27).
 ///
-/// It **retries** on [`RETRY_INTERVAL`] rather than giving up. A single failed
-/// search would otherwise leave `wf` permanently empty with no way back:
-/// `ctrl-r` refetches the maps it knows about, and after a failed search it
-/// knows about none.
+/// It **retries** on [`RETRY_INTERVAL`] rather than giving up, and that is now
+/// the only recovery a session has. A single failed search would otherwise
+/// leave `wf` empty for the whole run with no way back: the only other thing
+/// that fetches is the cached seed, a cold start has none, and no key asks
+/// again.
 ///
 /// It runs **unconditionally**, warm cache or cold (#28). The cache is a head
 /// start, never a skip: this is the one thing that can add a map opened since
@@ -324,7 +338,88 @@ pub fn spawn_discovery(
     })
 }
 
-/// Where the cursor lands after a load or a refresh swaps the ticket list.
+/// Take the background reading of what a `wf reap` would claim, off the path to
+/// the first frame (#137).
+///
+/// The same shape as [`spawn_discovery`] and for the same reason: the reading
+/// costs a `dl --ls --json` subprocess and one batched GraphQL call, and the
+/// picker is already drawn and answering keys. Nothing on the way to the first
+/// frame waits for this — it folds into the view when it lands, through the one
+/// channel everything else arrives on.
+///
+/// The reading is handed in as a *future* rather than taken as a capability
+/// this could invoke: what reaches the screen is a value, and nothing in this
+/// module can ask for a deletion or perform one.
+///
+/// Silent by construction: the future answers `Option`, and a `None` — no `dl`,
+/// a listing that failed, a tracker that would not answer, nothing to reclaim —
+/// sends nothing at all. There is no failure event because there is no failure
+/// worth a word.
+///
+/// Returns a [`Survey`] so the launch path can stop it and wait, exactly as it
+/// does for the map loads: the reading holds child processes of its own, and an
+/// in-flight one outliving the `exec` would be inherited by the agent.
+pub fn spawn_survey<S>(survey: S, tx: mpsc::UnboundedSender<LoadEvent>) -> Survey
+where
+    S: Future<Output = Option<Reading>> + Send + 'static,
+{
+    Survey(tokio::spawn(async move {
+        if let Some(reading) = survey.await {
+            let _ = tx.send(LoadEvent::Surveyed(reading));
+        }
+    }))
+}
+
+/// The running reading, as something that can only be **stopped**.
+///
+/// A `JoinHandle` would do the job and did, until the guard on "the picker
+/// never waits for this" turned out to be a grep over `main.rs` — which passes
+/// happily for `let _ = survey.await;` written any of the several ways that
+/// spelling admits. The only thing this type offers is
+/// [`stop`](Survey::stop), so *this handle* cannot be waited on.
+///
+/// It is worth being exact about how far that goes, because the obvious
+/// stronger claim is false and was made here: it does **not** put the reading
+/// off limits before the first frame. The reading is a separate value, and
+/// `let found = survey_live().await;` above the call compiles, is green, and
+/// puts a subprocess and a round trip in front of the screen. What rules that
+/// out is a fact about a run —
+/// `picker::tests::the_first_frame_is_drawn_before_anything_is_asked`, which
+/// records the frame and the subprocesses into one ordered log and reads the
+/// order off it.
+///
+/// Which leaves exactly one hazard this type does answer, and
+/// [`stop`](Survey::stop) is where it is.
+#[derive(Debug)]
+pub struct Survey(JoinHandle<()>);
+
+impl Survey {
+    /// Stop the reading and wait until it is really gone.
+    ///
+    /// Both halves matter, and only on the launch path. `abort` asks; the
+    /// `await` is what waits for the task's future to be *dropped*, and
+    /// dropping it is what closes the `dl` or `gh` this reading may have in
+    /// flight (`kill_on_drop`). Skipping the wait — or dropping the handle, or
+    /// forgetting it — leaves a live child that outlives the `exec`, and the
+    /// agent that replaces `wf` inherits it holding the terminal it just took
+    /// over.
+    pub async fn stop(self) {
+        self.0.abort();
+        let _ = self.0.await;
+    }
+
+    /// Wait for the reading to finish of its own accord.
+    ///
+    /// Test-only, and that is the whole point of the type: production has no
+    /// way to wait for this, so the tests below can wait for a reading that
+    /// answers immediately without opening the door `main.rs` must not have.
+    #[cfg(test)]
+    pub(crate) async fn settle(self) {
+        self.0.await.expect("the reading task");
+    }
+}
+
+/// Where the cursor lands after a load swaps the ticket list.
 ///
 /// Identity wins over position: if the previously selected row still exists
 /// anywhere in the new order, the cursor follows it. Only if it vanished does
@@ -350,6 +445,143 @@ pub fn preserve_cursor<K: PartialEq>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reading that never answers — the reading `wf` must be able to draw
+    /// over. A `pending` future rather than a long sleep, so "the picker did
+    /// not wait" is a fact about the code and not about a timer.
+    async fn never() -> Option<Reading> {
+        std::future::pending().await
+    }
+
+    #[tokio::test]
+    async fn the_picker_never_waits_on_the_reading() {
+        // The claim that keeps this off the critical path: spawning the reading
+        // hands back control immediately, and the loop that draws the first
+        // frame finds an empty channel rather than a value it had to wait for.
+        // The reading here *never* completes, so anything that awaited it would
+        // hang this test rather than slow it.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let survey = spawn_survey(never(), tx.clone());
+            assert!(
+                rx.try_recv().is_err(),
+                "nothing may be on the channel before the reading lands"
+            );
+            survey.stop().await;
+        })
+        .await
+        .expect("the picker must not wait for the reading");
+    }
+
+    #[tokio::test]
+    async fn a_reading_that_lands_folds_in_through_the_one_channel() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let found = Reading::for_test(
+            Some(crate::reclaim::Reclaimable::for_test(&["ws-a"], 0)),
+            crate::liveness::Liveness::default(),
+        );
+        spawn_survey(std::future::ready(Some(found.clone())), tx.clone())
+            .settle()
+            .await;
+        match rx.try_recv() {
+            Ok(LoadEvent::Surveyed(reading)) => assert_eq!(reading, found),
+            other => panic!("the reading must arrive as its own event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reading_that_found_nothing_says_nothing() {
+        // No `dl`, a failed listing, a tracker that would not answer, or simply
+        // nothing to reclaim: one silence, no event, and above all no error.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_survey(std::future::ready(None), tx.clone())
+            .settle()
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a reading with nothing to say must send nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_the_reading_waits_for_it_to_be_gone() {
+        // `abort` on its own only *asks*. What the launch path needs is that
+        // the task's future has been dropped by the time this returns, because
+        // dropping it is what kills the `dl` or `gh` the reading may still have
+        // in flight — an `abort` without the wait, or a handle simply forgotten,
+        // leaves that child alive to be inherited by the agent `wf` execs.
+        //
+        // The witness is an `Arc` the task holds: the future cannot be dropped
+        // while the count is above one, and cannot survive once it is one.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let witness = std::sync::Arc::new(());
+        let held = std::sync::Arc::clone(&witness);
+        let survey = spawn_survey(
+            async move {
+                std::future::pending::<()>().await;
+                drop(held);
+                None
+            },
+            tx,
+        );
+        survey.stop().await;
+        assert_eq!(
+            std::sync::Arc::strong_count(&witness),
+            1,
+            "the reading is still running after it was stopped"
+        );
+    }
+
+    #[test]
+    fn the_background_reading_carries_a_value_and_never_a_capability() {
+        // #137's safety claim, at the seam that spawns the work: this module
+        // takes a future that answers with a reading, and its own text names
+        // neither `reap` nor any means of destruction. That is a fact about
+        // this file, not about everything a future handed to it might do — the
+        // reading itself is guarded in [`crate::reclaim`] and the loop that
+        // consumes it in the binary's `picker`.
+        // Its sibling in [`crate::reclaim`]'s list plus `reap`, and for the
+        // same reason: a shorter one here was a door in the same wall. A
+        // `std::fs::remove_dir_all` inside the spawned task passed both this
+        // and the argv probe, because a directory removed in-process runs no
+        // command for a shim to write down.
+        //
+        // `unsafe` used to be on this list and is not, for the reason its
+        // sibling gives: `unsafe_code = "deny"` in `Cargo.toml` already covers
+        // every target in the crate.
+        //
+        // `reap` bare rather than `reap::`, matching `picker.rs`: this file has
+        // no business naming the module at all, and the module cannot be
+        // reached without its name being written, so `use crate::reap as tidy;`
+        // is caught here too. It costs nothing — nothing in this file's code
+        // says the word.
+        //
+        // `fs` is bare for the same reason, and that took a second round to
+        // notice: written `fs::`, it was reopened by `use std::fs as sys;`.
+        // Measured, not assumed, that it costs nothing: `fs` occurs in none of
+        // the four guarded files' code. What it buys here is not the aliased
+        // `remove_dir_all` inside the spawned task — `remove` catches that at
+        // either spelling — but the calls `remove` does not name; see
+        // [`crate::reclaim`], where an aliased `fs::write` is red at `fs` and
+        // green at `fs::`. That pair was measured there and not here, so this
+        // list carries the bare name by the same argument rather than by its
+        // own row.
+        let code = crate::probe::code_only("refresh.rs", include_str!("refresh.rs"));
+        for forbidden in [
+            "reap",
+            "remove",
+            "\"rm\"",
+            "--force",
+            "Command",
+            "process::",
+            "fs",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the background reading must not be able to delete: it names {forbidden:?}"
+            );
+        }
+    }
 
     const A: (&str, u64) = ("wayfinder", 6);
     const B: (&str, u64) = ("wayfinder", 7);
@@ -449,9 +681,10 @@ mod tests {
 
     #[test]
     fn one_map_reporting_twice_does_not_complete_another_maps_load() {
-        // The loads are concurrent, and `ctrl-r` can make a map report again
-        // while a slow one is still out. Counting arrivals would call that
-        // done; naming who is still pending cannot.
+        // The loads are concurrent, and a map whose load was aborted mid-flight
+        // can already have queued its answer. Counting arrivals would call two
+        // reports from one map a finished load of two; naming who is still
+        // pending cannot be fooled that way, whoever reports twice and why.
         let mut startup = cold();
         startup.searched(&found(&[("fast/one", 1), ("slow/two", 2)]));
         startup.record_arrival(&MapId::new("fast/one", 1));
@@ -502,30 +735,6 @@ mod tests {
         assert_eq!(startup.hint(), "· searching for maps…");
         startup.searched(&found(&[("a/one", 1), ("b/two", 2)]));
         assert!(startup.is_loaded());
-    }
-
-    #[test]
-    fn ctrl_r_puts_the_load_back_on_the_count_line() {
-        // A refresh refetches every map, so nothing has arrived until it does.
-        // Without this the hint stays empty and `ctrl-r` is a silent pause.
-        let mut startup = cold();
-        let maps = found(&[("a/one", 1), ("b/two", 2)]);
-        startup.searched(&maps);
-        startup.record_arrival(&MapId::new("a/one", 1));
-        startup.record_arrival(&MapId::new("b/two", 2));
-        assert!(startup.is_loaded());
-
-        startup.reloading();
-        assert!(!startup.is_loaded());
-        assert_eq!(startup.hint(), "· loading maps 0/2");
-        startup.record_arrival(&MapId::new("a/one", 1));
-        assert_eq!(startup.hint(), "· loading maps 1/2");
-        startup.record_arrival(&MapId::new("b/two", 2));
-        assert!(
-            startup.is_loaded(),
-            "the search already answered; it stays answered"
-        );
-        assert_eq!(startup.hint(), "");
     }
 
     #[test]

@@ -62,6 +62,14 @@ async fn main() {
         .collect();
 
     let mut app = App::new(clusters);
+    // Stand on the first named map's project. `App::new` opens on the project
+    // list, which is drawn from a registry this example has none of — so with
+    // no `enter` the preview would be a blank screen rather than the tree it
+    // was asked to render.
+    if let Some(id) = ids.first() {
+        app.enter(&id.repo);
+    }
+    app.startup = wf::refresh::Startup::loaded();
     for key in &keys {
         press(&mut app, key);
     }
@@ -74,6 +82,7 @@ async fn main() {
         wf::view::Stop::Map(id) => format!("map #{}", id.number),
         wf::view::Stop::Ticket(row) => format!("#{}", app.ticket(row).number),
         wf::view::Stop::Group(g) => format!("{:?}", g.kind),
+        wf::view::Stop::Project(repo) => format!("project {repo}"),
     };
     println!(
         "cursor: {} of {} → {} at depth {}",

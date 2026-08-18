@@ -1,37 +1,34 @@
 //! The prompts `wf` execs, shipped in the same package as the binary.
 //!
-//! `wf` does not merely *mention* `/wf-tdd` and `/wf-auto` — it hardcodes
-//! them in [`crate::launch::route`] and execs them. That makes the skill files
-//! part of `wf`'s interface, and an interface split across two repos on two
-//! release cadences is one that drifts: `wf` reached 0.6.0 still routing
-//! `defer` at a `/wayfinder` section that `/wayfinder-auto` had superseded
-//! weeks earlier, and nothing anywhere could notice.
+//! `wf` does not merely *mention* `wf-tdd` and `wf-auto` — it hardcodes them
+//! in [`crate::launch::route`] and execs them. That makes the skill files part
+//! of `wf`'s interface, and an interface split across two repos on two release
+//! cadences is one that drifts: `wf` reached 0.6.0 still routing `defer` at a
+//! `wayfinder` section that `wayfinder-auto` had superseded weeks earlier, and
+//! nothing anywhere could notice.
 //!
 //! So the skills live in this repo, under `skills/`, and the conda recipe
 //! installs them beside the binary at `<prefix>/share/wf/skills`. One package,
 //! one version, one `pixi global update wf`.
 //!
-//! What this module does *not* do is teach the agent where to look. Claude Code
-//! reads `~/.claude/skills`, so the last step is a **symlink** from there
-//! ([`install`]) — a link rather than a copy, so that a name is `wf`'s only
-//! when `wf` put it there, and a real directory can go on meaning *somebody
-//! else owns this*.
+//! What this module does *not* do is teach an agent where to look. Claude Code
+//! reads `~/.claude/skills` and Codex reads `~/.codex/skills`, so the last step
+//! is a **symlink** from each ([`install`]) — a link rather than a copy, so that
+//! a name is `wf`'s only when `wf` put it there, and a real directory can go on
+//! meaning *somebody else owns this*.
 //!
 //! **What the link points at is the part that is not obvious.** Not the package
-//! bundle: an isolated launch ([`crate::launch::Isolation`], #80) runs the agent
-//! in a container with the host's `~/.claude` bind-mounted and nothing else —
-//! no pixi prefix, and the home directory at a different absolute path
-//! (`/home/you` outside, `/home/vscode` inside). A link into
+//! bundle: an isolated launch ([`crate::launch::Isolation`], #80) may run the
+//! agent in a container under a different home directory. A link into
 //! `~/.pixi/envs/wf/share/wf/skills` is a perfectly good link on the host and a
 //! dangling one in there, and a dangling skill is not an error anyone reports:
-//! it is `Unknown command: /wf-tdd`, seconds after a launch, with nothing to say
-//! why (#107).
+//! it is an unknown-skill prompt seconds after a launch, with nothing to say why
+//! (#107).
 //!
 //! So [`install`] puts a **copy of the bundle beside the links** —
-//! `<config>/wf-skills`, inside the tree that is mounted — and links to it
-//! *relatively* (`../wf-skills/wf-tdd`), which is the whole reason the same link
-//! resolves under both home directories. The copy is then the thing this module
-//! has to keep honest, and it does that in three places rather than trusting it:
+//! `<config>/wf-skills`, beside each agent's links — and links to it *relatively*
+//! (`../wf-skills/wf-tdd`). The copy is then the thing this module has to keep
+//! honest, and it does that in three places rather than trusting it:
 //! [`install`] rewrites it and records where it came from, [`refresh`] brings it
 //! back in step with *that* source at every launch — links and all, so a build
 //! that ships a new skill needs no second command — and [`status`] reports it as
@@ -42,6 +39,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::launch::Agent;
+
 /// The skills this build ships — the ones [`crate::launch::Route`] can exec,
 /// plus the single-ticket sibling they share their tracker notes with.
 ///
@@ -49,7 +48,7 @@ use anyhow::{Context, Result};
 /// what the routing table promises, so a skill that vanishes from the package
 /// should be a *reported* absence, not a silently shorter list.
 ///
-/// Every name is prefixed `wf`, because `~/.claude/skills` is one flat
+/// Every name is prefixed `wf`, because each agent's skills directory is a flat
 /// namespace shared with every other source of skills the user has. Unprefixed,
 /// `tdd` and `review` are names `wf` *squats on* rather than merely occupies —
 /// while it holds one, the user cannot have their own, and [`install`] would
@@ -67,11 +66,15 @@ pub const BUNDLE_ENV: &str = "WF_SKILLS_DIR";
 /// where the agent will actually read from rather than where it usually does.
 const CLAUDE_CONFIG_ENV: &str = "CLAUDE_CONFIG_DIR";
 
-/// The copy of the bundle the links point at, as a name inside Claude Code's
-/// config directory (`~/.claude/wf-skills`).
+/// Codex's configuration root. It is the parent of `skills/`, unlike Claude's
+/// override which names the config directory whose child is `skills/`.
+const CODEX_HOME_ENV: &str = "CODEX_HOME";
+
+/// The copy of the bundle the links point at, as a name inside the selected
+/// agent's config directory (`~/.claude/wf-skills` or `~/.codex/wf-skills`).
 ///
-/// A sibling of `skills/` rather than a directory inside it, because Claude Code
-/// reads *every* directory under `skills/` — a copy in there would register five
+/// A sibling of `skills/` rather than a directory inside it, because the agents
+/// read *every* directory under `skills/` — a copy in there would register five
 /// more skills under a second set of names.
 pub const MIRROR: &str = "wf-skills";
 
@@ -167,23 +170,34 @@ impl Bundle {
     }
 }
 
-/// Where Claude Code reads personal skills from: `$CLAUDE_CONFIG_DIR/skills`,
-/// or `~/.claude/skills`.
+/// Where `agent` reads personal skills from.
 ///
 /// # Errors
 ///
-/// When `$CLAUDE_CONFIG_DIR` is unset and the home directory cannot be
+/// When the relevant agent override is unset and the home directory cannot be
 /// resolved — there is then nowhere to install to and nothing to guess.
-pub fn claude_skills_dir() -> Result<PathBuf> {
-    if let Some(configured) = std::env::var_os(CLAUDE_CONFIG_ENV).filter(|v| !v.is_empty()) {
-        return Ok(PathBuf::from(configured).join("skills"));
+pub fn skills_dir(agent: Agent) -> Result<PathBuf> {
+    match agent {
+        Agent::Claude => {
+            if let Some(configured) = std::env::var_os(CLAUDE_CONFIG_ENV).filter(|v| !v.is_empty())
+            {
+                return Ok(PathBuf::from(configured).join("skills"));
+            }
+            let home = dirs::home_dir().context("cannot resolve the home directory")?;
+            Ok(home.join(".claude").join("skills"))
+        }
+        Agent::Codex => {
+            if let Some(configured) = std::env::var_os(CODEX_HOME_ENV).filter(|v| !v.is_empty()) {
+                return Ok(PathBuf::from(configured).join("skills"));
+            }
+            let home = dirs::home_dir().context("cannot resolve the home directory")?;
+            Ok(home.join(".codex").join("skills"))
+        }
     }
-    let home = dirs::home_dir().context("cannot resolve the home directory")?;
-    Ok(home.join(".claude").join("skills"))
 }
 
-/// Where an install goes: the directory Claude Code reads, and the copy of the
-/// bundle that sits beside it.
+/// Where an install goes: the selected agent's skills directory, and the copy
+/// of the bundle that sits beside it.
 ///
 /// One type rather than two paths passed around together, because they are not
 /// independent. The links are relative — `../wf-skills/<name>` — so the copy is
@@ -225,12 +239,12 @@ impl Target {
     ///
     /// # Errors
     ///
-    /// When [`claude_skills_dir`] cannot be resolved.
-    pub fn resolve() -> Result<Target> {
-        Target::beside(&claude_skills_dir()?)
+    /// When this agent's skills directory cannot be resolved.
+    pub fn resolve(agent: Agent) -> Result<Target> {
+        Target::beside(&skills_dir(agent)?)
     }
 
-    /// The directory Claude Code reads.
+    /// The directory the selected agent reads.
     pub fn links(&self) -> &Path {
         &self.links
     }
@@ -288,7 +302,7 @@ impl Link {
     }
 }
 
-/// What `~/.claude/skills/<name>` amounts to right now — the link and the
+/// What one agent's `skills/<name>` amounts to right now — the link and the
 /// prompt behind it, together, because "which prompt is going to run" is the
 /// only question worth answering and neither half settles it alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -384,7 +398,8 @@ fn link_state(name: &str, link: &Path) -> Link {
 ///
 /// The copy is a copy, so "is the prompt that will run this build's?" is a
 /// content question, and no stat answers it: `pixi global update wf` rewrites
-/// the bundle in the prefix without touching anything under `~/.claude`. The
+/// the bundle in the prefix without touching anything under an agent's config
+/// directory. The
 /// trees are a handful of small markdown files, so comparing bytes is cheaper
 /// than being clever about it, and an unreadable side answers `false` — "not
 /// known to match" is the only safe direction, and it costs one re-copy.
@@ -565,8 +580,8 @@ pub enum Healed {
 }
 
 /// Bring the installed skills back in step with the bundle they were installed
-/// from — their contents *and* which of them this machine has links for at all
-/// — and name what moved.
+/// from — their contents *and* which of them this agent's directory has links
+/// for at all — and name what moved.
 ///
 /// This is what keeps "a copy" from meaning "a copy that goes stale". `wf` is
 /// the thing that launches the agent, so the copy is rewritten by the very
@@ -578,11 +593,12 @@ pub enum Healed {
 /// The *set* is kept in step for the same reason the contents are, and it was
 /// the larger hole. A skill a new build ships is one no install on this machine
 /// ever saw, so a launch that considered only links already pointing at the
-/// copy skipped it forever, and `pixi global update wf` rewrites the bundle in the
-/// prefix while writing nothing under `~/.claude` that could notice. The report
-/// that closed it: update, launch into a devcontainer, `Unknown command:
-/// /wf-one` — with nothing anywhere to connect the two (#170). So a link that
-/// is *missing* is created, and a stale one is repointed only where its target
+/// copy skipped it forever, and `pixi global update wf` rewrites the bundle in
+/// the prefix while writing nothing under an agent's config directory that
+/// could notice. The report that closed it: update, launch into a devcontainer,
+/// and an unknown-skill prompt for one the release plainly shipped — with
+/// nothing anywhere to connect the two (#170). So a link that is *missing* is
+/// created, and a stale one is repointed only where its target
 /// proves `wf` wrote it — the same test [`sweep`] removes links by, which is
 /// what makes the pre-#110 link into the prefix safe to reclaim and a link
 /// somebody else left impossible to touch.
@@ -712,7 +728,7 @@ fn is_ours(target: &Path, bundle: &Path) -> bool {
 /// they iterate [`BUNDLED`], so the moment `wayfinder` left that list, the link
 /// named `wayfinder` stopped being anything either function looks at — while
 /// staying on disk, pointing into a bundle where its target no longer exists.
-/// Claude Code would go on reading a dangling entry forever, and no amount of
+/// An agent would go on reading a dangling entry forever, and no amount of
 /// `wf skills install` would mention it.
 ///
 /// Scoped by where the link *points* rather than by a list of former names: a
@@ -765,8 +781,7 @@ pub fn report(bundle: &Bundle, target: &Target) -> String {
         FoundBy::Checkout => "this checkout",
     };
     let mut out = format!(
-        "bundle  {} ({source})\nlinks   {}\ncopy    {} (what the links point at, \
-         so a devcontainer can read them too)\n\n",
+        "bundle  {} ({source})\nlinks   {}\ncopy    {} (what the links point at)\n\n",
         bundle.path.display(),
         target.links.display(),
         target.mirror.display()
@@ -1364,7 +1379,8 @@ mod tests {
         // skill the package does not ship. Swept over `Route::all`, not a list
         // written out here — a hand-written list is a second place to remember,
         // and a route added without being added to it is exactly the case this
-        // is meant to catch.
+        // is meant to catch. The invocation sigil belongs to the chosen agent;
+        // the skill name is the shared bundle identity.
         use crate::launch::Route;
         for route in Route::all() {
             // `None` is the one route that invokes no skill (#112): there is no
@@ -1382,7 +1398,7 @@ mod tests {
         // route missing from the cycle would be silently skipped above.
         assert_eq!(
             Route::all().len(),
-            5,
+            6,
             "every route must be in the cycle `Route::all` walks"
         );
     }

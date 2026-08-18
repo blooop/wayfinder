@@ -9,16 +9,37 @@
 # could save. If that number ever grows into the minutes, this is the file to
 # revisit — see blooop/wayfinder#39 for the measurements.
 #
-# What it *does* carry is the three binaries `wf` shells out to and discovers on
-# PATH — `gh`, `zellij`, and the agent CLI — because `cargo test` here is not
-# hermetic: tests/live_fetch.rs drives `gh` against the real tracker and
-# tests/live_zellij_launch.rs starts real zellij sessions.
+# What it *does* carry is three binaries, for two different reasons.
+#
+# `gh` and the agent CLI are things `wf` itself shells out to and discovers on
+# PATH, so a workspace without them cannot run `wf` at all. They are not here
+# for the tests: `cargo test` in here is hermetic and stays green with no
+# network, because every test that reaches a real GitHub is `#[ignore]`d with a
+# reason (see the Checks section of README.md). Running that gated set inside a
+# workspace is a thing you can choose to do — `cargo test -- --ignored` — and
+# `gh` being present is what makes the choice available.
+#
+# `zellij` is here for a different reason and it is worth saying so, because
+# this comment used to justify it by a test file that no longer exists: `wf`
+# stopped launching zellij sessions in 9ae2897 and no code or test in this repo
+# names it now. It stays for interactive use — a workspace is somewhere a
+# person works, and splitting the terminal inside one is worth carrying a
+# single static binary for.
 FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
 
 # Pinned rather than "latest" so an image rebuild is a deliberate version bump
-# and not a silent one. Both are plain static binaries with no build step.
+# and not a silent one. `gh` and `zellij` are plain static binaries with no build
+# step; the agent CLI arrives through its own installer, which turns out to
+# accept a version (`install.sh [stable|latest|VERSION]`) — so it is pinned here
+# too rather than left to drift, which matters more now that this image is
+# published and shared than it did when every workspace built its own.
+#
+# It is a floor and not a ceiling: the agent CLI updates itself in place, so a
+# long-lived container will run something newer than this. What the pin buys is
+# that two workspaces created from the same image *start* from the same version.
 ARG GH_VERSION=2.97.0
 ARG ZELLIJ_VERSION=0.44.3
+ARG CLAUDE_VERSION=2.1.223
 
 # One layer, and the tarballs are deleted in it: an unpacked tarball left behind
 # in an earlier layer stays in the image however thoroughly a later layer removes
@@ -46,9 +67,27 @@ RUN set -eux; \
 # user that will run it. `~/.claude` is a bind mount from the host (see
 # devcontainer.json) and is deliberately *not* what this writes to — the binary
 # lives in the image, the credentials and settings come from the host at runtime.
+#
+# The pin is an argument to a third-party installer, so it is compared, not
+# trusted: `gh` and `zellij` above carry their versions in the download URL and
+# a wrong version cannot resolve, but an installer that silently ignored its
+# argument would leave this pin buying nothing with the build still green. The
+# comparison also backstops the unpiped `curl | bash` — a truncated script that
+# installed something else fails here.
+#
+# Matched on a word boundary rather than as a substring, because a substring
+# match accepts a version it was never pinned to: `2.1.2234` contains `2.1.223`,
+# as does `12.1.223`. Boundary matching refuses both. It is not fully
+# shape-proof — `.` and `-` are non-word characters, so a `2.1.223-beta` would
+# still match, and a `v`-prefixed `v2.1.223` would be refused (loudly, the safe
+# direction) — but it stays agnostic about the line the version arrives in
+# (today: `2.1.223 (Claude Code)`), where parsing a field out would be one more
+# format to keep in step with the upstream installer.
 USER vscode
 RUN set -eux; \
-    curl -fsSL https://claude.ai/install.sh | bash; \
-    /home/vscode/.local/bin/claude --version
+    curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_VERSION"; \
+    installed="$(/home/vscode/.local/bin/claude --version)"; \
+    printf '%s' "$installed" | grep -qwF "$CLAUDE_VERSION" \
+      || { echo "pinned CLAUDE_VERSION=$CLAUDE_VERSION but installed: $installed" >&2; exit 1; }
 ENV PATH=/home/vscode/.local/bin:$PATH
 USER root

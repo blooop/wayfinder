@@ -6,6 +6,48 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Every variant of a sum type, one value per variant, with the compiler
+/// holding the list complete.
+///
+/// The single variant list feeds both a wildcard-free `match` and the
+/// returned `Vec`, so the proof and the iteration cannot disagree: a variant
+/// missing from the list is a non-exhaustive match naming it, a variant
+/// listed twice is an unreachable pattern (a warning CI denies), and there is
+/// no way to satisfy the compiler without also entering the iteration. That
+/// is what lets the launch matrix and the doc-vocabulary guards iterate *the
+/// type* rather than a restatement of it (#133) — a hand-written array beside
+/// a wildcard-free `match` reintroduces exactly the drift the `match`
+/// removed: a probe variant compiled and greened while never being launched
+/// and never being required of the docs.
+///
+/// A variant that carries data names one representative value after `=>` —
+/// the `match` still covers its arm by pattern, the representative is checked
+/// at run time to be the arm it stands for, and a caller that needs the full
+/// payload grid expands it itself.
+macro_rules! every_variant {
+    ($ty:ident: $($variant:ident $(=> $value:expr)?),+ $(,)?) => {{
+        let _list_is_complete = |value: &$ty| match value {
+            $($ty::$variant { .. } => ()),+
+        };
+        vec![$(crate::model::every_variant!(@one $ty, $variant $(, $value)?)),+]
+    }};
+    (@one $ty:ident, $variant:ident) => { $ty::$variant };
+    (@one $ty:ident, $variant:ident, $value:expr) => {{
+        let representative = $value;
+        assert!(
+            matches!(representative, $ty::$variant { .. }),
+            concat!(
+                "the representative must be ",
+                stringify!($ty),
+                "::",
+                stringify!($variant)
+            )
+        );
+        representative
+    }};
+}
+pub(crate) use every_variant;
+
 /// The identity of one map: the repo it lives in and its map issue number.
 ///
 /// A repo can hold several open maps at once (#50), so the slug alone stopped
@@ -213,7 +255,11 @@ pub fn stage(prs: &[PrLink], status: &Status) -> Stage {
 /// ordinary value rather than a missing one. Every site that decides something
 /// from a type matches all six arms with no wildcard, which is what makes a
 /// new `wayfinder:*` type a compile error rather than a silent misreading.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized as its own snake-case name in the launch context (#124), so a
+/// launched agent is told how to open without re-reading the issue's labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TicketType {
     /// `wayfinder:build` — the one execution type (#61): a ticket that is a
     /// build contract, worked by `/tdd` and `/review` across its stages rather
@@ -239,6 +285,13 @@ pub enum TicketType {
 }
 
 impl TicketType {
+    /// Every type, in declaration order, with the compiler holding the list
+    /// complete — see `every_variant`. What the launch matrix and the doc
+    /// vocabulary iterate, so a new type cannot exist unlaunched (#133).
+    pub fn every() -> Vec<TicketType> {
+        every_variant!(TicketType: Build, Research, Task, Grilling, Prototype, Untyped)
+    }
+
     /// Parse one label name. `None` for anything that is not a type label —
     /// the *only* wildcard match in the type's whole surface, and it belongs
     /// here because a label string genuinely is an open domain: any repo can
@@ -313,7 +366,12 @@ impl TicketType {
 /// (closing keywords and manual links, mentions excluded; the #49 resolution),
 /// shown as a `⇄` badge on the ticket's row. Evidence of progress, never a row
 /// of its own (#47).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialized straight into the launch context a picked ticket hands its agent
+/// (#124) — which PR to diff is `wf-review`'s whole rediscovery cost — rather
+/// than copied into a wire type beside this one, so there is nothing here for a
+/// second declaration to drift from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrLink {
     /// Full slug of the repo the PR lives in. Links are cross-repo capable,
     /// so this may differ from the ticket's repo — the badge says so when it
@@ -334,7 +392,8 @@ impl PrLink {
 /// boundary, so "draft" is a state of its own rather than a flag to remember
 /// to check. Only an open, ready PR carries the live signals: checks and
 /// review are questions about something still in flight.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PrStatus {
     Draft,
     Open { checks: Checks, review: Review },
@@ -342,10 +401,28 @@ pub enum PrStatus {
     Closed,
 }
 
+impl PrStatus {
+    /// One value of every arm, compiler-complete (`every_variant`). `Open`
+    /// carries data, so a representative stands for it; a caller after the
+    /// full signal grid expands it over [`Checks::every`] × [`Review::every`].
+    pub fn every_arm() -> Vec<PrStatus> {
+        every_variant!(PrStatus:
+            Draft,
+            Open => PrStatus::Open {
+                checks: Checks::Absent,
+                review: Review::NotRequired,
+            },
+            Merged,
+            Closed,
+        )
+    }
+}
+
 /// The check rollup on an open PR. `Absent` is its own meaning — no checks
 /// configured — parsed from the *nullable* `statusCheckRollup` (#49), not a
 /// stand-in for "unknown".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Checks {
     Absent,
     Pending,
@@ -353,15 +430,30 @@ pub enum Checks {
     Failing,
 }
 
+impl Checks {
+    /// Every rollup, compiler-complete (`every_variant`).
+    pub fn every() -> Vec<Checks> {
+        every_variant!(Checks: Absent, Pending, Passing, Failing)
+    }
+}
+
 /// The review decision on an open PR. A null `reviewDecision` means no review
 /// is required (#49) — `NotRequired`, a settled state — where `Required` is a
 /// review asked for and not yet given.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Review {
     NotRequired,
     Required,
     Approved,
     ChangesRequested,
+}
+
+impl Review {
+    /// Every decision, compiler-complete (`every_variant`).
+    pub fn every() -> Vec<Review> {
+        every_variant!(Review: NotRequired, Required, Approved, ChangesRequested)
+    }
 }
 
 /// One ticket (sub-issue) on a map.
@@ -1071,5 +1163,25 @@ mod tests {
                 (RowGlyph::Blocked, 1),
             ]
         );
+    }
+
+    #[test]
+    fn the_full_glyph_vocabulary_sorts_into_display_order() {
+        // `RowGlyph`'s derived `Ord` *is* the display order — the cluster
+        // header, shut-group rollups, and branch-root rollups all render
+        // tallies in it — so reordering the `Stage` declaration silently
+        // reorders the screen while the tallies elsewhere in the suite stay
+        // green (#86). Sorting the whole vocabulary pins the sequence.
+        let mut glyphs = [
+            RowGlyph::Blocked,
+            RowGlyph::Stage(Stage::Done),
+            RowGlyph::Stage(Stage::NeedsAttention),
+            RowGlyph::Stage(Stage::InReview),
+            RowGlyph::Stage(Stage::Building),
+            RowGlyph::Stage(Stage::Ready),
+        ];
+        glyphs.sort();
+        let sequence: String = glyphs.iter().map(|g| g.char()).collect();
+        assert_eq!(sequence, "○◐◍!●⊘");
     }
 }

@@ -1,10 +1,14 @@
 name: CI
 
-# Formatting, lints, tests and docs — everything that can be judged without
-# building a package. `package.yml` is the other half: it proves the recipe
-# still installs and runs. Kept apart on purpose. A rattler build takes minutes
-# and downloads a toolchain of its own, so folding `cargo fmt` into it would
-# make the cheapest possible failure the slowest one to hear about.
+# Formatting, lints, tests and docs — everything that can be judged with
+# nothing but a compiler and this checkout. Three other workflows cover what
+# cannot: `package.yml` proves the recipe still installs and runs,
+# `devlaunch-contract.yml` runs `wf` against a real `dl` at three chosen
+# versions, and `live.yml` runs the gh-live tests against the real tracker
+# after a merge. All four are kept apart on purpose, and for one reason — a rattler
+# build and a conda solve each take minutes and download a toolchain of their
+# own, so folding `cargo fmt` into either would make the cheapest possible
+# failure the slowest one to hear about.
 on:
   pull_request:
   push:
@@ -73,16 +77,45 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked
 
-      # The unit tests, the ones that need nothing but a compiler. Everything
-      # under `tests/` is a `live_*` integration test — a real `gh`, real
-      # network, and assertions against this project's own tracker as it stands
-      # today — so running them here would make CI fail whenever the map moves
-      # on. They are compiled below instead of run.
+      # The unit tests, the ones that need nothing but a compiler. The `live_*`
+      # integration tests under `tests/` are excluded: most of them want a real
+      # `gh`, real network, and assertions against this project's own tracker as
+      # it stands today, so running them here would make CI fail whenever the
+      # map moves on. `live_devlaunch.rs` is excluded for a different reason —
+      # it wants a real `dl` at a chosen version, which is a pixi environment
+      # and therefore `devlaunch-contract.yml`'s job, not this one's. All of
+      # them are compiled below instead of run.
       - name: Unit tests
         run: cargo test --locked --lib --bins --examples
 
-      # The one part of `tests/` that needs neither network nor `gh`: the
-      # fixture's own diagnostic, which decides what a failing live test tells
+      # An offline resident of `tests/`: shape checks on the doc snippets
+      # agents copy-paste, no network and no `gh` — the seam is the doc text
+      # itself. It has to be named here because the step above stops at
+      # `--lib --bins --examples`, and an assertion no workflow runs is not
+      # an assertion.
+      - name: Skill doc shape checks
+        run: cargo test --locked --test skill_docs
+
+      # Another config-as-behavior binary, same reasoning: what a workspace
+      # boots from and what `devcontainer.yml` publishes are promises split
+      # across two devcontainer configs and a workflow, and nothing but this
+      # notices when one of them moves. Named here for the same reason as the
+      # step above — the unit-test step stops at `--lib --bins --examples`.
+      - name: Devcontainer prebuild contract
+        run: cargo test --locked --test devcontainer_prebuild
+
+      # The guard on the exclusion every step around it depends on: the live
+      # binaries are safe to leave out of the unit-test step only because each
+      # of their tests carries `#[ignore]`, and a new one that forgets it is
+      # invisible both here and in `live.yml`, which selects with `--ignored`.
+      # This walks `tests/live_*.rs` and reads the attributes off the source,
+      # which is the only place the omission is visible — running the tests
+      # cannot see it, since running them is the symptom.
+      - name: The live tests are all gated
+        run: cargo test --locked --test offline_green
+
+      # The live fixture's own diagnostic — offline like its three siblings
+      # above — which decides what a failing live test tells
       # you about a missing GH_TOKEN. It is split from the environment it reads
       # precisely so it can be asserted — and an assertion no workflow runs is
       # not an assertion. Named by filter, so the live tests around it stay
@@ -94,8 +127,8 @@ jobs:
         run: "cargo test --locked --test live_fetch -- common::"
 
       # Compiled but not run: a test that no longer builds is rot, and this is
-      # what catches it at the commit that caused it rather than the next time
-      # somebody runs them by hand.
+      # what catches it at the commit that caused it rather than at the next
+      # `live.yml` run after a merge.
       - name: The live tests still compile
         run: cargo test --locked --all-targets --no-run
 

@@ -6,37 +6,70 @@
 //! 2. The screen goes up before any network call (#27), with the cached map
 //!    numbers (#28) already being fetched.
 //! 3. One `wayfinder:map` label search reconciles that set; every map streams
-//!    in as it lands. `ctrl-r` asks again. Nothing polls: `wf` is on screen for
-//!    seconds and restarts warm in ~0.6 s.
-//! 4. Inside a checkout whose repo has a map, the screen opens focused on
-//!    it (`Scope::Project`, repo column dropped); `ctrl-g` widens to all
-//!    projects, `ctrl-f` re-focuses.
+//!    in as it lands, once. Nothing polls and no key asks again: `wf` is on
+//!    screen for seconds and restarts warm in ~0.6 s, so running it again is
+//!    the refresh.
+//! 4. Inside a checkout, the screen opens **on that project** and nowhere
+//!    else; run outside one and it opens on the project list, most recently
+//!    used first. Both are drawn from the cache, so neither waits on the
+//!    search — and `←` walks between them.
 //! 5. `enter` picks a ticket, and that is the end of `wf`: the loop returns,
 //!    the terminal is restored, and this process is replaced by the agent
-//!    ([`wf::launch::Launch::exec`]). The one ordering that matters —
-//!    restore *then* exec — is the two statements at the bottom of [`main`],
-//!    because after the exec there is no `wf` left to restore anything.
+//!    ([`wf::launch::Launch::exec`]).
+//!
+//! This file is argv and nothing else: it decides what was asked for and hands
+//! it to whoever answers. `wf skills` is [`run_skills`] here because linking a
+//! directory is a few lines; both reaps — `wf reap` ([`wf::reap::run`]) and the
+//! scoped `wf reap --finished` an autonomous run ends with
+//! ([`wf::reap::cleanup`]) — are in the *library*, because reaping deletes
+//! workspaces and the deletion they call ([`wf::reap`]'s private `remove`) is
+//! not something this crate may name. The picker is [`picker`], a module of its
+//! own.
+//!
+//! Half of that arrangement is a fact about visibility, and needs no checking:
+//! the deletion is private to a module in another crate, so no alias, helper or
+//! submodule of this binary can call it, and the edit that tries does not
+//! compile.
+//!
+//! The other half is not. `wf::reap::run` has to be public for the arm below to
+//! dispatch it, and it *contains* the deletion — `reap::run(true, true)` is a
+//! forced reap with the unsaved-work guard waived. Nothing in the language
+//! stops a line anywhere in this crate calling it, so what stands in its place
+//! is a grep: [`tests::the_binary_writes_reap_only_where_it_is_listed_here`]
+//! holds the whole list of lines of *code* in this file that write the word
+//! `reap`, and `picker.rs` may not write it at all. Lines of code, not lines:
+//! `USAGE` writes `wf reap` twice because that is the command it documents, and
+//! the help text is cut out before the list is taken — the cut being checked
+//! against `USAGE`'s own line count, because an unbounded one was itself an
+//! escape (see `tests::without_usage`). The same test also forbids this file
+//! the two ways to delete that go nowhere near `reap`: `Command`, and the bare
+//! word `fs`, which no spelling of `std::fs` can avoid writing.
+//!
+//! That is a guard over the source text of two files, and it is worth what that
+//! is: it catches a cleanup wired in here by accident, which is the mistake
+//! anyone is actually likely to make. It does not stop someone routing around
+//! it. A third file calling `wf::reap::run` is caught by neither grep, and
+//! neither is a second name for the module re-exported from the library. See
+//! [`picker`] for the guard that watches a run rather than a file, and #137 for
+//! the crate split that would settle it.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
-use anyhow::{bail, Context, Result};
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
-use ratatui::DefaultTerminal;
+use anyhow::Result;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio::task::JoinHandle;
 
-use wf::app::{App, Outcome, Scope};
-use wf::launch::Launch;
-use wf::model::{Map, MapId};
-use wf::projects::{self, ProjectsCache};
+use wf::emit;
+use wf::launch::Agent;
 use wf::reap;
-use wf::refresh::{LoadEvent, Loaders, MapFetch, Startup};
 use wf::skills;
 
-/// How long the loop waits on a keypress before redrawing — the cadence at
-/// which streamed load events reach the screen.
-const TICK: std::time::Duration = std::time::Duration::from_millis(250);
+mod picker;
+
+/// Test scaffolding shared with the library's own tests — the same
+/// `src/probe.rs`, compiled into this crate too, because that is the only way
+/// the binary's tests can reach it. Never compiled into a release.
+#[cfg(test)]
+mod probe;
 
 /// Everything `wf`'s argv can mean. Only one shape opens the TUI; the others
 /// answer on a stream and exit, touching neither the terminal nor `gh` — which
@@ -47,20 +80,39 @@ enum Invocation {
     Tui,
     /// Report where the bundled skills are and whether they are linked.
     SkillsReport,
-    /// Link the bundled skills into Claude Code's personal skills directory.
+    /// Link the bundled skills into Claude Code's and Codex's personal skills
+    /// directories.
     SkillsInstall,
-    /// Remove the workspaces whose tickets are closed. `yes` skips the prompt;
-    /// `insist` also reaps workspaces holding work that is not pushed anywhere,
-    /// which is what a devcontainer that dirties its own checkout on every
-    /// build leaves behind.
-    Reap {
-        yes: bool,
-        insist: bool,
-    },
+    /// Remove the workspaces whose tickets are finished, over the scope the
+    /// argv chose.
+    Reap(ReapScope),
     /// Print to stdout, exit 0.
     Print(String),
     /// Print to stderr, exit 2.
     Reject(String),
+}
+
+/// Which workspaces a reap is about — the two commands that share the verb.
+///
+/// A sum rather than a scope field beside the flags, because the flags do not
+/// mean the same things on both sides and one of them must not exist at all on
+/// the second: `-f` waives `dl`'s unsaved-work guard, and the unattended path's
+/// whole safety argument is that the guard holds. There is no field here for it
+/// to be set in, so no argv this parser accepts can force an unattended
+/// deletion — that is the ticket's "never automatic in any mode" as a shape
+/// rather than as a check somebody has to keep passing.
+///
+/// A prompt is the same story: [`ReapScope::Finished`] carries no `yes`,
+/// because the agent that just drove those tickets to done is the reader and
+/// there is nobody left to ask.
+#[derive(Debug, PartialEq, Eq)]
+enum ReapScope {
+    /// `wf reap [-y] [-f]` — every wayfinder workspace on the machine, planned
+    /// for a human to read and confirm.
+    Machine { yes: bool, insist: bool },
+    /// `wf reap --finished <owner/repo#n>…` — the nodes an autonomous run
+    /// itself drove to done, and only those (#151).
+    Finished(BTreeSet<reap::Node>),
 }
 
 const USAGE: &str = "\
@@ -69,24 +121,35 @@ wf — the multi-project wayfinder ticket selector
 usage: wf [--version | --help]
        wf skills [install]
        wf reap [-y] [-f]
+       wf reap --finished <owner/repo#n>...
 
-With no arguments: opens the picker over every mapped project, focused on the
-checkout you are standing in. enter runs an agent on the picked ticket, in that
-checkout, replacing wf — so wf is gone by the time the agent draws. ctrl-f and
-ctrl-g narrow and widen the scope, ctrl-r refetches, esc quits.
+With no arguments: opens on the project you are standing in, or on the list of
+every registered project — most recently used first — when you are not standing
+in one. enter selects a project, or runs an agent on the picked ticket in that
+project's checkout, replacing wf — so wf is gone by the time the agent draws.
+Left backs out, esc quits. Each map is fetched once per run.
 
 wf skills          report which prompt each route would actually run
-wf skills install  link this build's skills into ~/.claude/skills
-wf reap            remove the workspaces whose tickets are closed (-y to skip
-                   the prompt). Keeps anything running or holding work that is
-                   not pushed anywhere; -f reaps the unpushed ones too, naming
-                   what it discards. Needs dl 0.0.21 or newer.
+wf skills install  link this build's skills into ~/.claude/skills and ~/.codex/skills
+wf reap            remove the workspaces whose work is over — a closed ticket,
+                   or an open one whose PR merged with nothing still in flight
+                   (-y to skip the prompt). Warns about the ones it suspects
+                   but will not delete: a ticket whose PRs all closed unmerged,
+                   or one nobody claimed that nothing came of. Keeps anything
+                   running or holding work that is not pushed anywhere; -f
+                   reaps the unpushed ones too, naming what it discards.
+                   Needs dl 0.0.21 or newer.
+wf reap --finished the cleanup an autonomous run ends with: the same reading,
+                   scoped to the tickets that run itself drove to done and to
+                   nothing else on the machine. Never prompts, deletes only a
+                   workspace dl has said is fully pushed, and stops without
+                   deleting anything if it meets a row it did not expect. There
+                   is no -f here, in any spelling.
 
 The skills wf execs ship in this package, so they update with it. `install`
-links ~/.claude/skills at a copy of them kept beside it, which is the only
-place a launch inside a devcontainer can read them from; every launch brings
-that copy back in step. Set WF_SKILLS_DIR to install a checkout's skills
-instead, while you are editing them.";
+links both agents' skills directories at copies kept beside them; every launch
+brings its selected agent's copy back in step. Set WF_SKILLS_DIR to install a
+checkout's skills instead, while you are editing them.";
 
 /// Parse argv (without the program name). `wf` takes at most one argument, and
 /// anything it does not recognise is rejected rather than ignored, so a typo
@@ -110,10 +173,10 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Invocation {
             "--version" | "-V" => Invocation::Print(format!("wf {}", env!("CARGO_PKG_VERSION"))),
             "--help" | "-h" => Invocation::Print(USAGE.to_string()),
             "skills" => Invocation::SkillsReport,
-            "reap" => Invocation::Reap {
+            "reap" => Invocation::Reap(ReapScope::Machine {
                 yes: false,
                 insist: false,
-            },
+            }),
             other => Invocation::Reject(format!("wf: unknown argument {other:?}\n{USAGE}")),
         },
         [first, second] if first == "skills" => match second.as_str() {
@@ -129,29 +192,65 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Invocation {
     }
 }
 
-/// Parse `wf reap`'s flags, which unlike every other `wf` argument may be
+/// Parse `wf reap`'s arguments, which unlike every other `wf` argument may be
 /// combined and given in any order.
 ///
 /// Rejecting an unknown flag rather than ignoring it matters more here than
-/// anywhere else in this parser: the two flags waive a confirmation and a
-/// safety guard, so a typo that were quietly dropped would leave someone
-/// believing they had asked for something they had not — and a mistyped `-y`
-/// that silently opened a prompt is a much better outcome than a mistyped `-f`
-/// that silently did nothing.
-fn parse_reap(flags: &[String]) -> Invocation {
-    let (mut yes, mut insist) = (false, false);
-    for flag in flags {
-        match flag.as_str() {
+/// anywhere else in this parser: the flags waive a confirmation and a safety
+/// guard, so a typo that were quietly dropped would leave someone believing
+/// they had asked for something they had not — and a mistyped `-y` that
+/// silently opened a prompt is a much better outcome than a mistyped `-f` that
+/// silently did nothing.
+///
+/// The same posture decides the three combinations refused below rather than
+/// resolved. `--finished` with `-f` is the one this ticket exists for: those
+/// two together spell an unattended deletion with `dl`'s unsaved-work guard
+/// waived, which is the one thing no mode of `wf` may do, so it is rejected at
+/// the argv rather than ignored inside the command. `--finished` with `-y` is
+/// refused because that path has no prompt to skip, and a flag accepted where
+/// it means nothing teaches a caller it did something. And a node reference
+/// with no `--finished` is a scope with no command to apply it to.
+fn parse_reap(args: &[String]) -> Invocation {
+    let (mut yes, mut insist, mut scoped) = (false, false, false);
+    let mut nodes = BTreeSet::new();
+    for arg in args {
+        match arg.as_str() {
             "-y" | "--yes" => yes = true,
             "-f" | "--force" => insist = true,
-            other => {
-                return Invocation::Reject(format!(
-                    "wf: unknown reap argument {other:?} (expected `-y` or `-f`)\n{USAGE}"
-                ))
-            }
+            "--finished" => scoped = true,
+            other => match reap::Node::parse(other) {
+                Some(node) => {
+                    nodes.insert(node);
+                }
+                None => {
+                    return Invocation::Reject(format!(
+                        "wf: unknown reap argument {other:?} (expected `-y`, `-f`, \
+                         `--finished`, or a node like `owner/repo#151`)\n{USAGE}"
+                    ))
+                }
+            },
         }
     }
-    Invocation::Reap { yes, insist }
+    match (scoped, insist, yes, nodes.is_empty()) {
+        (true, true, _, _) => Invocation::Reject(format!(
+            "wf: -f is never automatic — `--finished` waives no guard of dl's, \
+             in any mode\n{USAGE}"
+        )),
+        (true, _, true, _) => Invocation::Reject(format!(
+            "wf: -y says nothing beside `--finished` — that cleanup never \
+             prompts\n{USAGE}"
+        )),
+        (true, _, _, true) => Invocation::Reject(format!(
+            "wf: `--finished` needs the nodes the run drove to done, like \
+             `owner/repo#151`\n{USAGE}"
+        )),
+        (false, _, _, false) => Invocation::Reject(format!(
+            "wf: a node belongs to `--finished` — an unscoped reap is about \
+             every workspace on the machine\n{USAGE}"
+        )),
+        (true, _, _, false) => Invocation::Reap(ReapScope::Finished(nodes)),
+        (false, _, _, true) => Invocation::Reap(ReapScope::Machine { yes, insist }),
+    }
 }
 
 /// `wf skills` and `wf skills install`. Both resolve the bundle and the target
@@ -165,145 +264,63 @@ fn run_skills(install: bool) -> Result<()> {
     use std::fmt::Write;
 
     let bundle = skills::Bundle::resolve()?;
-    let target = skills::Target::resolve()?;
-    if !install {
-        emit(&skills::report(&bundle, &target));
-        return Ok(());
-    }
-    // Before linking, not after: a swept name could be one this build ships
-    // under a new spelling, and clearing the old link first keeps the two
-    // steps from racing over the same directory entry.
-    let swept = skills::sweep(&bundle, &target)?;
-    let done = skills::install(&bundle, &target)?;
     let mut out = String::new();
-    for link in &swept {
-        let _ = writeln!(
-            out,
-            "  {:<15} removed — a skill an older wf shipped and this one does not",
-            link.file_name()
-                .unwrap_or(link.as_os_str())
-                .to_string_lossy()
-        );
+    let mut blocked = false;
+    for agent in Agent::all() {
+        let target = skills::Target::resolve(agent)?;
+        let _ = writeln!(out, "{}", agent.label());
+        if install {
+            // Before linking, not after: a swept name could be one this build
+            // ships under a new spelling, and clearing the old link first keeps
+            // the two steps from racing over the same directory entry.
+            let swept = skills::sweep(&bundle, &target)?;
+            let done = skills::install(&bundle, &target)?;
+            for link in &swept {
+                let _ = writeln!(
+                    out,
+                    "  {:<15} removed — a skill an older wf shipped and this one does not",
+                    link.file_name()
+                        .unwrap_or(link.as_os_str())
+                        .to_string_lossy()
+                );
+            }
+            for (name, outcome) in &done {
+                let line = match outcome {
+                    skills::Outcome::AlreadyCurrent => "already current".to_string(),
+                    skills::Outcome::Refreshed => {
+                        "refreshed — the prompt behind the link is now this build's".to_string()
+                    }
+                    skills::Outcome::Linked { was: None } => "linked".to_string(),
+                    skills::Outcome::Linked { was: Some(old) } => {
+                        format!("relinked (was {})", old.display())
+                    }
+                    skills::Outcome::Blocked => format!(
+                        "BLOCKED — {} is a real directory, not a link. Remove it \
+                         (chezmoi may own it) and run this again",
+                        target.links().join(name).display()
+                    ),
+                    skills::Outcome::NotInBundle => {
+                        "NOT IN BUNDLE — this build shipped without it".to_string()
+                    }
+                };
+                let _ = writeln!(out, "  {name:<15} {line}");
+            }
+            blocked |= done.iter().any(|(_, outcome)| {
+                matches!(
+                    outcome,
+                    skills::Outcome::Blocked | skills::Outcome::NotInBundle
+                )
+            });
+            out.push('\n');
+        }
+        out.push_str(&skills::report(&bundle, &target));
+        out.push('\n');
     }
-    for (name, outcome) in &done {
-        let line = match outcome {
-            skills::Outcome::AlreadyCurrent => "already current".to_string(),
-            skills::Outcome::Refreshed => {
-                "refreshed — the prompt behind the link is now this build's".to_string()
-            }
-            skills::Outcome::Linked { was: None } => "linked".to_string(),
-            skills::Outcome::Linked { was: Some(old) } => {
-                format!("relinked (was {})", old.display())
-            }
-            skills::Outcome::Blocked => format!(
-                "BLOCKED — {} is a real directory, not a link. Remove it \
-                 (chezmoi may own it) and run this again",
-                target.links().join(name).display()
-            ),
-            skills::Outcome::NotInBundle => {
-                "NOT IN BUNDLE — this build shipped without it".to_string()
-            }
-        };
-        let _ = writeln!(out, "  {name:<15} {line}");
-    }
-    out.push('\n');
-    out.push_str(&skills::report(&bundle, &target));
     emit(&out);
-    if done
-        .iter()
-        .any(|(_, o)| matches!(o, skills::Outcome::Blocked | skills::Outcome::NotInBundle))
-    {
+    if blocked {
         std::process::exit(1);
     }
     Ok(())
-}
-
-/// `wf reap`: remove the workspaces whose tickets are closed.
-///
-/// The division of labour is the one the launch already draws — `dl` owns the
-/// containers, `wf` owns the tickets — so this asks `dl` what exists, asks the
-/// tracker which of those nodes are closed, prints the plan, and hands the
-/// finished ones back to `dl`. No terminal is taken: this is a stream command
-/// like `wf skills`, not a second TUI.
-///
-/// The plan is printed **before** the prompt and includes what is being kept,
-/// because a workspace someone expected to go and that stayed is the thing they
-/// most need told about, and a reason they disagree with ("still running" when
-/// they thought they had stopped it) is only actionable while no is an answer.
-async fn run_reap(yes: bool, insist: bool) -> Result<()> {
-    use std::collections::BTreeSet;
-    use std::fmt::Write;
-    use std::io::Write as _;
-
-    let workspaces = reap::workspaces().await?;
-    let nodes: BTreeSet<reap::Node> = workspaces.iter().filter_map(reap::node_of).collect();
-    if nodes.is_empty() {
-        emit("no wayfinder workspaces on this machine — nothing to reap\n");
-        return Ok(());
-    }
-    let finished = reap::finished_nodes(&nodes).await?;
-    let verdicts = reap::plan(&workspaces, &finished, insist);
-
-    let (doomed, kept): (Vec<_>, Vec<_>) = verdicts
-        .iter()
-        .partition(|v| matches!(v, reap::Verdict::Reap { .. }));
-    let mut out = String::new();
-    for verdict in &kept {
-        let _ = writeln!(out, "  keep  {}  ({})", verdict.id(), verdict.reason());
-    }
-    for verdict in &doomed {
-        let _ = writeln!(out, "  reap  {}  ({})", verdict.id(), verdict.reason());
-    }
-    emit(&out);
-    if doomed.is_empty() {
-        emit("nothing to reap\n");
-        return Ok(());
-    }
-
-    if !yes {
-        emit(&format!("\ndelete {} workspace(s)? [y/N] ", doomed.len()));
-        let _ = std::io::stdout().flush();
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
-            .context("cannot read the answer")?;
-        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            emit("aborted\n");
-            return Ok(());
-        }
-    }
-
-    // One at a time, reporting each: `dl <ws> rm` tears down a container, and a
-    // failure part-way through leaves a set the next run has to be able to make
-    // sense of. Failures are collected rather than propagated at the first one,
-    // so a single wedged workspace does not strand the rest.
-    let mut failed = Vec::new();
-    for verdict in &doomed {
-        match reap::remove(verdict.id(), insist).await {
-            Ok(()) => emit(&format!("removed {}\n", verdict.id())),
-            Err(e) => {
-                emit(&format!("could not remove {}: {e}\n", verdict.id()));
-                failed.push(verdict.id().to_string());
-            }
-        }
-    }
-    if !failed.is_empty() {
-        bail!("{} workspace(s) could not be removed", failed.len());
-    }
-    Ok(())
-}
-
-/// Write a whole report to stdout, tolerating a reader that has gone away.
-///
-/// `println!` panics on a closed pipe: Rust ignores `SIGPIPE`, so the write
-/// returns `EPIPE` and the macro unwraps it. `wf skills | head` is an ordinary
-/// thing to type and a panic is an absurd answer to it — the reader stopped
-/// listening, which is not this program's problem to report. One write of one
-/// string rather than a line at a time, so there is a single place for that to
-/// be true.
-fn emit(text: &str) {
-    use std::io::Write;
-    let _ = std::io::stdout().write_all(text.as_bytes());
 }
 
 #[tokio::main]
@@ -311,150 +328,34 @@ async fn main() -> Result<()> {
     match parse_args(std::env::args().skip(1)) {
         Invocation::Print(text) => {
             println!("{text}");
-            return Ok(());
+            Ok(())
         }
         Invocation::Reject(text) => {
             eprintln!("{text}");
-            std::process::exit(2);
+            std::process::exit(2)
         }
         // Both skills paths answer on a stream and exit, like `--version`:
         // no terminal, no `gh`, so they stay usable in a package test and in
         // whatever script installs the tool.
-        Invocation::SkillsReport => {
-            run_skills(false)?;
-            return Ok(());
-        }
-        Invocation::SkillsInstall => {
-            run_skills(true)?;
-            return Ok(());
-        }
-        Invocation::Reap { yes, insist } => {
-            run_reap(yes, insist).await?;
-            return Ok(());
-        }
-        Invocation::Tui => {}
-    }
-
-    // Accretive registration: running wf here is what makes this checkout
-    // a project. Non-checkouts and non-GitHub remotes are simply None. This
-    // is local git (<10ms) and the projects cache it writes is what the first
-    // frame is drawn from, so it stays ahead of the screen.
-    let cwd = std::env::current_dir().context("cannot resolve the working directory")?;
-    let here = projects::discover_checkout(&cwd).await;
-    let cache_path =
-        projects::default_cache_path().context("cannot resolve the XDG cache directory")?;
-    let mut cache = ProjectsCache::load_or_default(&cache_path);
-    // Accretion needs a matching forget: a checkout that has been deleted must
-    // stop offering itself as somewhere an agent could run.
-    let pruned = cache.prune_missing();
-    if let Some((path, slug)) = &here {
-        cache.register(path.clone(), slug.clone());
-        cache.save(&cache_path)?;
-    } else if pruned {
-        cache.save(&cache_path)?;
-    }
-    let repos = cache.repos();
-    // The head start (#28): the map numbers the last search found. Reading them
-    // is one local file read that has already happened, so the fetches can start
-    // before the first frame instead of after the ~2.5 s search — which is where
-    // time-to-*data* actually went. The search still runs (see
-    // [`wf::refresh::spawn_discovery`]); this only decides what `wf` fetches
-    // while waiting for it.
-    let seed = cache.map_seed();
-    let mut app = App::empty().with_checkouts(cache.checkouts.clone());
-    app.open_maps = seed.clone();
-    app.startup = Startup::seeded(&seed);
-
-    // The screen goes up *before* any network call (#27). Everything that used
-    // to run here — the map search, a serial fetch per repo — now streams into a
-    // UI that is already drawn and already reading keys.
-    let mut terminal = ratatui::init();
-    spawn_terminal_guard();
-
-    let (tx, updates) = mpsc::unbounded_channel();
-    let discovery = wf::refresh::spawn_discovery(repos, cache_path, tx.clone());
-
-    // cwd-open focuses the project (lazygit-style). Only the map *search* can
-    // say authoritatively whether this repo has a map, so the focus is handed to
-    // the loop to apply the moment discovery lands — but a seeded repo can be
-    // focused from the first frame, and usually is, so the picker no longer
-    // opens wide and jumps a couple of seconds later. `focus` is kept either
-    // way: the search still gets to overrule a seed that has gone stale.
-    let focus = here.map(|(_, slug)| slug);
-    if let Some(slug) = focus
-        .as_ref()
-        .filter(|slug| seed.iter().any(|id| &id.repo == *slug))
-    {
-        app.scope = Scope::Project(slug.clone());
-    }
-    let ending = run(&mut terminal, app, discovery, tx, updates, focus).await;
-
-    // The one ordering that matters, and the reason the exec is here rather
-    // than in the loop: the terminal must be back in the shell's hands before
-    // the process image is replaced, because afterwards there is no `wf` left
-    // to put it back.
-    //
-    // `show_cursor` is part of that and not a flourish. Nothing in the picker
-    // ever positions a cursor, so every `Terminal::draw` writes `ESC[?25l`, and
-    // the only thing that writes it back is `Terminal`'s `Drop` —
-    // `ratatui::restore()` is just raw-mode-off plus leave-alternate-screen.
-    // On the quit path `Drop` runs at the end of `main`; on the handover path
-    // `exec` replaces the image first and it never runs. So the agent would
-    // inherit an invisible cursor, on a terminal-global mode that outlives the
-    // alternate screen. This is the line the deleted `suspend()` had.
-    let _ = terminal.show_cursor();
-    ratatui::restore();
-    match ending? {
-        Ending::Quit => Ok(()),
-        Ending::Handover(launch) => {
-            // The prompts the agent is about to run. `wf skills install` links
-            // `~/.claude/skills` at a *copy* of the bundle, because that is the
-            // only place a devcontainer can read them from, and a copy is a
-            // thing that can fall behind a `pixi global update wf`. This is
-            // where it cannot: the process that refreshes it is the same one
-            // that then execs the prompt, so no launch ever gets ahead by even
-            // one release.
-            refresh_skills();
-            // Only ever returns an error: on success this process *is* the agent.
-            Err(launch.exec())
-        }
-    }
-}
-
-/// Bring the installed skills back in step with the bundle they were installed
-/// from — their contents, and which of them this machine has links for at all.
-///
-/// Best-effort, and deliberately silent when there is nothing to do: a machine
-/// with no home directory to resolve, and one that never ran
-/// `wf skills install`, are not worth a word on the way into an agent. Two
-/// things are worth one. A copy that could not be *written*, because the agent
-/// is then about to run a prompt that is not the one that was installed. And a
-/// link that had to be *created*, because that means this launch changed which
-/// prompts the machine has — the thing that used to happen only at an install
-/// you typed, and that a release's worth of launches did silently not do
-/// (#170).
-fn refresh_skills() {
-    let Ok(target) = skills::Target::resolve() else {
-        return;
-    };
-    match skills::refresh(&target) {
-        Err(err) => eprintln!("wf: could not refresh the installed skills: {err:#}"),
-        Ok(healed) => {
-            for (name, what) in healed {
-                match what {
-                    skills::Healed::Copied => {}
-                    skills::Healed::Linked { was: None } => {
-                        eprintln!("wf: linked the {name} skill, which this build ships and this machine had not");
-                    }
-                    skills::Healed::Linked { was: Some(old) } => {
-                        eprintln!(
-                            "wf: repointed the {name} skill, which still linked to {}",
-                            old.display()
-                        );
-                    }
-                }
-            }
-        }
+        Invocation::SkillsReport => run_skills(false),
+        Invocation::SkillsInstall => run_skills(true),
+        // The one place in this binary that reaches a deletion, and it reaches
+        // it as a whole command: prompt, plan, and the private `remove` this
+        // crate could not spell if it wanted to. Listed, with every other line
+        // here that writes the word, by
+        // `the_binary_writes_reap_only_where_it_is_listed_here` — an arm that
+        // merely exists says nothing about the rest of the file, and a prologue
+        // before this match is how an earlier round deleted a workspace on
+        // `wf --version`.
+        Invocation::Reap(ReapScope::Machine { yes, insist }) => reap::run(yes, insist).await,
+        // The unattended sibling, and the argv that reaches it can set neither
+        // flag: `ReapScope::Finished` has no field for a waiver or a prompt, so
+        // this arm cannot spell `reap::run(true, true)` however it is edited.
+        Invocation::Reap(ReapScope::Finished(nodes)) => reap::cleanup(&nodes).await,
+        // And the one shape that opens the TUI, which is the whole of what this
+        // arm may do — the picker is handed the process, not a deletion, and
+        // this line is what keeps the rest of this file out of its path.
+        Invocation::Tui => picker::run_picker().await,
     }
 }
 
@@ -504,153 +405,237 @@ fn spawn_terminal_guard() {
     }
 }
 
-/// Why the event loop ended — the two ways `wf` gives the terminal back.
-///
-/// A sum rather than "quit, plus maybe a launch on the side": these are the
-/// only two exits, they are mutually exclusive, and the second carries exactly
-/// what the caller needs to finish the job. Nothing here performs the launch,
-/// because performing it means the terminal must already be restored — and this
-/// value is what carries that requirement out to where it can be met.
-enum Ending {
-    /// The user quit.
-    Quit,
-    /// A ticket was picked. `wf`'s last act is to become its agent.
-    Handover(Launch),
-}
-
-/// The event loop. It starts with **no data at all** (#27): which repos even
-/// have maps, and the maps themselves, arrive as [`LoadEvent`]s while the screen
-/// is already up and answering keys.
-///
-/// `focus` is the cwd checkout's repo slug, if `wf` was run inside one — held
-/// as an `Option` that is *taken*, so the lazygit-style focus can be applied at
-/// most once, when discovery makes it answerable.
-async fn run(
-    terminal: &mut DefaultTerminal,
-    mut app: App,
-    discovery: JoinHandle<()>,
-    tx: UnboundedSender<LoadEvent>,
-    mut updates: UnboundedReceiver<LoadEvent>,
-    mut focus: Option<String>,
-) -> Result<Ending> {
-    let mut clusters: BTreeMap<MapId, Map> = BTreeMap::new();
-    // The cached seed starts fetching immediately (#28); the search's answer
-    // reconciles this set rather than adding to it, so a map that closed or
-    // opened is corrected in the tasks actually doing the fetching, not just
-    // in the state the screen reads.
-    let mut loaders = Loaders::new();
-    loaders.reconcile(&app.open_maps, &tx);
-    loop {
-        // Drain everything that landed before drawing. A fetch swaps one map's
-        // cluster; App::replace_clusters keeps the cursor pinned to row
-        // identity, query and scope untouched.
-        while let Ok(event) = updates.try_recv() {
-            match event {
-                LoadEvent::Discovered(found) => {
-                    // Reconciling the loaders *is* the load for every map the
-                    // seed did not already cover: those fetches are all in
-                    // flight at once and each lands on screen as it arrives.
-                    loaders.reconcile(&found, &tx);
-                    app.startup.searched(&found);
-                    if let Some(slug) = focus.take() {
-                        if found.iter().any(|id| id.repo == slug) {
-                            app.scope = Scope::Project(slug);
-                        } else {
-                            // The seed may have focused this repo a moment ago on
-                            // a map that is gone; the search is the authority, so
-                            // the focus goes back.
-                            if app.scope == Scope::Project(slug.clone()) {
-                                app.scope = Scope::All;
-                            }
-                            app.notice = Some(format!(
-                                "{slug} has no wayfinder:map — showing all projects"
-                            ));
-                        }
-                    }
-                    // Maps the search dropped must stop being rendered as well as
-                    // stop being fetched — their rows are as stale as their load.
-                    // A map that is no longer open also stops being a *failure*:
-                    // there is nothing left to have failed.
-                    clusters.retain(|id, _| found.contains(id));
-                    app.failed.retain(|id| found.contains(id));
-                    app.open_maps = found;
-                    app.replace_clusters(clusters.clone());
-                }
-                // Discovery retries, so this is a status report and not an end
-                // state: `wf` stays on screen and recovers when the search does.
-                LoadEvent::SearchFailed => {
-                    app.notice = Some("map search failed — retrying".to_string());
-                }
-                LoadEvent::Fetched { id, outcome } => {
-                    app.startup.record_arrival(&id);
-                    match outcome {
-                        MapFetch::Loaded(new_map) => {
-                            app.failed.remove(&id);
-                            clusters.insert(id, new_map);
-                            app.replace_clusters(clusters.clone());
-                        }
-                        // Nothing polls any more, so a failed load is not a blip
-                        // the next cycle papers over — it is the final word on
-                        // that map until someone asks again. Recorded as state
-                        // rather than announced as a notice, because a notice
-                        // is gone on the next keypress and this is not.
-                        MapFetch::Failed => {
-                            app.failed.insert(id);
-                        }
-                    }
-                }
-            }
-        }
-
-        terminal.draw(|frame| wf::ui::draw(frame, &app))?;
-        if event::poll(TICK)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                let scope_before = app.scope.clone();
-                let outcome = app.handle_key(key);
-                // A scope the user chose while the load was still out is theirs
-                // to keep: the pending cwd focus is dropped rather than applied
-                // over their `ctrl-g` when discovery lands a moment later.
-                if app.scope != scope_before {
-                    focus = None;
-                }
-                match outcome {
-                    Outcome::Quit => return Ok(Ending::Quit),
-                    // Through the loaders, not alongside them: a refetch that
-                    // raced an in-flight load used to be silently overwritten
-                    // by the older snapshot. One channel, send order, newest
-                    // write wins. Results stream in as they land, so the last
-                    // word on how it went is the count line, not this notice.
-                    Outcome::Refresh => {
-                        loaders.restart(&app.open_maps, &tx);
-                        app.startup.reloading();
-                        app.failed.clear();
-                    }
-                    // Nothing after this can be drawn. Stop the background work
-                    // *and wait for it* before handing over: an in-flight `gh`
-                    // outlives the `exec` otherwise, and the agent inherits it
-                    // as a zombie holding the terminal it just took over.
-                    Outcome::Launch(launch) => {
-                        loaders.shutdown().await;
-                        discovery.abort();
-                        let _ = discovery.await;
-                        return Ok(Ending::Handover(launch));
-                    }
-                    Outcome::Continue => {}
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().copied().map(String::from).collect()
+    }
+
+    /// Every line of `code` that writes `token` as a word of its own — not as
+    /// part of a longer identifier, so `parse_reap` and `Reap` are not
+    /// occurrences of `reap`.
+    ///
+    /// A *word*, and that is the whole technique. Counting `"reap::"` was green
+    /// for `use wf::reap as tidy;`, and counting `"wf::reap"` was green for
+    /// `use crate::reap as tidy;` — each round found another spelling of the
+    /// same path. There is no spelling of the module that does not write its
+    /// name, so the name is what is counted. `picker.rs` has been immune since
+    /// round 5 for exactly this reason; this is that technique, applied here.
+    fn lines_naming<'a>(code: &'a str, token: &str) -> Vec<&'a str> {
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        code.lines()
+            .filter(|line| {
+                line.match_indices(token).any(|(at, _)| {
+                    !line[..at].chars().next_back().is_some_and(ident)
+                        && !line[at + token.len()..].chars().next().is_some_and(ident)
+                })
+            })
+            .map(str::trim)
+            .collect()
+    }
+
+    /// `code` with the `USAGE` literal cut out — from its `const` line to the
+    /// line that closes the string.
+    ///
+    /// `USAGE` is help text. It writes `wf reap` because that is the command it
+    /// documents, and it calls nothing. Leaving it in [`lines_naming`]'s input
+    /// put two of its hand-wrapped lines into the list below, which turned that
+    /// list into a pin on the wrapping: rewording the `wf reap` paragraph — no
+    /// capability changed, the same code, the same seven sites — failed the
+    /// guard, and failed it with a message saying the file wrote `reap`
+    /// somewhere new, which was not true. Cutting the literal out leaves the
+    /// list five lines of code, which is what the guard is about.
+    ///
+    /// # Panics
+    ///
+    /// If `USAGE` is not found; if no line at or below it ends `";`; or if the
+    /// first line that does is not `USAGE`'s own closing line, measured against
+    /// the constant's line count. The third is not decoration — without it this
+    /// function cut from `USAGE` to whatever `";` came next, however far below,
+    /// and that was an escape rather than a hypothetical: see the comment on
+    /// the assertion.
+    ///
+    /// All three are the fail-closed posture of [`probe::code_only`]: a shape
+    /// this cannot account for fails the guard rather than being skipped past.
+    /// It is a real constraint on `USAGE` and not only on attackers, and it is
+    /// stated from the three lines below rather than from a run: the literal
+    /// has to open with `const USAGE: &str = "` at column 0, and it has to
+    /// close on a line whose last two characters are `";`. A `concat!`, or a
+    /// trailing comment on the closing line, is a shape this refuses.
+    fn without_usage(code: &str) -> String {
+        let lines: Vec<&str> = code.lines().collect();
+        let opens = lines
+            .iter()
+            .position(|line| line.starts_with("const USAGE: &str = \""))
+            .expect("main.rs defines USAGE at column 0");
+        let closes = opens
+            + lines[opens..]
+                .iter()
+                .position(|line| line.trim_end().ends_with("\";"))
+                .expect("the USAGE literal is closed by a line ending `\";`");
+        // The line found above is the first one ending `";` at or below the
+        // `const`. That it closes *`USAGE`'s own* literal is a separate fact,
+        // and it has to be checked rather than assumed: a trailing comment on
+        // the closing line makes `ends_with` miss it, the search runs on to the
+        // next `";`-terminated line anywhere below, and everything between is
+        // cut out of the list. That is not hypothetical and it was this
+        // function's own doing: written without this assertion, a helper placed
+        // directly under `USAGE` — `async fn wash_up() { reap::run(true, true);
+        // let _ = "swept"; }`, called from `main()`'s first line — was cut out
+        // whole by a trailing comment on `USAGE`'s closing line, and the whole
+        // selection was green. With the assertion the same edit is bins 16/1;
+        // without the trailing comment it is bins 16/1 on the list below, which
+        // is what says the comment was the vehicle.
+        //
+        // Comparing the span to the constant's own line count is what ties the
+        // cut to the literal: it is the compiler that says how many lines
+        // `USAGE` has. A rewrap that changes that count changes both sides
+        // together — measured, not assumed: rewording and rewrapping the
+        // `wf reap` paragraph from eight lines to ten stays green — so this
+        // does not put back the pin on the wrapping that it removed.
+        assert_eq!(
+            closes - opens,
+            USAGE.lines().count(),
+            "the lines cut here are not `USAGE`. Counting this file's code with \
+             its comment lines already dropped, the `const` is at line {}, the \
+             first line below it ending `\";` is line {}, and `USAGE` itself is \
+             {} lines — so that line closes some other literal and this cut is \
+             swallowing code that the `reap` list below would otherwise read",
+            opens + 1,
+            closes + 1,
+            USAGE.lines().count()
+        );
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| !(opens..=closes).contains(at))
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_binary_writes_reap_only_where_it_is_listed_here() {
+        // What is left for a grep to say once the deletion itself is out of
+        // reach.
+        //
+        // `reap::remove` is private to the library's `reap` module, so nothing
+        // in this crate can call it — that half needs no test, it is a compile
+        // error. What this crate *can* still name is `reap::run`, the whole
+        // `wf reap` command, prompt and plan and all, and `reap::run(true,
+        // true)` is a forced deletion. A previous round's escape was exactly
+        // that as a prologue before the match, and `wf --version` reaped a
+        // workspace and exited 0.
+        //
+        // So this is the whole list of lines of *code* in this file that write
+        // the word `reap`, compared as a list rather than as a count. All nine
+        // are code: the import, the scope type's node field, the two parse arms
+        // — one of which calls `parse_reap` — the node parse the scoped form
+        // needs, two rejection messages, and the two dispatch arms. The help
+        // text is cut out first (see `without_usage`), because it is prose and
+        // pinning its line wrapping here made the guard fail on rewraps and say
+        // something untrue when it did.
+        //
+        // Four of the nine arrived with the unattended cleanup (#151), and what
+        // this guard is worth is different for that arm than for the one above
+        // it. `reap::run(true, true)` is a forced deletion, so the list is what
+        // stands between this file and one; `reap::cleanup` takes a scope and
+        // no flags, and there is no argument to it that waives anything. The
+        // reason it is still listed is the *scope*: a line reaching that
+        // function with a set this file assembled somewhere other than the
+        // parse arm — a default, a widening, every node of a map — would be an
+        // unattended deletion nobody asked for, and it would have to write this
+        // word to get there.
+        //
+        // Any new line of code *this reads* that writes the word fails here,
+        // whatever it writes around it: an alias (`use wf::reap as tidy;`,
+        // `use crate::reap as tidy;`), a path through the crate root, a call
+        // split over two lines — each of those was a reviewer's escape and each
+        // is red now. The module cannot be reached without its name being
+        // written somewhere, so the name is what is counted.
+        //
+        // "That this reads" is doing work in that sentence, and it is the part
+        // that has failed twice. What this test sees is `code_only` minus
+        // `without_usage`'s cut, and both of those are text handling that can be
+        // argued out of reading part of the file — `code_only` was defeated by a
+        // decoy and then by indentation, and `without_usage` shipped for one
+        // round with an unbounded cut that hid a `reap::run(true, true)` call
+        // outright. Both now check their own shape and fail closed, which is why
+        // this comment says what it reads rather than "every line".
+        //
+        // What this does **not** reach, in the design rather than by defect: a
+        // third file calling `wf::reap::run`, and a re-export that gives the
+        // module a second name in the library. It is a grep over one file, and a
+        // grep over one file cannot see either. What it is good for is the
+        // accident — a maintainer wiring a cleanup in without noticing — and
+        // that is the claim the module doc makes for it too.
+        let code = probe::code_only("main.rs", include_str!("main.rs"));
+        assert_eq!(
+            lines_naming(&without_usage(&code), "reap"),
+            [
+                "use wf::reap;",
+                "Finished(BTreeSet<reap::Node>),",
+                "\"reap\" => Invocation::Reap(ReapScope::Machine {", // }
+                "[first, rest @ ..] if first == \"reap\" => parse_reap(rest),",
+                "other => match reap::Node::parse(other) {", // }
+                "\"wf: unknown reap argument {other:?} (expected `-y`, `-f`, \\",
+                "\"wf: a node belongs to `--finished` — an unscoped reap is about \\",
+                "Invocation::Reap(ReapScope::Machine { yes, insist }) => reap::run(yes, insist).await,",
+                "Invocation::Reap(ReapScope::Finished(nodes)) => reap::cleanup(&nodes).await,",
+            ],
+            "the lines of code in this file that write `reap` are no longer the five \
+             listed here. A line that is not in the list is a way this binary reaches \
+             `wf::reap::run`, which is a forced deletion when it is called with both \
+             flags; a listed line that is gone means the list is stale. Read the diff \
+             and decide which before editing the list"
+        );
+        // The dangling opening brace in the second entry is real: the arm it
+        // quotes opens a struct literal and rustfmt wraps the line there. The
+        // trailing comment that closes it is not decoration —
+        // `probe::code_only` counts braces as text to find where this module
+        // ends, so a string that opens one and never closes it fails this
+        // file's own guard. That is the fail-closed cost described in that
+        // function's doc, paid here, in the one place this file pays it.
+
+        // The other half of the same claim, at the other arm: opening the TUI
+        // is the whole of what `wf` with no arguments does.
+        assert!(
+            code.contains("Invocation::Tui => picker::run_picker().await,"),
+            "opening the TUI must be the whole of what that arm does"
+        );
+
+        // And the deletion that does not go through `reap` at all. `main` is
+        // argv and dispatch; it starts no subprocess of its own. A prologue
+        // reading `Command::new("dl").args([id, "rm", "--force"]).output()` is
+        // the most ordinary shape an accidental cleanup takes, it runs on every
+        // invocation including `wf --version`, and until this line nothing in
+        // this file looked for it. `process::` and `tokio::spawn` are *not*
+        // added beside it: this file genuinely uses both, for the signal
+        // handler and the exit code.
+        assert!(
+            !code.contains("Command"),
+            "this file dispatches; it does not run anything itself, and a \
+             subprocess started here runs on every `wf` invocation"
+        );
+
+        // And the deletion that starts no subprocess at all. A reviewer put
+        // `std::fs::remove_dir_all` of the real clone and record paths in
+        // `main()`: `wf --version` printed the version, exited 0, and destroyed
+        // both, with the whole selection green — the same accidental cleanup
+        // the line above is for, written in-process instead of as argv.
+        //
+        // Bare `fs`, not `fs::`, for the reason `lines_naming`'s doc gives for
+        // `reap`: `use std::fs as sys;` writes no `fs::` and reopens the whole
+        // thing. The module cannot be reached without its name being written,
+        // so the name is what is counted. It is free here — `fs` does not
+        // occur in this file's code at all, in an identifier or anywhere else.
+        assert!(
+            !code.contains("fs"),
+            "this file dispatches; deleting a directory in-process is not \
+             something it does, under any spelling of `std::fs`"
+        );
     }
 
     #[test]
@@ -677,24 +662,24 @@ mod tests {
     fn reap_takes_its_two_flags_in_any_order_or_neither() {
         assert_eq!(
             parse_args(argv(&["reap"])),
-            Invocation::Reap {
+            Invocation::Reap(ReapScope::Machine {
                 yes: false,
                 insist: false
-            }
+            })
         );
         assert_eq!(
             parse_args(argv(&["reap", "-y"])),
-            Invocation::Reap {
+            Invocation::Reap(ReapScope::Machine {
                 yes: true,
                 insist: false
-            }
+            })
         );
         assert_eq!(
             parse_args(argv(&["reap", "-f"])),
-            Invocation::Reap {
+            Invocation::Reap(ReapScope::Machine {
                 yes: false,
                 insist: true
-            }
+            })
         );
         // Both, either way round, long or short: these waive a prompt and a
         // safety guard, so the shapes someone will actually type all have to
@@ -706,12 +691,115 @@ mod tests {
         ] {
             assert_eq!(
                 parse_args(argv(&both)),
-                Invocation::Reap {
+                Invocation::Reap(ReapScope::Machine {
                     yes: true,
                     insist: true
-                },
+                }),
                 "{both:?}"
             );
+        }
+    }
+
+    /// The nodes a scoped reap parsed, by name, or `None` if it was not one.
+    fn scoped(invocation: &Invocation) -> Option<Vec<String>> {
+        match invocation {
+            Invocation::Reap(ReapScope::Finished(nodes)) => {
+                Some(nodes.iter().map(reap::Node::name).collect())
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_scoped_reap_carries_the_nodes_the_run_finished_and_nothing_else() {
+        // The argv an autonomous run's cleanup step writes. Two repos on one
+        // line, because a run can walk a map whose build tickets landed in more
+        // than one — and the owner is spelt out on each, since that is what
+        // decides whose tracker is asked and therefore what may be deleted.
+        assert_eq!(
+            scoped(&parse_args(argv(&[
+                "reap",
+                "--finished",
+                "blooop/wayfinder#151",
+                "blooop/devlaunch#80",
+            ]))),
+            Some(vec![
+                "devlaunch#80".to_string(),
+                "wayfinder#151".to_string()
+            ])
+        );
+        // The flag may come after the nodes it scopes, like every other reap
+        // argument.
+        assert_eq!(
+            scoped(&parse_args(argv(&[
+                "reap",
+                "blooop/wayfinder#151",
+                "--finished"
+            ]))),
+            Some(vec!["wayfinder#151".to_string()])
+        );
+    }
+
+    #[test]
+    fn the_unattended_cleanup_has_no_argv_that_forces_it() {
+        // The ticket's rule as a rejection: `-f` waives the unsaved-work guard
+        // that the unattended path's whole recoverability floor is built on,
+        // and it stays a human's to type. Both spellings, and the message says
+        // which rule it is rather than only that something was wrong.
+        for forced in [
+            vec!["reap", "--finished", "blooop/wayfinder#151", "-f"],
+            vec!["reap", "-f", "--finished", "blooop/wayfinder#151"],
+            vec!["reap", "--force", "--finished", "blooop/wayfinder#151"],
+        ] {
+            match parse_args(argv(&forced)) {
+                Invocation::Reject(message) => assert!(
+                    message.contains("-f is never automatic"),
+                    "{forced:?}: {message}"
+                ),
+                other => panic!("expected a rejection of {forced:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_scoped_forms_that_mean_nothing_are_refused_rather_than_guessed_at() {
+        // Three ways of half-writing the command, each rejected by the thing it
+        // is missing. A scope with nothing in it would otherwise read as "the
+        // run finished nothing", which is indistinguishable from success and is
+        // the reading that lets a broken caller's cleanup pass unnoticed.
+        for (args, expected) in [
+            (vec!["reap", "--finished"], "needs the nodes"),
+            (
+                vec!["reap", "--finished", "blooop/wayfinder#151", "-y"],
+                "never prompts",
+            ),
+            (
+                vec!["reap", "blooop/wayfinder#151"],
+                "belongs to `--finished`",
+            ),
+        ] {
+            match parse_args(argv(&args)) {
+                Invocation::Reject(message) => {
+                    assert!(message.contains(expected), "{args:?}: {message}");
+                }
+                other => panic!("expected a rejection of {args:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_node_this_binary_cannot_place_is_rejected_rather_than_scoped_away() {
+        // A reference without an owner names no repository, so there is no
+        // tracker to ask and no way to know whose workspaces are in question.
+        // Dropping it would silently shrink the scope, which is the failure
+        // direction that leaves workspaces behind rather than deletes extra —
+        // and still a caller believing it asked for something it did not.
+        match parse_args(argv(&["reap", "--finished", "wayfinder#151"])) {
+            Invocation::Reject(message) => {
+                assert!(message.contains("wayfinder#151"), "{message}");
+                assert!(message.contains("owner/repo#151"), "{message}");
+            }
+            other => panic!("expected a rejection, got {other:?}"),
         }
     }
 
@@ -768,6 +856,62 @@ mod tests {
             Invocation::Reject(message) => assert!(message.contains("too many"), "{message}"),
             other => panic!("expected a rejection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_cleanup_the_autonomous_skill_prints_is_one_this_binary_accepts() {
+        // The skills are what `wf` execs, so the command `wf-auto` tells an
+        // unattended run to end with is this binary's behaviour as much as the
+        // parser is — and the two ship in one package and can drift in one
+        // edit. So the documented line is read out of the skill and handed to
+        // the real parser, with its placeholders filled in and nothing else
+        // changed.
+        //
+        // Both directions bite. Renaming the flag here without touching the
+        // skill leaves every autonomous run ending in a rejection; editing the
+        // skill to say `-f` — the one thing that must never be automatic —
+        // fails on the rejection the parser already makes.
+        let skill = include_str!("../skills/wf-auto/SKILL.md");
+        let block = skill
+            .split_once("## Clean up what this run finished")
+            .expect("wf-auto documents the cleanup step")
+            .1
+            .split("```")
+            .nth(1)
+            .expect("and gives it as a command block");
+        let filled = block
+            .replace(
+                "<owner/repo#n> [<owner/repo#n> ...]",
+                "blooop/wayfinder#151",
+            )
+            .trim()
+            .to_string();
+        assert_eq!(filled, "wf reap --finished blooop/wayfinder#151");
+        let typed: Vec<String> = filled
+            .split_whitespace()
+            .skip(1)
+            .map(String::from)
+            .collect();
+        assert!(
+            matches!(
+                parse_args(typed),
+                Invocation::Reap(ReapScope::Finished(ref nodes)) if nodes.len() == 1
+            ),
+            "the command wf-auto prints is not one this binary parses as a \
+             scoped cleanup: {filled}"
+        );
+    }
+
+    #[test]
+    fn the_usage_names_the_scoped_reap_and_says_it_cannot_be_forced() {
+        // The help is where a command is discoverable, and the two facts a
+        // reader has to be able to find without running it are that the scoped
+        // form exists and that no flag of it waives a guard.
+        assert!(USAGE.contains("wf reap --finished"), "{USAGE}");
+        assert!(
+            USAGE.contains("There\n                   is no -f here"),
+            "{USAGE}"
+        );
     }
 
     #[test]

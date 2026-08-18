@@ -135,13 +135,27 @@ impl Query {
         self.hit(ticket).map(|hit| hit.score)
     }
 
-    /// The match, with the characters it landed on — and `None` when it landed
-    /// badly enough not to count, which `tight` decides.
-    pub fn hit(&mut self, ticket: &Ticket) -> Option<Hit> {
-        let hay = haystack(ticket);
+    /// Match plain text, scored and with the characters it landed on.
+    ///
+    /// What the project list matches on — a row there is a repo slug and
+    /// nothing else, with no ticket to build a haystack from. It goes through
+    /// the same pattern and the same `tight` rule as a ticket row on
+    /// purpose: the two screens are one query field with one contract, and a
+    /// project list that matched loosely would be the second matching
+    /// vocabulary this rule exists to prevent.
+    pub fn text(&mut self, text: &str) -> Option<(u32, Vec<usize>)> {
+        let (score, indices) = self.matched(text)?;
+        Some((score, indices.into_iter().map(|i| i as usize).collect()))
+    }
+
+    /// The pattern against one haystack: the score and the char indices it
+    /// landed on, sorted, unique and tight — or `None`. The one place a match
+    /// is decided, so [`Query::hit`] and [`Query::text`] cannot come to differ
+    /// about what counts as one.
+    fn matched(&mut self, hay: &str) -> Option<(u32, Vec<u32>)> {
         let mut indices = Vec::new();
         let score = self.pattern.indices(
-            Utf32Str::new(&hay, &mut self.buf),
+            Utf32Str::new(hay, &mut self.buf),
             &mut self.matcher,
             &mut indices,
         )?;
@@ -151,9 +165,14 @@ impl Query {
         // unique before either does.
         indices.sort_unstable();
         indices.dedup();
-        if !tight(&hay.chars().collect::<Vec<char>>(), &indices) {
-            return None;
-        }
+        tight(&hay.chars().collect::<Vec<char>>(), &indices).then_some((score, indices))
+    }
+
+    /// The match, with the characters it landed on — and `None` when it landed
+    /// badly enough not to count, which `tight` decides.
+    pub fn hit(&mut self, ticket: &Ticket) -> Option<Hit> {
+        let hay = haystack(ticket);
+        let (score, indices) = self.matched(&hay)?;
 
         let repo_len = ticket.short_repo().chars().count();
         let mut hit = Hit {

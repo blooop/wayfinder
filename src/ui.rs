@@ -13,11 +13,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Overlay, Scope};
+use crate::app::{App, Overlay};
 use crate::filter;
-use crate::launch::{Launch, Mode, Staged};
+use crate::launch::{Agent, Candidate, Launch, Staged};
+use crate::liveness::Life;
 use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
-use crate::view::{Branch, Fold, GroupKind, Item, Plan};
+use crate::reclaim::Reclaimable;
+use crate::view::{Branch, Fold, GroupKind, Item, Plan, ProjectRow};
 
 /// One colour per glyph meaning, shared by the row column and the rollup
 /// pairs: calm colours for the flowing stages, red for the two that demand
@@ -50,7 +52,13 @@ fn glyph_style(glyph: RowGlyph) -> Style {
 /// half of what a ticket is matched against and the rows below do not draw it:
 /// typing a project name would otherwise sift the whole screen down to one
 /// cluster while underlining nothing anywhere.
-fn cluster_header(id: &MapId, map: &Map, lit: &[usize], under_cursor: bool) -> Line<'static> {
+fn cluster_header(
+    id: &MapId,
+    map: &Map,
+    lit: &[usize],
+    under_cursor: bool,
+    marks: Marks,
+) -> Line<'static> {
     let cyan = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     // The cursor rides *before* the `▌`, not after it: the bar is the cluster's
     // left edge and every row below hangs off it, so a marker inside it would
@@ -58,12 +66,61 @@ fn cluster_header(id: &MapId, map: &Map, lit: &[usize], under_cursor: bool) -> L
     let mut spans = vec![cursor_span(under_cursor), Span::styled("▌ ", cyan)];
     spans.extend(lit_spans(id.short_repo(), lit, cyan));
     spans.push(Span::styled(format!(" · {}", map.title), cyan));
+    // A map is a node, so a charting session is as resumable as a build one,
+    // and a map's own workspace is as launchable — the header is the only place
+    // the list can say either (#35).
+    spans.extend(marks.spans());
     for (glyph, count) in map.tally() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("{}{count}", glyph.char()),
             glyph_style(glyph),
         ));
+    }
+    Line::from(spans)
+}
+
+/// A project row: the body of the project list, and the line a project's own
+/// screen opens on.
+///
+/// The same left edge every cluster has, one shade quieter — a project is the
+/// container its maps sit in, so it reads as somewhere to stand rather than as
+/// something that has happened. It carries the full `owner/name` rather than
+/// the short name the cluster headers show, because this is the one place two
+/// forks of one repo sit next to each other and the short names would be
+/// identical.
+///
+/// The tail says what is inside, and has three honest answers: the stage
+/// rollup once maps are on hand, `no map — enter to start one` once the search
+/// has answered and found none, and `loading…` in between. That third one is
+/// the whole reason [`ProjectRow::loaded`] exists — a repo whose maps are still
+/// in flight and a repo that has none are the same zero, and calling the first
+/// "no map" is the lie [`crate::refresh::Startup`] exists to prevent.
+fn project_line(row: &ProjectRow, under_cursor: bool) -> Line<'static> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let cyan = Style::new().fg(Color::Cyan);
+    let mut spans = vec![cursor_span(under_cursor), Span::styled("▌ ", cyan)];
+    spans.extend(lit_spans(&row.repo, &row.lit, cyan));
+    match (row.maps, row.loaded) {
+        (0, false) => spans.push(Span::styled(" · loading…", dim)),
+        (0, true) => spans.push(Span::styled(" · no map — enter to start one", dim)),
+        (n, _) => {
+            spans.push(Span::styled(
+                if n == 1 {
+                    " · 1 map".to_string()
+                } else {
+                    format!(" · {n} maps")
+                },
+                dim,
+            ));
+            for &(glyph, count) in &row.rollup {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("{}{count}", glyph.char()),
+                    glyph_style(glyph),
+                ));
+            }
+        }
     }
     Line::from(spans)
 }
@@ -221,6 +278,11 @@ fn pr_badge(ticket_repo: &str, pr: &PrLink) -> Vec<Span<'static>> {
 /// `lit` is where a live query landed in the `#n title` half — the only part of
 /// the row that was matched against, and so the only part that can honestly
 /// claim to be why the row is on screen.
+///
+/// `resumable` adds the `⏎` badge (#35): a conversation from a previous launch
+/// is waiting on this node. A bare flag rather than the record itself, because
+/// the row says only *that* there is a way back — how old it is belongs to the
+/// picker, where the choice is actually made.
 fn ticket_line(
     ticket: &Ticket,
     prefix: &str,
@@ -228,6 +290,7 @@ fn ticket_line(
     branch: &Branch,
     lit: &[usize],
     under_cursor: bool,
+    marks: Marks,
 ) -> Line<'static> {
     // Nested rows carry the cursor column as extra indent, so a branch begins
     // directly under the glyph of the row it hangs from instead of to its left.
@@ -253,6 +316,7 @@ fn ticket_line(
             Style::new().add_modifier(Modifier::DIM),
         ));
     }
+    spans.extend(marks.spans());
     for pr in &ticket.prs {
         spans.extend(pr_badge(&ticket.repo, pr));
     }
@@ -280,8 +344,25 @@ fn ticket_line(
 /// by omission: a row the query landed on is a match, and a match is drawn as
 /// [`Item::Ticket`], never as one of these.
 fn context_line(ticket: &Ticket, prefix: &str) -> Line<'static> {
-    ticket_line(ticket, prefix, &[], &Branch::Plain, &[], false)
-        .patch_style(Style::new().add_modifier(Modifier::DIM))
+    // No resume badge either, for the same reason it carries no cursor: a
+    // context row is not somewhere `enter` can be pressed, so a badge about
+    // what `enter` would do there would be an offer the row cannot honour.
+    //
+    // No liveness marking, on the narrower ground these rows already stand on:
+    // a context row shows no PR badges either. It is drawn to say *where* the
+    // matches beneath it live, and everything it says about itself is furniture
+    // — so a stalled node reachable only as somebody else's context is not
+    // marked on a sifted screen, and is there the moment the query clears.
+    ticket_line(
+        ticket,
+        prefix,
+        &[],
+        &Branch::Plain,
+        &[],
+        false,
+        Marks::default(),
+    )
+    .patch_style(Style::new().add_modifier(Modifier::DIM))
 }
 
 /// The body as styled lines: the [`Plan`] walked in order. Shared by the live
@@ -372,7 +453,13 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
             Item::Header(id) => {
                 let map = &app.clusters[id];
                 let lit = query.as_mut().map(|q| q.in_repo(map)).unwrap_or_default();
-                lines.push(cluster_header(id, map, &lit, under_cursor));
+                lines.push(cluster_header(
+                    id,
+                    map,
+                    &lit,
+                    under_cursor,
+                    Marks::of(app, &id.repo, id.number),
+                ));
             }
             Item::Ticket {
                 row,
@@ -394,8 +481,10 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
                     branch,
                     &lit,
                     under_cursor,
+                    Marks::of(app, &ticket.repo, ticket.number),
                 ));
             }
+            Item::Project(project) => lines.push(project_line(project, under_cursor)),
             Item::Context { row, prefix } => lines.push(context_line(app.ticket(row), prefix)),
             Item::Group { id, held, fold } => {
                 lines.push(group_line(id.kind, *held, fold, under_cursor));
@@ -410,44 +499,67 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
 /// agent right here and `wf` is gone (#34); `esc` clears the query first and
 /// quits on an empty one, and `q` only quits when the query is empty (mid-query
 /// it types).
-const KEY_HINTS: &str =
-    "  enter launch · ←→ open · tab structure · ctrl-f focus · ctrl-r refresh · esc quit";
+/// The hint line, which is the level's — because the keys mean different
+/// enough things on the two screens that one line would have to be vague about
+/// both. `enter` opens a project up here and launches an agent down there;
+/// `tab` and the depth keys have nothing to toggle or descend into on a flat
+/// list of projects; and `←` being the way *back* is worth saying exactly where
+/// there is somewhere to go back to.
+fn key_hints(app: &App) -> &'static str {
+    if app.current_repo().is_some() {
+        "  enter launch · ←→ open · ← back · tab structure · esc quit"
+    } else {
+        "  enter open · ↑↓ move · type to filter · esc quit"
+    }
+}
 
 /// The project heading in the title bar.
 ///
-/// An empty screen has three meanings — still loading (#27), every fetch
-/// failed, or genuinely no projects — and telling a user with three registered
-/// projects that they have none is the exact ambiguity
-/// [`crate::refresh::Startup`] exists to remove. So both other cases are named
-/// before "no projects" is claimed. With clusters on screen, the heading
-/// counts the ground they cover: the one repo's slug, or how many projects.
+/// On a project's own screen it is that project — the level *is* the screen, so
+/// the title says which one whatever the fetch has managed so far.
+///
+/// On the project list it counts the registered repos, which is a fact off the
+/// cache and needs no network, so the ambiguity the old heading had to
+/// disentangle is gone with the screen that had it: an empty list now means one
+/// thing (nothing registered) instead of three (still loading, every fetch
+/// failed, or genuinely none). A failed *map* fetch no longer empties this
+/// screen at all — the projects are still listed — so it is named here only
+/// while it is the most interesting thing true, and on the count line
+/// ([`failure_note`]) in every case.
 ///
 /// # Panics
 ///
 /// Never: the arm that takes the single failed id has already matched on
 /// `len() == 1`.
 pub fn heading(app: &App) -> String {
-    if app.clusters.is_empty() {
-        if !app.startup.is_loaded() {
-            return "loading…".to_string();
-        }
-        // Naming the map is the whole value when there is one: "GitHub is
-        // unreachable" and "you have no projects" are different problems with
-        // different fixes, and the empty list looks identical either way.
+    if let Some(repo) = app.current_repo() {
+        return repo.to_string();
+    }
+    let projects = app.projects();
+    if projects.is_empty() {
+        return "no projects — run wf inside a checkout to register it".to_string();
+    }
+    // Naming the map is the whole value when there is one: "GitHub is
+    // unreachable" and "that project has nothing open" are different problems
+    // with different fixes, and a bare count reads the same either way.
+    //
+    // This named the refresh chord as the retry until that key was retired.
+    // Naming a key that no longer exists is worse than saying nothing, and
+    // saying nothing leaves the reader on a screen with a failure and no move
+    // to make — so it names the move that is left. Restarting really is the
+    // retry now: each map is fetched once per run, and a warm start is ~0.6 s.
+    if app.clusters.is_empty() && app.startup.is_loaded() {
         match app.failed.len() {
             0 => {}
             1 => {
                 let id = app.failed.iter().next().expect("len checked");
-                return format!("{}#{} — fetch failed, ctrl-r retries", id.repo, id.number);
+                return format!("{}#{} — fetch failed, run wf again", id.repo, id.number);
             }
-            n => return format!("{n} maps failed to fetch — ctrl-r retries"),
+            n => return format!("{n} maps failed to fetch — run wf again"),
         }
-        return "no projects — run wf inside a checkout to register it".to_string();
     }
-    let repos: std::collections::BTreeSet<&str> =
-        app.clusters.keys().map(|id| id.repo.as_str()).collect();
-    match repos.len() {
-        1 => (*repos.iter().next().expect("len checked")).to_string(),
+    match projects.len() {
+        1 => projects.into_iter().next().expect("len checked"),
         n => format!("{n} projects"),
     }
 }
@@ -474,6 +586,30 @@ pub fn failure_note(app: &App) -> String {
     }
 }
 
+/// The `· N reclaimable: …` segment on the count line (#137): what a
+/// `wf reap` would claim, once the background reading has landed.
+///
+/// Empty while the reading is out, and empty forever if it failed or found
+/// nothing — the three are one silence on purpose, because none of them is
+/// something a person picking a ticket needs told about.
+///
+/// It names the workspaces rather than only counting them: a bare number is
+/// something a reader has no way to agree or disagree with, and the point of
+/// surfacing this at all is that `wf reap` is then a decision rather than an
+/// errand. The picker does nothing with it — the segment *is* the feature.
+///
+/// `width` is what is left of the count line once everything else on it has
+/// been laid down. Real workspace ids are ~40 characters, so this segment is
+/// the one on the line that has to be *sized* rather than written and clipped:
+/// see [`Reclaimable::hint`] for what it gives up first, and what it never
+/// gives up.
+pub fn reclaim_note(app: &App, width: usize) -> String {
+    app.reclaimable
+        .as_ref()
+        .map(|found| Reclaimable::hint(found, width))
+        .unwrap_or_default()
+}
+
 /// The `· N idle maps hidden` segment on the count line (#51): the leverage
 /// view drops a map with nothing takeable from the body, and the count is the
 /// only trace of it — silence would read as the map not existing at all. The
@@ -484,6 +620,121 @@ pub fn idle_note(plan: &Plan) -> String {
         1 => "· 1 idle map hidden".to_string(),
         n => format!("· {n} idle maps hidden"),
     }
+}
+
+/// The badge a row carries when a previous launch left a conversation on it
+/// (#35) — the same glyph as the key that rejoins it.
+const RESUME_BADGE: &str = "  ⏎";
+
+/// The badge a node carries when a container of its is up.
+///
+/// A square, where every stage glyph is round, because it is not a stage: the
+/// row's leading glyph is what the *tracker* says the work is, and this is what
+/// the *machine* says is happening to it. Two vocabularies that must not be
+/// mistaken for one another at a glance, so they do not share a shape.
+const RUNNING_BADGE: &str = "  ▣";
+
+/// The badge a node carries when it is claimed, has nothing pushed, and nothing
+/// of its is running.
+///
+/// It sits next to a `◐ building` stage glyph, and that juxtaposition *is* the
+/// finding: the tracker believes this is in progress, and no container of its
+/// is up. An hourglass because what it reports is elapsed time and nothing else
+/// — see [`Life::Stalled`](crate::liveness::Life::Stalled) for how little that
+/// claims.
+const STALLED_BADGE: &str = "  ⧖";
+
+/// What the app knows about a row's node that the ticket itself cannot say.
+///
+/// Both fields are per-node lookups against state the tracker never supplied —
+/// one from the launch record, one from this machine — and both are decided at
+/// the same call site for the same `(repo, number)`. Carrying them as one value
+/// is what keeps a row's signature from growing a parameter every time `wf`
+/// learns something new about a node, and it puts the two badges in one place
+/// so a ticket row and a cluster header cannot drift apart about their order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Marks {
+    /// A previous launch left a conversation on this node (#35).
+    resumable: bool,
+    /// What this machine says is happening to it, if anything.
+    life: Option<Life>,
+}
+
+impl Marks {
+    /// Everything the app has to say about one node.
+    fn of(app: &App, repo: &str, number: u64) -> Self {
+        Self {
+            resumable: app.resume(repo, number).is_some(),
+            life: app.liveness.of(repo, number),
+        }
+    }
+
+    /// The badges, in the one order both row kinds draw them: what `enter`
+    /// would rejoin, then what is happening to it now.
+    fn spans(self) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        if self.resumable {
+            spans.push(Span::styled(
+                RESUME_BADGE,
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
+            ));
+        }
+        spans.extend(life_span(self.life));
+        spans
+    }
+}
+
+/// The spans a row's liveness marking contributes, if any.
+///
+/// **No new colour.** Cyan is already "`wf`'s own record about this row" — it
+/// is what `⏎` is drawn in — and these two are the same kind of fact from the
+/// same background reading, so they join it rather than minting a seventh hue
+/// on a screen that deliberately spends six (see [`CURSOR_COLOR`], and the
+/// query-match modifier that was chosen over a colour for the same reason).
+///
+/// The two are told apart by weight instead: a running container is live, so it
+/// is undimmed; a stall is a session that is over, which is exactly what DIM
+/// means everywhere else here. That leaves the badge for the thing that has
+/// stopped quieter than the one still going, which is the right way round for a
+/// picker — the loud version of "stalled" belongs on the count line, where it
+/// is a summons and not a decoration.
+fn life_span(life: Option<Life>) -> Option<Span<'static>> {
+    let cyan = Style::new().fg(Color::Cyan);
+    match life? {
+        Life::Running => Some(Span::styled(RUNNING_BADGE, cyan)),
+        Life::Stalled => Some(Span::styled(
+            STALLED_BADGE,
+            cyan.add_modifier(Modifier::DIM),
+        )),
+    }
+}
+
+/// How long ago `then` was, from `now`, in the one unit that reads: `20m ago`,
+/// `3h ago`, `5d ago`.
+///
+/// A pure function of the two instants rather than a method reading the clock,
+/// so the rendering is pinned by tests instead of raced against a wall clock —
+/// the same reason the launch context carries no snapshot instant.
+///
+/// A clock that moved backwards between the launch and now reads as **the
+/// present**. Both alternatives are worse: a negative age cannot be spelt, and
+/// an unsigned subtraction would wrap to an age of a hundred billion years.
+fn ago(then: u64, now: u64) -> String {
+    let secs = now.saturating_sub(then);
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{}m ago", secs / 60),
+        3_600..=86_399 => format!("{}h ago", secs / 3_600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+/// Now, in seconds since the Unix epoch — read once per frame that draws an
+/// age, and never anywhere a test asserts on.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// A centered box `width`×`height` (clamped) inside `area`.
@@ -508,10 +759,19 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// drawn per option rather than once for the cursor's — the difference between
 /// `/wf`, `/wf-auto` and no skill at all (#112) *is* the choice being made, so
 /// every one of them is on screen.
-fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, mode: Mode, steer: &str) {
+/// The agent is in the title rather than another row: it applies to every
+/// candidate, and horizontal keys can change it without moving the vertical
+/// cursor.
+fn draw_launch_picker(
+    frame: &mut Frame<'_>,
+    staged: &Staged,
+    agent: Agent,
+    candidate: Candidate,
+    steer: &str,
+) {
     let mut lines = vec![Line::default()];
-    for option in Mode::all() {
-        let picked = option == mode;
+    for option in staged.candidates() {
+        let picked = option == candidate;
         let marker = if picked { '▶' } else { ' ' };
         // The cursor's row is the one that will run, so it is the one that reads
         // as bold; the others stay dim enough to scan past.
@@ -520,30 +780,59 @@ fn draw_launch_picker(frame: &mut Frame<'_>, staged: &Staged, mode: Mode, steer:
         } else {
             Style::new().add_modifier(Modifier::DIM)
         };
+        // A resume names when the conversation was left, which its label
+        // cannot: three weeks old and twenty minutes old are the same row
+        // otherwise, and they are not the same decision.
+        let blurb = match (option, staged.resume()) {
+            (Candidate::Resume { .. }, Some(resume)) => {
+                format!("{} · {}", ago(resume.at, now_secs()), option.blurb())
+            }
+            _ => option.blurb().to_string(),
+        };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {marker} {:<12}", option.label()), emphasis),
+            Span::styled(format!("  {marker} {:<14}", option.label()), emphasis),
             Span::styled(
-                format!("{:<10}", staged.route(option).label()),
+                format!("{:<18}", option.invocation(agent)),
                 Style::new().fg(Color::Cyan),
             ),
-            Span::styled(option.blurb(), Style::new().add_modifier(Modifier::DIM)),
+            Span::styled(blurb, Style::new().add_modifier(Modifier::DIM)),
         ]));
     }
     lines.push(Line::default());
-    // The steer field is always shown, empty or not: it is the other half of
+    // The text field is always shown, empty or not: it is the other half of
     // what enter will do, and a field that appears only once you have typed
-    // into it cannot tell you that you may.
+    // into it cannot tell you that you may. Its *name* is the picked row's
+    // (#114) — one field, three meanings, and the row says which one is live:
+    // steering an agent, the task itself, or a seed for a charting session.
     lines.push(Line::from(vec![
-        Span::styled("    steer  ", Style::new().add_modifier(Modifier::DIM)),
+        Span::styled(
+            format!("    {:<6} ", candidate.field()),
+            Style::new().add_modifier(Modifier::DIM),
+        ),
         Span::raw(steer.to_string()),
         Span::styled("█", Style::new().add_modifier(Modifier::DIM)),
     ]));
     lines.push(Line::default());
     lines.push(Line::styled(
-        "  enter launch · ↑/↓ mode · type to steer · esc cancel",
+        "  enter launch · ←/→ agent · ↑/↓ pick · type to fill · esc cancel",
         Style::new().add_modifier(Modifier::DIM),
     ));
-    let title = format!(" launch {} {} ", staged.key(), staged.title);
+    // The repo leads the title because it is the one fact *every* row shares
+    // (#114): the launch rows work this node, and the creation rows start
+    // something new in the repo it belongs to. Naming only the node would be
+    // true of half the list — and the repo is exactly what creation would
+    // otherwise have to ask for.
+    // The picked row decides which agent the title names: on a resume it is
+    // the recorded one, since that is what `enter` will become. Anything else
+    // would put a Codex title over a row that runs Claude.
+    let title = format!(
+        " launch {} · {} · {} {} ",
+        candidate.agent(agent).label(),
+        staged.repo,
+        staged.key(),
+        staged.title()
+    );
+    let title = title.trim_end().to_string() + " ";
     let width = lines
         .iter()
         .map(|l| l.width() as u16 + 4)
@@ -570,9 +859,10 @@ fn draw_overlay(frame: &mut Frame<'_>, app: &App) {
         Overlay::None => {}
         Overlay::PickLaunch {
             staged,
-            mode,
+            candidate,
+            agent,
             steer,
-        } => draw_launch_picker(frame, staged, *mode, steer),
+        } => draw_launch_picker(frame, staged, *agent, *candidate, steer),
         Overlay::PickCheckout { launches, cursor } => {
             draw_checkout_picker(frame, launches, *cursor);
         }
@@ -639,14 +929,12 @@ fn draw_checkout_picker(frame: &mut Frame<'_>, launches: &[Launch], cursor: usiz
 /// count line against the query whose matches it counts.
 /// The which-checkout picker, when open, floats over all of it.
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
-    let mut block = match &app.scope {
-        Scope::All => Block::bordered().title(format!(" wf · {} ", heading(app))),
-        // The focused title names the project by its full slug — with one
-        // project on screen there is room, and it disambiguates forks.
-        Scope::Project(repo) => Block::bordered().title(format!(" wf · {repo} — focused ")),
-    };
-    if app.scope != Scope::All {
-        block = block.title_top(Line::from(" ctrl-g all projects ").right_aligned());
+    let mut block = Block::bordered().title(format!(" wf · {} ", heading(app)));
+    // The way back, named on the screen it applies to. A project screen is the
+    // only one with anywhere to go back to, and `←` is the only key that goes
+    // there — so this line appears exactly when it is true.
+    if app.current_repo().is_some() {
+        block = block.title_top(Line::from(" ← all projects ").right_aligned());
     }
     let inner = block.inner(frame.area());
     frame.render_widget(block, frame.area());
@@ -688,28 +976,73 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     // staged — the staged launch is a modal now (#62's line became
     // [`draw_launch_picker`]), and a modal does not need the row it covers to
     // move out of its way.
-    let status = [app.startup.hint(), failure_note(app), idle_note(&plan)]
+    let mut parts: Vec<String> = [app.startup.hint(), failure_note(app), idle_note(&plan)]
         .into_iter()
         .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+        .collect();
+    let (shown, total) = app.counts();
+    let counts = format!("  {shown}/{total}");
+    let notice = app
+        .notice
+        .as_ref()
+        .map(|notice| format!("   {notice}"))
+        .unwrap_or_default();
+    // The reclaim segment is sized rather than written and clipped, because it
+    // is the only one on this line whose content is unbounded — a `dl`
+    // workspace id is ~40 characters and there can be three of them. It goes
+    // last and takes what the rest of the line has left, which is why the rest
+    // of the line is measured first.
+    let spent = counts.chars().count()
+        + 2
+        + parts
+            .iter()
+            .map(|part| part.chars().count() + 1)
+            .sum::<usize>()
+        + notice.chars().count();
+    let mut left = (count_area.width as usize).saturating_sub(spent);
+    // Stalls are laid down before the reclaim note, but not at any price: what
+    // is held back for the reclaim note is exactly the width at which it stops
+    // being a word (`Reclaimable::min_width`), because its own last arm clips
+    // the count rather than vanishing. Without that, two named stalls on a
+    // 60-column terminal left it three characters short and it rendered
+    // `· 2 reclaima`.
+    //
+    // Yielding is the whole of the concession. Stalls still outrank the reap
+    // pointer and the warned aside — both of those go while `· N stalled` is
+    // still naming nodes — and `Liveness::hint`'s own ladder does the yielding
+    // gracefully, dropping to one name and then to the bare count, which the
+    // rows' own `⧖` markings make readable anyway.
+    let reserved = app
+        .reclaimable
+        .as_ref()
+        .map_or(0, |found| found.min_width() + 1);
+    let stalled = app.liveness.hint(left.saturating_sub(reserved));
+    if !stalled.is_empty() {
+        left = left.saturating_sub(stalled.chars().count() + 1);
+        parts.push(stalled);
+    }
+    let note = reclaim_note(app, left);
+    if !note.is_empty() {
+        parts.push(note);
+    }
+    let status = parts.join(" ");
     let mut count_spans = vec![
-        Span::raw(format!("  {}/{}", app.visible().len(), app.scoped().len())),
+        Span::raw(counts),
         Span::styled(
             format!("  {status}"),
             Style::new().add_modifier(Modifier::DIM),
         ),
     ];
-    if let Some(notice) = &app.notice {
+    if !notice.is_empty() {
         count_spans.push(Span::styled(
-            format!("   {notice}"),
+            notice,
             Style::new().add_modifier(Modifier::DIM),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(count_spans)), count_area);
 
     frame.render_widget(
-        Paragraph::new(KEY_HINTS).style(Style::new().add_modifier(Modifier::DIM)),
+        Paragraph::new(key_hints(app)).style(Style::new().add_modifier(Modifier::DIM)),
         hint_area,
     );
     draw_overlay(frame, app);
@@ -761,10 +1094,26 @@ mod tests {
         }
     }
 
+    /// An app standing on `repo`'s screen. `App::new` opens on the project
+    /// *list*, which draws no cluster at all, so a test about what a cluster
+    /// looks like has to say which project's screen it is on.
+    fn app_on(repo: &str, clusters: BTreeMap<MapId, Map>) -> App {
+        let mut app = App::new(clusters);
+        app.enter(repo);
+        app
+    }
+
     fn fixture_app() -> App {
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
-        App::new(clusters)
+        app_on("blooop/wayfinder", clusters)
+    }
+
+    /// Step the cursor down `n` stops.
+    fn down(app: &mut App, n: usize) {
+        for _ in 0..n {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
     }
 
     fn type_str(app: &mut App, s: &str) {
@@ -775,7 +1124,13 @@ mod tests {
 
     /// Render the app through `TestBackend` and return the screen as text.
     fn render(app: &App) -> String {
-        let backend = TestBackend::new(90, 24);
+        render_at(90, app)
+    }
+
+    /// The same, on a terminal of a stated width — for the claims that are
+    /// about what survives a narrow one.
+    fn render_at(width: u16, app: &App) -> String {
+        let backend = TestBackend::new(width, 24);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal.draw(|f| draw(f, app)).expect("draw");
         let buf = terminal.backend().buffer();
@@ -787,6 +1142,98 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// The fixture app, with a conversation left on `number`.
+    fn app_resuming(number: u64) -> App {
+        fixture_app().with_sessions(vec![crate::projects::Session::new(
+            "blooop/wayfinder".to_string(),
+            number,
+            Agent::Claude,
+            std::path::PathBuf::from("/data/proj/wayfinder"),
+            crate::launch::Isolation::Host,
+        )])
+    }
+
+    #[test]
+    fn a_row_you_left_a_conversation_on_says_so_before_anything_is_fetched() {
+        // The badge is drawn from the local cache, so it is on the *first*
+        // frame — the same frame-zero rule the project list follows. Nothing
+        // asks `dl`, and nothing waits for the map search.
+        let screen = render(&app_resuming(7));
+        let row = screen
+            .lines()
+            .find(|l| l.contains("#7 Supervising"))
+            .expect("the row is on screen");
+        assert!(row.contains('⏎'), "{row}");
+        // And only that row: the badge is a fact about one node.
+        let other = screen
+            .lines()
+            .find(|l| l.contains("#6 Re-entry"))
+            .expect("the neighbour is on screen");
+        assert!(!other.contains('⏎'), "{other}");
+    }
+
+    #[test]
+    fn a_map_you_have_charted_before_carries_the_badge_too() {
+        // A map is a node (#96) and its picker offers the resume row, so the
+        // list has to say so — otherwise the only way to discover a charting
+        // session is waiting is to press enter on every header.
+        let screen = render(&app_resuming(1));
+        let header = screen
+            .lines()
+            .find(|l| l.contains("Map: wf"))
+            .expect("the cluster header is on screen");
+        assert!(header.contains('⏎'), "{header}");
+    }
+
+    #[test]
+    fn the_resume_row_says_how_long_ago_you_left_it() {
+        // Whether a conversation is twenty minutes or three weeks old changes
+        // whether you want it back, and it is the one thing the row's label
+        // cannot say. The rendering is a pure function of the two instants, so
+        // it is pinned here rather than against a wall clock.
+        assert_eq!(ago(1_000, 1_000), "just now");
+        assert_eq!(ago(1_000, 1_030), "just now");
+        assert_eq!(ago(1_000, 1_000 + 20 * 60), "20m ago");
+        assert_eq!(ago(1_000, 1_000 + 3 * 3_600), "3h ago");
+        assert_eq!(ago(1_000, 1_000 + 5 * 86_400), "5d ago");
+        // A clock that went backwards between the launch and now reads as the
+        // present rather than as a negative age or a huge one.
+        assert_eq!(ago(2_000, 1_000), "just now");
+    }
+
+    #[test]
+    fn the_picker_draws_the_way_back_as_the_argv_it_will_actually_run() {
+        // The skill column names what execs. Every other row names a skill;
+        // this one has none, so it names the agent's own resume flags — which
+        // is exactly the difference between resuming and `plain`, and the two
+        // sit one row apart.
+        let mut app = app_resuming(6);
+        down(&mut app, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("resume"), "{screen}");
+        assert!(screen.contains("claude --continue"), "{screen}");
+    }
+
+    #[test]
+    fn the_picker_title_names_the_agent_that_will_actually_rejoin() {
+        // The title is the agent axis's readout, and on the resume row the
+        // axis is the record's rather than the picker's. A Codex title over a
+        // row that runs Claude is the one lie this screen could tell.
+        let mut app = fixture_app().with_sessions(vec![crate::projects::Session::new(
+            "blooop/wayfinder".to_string(),
+            6,
+            Agent::Codex,
+            std::path::PathBuf::from("/data/proj/wayfinder"),
+            crate::launch::Isolation::Host,
+        )]);
+        down(&mut app, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("launch Codex"), "{screen}");
+        assert!(screen.contains("codex resume --last"), "{screen}");
     }
 
     #[test]
@@ -836,7 +1283,7 @@ mod tests {
         }];
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), map);
-        let screen = render(&App::new(clusters));
+        let screen = render(&app_on("blooop/wayfinder", clusters));
         // ○0 is not drawn: the counts name the stages the map is actually in.
         assert!(
             screen.contains("▌ wayfinder · Map: wf  ◍1  !1  ●1  ⊘2"),
@@ -959,7 +1406,7 @@ mod tests {
         }];
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), map);
-        let app = App::new(clusters);
+        let app = app_on("blooop/wayfinder", clusters);
         let screen = render(&app);
         // Same-repo badge: `⇄ PR#n <state>` after the [type] suffix.
         assert!(
@@ -1005,7 +1452,7 @@ mod tests {
         }];
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), map);
-        let screen = render(&App::new(clusters));
+        let screen = render(&app_on("blooop/wayfinder", clusters));
         assert!(screen.contains("◍ #6 Re-entry breadcrumbs"), "{screen}");
         assert!(screen.contains("! #9 Main screen design"), "{screen}");
         // Blocked still overrides whatever stage lies beneath.
@@ -1032,7 +1479,7 @@ mod tests {
         }];
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), map);
-        let mut app = App::new(clusters);
+        let mut app = app_on("blooop/wayfinder", clusters);
         let screen = render(&app);
         assert!(screen.contains("● 1 done (hidden) ◐1"), "{screen}");
 
@@ -1066,7 +1513,7 @@ mod tests {
         }];
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), map);
-        let screen = render(&App::new(clusters));
+        let screen = render(&app_on("blooop/wayfinder", clusters));
         assert!(screen.contains("⇄ PR#14 open"), "{screen}");
         assert!(!screen.contains('✓'), "{screen}");
         assert!(!screen.contains('✗'), "{screen}");
@@ -1098,17 +1545,241 @@ mod tests {
         );
     }
 
+    /// The two markings land on the rows they are about, and say different
+    /// things: one node has a container up, another is claimed with nothing
+    /// running. Both come from the same reading.
+    #[test]
+    fn a_running_container_and_a_stall_are_marked_on_the_rows_they_belong_to() {
+        let mut app = fixture_app();
+        app.liveness = crate::liveness::Liveness::for_test(
+            &[("blooop/wayfinder", 6)],
+            &[("blooop/wayfinder", 9)],
+        );
+        let screen = render(&app);
+        let row = |needle: &str| {
+            screen
+                .lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no row for {needle}: {screen}"))
+                .to_string()
+        };
+        assert!(
+            row("Re-entry breadcrumbs").contains('▣'),
+            "a node with a container up says so: {screen}"
+        );
+        assert!(
+            row("Main screen design").contains('⧖'),
+            "a claimed node with nothing running says so: {screen}"
+        );
+        // The two are never the same mark, and neither leaks onto a row the
+        // reading said nothing about.
+        assert!(!row("Re-entry breadcrumbs").contains('⧖'), "{screen}");
+        assert!(!row("Supervising AFK agents").contains('▣'), "{screen}");
+        assert!(!row("Supervising AFK agents").contains('⧖'), "{screen}");
+    }
+
+    #[test]
+    fn the_first_frame_marks_no_row_and_names_no_stall() {
+        // No reading has landed, which is the state every run starts in and
+        // stays in when `dl` is absent or the listing failed.
+        let app = fixture_app();
+        let screen = render(&app);
+        assert!(!screen.contains('▣'), "{screen}");
+        assert!(!screen.contains('⧖'), "{screen}");
+        assert!(!screen.contains("stalled"), "{screen}");
+    }
+
+    /// A stall reaches the count line as well as the row, because the row is
+    /// not always on screen: the project list has no ticket rows at all, and a
+    /// stalled node can be inside a fold or another map.
+    #[test]
+    fn the_count_line_names_what_stopped_moving() {
+        let mut app = fixture_app();
+        app.liveness = crate::liveness::Liveness::for_test(
+            &[],
+            &[("blooop/wayfinder", 9), ("blooop/wayfinder", 14)],
+        );
+        let screen = render(&app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("stalled"))
+            .unwrap_or_else(|| panic!("no stall segment: {screen}"));
+        assert!(line.contains("2 stalled"), "{line}");
+        assert!(line.contains("wayfinder#9"), "{line}");
+    }
+
+    /// The two variable-length segments share one line, and neither may leave
+    /// the other unreadable: the `wf reap` pointer is the half of the reclaim
+    /// hint a reader can act on, and it still fits.
+    #[test]
+    fn a_stall_segment_leaves_the_reclaim_pointer_its_room() {
+        let mut app = fixture_app();
+        app.liveness = crate::liveness::Liveness::for_test(
+            &[],
+            &[
+                ("blooop/wayfinder", 9),
+                ("blooop/wayfinder", 14),
+                ("blooop/wayfinder", 7),
+            ],
+        );
+        app.reclaimable = Some(Reclaimable::for_test(&["wf-129-closed"], 0));
+        let screen = render_at(120, &app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("stalled"))
+            .unwrap_or_else(|| panic!("no stall segment: {screen}"));
+        assert!(line.contains("3 stalled"), "{line}");
+        assert!(
+            line.contains("wf reap"),
+            "the command survives beside the stalls: {line}"
+        );
+    }
+
+    /// Neither segment is ever clipped to a fragment, at any width.
+    ///
+    /// The regression this pins was visible only on a rendered screen: with two
+    /// stalls named on a 60-column terminal, the reclaim note was left three
+    /// characters short of its own count and its last arm — which clips rather
+    /// than vanishing — put `· 2 reclaima` on the line. Every assertion about
+    /// these two segments passed, because each was measured on its own.
+    ///
+    /// Fragments are also how an *overrun* shows up here, and deliberately the
+    /// only way it can: the frame buffer is the area's width by construction,
+    /// so a line that asked for more was already truncated by the time it can
+    /// be read back, and `inner.len() <= width` is a fact about `ratatui`
+    /// rather than about this code. What a truncation leaves behind is a
+    /// partial word at the end of the line, which is what is asserted.
+    #[test]
+    fn neither_count_line_segment_can_clip_the_other_into_a_fragment() {
+        let mut app = fixture_app();
+        app.liveness = crate::liveness::Liveness::for_test(
+            &[],
+            &[("blooop/wayfinder", 9), ("blooop/wayfinder", 14)],
+        );
+        app.reclaimable = Some(Reclaimable::for_test(
+            &["devlaunch-github-blooop-wayfinder-127-ladepomi", "wf-80-x"],
+            1,
+        ));
+        for width in 40..=130u16 {
+            let screen = render_at(width, &app);
+            let line = screen.lines().nth(2).expect("a count line");
+            let inner: String = line.chars().skip(1).take(width as usize - 2).collect();
+            // A word or nothing. Any proper prefix of "reclaimable"/"stalled"
+            // left at the end of the line is the fragment this exists to catch.
+            // From one character: `· 2 r` is as wrong as `· 2 reclaima`, and no
+            // segment ends in a letter that could be mistaken for one — the
+            // names end in digits, the asides in `)`, the pointer in `p`.
+            for whole in ["reclaimable", "stalled"] {
+                for cut in 1..whole.len() {
+                    let fragment = &whole[..cut];
+                    assert!(
+                        !inner.trim_end().ends_with(fragment),
+                        "{width}: {whole:?} was clipped to {fragment:?}: {:?}",
+                        inner.trim_end()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_first_frame_says_nothing_about_reclaimable_workspaces() {
+        // The reading is a `dl` subprocess and a GraphQL call behind the
+        // screen. Until it lands — and forever, if it failed or found nothing —
+        // the picker looks exactly as it did before #137.
+        let app = fixture_app();
+        assert_eq!(app.reclaimable, None, "nothing has been read yet");
+        let screen = render(&app);
+        assert!(
+            !screen.contains("reclaimable"),
+            "the picker must not mention a reading it has not got: {screen}"
+        );
+    }
+
+    #[test]
+    fn the_count_line_names_what_a_reap_would_claim_once_the_reading_lands() {
+        // A count alone cannot be judged, so the segment names the workspaces
+        // and the command that acts on them. Nothing here deletes anything —
+        // the whole feature is this sentence.
+        let mut app = fixture_app();
+        app.reclaimable = Some(Reclaimable::for_test(&["ws-a", "ws-b"], 0));
+        let screen = render(&app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("reclaimable"))
+            .unwrap_or_else(|| panic!("the count line says so: {screen}"));
+        assert!(line.contains("2 reclaimable"), "{line}");
+        assert!(line.contains("ws-a"), "{line}");
+        assert!(line.contains("ws-b"), "{line}");
+        assert!(line.contains("wf reap"), "{line}");
+    }
+
+    #[test]
+    fn a_warned_workspace_is_never_drawn_as_reclaimable() {
+        // #128's posture, at the last place it could be lost: the warned count
+        // is an aside, and the leading number is the doomed set's alone.
+        let mut app = fixture_app();
+        app.reclaimable = Some(Reclaimable::for_test(&["ws-a"], 2));
+        let screen = render(&app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("reclaimable"))
+            .unwrap_or_else(|| panic!("the count line says so: {screen}"));
+        assert!(line.contains("1 reclaimable"), "{line}");
+        assert!(line.contains("+2 to check by hand"), "{line}");
+    }
+
+    #[test]
+    fn the_count_line_keeps_the_command_when_the_names_are_real_ones() {
+        // `ws-a` fits anywhere and proves nothing. A `dl` workspace id is ~40
+        // characters, and three of them written out unconditionally push the
+        // aside and the `wf reap` pointer past the right edge of an
+        // 80-column terminal — leaving a segment that names workspaces and
+        // says nothing about what to do with them.
+        let mut app = fixture_app();
+        app.reclaimable = Some(Reclaimable::for_test(
+            &[
+                "devlaunch-github-com-blooop-wayfinder-129",
+                "devlaunch-github-com-blooop-wayfinder-127",
+                "devlaunch-github-com-blooop-wayfinder-80x",
+            ],
+            1,
+        ));
+        for width in [80, 100, 120] {
+            let screen = render_at(width, &app);
+            let line = screen
+                .lines()
+                .find(|line| line.contains("reclaimable"))
+                .unwrap_or_else(|| panic!("{width}: the count line says so: {screen}"));
+            assert!(line.contains("3 reclaimable"), "{width}: {line}");
+            assert!(
+                line.contains("(+1 to check by hand)"),
+                "{width}: the aside is never what gets clipped: {line}"
+            );
+            assert!(
+                line.contains("wf reap"),
+                "{width}: nor is the command: {line}"
+            );
+            assert!(
+                line.contains("129"),
+                "{width}: and a workspace is still named: {line}"
+            );
+        }
+    }
+
     #[test]
     fn idle_maps_drop_to_the_count_line_and_tab_brings_them_back() {
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
+        // A second map of the *same* project: a screen is one repo's, so an
+        // idle map has to be one of this repo's to be dropped from it.
         clusters.insert(
-            MapId::new("blooop/dotfiles", 4),
+            MapId::new("blooop/wayfinder", 4),
             Map {
-                title: "Map: dotfiles".to_string(),
+                title: "Map: the archive".to_string(),
                 last_activity: None,
                 tickets: vec![ticket(
-                    "blooop/dotfiles",
+                    "blooop/wayfinder",
                     103,
                     "All done here",
                     false,
@@ -1117,17 +1788,20 @@ mod tests {
                 )],
             },
         );
-        let mut app = App::new(clusters);
+        let mut app = app_on("blooop/wayfinder", clusters);
         let screen = render(&app);
         assert!(
-            !screen.contains("▌ dotfiles"),
+            !screen.contains("Map: the archive"),
             "an idle map leaves the body: {screen}"
         );
         assert!(screen.contains("· 1 idle map hidden"), "{screen}");
         // The forest is the escape hatch: everything renders there.
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let screen = render(&app);
-        assert!(screen.contains("▌ dotfiles · Map: dotfiles"), "{screen}");
+        assert!(
+            screen.contains("▌ wayfinder · Map: the archive"),
+            "{screen}"
+        );
         assert!(!screen.contains("idle map"), "{screen}");
     }
 
@@ -1152,7 +1826,7 @@ mod tests {
                 )],
             },
         );
-        let app = App::new(clusters);
+        let app = app_on("blooop/wayfinder", clusters);
         let screen = render(&app);
         let first = screen
             .find("▌ wayfinder · Map: wf")
@@ -1176,12 +1850,12 @@ mod tests {
         // of the keys that would have put it there are deliberately set here.
         let mut clusters = BTreeMap::new();
         clusters.insert(
-            MapId::new("blooop/archive", 1),
+            MapId::new("blooop/wayfinder", 1),
             Map {
-                title: "Map: archive".to_string(),
+                title: "Map: the archive".to_string(),
                 last_activity: Activity::parse("2026-08-06T12:00:00Z"),
                 tickets: vec![ticket(
-                    "blooop/archive",
+                    "blooop/wayfinder",
                     88,
                     "Shipped last week",
                     false,
@@ -1205,7 +1879,7 @@ mod tests {
                 )],
             },
         );
-        let mut app = App::new(clusters);
+        let mut app = app_on("blooop/wayfinder", clusters);
         // The forest, because that is the screen a finished map appears on at
         // all — leverage drops it as idle.
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -1214,7 +1888,7 @@ mod tests {
             .find("▌ wayfinder · Map: the selection view")
             .expect("the live cluster");
         let finished = screen
-            .find("▌ archive · Map: archive")
+            .find("▌ wayfinder · Map: the archive")
             .expect("the finished cluster");
         assert!(
             live < finished,
@@ -1240,8 +1914,11 @@ mod tests {
         assert!(screen.contains("> █"));
         assert!(screen.contains("enter launch"));
         assert!(screen.contains("tab structure"));
-        assert!(screen.contains("ctrl-r refresh"));
         assert!(screen.contains("esc quit"));
+        // The hint bar names only keys that do something. The refresh chord
+        // used to sit between `tab structure` and `esc quit`; it is unbound
+        // now, and a hint outliving its binding is a screen telling a lie.
+        assert!(!screen.contains("refresh"), "{screen}");
         assert!(screen.contains("wf · blooop/wayfinder"));
     }
 
@@ -1258,11 +1935,15 @@ mod tests {
         assert!(lines[2].contains("5/5"), "{screen}");
         // The body follows, still opening on its own blank spacer line — which
         // now reads as the gap between the chrome and the first cluster.
+        // The project row leads the body, with the spacer that separates it
+        // from the first cluster — so the cluster header is two lines further
+        // down than it was when the body opened straight onto it.
+        assert!(lines[4].contains("▌ blooop/wayfinder"), "{screen}");
         let header = lines
             .iter()
             .position(|l| l.contains("▌ wayfinder · Map: wf"))
             .expect("cluster header on screen");
-        assert_eq!(header, 4, "{screen}");
+        assert_eq!(header, 6, "{screen}");
         assert!(
             lines[lines.len() - 2].contains("enter launch"),
             "hints stay on the last line: {screen}"
@@ -1386,7 +2067,7 @@ mod tests {
         ));
         let mut clusters = BTreeMap::new();
         clusters.insert(MapId::new("blooop/wayfinder", 1), map);
-        let mut app = App::new(clusters);
+        let mut app = app_on("blooop/wayfinder", clusters);
         type_str(&mut app, "choose");
         let screen = render(&app);
         assert!(screen.contains("▾ ● 1 of 2 done"), "{screen}");
@@ -1440,9 +2121,11 @@ mod tests {
     /// The fixture map plus Build 4 launch inputs: two checkouts of the repo,
     /// so `enter` opens the which-checkout picker.
     fn launchable_app() -> App {
-        let checkout = |path: &str| crate::projects::Checkout {
-            path: std::path::PathBuf::from(path),
-            repo: "blooop/wayfinder".to_string(),
+        let checkout = |path: &str| {
+            crate::projects::Checkout::new(
+                std::path::PathBuf::from(path),
+                "blooop/wayfinder".to_string(),
+            )
         };
         fixture_app().with_checkouts(vec![
             checkout("/data/k1/wayfinder"),
@@ -1451,11 +2134,21 @@ mod tests {
     }
 
     #[test]
-    fn the_hint_line_advertises_the_one_launch_key_and_no_afk() {
+    fn the_hint_line_is_the_levels_and_advertises_no_afk() {
         let screen = render(&fixture_app());
-        assert!(screen.contains("enter launch"));
+        assert!(screen.contains("enter launch"), "{screen}");
+        assert!(screen.contains("← back"), "{screen}");
         assert!(!screen.contains("ctrl-a"), "{screen}");
         assert!(!screen.contains("afk"), "{screen}");
+
+        // On the list there is nothing to launch, nothing to descend into and
+        // nowhere further back — so the line says none of those.
+        let mut app = fixture_app();
+        app.level = crate::app::Level::Projects;
+        let screen = render(&app);
+        assert!(screen.contains("enter open"), "{screen}");
+        assert!(!screen.contains("← back"), "{screen}");
+        assert!(!screen.contains("tab structure"), "{screen}");
     }
 
     #[test]
@@ -1468,6 +2161,7 @@ mod tests {
     #[test]
     fn the_checkout_picker_floats_over_the_list_with_one_row_per_tree() {
         let mut app = launchable_app();
+        down(&mut app, 2); // past the project row and the cluster header, onto #6
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // stage
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // resolve
         let screen = render(&app);
@@ -1481,15 +2175,58 @@ mod tests {
     }
 
     #[test]
+    fn a_project_picker_draws_the_creation_rows_with_their_own_skills() {
+        // Creation is an act on a repo, so the rows live on the one stop that
+        // is a repo — and every row still names the skill it execs, including
+        // the ones that launch no node.
+        let mut app = fixture_app();
+        assert!(
+            matches!(app.cursor_stop(), Some(crate::view::Stop::Project(_))),
+            "the project row is where an untouched cursor already is"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("new task"), "{screen}");
+        assert!(screen.contains("/wf-one"), "{screen}");
+        assert!(screen.contains("one tracked ticket"), "{screen}");
+        assert!(screen.contains("new map"), "{screen}");
+        assert!(screen.contains("new map, auto"), "{screen}");
+        // The field is named for the row it fills: `task` on the first one,
+        // which is the only thing telling you the text is not steering.
+        assert!(screen.contains("task"), "{screen}");
+        // Nothing to launch here, so no launch row names a mode.
+        assert!(!screen.contains("interactive"), "{screen}");
+    }
+
+    #[test]
+    fn a_ticket_picker_draws_no_creation_rows() {
+        // The other half of the rule: a ticket is not a repo-level stop, so
+        // its picker is the three modes and nothing else.
+        let app = {
+            let mut app = fixture_app();
+            down(&mut app, 2); // past the project row and the cluster header
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            app
+        };
+        let screen = render(&app);
+        assert!(screen.contains("interactive"), "{screen}");
+        assert!(!screen.contains("new task"), "{screen}");
+        assert!(!screen.contains("new map"), "{screen}");
+    }
+
+    #[test]
     fn enter_opens_the_launch_picker_over_the_screen_with_every_mode_on_it() {
         let mut app = fixture_app();
 
         // Enter on #6 (a task at ready): the picker floats over the list,
         // titled with the node it launches.
+        down(&mut app, 2); // past the project row and the cluster header
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let screen = render(&app);
+        // The repo leads the title (#114): it is the one fact every row shares
+        // once a header's rows can start something new in it.
         assert!(
-            screen.contains("launch #6 Re-entry breadcrumbs"),
+            screen.contains("launch Claude · blooop/wayfinder · #6 Re-entry breadcrumbs"),
             "{screen}"
         );
         // Every mode is on screen with the skill each one would run, because
@@ -1507,7 +2244,19 @@ mod tests {
         assert!(screen.contains("claude"), "{screen}");
         assert!(screen.contains("no skill"), "{screen}");
         assert!(screen.contains("steer"), "{screen}");
+        assert!(screen.contains("←/→ agent"), "{screen}");
         assert!(screen.contains("esc cancel"), "{screen}");
+
+        // Horizontal movement changes the agent named in the title and the
+        // invocation syntax together; the vertically selected mode stays put.
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(
+            screen.contains("launch Codex · blooop/wayfinder · #6 Re-entry breadcrumbs"),
+            "{screen}"
+        );
+        assert!(screen.contains("$wf "), "{screen}");
+        assert!(screen.contains("$wf-auto"), "{screen}");
 
         // Down moves the pick; the marker moves with it and nothing about the
         // route line is stale, since each row draws its own.
@@ -1535,7 +2284,8 @@ mod tests {
         // Esc closes it and gives the whole screen back.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let screen = render(&app);
-        assert!(!screen.contains("launch #6"), "{screen}");
+        assert!(!screen.contains("launch Claude"), "{screen}");
+        assert!(!screen.contains("launch Codex"), "{screen}");
         assert!(screen.contains("5/5"), "{screen}");
     }
 
@@ -1543,10 +2293,16 @@ mod tests {
     fn the_first_frame_says_it_is_loading_rather_than_that_there_is_nothing() {
         // The whole point of #27: this screen is drawn before any network call,
         // so its empty list must not read as "no tickets" or "no projects".
-        let screen = render(&App::empty());
+        let mut app = App::empty();
+        app.enter("blooop/wayfinder");
+        let screen = render(&app);
         assert!(screen.contains("searching for maps…"), "{screen}");
-        assert!(screen.contains("wf · loading…"), "{screen}");
-        assert!(!screen.contains("no projects"), "{screen}");
+        // The screen is this project's from the first frame — the level came
+        // from a local `git` call, not from the fetch — and its row says the
+        // maps are still coming rather than that there are none.
+        assert!(screen.contains("wf · blooop/wayfinder"), "{screen}");
+        assert!(screen.contains("▌ blooop/wayfinder · loading…"), "{screen}");
+        assert!(!screen.contains("no map"), "{screen}");
     }
 
     #[test]
@@ -1556,13 +2312,22 @@ mod tests {
         // checkout" there sends the user to fix the one thing that is not
         // broken, so the failure has to win the heading — and it names the
         // *map*, because with several on one repo the repo alone is ambiguous.
-        let mut app = App::empty();
+        let mut app = App::empty().with_checkouts(vec![
+            crate::projects::Checkout::new(
+                std::path::PathBuf::from("/data/proj/wayfinder"),
+                "blooop/wayfinder".to_string(),
+            ),
+            crate::projects::Checkout::new(
+                std::path::PathBuf::from("/data/proj/dotfiles"),
+                "blooop/dotfiles".to_string(),
+            ),
+        ]);
         app.startup = Startup::loaded();
         app.failed.insert(MapId::new("blooop/wayfinder", 35));
         let screen = render(&app);
         assert!(!screen.contains("no projects"), "{screen}");
         assert!(
-            screen.contains("blooop/wayfinder#35 — fetch failed, ctrl-r retries"),
+            screen.contains("blooop/wayfinder#35 — fetch failed, run wf again"),
             "{screen}"
         );
 
@@ -1673,30 +2438,72 @@ mod tests {
                 )],
             },
         );
-        let mut app = App::new(clusters);
+        let mut app = app_on("blooop/wayfinder", clusters);
         for _ in 0..40 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         assert_eq!(app.cursor_ticket().unwrap().number, 50);
         let screen = render(&app);
         assert!(screen.contains("▶ ○ #50 Build: clusters"), "{screen}");
-        // And with the cursor back at the top — the first cluster's header,
-        // since #96 — the top is what shows.
+        // And with the cursor back at the top — the project's own row, which
+        // is the first stop of its screen — the top is what shows.
         for _ in 0..40 {
             app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         }
         let screen = render(&app);
-        assert!(screen.contains("▶ ▌ wayfinder · Map: wf"), "{screen}");
+        assert!(screen.contains("▶ ▌ blooop/wayfinder"), "{screen}");
         assert!(screen.contains("○ #1 Open 1"), "{screen}");
     }
 
     #[test]
-    fn focus_mode_names_the_scope_in_the_title() {
-        let mut app = fixture_app();
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    fn the_project_list_draws_a_row_per_project_with_what_is_inside_it() {
+        // The top-level screen: full slugs (two forks of one repo have the same
+        // short name and sit next to each other here), most recently used
+        // first, each saying how much is inside it in the same glyph vocabulary
+        // the rows below use.
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
+        let stamped = |path: &str, repo: &str, at: u64| crate::projects::Checkout {
+            path: std::path::PathBuf::from(path),
+            repo: repo.to_string(),
+            used: Some(at),
+        };
+        let mut app = App::new(clusters).with_checkouts(vec![
+            stamped("/data/proj/wayfinder", "blooop/wayfinder", 200),
+            stamped("/data/proj/newthing", "blooop/newthing", 100),
+        ]);
+        app.startup = Startup::loaded();
         let screen = render(&app);
-        assert!(screen.contains("wf · blooop/wayfinder — focused"));
-        assert!(screen.contains("ctrl-g all projects"));
-        assert!(screen.contains("▶ ○ #6 Re-entry breadcrumbs"));
+        assert!(screen.contains("wf · 2 projects"), "{screen}");
+        assert!(
+            !screen.contains("← all projects"),
+            "nowhere further out to go"
+        );
+
+        let lines: Vec<&str> = screen.lines().collect();
+        let wayfinder = lines
+            .iter()
+            .position(|l| l.contains("▌ blooop/wayfinder · 1 map"))
+            .expect("the mapped project");
+        let newthing = lines
+            .iter()
+            .position(|l| l.contains("▌ blooop/newthing · no map — enter to start one"))
+            .expect("the map-less project — a row here like any other");
+        assert!(wayfinder < newthing, "most recently used first: {screen}");
+        // The counts are the map's, in the glyphs the rows use.
+        assert!(lines[wayfinder].contains("○1"), "{screen}");
+        // And no ticket got onto this screen.
+        assert!(!screen.contains("#6 Re-entry breadcrumbs"), "{screen}");
+    }
+
+    #[test]
+    fn a_project_screen_names_its_project_and_the_way_back() {
+        let screen = render(&fixture_app());
+        assert!(screen.contains("wf · blooop/wayfinder"), "{screen}");
+        // The way back is named on the screen it applies to, and it is the key
+        // that does it — the chords that used to focus and widen are gone.
+        assert!(screen.contains("← all projects"), "{screen}");
+        assert!(!screen.contains("ctrl-f"), "{screen}");
+        assert!(!screen.contains("ctrl-g"), "{screen}");
     }
 }

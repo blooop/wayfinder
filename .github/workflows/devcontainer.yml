@@ -1,0 +1,88 @@
+name: Devcontainer image
+
+# Publishes the image every `dl blooop/wayfinder@<branch>` boots from, so that
+# the pinned `gh`, `zellij` and agent-CLI downloads in `.devcontainer/Dockerfile`
+# are paid for once here instead of once per branch on every developer's machine.
+# The crate build was never the cost — a cold `cargo build` is 9 seconds
+# (blooop/wayfinder#39) — which is why this publishes a thin image and warms no
+# cargo cache at all (blooop/wayfinder#38, reaffirmed on #43).
+#
+# The fourth workflow, and separate for the same reason the other three are:
+# `ci.yml` answers "is this commit sound" with nothing but a compiler,
+# `package.yml` proves the recipe installs, `devlaunch-contract.yml` runs against
+# a real `dl`. This one talks to a registry and is the only one that writes a
+# package, so a failure here means "the image did not publish" and nothing else.
+#
+# Plain `docker build`, deliberately not `devpod build`: nothing in this
+# devcontainer uses devcontainer *features*, so there is no metadata for a
+# devcontainer-aware builder to bake in, and a plain build is one less tool that
+# has to be installed and understood to read this file.
+on:
+  # A push to main that actually touched the devcontainer. The image's inputs are
+  # all in that directory, so any other push would republish identical content.
+  push:
+    branches: [main]
+    paths:
+      - ".devcontainer/**"
+
+  # By hand, which is not a nicety: the Actions outage of 2026-08-06
+  # (blooop/wayfinder#79) dropped webhook deliveries and three merges to main ran
+  # nothing at all. A missed run here leaves every workspace booting a stale tag,
+  # and nothing announces that — this is how you re-fire it without an empty
+  # commit. It is also the way to rebuild after a base-image security update,
+  # which changes the image without changing this repository.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devcontainer-${{ github.ref }}
+  # There is one mutable tag, so two runs racing to write it is the one thing
+  # worth preventing: the winner would be whichever finished last, not whichever
+  # commit is newer.
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: build + push (latest)
+    runs-on: ubuntu-latest
+    # On the job, not on the workflow, following `package.yml`: the only thing in
+    # this repository that can write to the package registry is the job below,
+    # and any job added to this file later starts read-only unless it says
+    # otherwise in its own block.
+    permissions:
+      contents: read
+      packages: write # push the image to ghcr.io
+    steps:
+      - uses: actions/checkout@v7
+
+      # Before the build, so a credential problem fails in two seconds rather
+      # than after the whole image has been built.
+      - name: Log in to ghcr.io
+        # Through step `env:` rather than `${{ }}` rendered into the script,
+        # following `package.yml`: the token never appears in a command line or
+        # a process listing (`echo` is a builtin, the login reads stdin).
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" \
+            | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      # The context is `.devcontainer`, not the repo root — the Dockerfile copies
+      # nothing out of the context, so the root would only send `target/` to the
+      # daemon for no reason. The devcontainer configs make the same choice for a
+      # harder reason (devpod's 5000-file context hash limit); this keeps all
+      # three building the same thing from the same directory.
+      #
+      # One tag, `latest`, and it is mutable on purpose: the devcontainer configs
+      # name a tag rather than a digest, so a workspace gets whatever is newest
+      # without anything in the repository having to be edited on every publish.
+      # A test holds this tag and the one the configs boot from to be the same
+      # string (tests/devcontainer_prebuild.rs).
+      - name: Build the image
+        run: docker build -t ghcr.io/blooop/wayfinder-devcontainer:latest .devcontainer
+
+      - name: Push it
+        run: docker push ghcr.io/blooop/wayfinder-devcontainer:latest

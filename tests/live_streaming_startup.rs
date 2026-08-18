@@ -38,6 +38,7 @@ fn scratch_cache(tag: &str) -> PathBuf {
 }
 
 #[tokio::test]
+#[ignore = "live: needs network + gh; asserts wall-clock budgets"]
 async fn discovery_then_every_map_arrives_through_one_channel() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let cache_path = scratch_cache("discovery");
@@ -52,7 +53,11 @@ async fn discovery_then_every_map_arrives_through_one_channel() {
             // The search retries, so a blip is survivable rather than fatal:
             // go round and wait for the next event.
             LoadEvent::SearchFailed => {}
-            other @ LoadEvent::Fetched { .. } => {
+            // Named rather than `_`, so a seventh kind of arrival is a compile
+            // error here and a decision someone makes — this file runs only
+            // after a merge (`live.yml`), which would make a wildcard in it
+            // the slowest-observed thing in the tree.
+            other @ (LoadEvent::Fetched { .. } | LoadEvent::Surveyed { .. }) => {
                 panic!("expected discovery first, got {other:?}")
             }
         }
@@ -100,6 +105,7 @@ async fn discovery_then_every_map_arrives_through_one_channel() {
 }
 
 #[tokio::test]
+#[ignore = "live: needs network + gh; asserts wall-clock budgets"]
 async fn a_cached_seed_fetches_the_map_without_waiting_for_the_search() {
     // The #28 claim, end to end: with the map id already in hand, the map
     // itself lands in one round trip — no ~2.5s search in front of it.
@@ -131,6 +137,7 @@ async fn a_cached_seed_fetches_the_map_without_waiting_for_the_search() {
 }
 
 #[tokio::test]
+#[ignore = "live: needs network + gh; asserts wall-clock budgets"]
 async fn a_stale_seed_reports_failure_and_is_replaced_by_the_search() {
     // A cached id that no longer names a map — here `#2`, a closed sub-issue
     // that exists and is not a map, which is refused for either reason alone.
@@ -174,52 +181,7 @@ async fn a_stale_seed_reports_failure_and_is_replaced_by_the_search() {
 }
 
 #[tokio::test]
-async fn restarting_the_loaders_refetches_and_cannot_be_beaten_by_the_load_it_replaced() {
-    // `ctrl-r`'s path. It goes through `Loaders` rather than fetching alongside
-    // them for one reason: a refetch started at t₁ and a load started at t₀ < t₁
-    // both write the same map's cluster, and the *older* one can land second.
-    // Nothing polls any more, so that stale map would be the last word. Every
-    // result reaching the UI through one channel in send order is what makes
-    // the newest write win, and that is what this pins.
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let live = common::a_live_map().await;
-    let seed: MapSet = [live.clone()].into_iter().collect();
-
-    let mut loaders = Loaders::new();
-    loaders.reconcile(&seed, &tx);
-    match next(&mut rx).await {
-        LoadEvent::Fetched {
-            outcome: MapFetch::Loaded(_),
-            ..
-        } => {}
-        other => panic!("the initial load must land first, got {other:?}"),
-    }
-
-    // The refresh: same map, and it must fetch again rather than skip a map it
-    // has already loaded — the `continue` in `reconcile` is exactly what
-    // `restart` exists to get past.
-    loaders.restart(&seed, &tx);
-    assert_eq!(loaders.targets(), seed);
-    match next(&mut rx).await {
-        LoadEvent::Fetched {
-            id,
-            outcome: MapFetch::Loaded(map),
-        } => {
-            assert_eq!(id, live);
-            assert!(!map.tickets.is_empty());
-        }
-        other => panic!("ctrl-r must refetch, got {other:?}"),
-    }
-
-    // And the channel is empty: exactly one result per load, so no third event
-    // is queued behind the refresh waiting to overwrite it.
-    assert!(
-        rx.try_recv().is_err(),
-        "a superseded load must not still be queued to clobber the refresh"
-    );
-}
-
-#[tokio::test]
+#[ignore = "live: needs network + gh; asserts wall-clock budgets"]
 async fn shutdown_leaves_nothing_in_flight() {
     // The launch path awaits this immediately before `exec`. An in-flight `gh`
     // that outlives the exec is inherited by the agent as a zombie holding its
