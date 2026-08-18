@@ -564,24 +564,45 @@ pub async fn run_picker() -> Result<()> {
     }
 }
 
-/// Bring the installed skill copies back in step with the bundle they were
-/// installed from.
+/// Bring the installed skills back in step with the bundle they were installed
+/// from — their contents, and which of them this machine has links for at all.
 ///
 /// Best-effort, and deliberately silent when there is nothing to do: a machine
 /// with no home directory to resolve, and one that never ran
-/// `wf skills install`, are not worth a word on the way into an agent. A copy
-/// that could not be *written* is different — the agent is about to run a
-/// prompt that is not the one that was installed — so that one is said out
-/// loud.
+/// `wf skills install`, are not worth a word on the way into an agent. Two
+/// things are worth one. A copy that could not be *written*, because the agent
+/// is then about to run a prompt that is not the one that was installed. And a
+/// link that had to be *created*, because that means this launch changed which
+/// prompts this machine has — the thing that used to happen only at an install
+/// somebody typed, and that a release's worth of launches did silently not do
+/// (#170).
 fn refresh_skills(agent: Agent) {
     let Ok(target) = skills::Target::resolve(agent) else {
         return;
     };
-    if let Err(err) = skills::refresh(&target) {
-        eprintln!(
+    match skills::refresh(&target) {
+        Err(err) => eprintln!(
             "wf: could not refresh the {} skills: {err:#}",
             agent.label()
-        );
+        ),
+        Ok(healed) => {
+            for (name, what) in healed {
+                match what {
+                    // The errand every launch runs; saying so would be noise.
+                    skills::Healed::Copied => {}
+                    skills::Healed::Linked { was: None } => eprintln!(
+                        "wf: linked the {name} skill for {}, which this build \
+                         ships and this machine had no link for",
+                        agent.label()
+                    ),
+                    skills::Healed::Linked { was: Some(old) } => eprintln!(
+                        "wf: repointed the {name} skill for {}, which still linked to {}",
+                        agent.label(),
+                        old.display()
+                    ),
+                }
+            }
+        }
     }
 }
 

@@ -108,8 +108,20 @@ links   /home/you/.codex/skills
 copy    /home/you/.codex/wf-skills (what the links point at)
 ```
 
+What a launch brings back in step is the **set** of skills as well as their
+contents. A skill gets a link when this build ships it *and* the source the copy
+was made from carries it — both, because the link has to name something and the
+prompt behind it comes from that source, not from the build doing the launching.
+For a package install those are the same thing, so a release that adds a skill
+adds it here. A link `wf` wrote that still points into a package prefix — the
+shape that resolves on your host and dangles in the container — is repointed at
+the copy. So `pixi global update wf` is the whole update, with no
+`wf skills install` to remember afterwards. Creating a link is worth a line on
+stderr, because a launch that silently did not was how that lasted a release.
+
 `wf` never deletes a real directory it did not create — if chezmoi or a
 hand-edit owns one, it says so and leaves it, and the other four still install.
+A link it cannot prove it wrote is left alone the same way, healed by nothing.
 Set `WF_SKILLS_DIR` to install a checkout's prompts instead of the package's,
 which is what you want while you are editing them: the copy **remembers where it
 was made from**, so every launch re-copies from your working tree and an edit is
