@@ -1044,6 +1044,15 @@ mod tests {
             PathBuf::from(format!("../{MIRROR}/wf-one")),
             "a healed link is the same relative shape install writes"
         );
+        // Healing once is healing: the link just written reads as this build's
+        // own to the launch after it, so nothing is relinked and no launch
+        // reports work it did not do. Asserted *here*, while the recorded
+        // source is still on disk — past the removal below `refresh` returns
+        // early and would say this of any state at all, healed or wrecked.
+        assert!(
+            refresh(&target).expect("refresh").is_empty(),
+            "the launch after that has nothing left to heal"
+        );
 
         // Which is the whole reason to heal it here rather than anywhere else:
         // it has to resolve as the container reads it, with no bundle and no
@@ -1054,10 +1063,6 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(container.join("skills/wf-one/SKILL.md")).expect("the prompt"),
             "---\n---\nthe new skill\n"
-        );
-        assert!(
-            refresh(&target).expect("refresh").is_empty(),
-            "and the launch after that has nothing left to heal"
         );
     }
 

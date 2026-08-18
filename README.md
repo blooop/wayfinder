@@ -109,13 +109,14 @@ copy    /home/you/.codex/wf-skills (what the links point at)
 ```
 
 What a launch brings back in step is the **set** of skills as well as their
-contents. A skill this build ships that the launched agent's skills directory
-has no link for gets one, and a link `wf` wrote that still points into a package
-prefix — the
+contents. A skill gets a link when this build ships it *and* the source the copy
+was made from carries it — both, because the link has to name something and the
+prompt behind it comes from that source, not from the build doing the launching.
+For a package install those are the same thing, so a release that adds a skill
+adds it here. A link `wf` wrote that still points into a package prefix — the
 shape that resolves on your host and dangles in the container — is repointed at
-the copy. So `pixi global update wf` is the whole update: there is no
-`wf skills install` to remember, and no release where a skill exists everywhere
-except on the machine you are launching from. Creating a link is worth a line on
+the copy. So `pixi global update wf` is the whole update, with no
+`wf skills install` to remember afterwards. Creating a link is worth a line on
 stderr, because a launch that silently did not was how that lasted a release.
 
 `wf` never deletes a real directory it did not create — if chezmoi or a
