@@ -33,7 +33,8 @@
 //! resolves under both home directories. The copy is then the thing this module
 //! has to keep honest, and it does that in three places rather than trusting it:
 //! [`install`] rewrites it and records where it came from, [`refresh`] brings it
-//! back in step with *that* source at every launch, and [`status`] reports it as
+//! back in step with *that* source at every launch — links and all, so a build
+//! that ships a new skill needs no second command — and [`status`] reports it as
 //! [`State::Outdated`] when it has drifted — so a stale copy is something that
 //! gets *seen*, rather than a prompt that quietly runs a release behind.
 
@@ -546,8 +547,26 @@ pub fn install(bundle: &Bundle, target: &Target) -> Result<Vec<(String, Outcome)
     Ok(done)
 }
 
-/// Bring the copies back in step with the bundle they were installed from, and
-/// name the ones that moved.
+/// What a launch put right on one skill's behalf — reported rather than
+/// printed, for the same reason [`Outcome`] is: the caller owns the wording.
+///
+/// The distinction is which of the two is worth interrupting a launch to say.
+/// Rewriting a copy is the errand [`refresh`] runs every time and would be
+/// noise; creating a link changes *which prompts this machine has*, and a
+/// release went by with that happening never rather than silently, which is
+/// the same kind of invisible (#170).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Healed {
+    /// The copy behind an existing link was rewritten from the recorded source.
+    Copied,
+    /// A link was created, or repointed from `was` — a link `wf` could prove it
+    /// wrote itself.
+    Linked { was: Option<PathBuf> },
+}
+
+/// Bring the installed skills back in step with the bundle they were installed
+/// from — their contents *and* which of them this machine has links for at all
+/// — and name what moved.
 ///
 /// This is what keeps "a copy" from meaning "a copy that goes stale". `wf` is
 /// the thing that launches the agent, so the copy is rewritten by the very
@@ -556,37 +575,86 @@ pub fn install(bundle: &Bundle, target: &Target) -> Result<Vec<(String, Outcome)
 /// the next session exactly as it was when the link pointed at the checkout
 /// itself.
 ///
+/// The *set* is kept in step for the same reason the contents are, and it was
+/// the larger hole. A skill a new build ships is one no install on this machine
+/// ever saw, so a launch that considered only links already pointing at the
+/// copy skipped it forever, and `pixi global update wf` rewrites the bundle in the
+/// prefix while writing nothing under `~/.claude` that could notice. The report
+/// that closed it: update, launch into a devcontainer, `Unknown command:
+/// /wf-one` — with nothing anywhere to connect the two (#170). So a link that
+/// is *missing* is created, and a stale one is repointed only where its target
+/// proves `wf` wrote it — the same test [`sweep`] removes links by, which is
+/// what makes the pre-#110 link into the prefix safe to reclaim and a link
+/// somebody else left impossible to touch.
+///
 /// Its source is [`installed_from`] and **not** this build's bundle, which is
 /// the difference between refreshing and overwriting: a `WF_SKILLS_DIR` install
 /// is a choice about which prompts run, and an ordinary launch has no standing
-/// to undo it.
+/// to undo it — nor may healing a link become the loophole that does, so a link
+/// created here points at a copy of the recorded source like every other.
 ///
-/// Nothing is touched unless there is something to keep in step: a machine that
-/// never ran `wf skills install`, a link chezmoi owns, or a recorded source that
-/// has since been deleted all leave the copy exactly as it is — a prompt one
-/// release behind still beats no prompt at all.
+/// Nothing else is touched: a machine that never ran `wf skills install`, a
+/// directory chezmoi owns, a link pointing somewhere `wf` never links, and a
+/// recorded source that has since been deleted are all left exactly as they are
+/// — a prompt one release behind still beats no prompt at all, and a name that
+/// is not `wf`'s is not `wf`'s to take.
 ///
 /// # Errors
 ///
-/// When a copy cannot be rewritten.
-pub fn refresh(target: &Target) -> Result<Vec<String>> {
+/// When a copy cannot be rewritten, or a link cannot be created.
+pub fn refresh(target: &Target) -> Result<Vec<(String, Healed)>> {
     let Some(bundle) = installed_from(target).filter(|source| source.is_dir()) else {
         return Ok(Vec::new());
     };
-    let mut refreshed = Vec::new();
+    let mut healed = Vec::new();
     for name in BUNDLED {
         let source = bundle.join(name);
         let copy = target.mirror.join(name);
-        if !source.is_dir() || link_state(name, &target.links.join(name)) != Link::Current {
+        let link = target.links.join(name);
+        if !source.is_dir() {
             continue;
         }
-        if same_tree(&source, &copy) {
-            continue;
+        // What the link needs, if anything. `None` leaves it exactly as it is;
+        // `Some(was)` writes it, carrying whatever it displaced.
+        let relink = match link_state(name, &link) {
+            Link::Current => None,
+            Link::Missing => Some(None),
+            // Repointed only where `is_ours` can *prove* `wf` wrote it, which
+            // is the whole permission argument: it covers the absolute link
+            // into the package prefix every `wf` before #110 wrote — the one
+            // that resolves on the host and dangles in the container — and it
+            // can never match a link somebody else left, however dead it looks.
+            Link::Stale(points_at) if is_ours(&points_at, &bundle) => Some(Some(points_at)),
+            Link::Stale(_) | Link::Unmanaged => continue,
+        };
+        // Always the copy before the link, so a link this function creates
+        // never points at a prompt that is not there yet.
+        let copy_moved = !same_tree(&source, &copy);
+        if copy_moved {
+            recopy(&source, &copy)?;
         }
-        recopy(&source, &copy)?;
-        refreshed.push(name.to_string());
+        match relink {
+            Some(was) => {
+                // `create_dir_all` because the links directory is Claude Code's
+                // rather than `wf`'s: a machine that installed once can have
+                // had it removed since, and a launch that cannot link is the
+                // failure this is all here to stop.
+                std::fs::create_dir_all(&target.links)
+                    .with_context(|| format!("cannot create {}", target.links.display()))?;
+                if was.is_some() {
+                    std::fs::remove_file(&link)
+                        .with_context(|| format!("cannot replace the link {}", link.display()))?;
+                }
+                std::os::unix::fs::symlink(Target::link_target(name), &link).with_context(
+                    || format!("cannot link {} → {}", link.display(), copy.display()),
+                )?;
+                healed.push((name.to_string(), Healed::Linked { was }));
+            }
+            None if copy_moved => healed.push((name.to_string(), Healed::Copied)),
+            None => {}
+        }
     }
-    Ok(refreshed)
+    Ok(healed)
 }
 
 /// Drop copies of skills this build no longer ships, leaving the source record.
@@ -914,7 +982,10 @@ mod tests {
 
         // `refresh` is what the launch path calls: it moves the copy and
         // nothing else.
-        assert_eq!(refresh(&target).expect("refresh"), vec!["wf-tdd"]);
+        assert_eq!(
+            refresh(&target).expect("refresh"),
+            vec![("wf-tdd".to_string(), Healed::Copied)]
+        );
         assert_eq!(
             std::fs::read_to_string(target.mirror().join("wf-tdd/SKILL.md")).expect("the copy"),
             "---\n---\nthe new prompt\n"
@@ -933,6 +1004,111 @@ mod tests {
         assert_eq!(
             done.iter().find(|(n, _)| n == "wf-tdd").expect("entry").1,
             Outcome::Refreshed
+        );
+    }
+
+    #[test]
+    fn a_launch_links_a_skill_the_update_newly_ships() {
+        // The #170 report, in the order it happened: install, then a
+        // `pixi global update wf` that rewrites the bundle with a skill this
+        // machine has no link for, then a launch. Keeping only the *contents*
+        // in step freezes the set of skills at whatever the last install saw,
+        // so the new one stays unlinked through every launch that follows —
+        // and the symptom lands in a container, as `Unknown command: /wf-one`,
+        // nowhere near the update that caused it.
+        let scratch = Scratch::new("newly-shipped");
+        let bundle = scratch.bundle(&["wf-one"]);
+        let target = scratch.target();
+        install(&bundle, &target).expect("install");
+        assert!(!target.links().join("wf-one").exists(), "not shipped yet");
+
+        write_skill(&bundle.path, "wf-one", "---\n---\nthe new skill\n");
+        refresh(&target).expect("refresh");
+        assert_eq!(
+            std::fs::read_link(target.links().join("wf-one")).expect("a link"),
+            PathBuf::from(format!("../{MIRROR}/wf-one")),
+            "a healed link is the same relative shape install writes"
+        );
+
+        // Which is the whole reason to heal it here rather than anywhere else:
+        // it has to resolve as the container reads it, with no bundle and no
+        // prefix in sight.
+        let container = scratch.0.join("container-home/.claude");
+        remount(&scratch.0.join("config"), &container);
+        std::fs::remove_dir_all(&bundle.path).expect("no bundle in the container");
+        assert_eq!(
+            std::fs::read_to_string(container.join("skills/wf-one/SKILL.md")).expect("the prompt"),
+            "---\n---\nthe new skill\n"
+        );
+        assert!(
+            refresh(&target).expect("refresh").is_empty(),
+            "and the launch after that has nothing left to heal"
+        );
+    }
+
+    #[test]
+    fn a_launch_tells_a_link_it_created_apart_from_a_copy_it_rewrote() {
+        // Silence is what let #170 survive a release: a launch that heals a
+        // link has changed *which prompts this machine has*, which is worth a
+        // word on the way past, while re-copying contents is the errand it runs
+        // every single time and would only be noise. The two are told apart
+        // here, where a test can hold them to it, rather than at the print.
+        let scratch = Scratch::new("reported");
+        let bundle = scratch.bundle(&["wf-one"]);
+        let target = scratch.target();
+        install(&bundle, &target).expect("install");
+
+        write_skill(&bundle.path, "wf-one", "---\n---\nthe new skill\n");
+        write_skill(&bundle.path, "wf-tdd", "---\n---\nthe new prompt\n");
+        assert_eq!(
+            refresh(&target).expect("refresh"),
+            vec![
+                ("wf-one".to_string(), Healed::Linked { was: None }),
+                ("wf-tdd".to_string(), Healed::Copied),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_launch_repoints_a_stale_link_wf_wrote_and_leaves_one_it_did_not() {
+        // The other half of #170, and what #104's rename left behind on every
+        // machine that had the old names: a link into the package prefix, the
+        // shape every `wf` before #110 wrote. It resolves on the host, so
+        // nothing short of the shape itself says it is wrong — and it dangles
+        // inside the container, which is where it is read. Repointing it costs
+        // nothing but a link, so it needs no permission. A link `wf` cannot
+        // prove it wrote is somebody's setup, and gets none.
+        let scratch = Scratch::new("repoint");
+        let bundle = scratch.bundle(&[]);
+        let target = scratch.target();
+        install(&bundle, &target).expect("install");
+
+        let prefix = scratch.0.join("old-prefix/share/wf/skills/wf-tdd");
+        std::fs::remove_file(target.links().join("wf-tdd")).expect("drop this build's link");
+        std::os::unix::fs::symlink(&prefix, target.links().join("wf-tdd")).expect("an older link");
+        let theirs = scratch.0.join("somewhere-else");
+        std::fs::create_dir_all(&theirs).expect("another tool's tree");
+        std::fs::remove_file(target.links().join("wf-review")).expect("drop this build's link");
+        std::os::unix::fs::symlink(&theirs, target.links().join("wf-review")).expect("their link");
+
+        assert_eq!(
+            refresh(&target).expect("refresh"),
+            vec![(
+                "wf-tdd".to_string(),
+                Healed::Linked {
+                    was: Some(prefix.clone())
+                }
+            )],
+            "one is wf's to reclaim and one is not"
+        );
+        assert_eq!(
+            link_state("wf-tdd", &target.links().join("wf-tdd")),
+            Link::Current
+        );
+        assert_eq!(
+            std::fs::read_link(target.links().join("wf-review")).expect("still a link"),
+            theirs,
+            "a link wf cannot prove it wrote is left pointing where it points"
         );
     }
 
@@ -983,7 +1159,10 @@ mod tests {
 
         // The released `wf` launching: it refreshes from the checkout, because
         // that is what was installed.
-        assert_eq!(refresh(&target).expect("refresh"), vec!["wf-tdd"]);
+        assert_eq!(
+            refresh(&target).expect("refresh"),
+            vec![("wf-tdd".to_string(), Healed::Copied)]
+        );
         assert_eq!(
             std::fs::read_to_string(target.mirror().join("wf-tdd/SKILL.md")).expect("the copy"),
             "---\n---\nthe prompt being edited\n"
@@ -1024,6 +1203,18 @@ mod tests {
                 .filter(|(n, _)| n != "wf-tdd")
                 .all(|(_, o)| matches!(o, Outcome::Linked { .. })),
             "one blocked skill must not stop the others: {done:?}"
+        );
+
+        // A launch heals links too now (#170), and it is the path nobody typed
+        // anything to start — so the restraint matters there more, not less.
+        assert!(refresh(&target).expect("refresh").is_empty());
+        assert_eq!(
+            std::fs::read_to_string(real.join("SKILL.md")).expect("the file must survive"),
+            "someone else's"
+        );
+        assert!(
+            !target.mirror().join("wf-tdd").exists(),
+            "and a launch writes no copy on a blocked skill's behalf either"
         );
     }
 

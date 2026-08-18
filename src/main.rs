@@ -421,21 +421,40 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Bring the installed skill copies back in step with the bundle they were
-/// installed from.
+/// Bring the installed skills back in step with the bundle they were installed
+/// from — their contents, and which of them this machine has links for at all.
 ///
 /// Best-effort, and deliberately silent when there is nothing to do: a machine
 /// with no home directory to resolve, and one that never ran
-/// `wf skills install`, are not worth a word on the way into an agent. A copy
-/// that could not be *written* is different — the agent is about to run a
-/// prompt that is not the one that was installed — so that one is said out
-/// loud.
+/// `wf skills install`, are not worth a word on the way into an agent. Two
+/// things are worth one. A copy that could not be *written*, because the agent
+/// is then about to run a prompt that is not the one that was installed. And a
+/// link that had to be *created*, because that means this launch changed which
+/// prompts the machine has — the thing that used to happen only at an install
+/// you typed, and that a release's worth of launches did silently not do
+/// (#170).
 fn refresh_skills() {
     let Ok(target) = skills::Target::resolve() else {
         return;
     };
-    if let Err(err) = skills::refresh(&target) {
-        eprintln!("wf: could not refresh the installed skills: {err:#}");
+    match skills::refresh(&target) {
+        Err(err) => eprintln!("wf: could not refresh the installed skills: {err:#}"),
+        Ok(healed) => {
+            for (name, what) in healed {
+                match what {
+                    skills::Healed::Copied => {}
+                    skills::Healed::Linked { was: None } => {
+                        eprintln!("wf: linked the {name} skill, which this build ships and this machine had not");
+                    }
+                    skills::Healed::Linked { was: Some(old) } => {
+                        eprintln!(
+                            "wf: repointed the {name} skill, which still linked to {}",
+                            old.display()
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

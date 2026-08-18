@@ -86,8 +86,18 @@ copy    /home/you/.claude/wf-skills (what the links point at, so a devcontainer 
   wf-review       not a link — another tool owns this one
 ```
 
+What a launch brings back in step is the **set** of skills as well as their
+contents. A skill this build ships that your `~/.claude/skills` has no link for
+gets one, and a link `wf` wrote that still points into a package prefix — the
+shape that resolves on your host and dangles in the container — is repointed at
+the copy. So `pixi global update wf` is the whole update: there is no
+`wf skills install` to remember, and no release where a skill exists everywhere
+except on the machine you are launching from. Creating a link is worth a line on
+stderr, because a launch that silently did not was how that lasted a release.
+
 `wf` never deletes a real directory it did not create — if chezmoi or a
 hand-edit owns one, it says so and leaves it, and the other four still install.
+A link it cannot prove it wrote is left alone the same way, healed by nothing.
 Set `WF_SKILLS_DIR` to install a checkout's prompts instead of the package's,
 which is what you want while you are editing them: the copy **remembers where it
 was made from**, so every launch re-copies from your working tree and an edit is
