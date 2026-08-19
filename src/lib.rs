@@ -41,6 +41,7 @@ pub mod app;
 pub mod fetch;
 pub mod filter;
 pub mod launch;
+pub mod linked;
 pub mod liveness;
 pub mod model;
 /// Test scaffolding shared by more than one module, and by both crates —

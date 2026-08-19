@@ -1070,7 +1070,7 @@ pub fn parse_workspaces(body: &[u8]) -> Result<Vec<Workspace>> {
 /// invent a failure out of a workspace that was never `dl`'s to inspect. Rows
 /// that are `dl`'s but not `wf`'s are left marked anyway; [`plan`] drops them
 /// for not being ours, and this function has no business knowing that.
-fn answered_where_dl_answers(workspaces: &mut [Workspace], answers: bool) {
+pub(crate) fn answered_where_dl_answers(workspaces: &mut [Workspace], answers: bool) {
     if !answers {
         return;
     }
