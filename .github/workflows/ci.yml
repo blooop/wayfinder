@@ -74,8 +74,8 @@ jobs:
 
       # First, because it is the one check that cannot be wrong about the code:
       # it either matches `cargo fmt` or it does not. rustfmt.toml holds only
-      # stable options, so this runs on the stable toolchain above rather than
-      # needing nightly.
+      # stable options, so this runs on the pinned release toolchain above rather
+      # than needing nightly.
       - name: Formatting
         run: cargo fmt --all --check
 

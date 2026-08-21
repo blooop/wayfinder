@@ -121,28 +121,52 @@ fn the_pin_carries_the_components_ci_needs() {
 
 /// No workflow installs a toolchain by name.
 ///
-/// The action is listed by name because naming a version is the only way to use
-/// it — it selects by `@rev` and has never read `rust-toolchain.toml`. The
-/// `rustup` subcommands are the hand-rolled equivalents. `rustup show`, which is
-/// what the workflows run now, takes no version and is deliberately absent.
+/// `dtolnay/rust-toolchain` is refused outright, because naming a version is the
+/// only way to use it: it selects by `@rev` and has never read
+/// `rust-toolchain.toml`.
+///
+/// The rustup subcommands are refused only when they carry an *argument*, which
+/// is the part that makes them a second home. The bare forms are welcome and one
+/// of them is a fair replacement for what the workflows run today: `rustup
+/// toolchain install` with nothing after it installs exactly what the pin names.
+/// Rejecting those too would be a guard that lies — it would report a version
+/// named outside this file when none was.
 #[test]
 fn no_workflow_names_a_toolchain_version() {
-    let banned = [
-        "rust-toolchain@",
+    /// Subcommands whose argument, if any, would be a toolchain.
+    const TAKES_A_TOOLCHAIN: [&str; 4] = [
         "rustup toolchain install",
-        "rustup default ",
-        "rustup override ",
-        "rustup update ",
+        "rustup default",
+        "rustup override set",
+        "rustup update",
     ];
+    /// Shell punctuation and comments are not toolchain names.
+    fn is_an_argument(token: &str) -> bool {
+        !token.is_empty() && !matches!(token, "&&" | "||" | ";" | "|") && !token.starts_with('#')
+    }
+
     for (name, body) in workflows() {
-        for pattern in banned {
-            assert!(
-                !body.contains(pattern),
-                ".github/workflows/{name} contains `{pattern}`, which names a \
-                 toolchain outside rust-toolchain.toml. rustup reads that file \
-                 for any cargo command in the checkout, so the step needs no \
-                 version at all — see the note in ci.yml"
-            );
+        assert!(
+            !body.contains("rust-toolchain@"),
+            ".github/workflows/{name} uses `dtolnay/rust-toolchain`, which selects \
+             by `@rev` and cannot read rust-toolchain.toml — so using it at all \
+             means naming a version here. `rustup show active-toolchain` needs none."
+        );
+
+        for command in TAKES_A_TOOLCHAIN {
+            for line in body.lines() {
+                let Some((_, rest)) = line.split_once(command) else {
+                    continue;
+                };
+                let argument = rest.split_whitespace().next().unwrap_or_default();
+                assert!(
+                    !is_an_argument(argument),
+                    ".github/workflows/{name} runs `{command} {argument}`, which \
+                     names a toolchain outside rust-toolchain.toml. Drop the \
+                     argument: rustup then acts on the pinned toolchain, which is \
+                     the only one a step in this checkout should be reaching for."
+                );
+            }
         }
     }
 }
