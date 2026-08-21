@@ -1,0 +1,25 @@
+# The Rust version, written down once. Nothing else in this repository names a
+# version of the compiler; everything that needs one reads this file.
+#
+# Three of the four consumers get that for free, because rustup honours this
+# file for every cargo invocation inside the checkout: a developer's shell, the
+# devcontainer, and the GitHub runners — which is why no workflow installs a
+# toolchain by name any more. It also takes the decision away from
+# `mcr.microsoft.com/devcontainers/rust:1-bookworm`, whose floating `1` tag
+# used to be what chose the compiler inside a devcontainer.
+#
+# The fourth is `recipe/recipe.yaml`, which asks conda-forge rather than rustup
+# and cannot honour this file on its own. It reads it explicitly instead, with
+# `load_from_file("../rust-toolchain.toml")` — see the note beside that line.
+#
+# Why 1.97.1 and not the newest stable: it is the newest conda-forge packages,
+# and the recipe is what compiles the binary that ships. Pinning to a version
+# CI can install but the release build cannot means testing with one compiler
+# and shipping another — the gap that let clippy 1.98 reject `main` on a day
+# nobody committed anything while the package went on building fine (#173).
+# Bumping is one edit to `channel` below, and it waits on conda-forge.
+[toolchain]
+channel = "1.97.1"
+# rustup installs these alongside the compiler, which is what lets the
+# workflows drop `components: rustfmt, clippy` along with the action.
+components = ["clippy", "rustfmt"]

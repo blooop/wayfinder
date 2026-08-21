@@ -75,7 +75,15 @@ build:
 
 requirements:
   build:
-    - rust >=1.75
+    # The same pin everything else reads, read rather than repeated. This build
+    # resolves `rust` from conda-forge instead of rustup, so it is the one
+    # consumer that cannot honour `rust-toolchain.toml` on its own — hence the
+    # explicit load, relative to this recipe's own directory.
+    #
+    # `load_from_file` is experimental, which is what `--experimental` in
+    # `package.yml` is for. That coupling cannot rot quietly: without the flag
+    # rattler-build refuses to render this file at all and points at this line.
+    - rust ==${{ load_from_file("../rust-toolchain.toml").toolchain.channel }}
     # Rust links libgcc_s, so without a C compiler's run_exports the package
     # would ship an undeclared dependency on it (rattler-build says so:
     # "Overlinking against libgcc_s.so.1"). This is what adds `libgcc` to the run

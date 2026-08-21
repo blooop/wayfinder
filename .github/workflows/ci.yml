@@ -50,10 +50,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install the Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No version is named here, and that is the point: rustup reads
+      # `rust-toolchain.toml` and installs exactly the channel and the components
+      # it names. `dtolnay/rust-toolchain` cannot do that — it selects by `@rev`
+      # and has never read that file — so keeping it would mean the compiler
+      # version lived in this file too. That is what `@stable` was: a second
+      # source of truth that moved on its own, and took `main` red with it on a
+      # day nobody committed anything (#173).
+      #
+      # Any rustup command inside the checkout triggers the install. This one is
+      # here so the download is a named step in the log rather than a surprise in
+      # the middle of the first cargo command, and so a channel that cannot be
+      # fetched fails against a step that says why.
+      - name: Install the Rust toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain
 
       # Keyed on the lockfile and the compiler version, and scoped to this
       # workflow so `package.yml`'s registry cache stays a separate thing.
@@ -64,8 +74,8 @@ jobs:
 
       # First, because it is the one check that cannot be wrong about the code:
       # it either matches `cargo fmt` or it does not. rustfmt.toml holds only
-      # stable options, so this runs on the stable toolchain above rather than
-      # needing nightly.
+      # stable options, so this runs on the pinned release toolchain above rather
+      # than needing nightly.
       - name: Formatting
         run: cargo fmt --all --check
 
@@ -103,6 +113,15 @@ jobs:
       # step above — the unit-test step stops at `--lib --bins --examples`.
       - name: Devcontainer prebuild contract
         run: cargo test --locked --test devcontainer_prebuild
+
+      # The third config-as-behavior binary, and the one that keeps this file
+      # honest: the step above that installs the toolchain names no version
+      # because `rust-toolchain.toml` is the only place one is written. Nothing
+      # at runtime notices when a second place appears — a workflow that installs
+      # a toolchain by name still passes every other check here — so the guard
+      # has to read the configuration, which is what this does.
+      - name: The Rust pin has one home
+        run: cargo test --locked --test toolchain_pin
 
       # The guard on the exclusion every step around it depends on: the live
       # binaries are safe to leave out of the unit-test step only because each

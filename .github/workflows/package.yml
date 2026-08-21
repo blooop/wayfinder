@@ -28,9 +28,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The recipe carries the version literally (rattler-build can only read it
-      # out of Cargo.toml under --experimental), so the two can drift. Catch it
-      # on every pull request rather than halfway through a release.
+      # The recipe carries the *package* version literally, so the two can drift.
+      # Catch it on every pull request rather than halfway through a release.
+      #
+      # The build below now passes `--experimental` for the Rust pin, so
+      # `load_from_file("../Cargo.toml").package.version` would work here too and
+      # retire this step. Folding it in is a separate change from pinning the
+      # toolchain; until then this check is what holds the line.
       - name: Recipe version tracks Cargo.toml
         run: |
           crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
@@ -96,6 +100,12 @@ jobs:
           # in step with the pin in the release job below.
           rattler-build-version: v0.72.2
           recipe-path: recipe/recipe.yaml
+          # --experimental: `recipe.yaml` reads the Rust version out of
+          # `rust-toolchain.toml` with `load_from_file`, so that the pin has one
+          # home and the conda build is not a second place it is written down.
+          # The function is gated behind this flag; without it the render fails
+          # loudly at that line rather than falling back to anything.
+          #
           # --no-config: rattler-build otherwise discovers any pixi or
           # rattler-build config file in the tree and adopts its default-channels,
           # so this keeps the build resolving against exactly the two channels
@@ -106,7 +116,7 @@ jobs:
           # dependencies). The build needs it for the test environment
           # rattler-build creates from the freshly built package, not for the
           # cargo build itself, which still resolves from conda-forge alone.
-          build-args: --channel https://prefix.dev/blooop --channel conda-forge --no-config
+          build-args: --experimental --channel https://prefix.dev/blooop --channel conda-forge --no-config
           artifact-name: wf-conda-package
 
       - name: Locate the package
