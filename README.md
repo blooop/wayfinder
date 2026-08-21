@@ -55,8 +55,8 @@ this: `wf` reached 0.6.0 still routing `defer` at a `/wf` section that
 `/wf-auto` had superseded weeks earlier, and nothing anywhere could
 notice.
 
-Five skills ship: `wf`, `wf-auto`, `wf-one`, `wf-tdd` and `wf-review` — the four
-`wf` can exec, plus the single-ticket sibling that shares their
+Six skills ship: `wf`, `wf-mid`, `wf-auto`, `wf-one`, `wf-tdd` and `wf-review` —
+the five `wf` can exec, plus the single-ticket sibling that shares their
 `GITHUB_TRACKER.md` and `LIFECYCLE.md`. A unit test asserts every route's skill
 name is one of them, so a route can never name a skill the package does not
 ship.
@@ -97,6 +97,7 @@ links   /home/you/.claude/skills
 copy    /home/you/.claude/wf-skills (what the links point at)
 
   wf              ok
+  wf-mid          ok
   wf-auto         ok
   wf-one          outdated — the copy is not this build's
   wf-tdd          stale — links to /home/you/projects/wayfinder/skills
@@ -637,6 +638,7 @@ the two things still undecided — which agent runs it, and who resolves the nod
 ┌ launch Claude · blooop/wayfinder · #65 Author the wf-tdd skill ───────┐
 │                                                                         │
 │  ▶ interactive   /wf-tdd   you are in the loop; it grills you           │
+│    mid           /wf-mid   it decides what it can and asks only what it…│
 │    auto          /wf-auto  the agent decides alone and drives it to done│
 │    plain         claude    no skill; a bare session on the node's branch│
 │                                                                         │
@@ -691,6 +693,7 @@ navigation:
 │                                                                         │
 │  ▶ new task      /wf-one   one tracked ticket, built and reviewed       │
 │    new map       /wf       chart a new map in this repo, with you       │
+│    new map, mid  /wf-mid   chart a new map in this repo, asking little  │
 │    new map, auto /wf-auto  chart a new map in this repo, alone          │
 │                                                                         │
 │    task   █                                                             │
@@ -704,6 +707,41 @@ there are no launch rows, and `enter` with an empty `task` field refuses on the
 count line rather than filing something blank. Which is why the creating default
 is safe: `enter enter` on a fresh screen does nothing at all.
 
+### `mid`: which questions are worth asking
+
+The mode rows are one axis — who decides — and its two ends were the only
+choices for a long time. `interactive` asks you about every decision on the map;
+`auto` asks you about none of them. Most maps are neither: most of their
+decisions have one defensible answer under the same four principles `wf-auto`
+declares, and two or three genuinely do not.
+
+`mid` is that middle. It does the cheap legwork first — research subagents,
+prototypes, a read of the repo — settles whatever the principles settle, and
+escalates a decision to you only when it passes all three tests:
+
+1. **the legwork is already done** — it never asks what a read can answer or a
+   prototype can show;
+2. **the principles do not settle it** — applied in order, two options are still
+   live and the route already walked does not imply either;
+3. **and it is** a taste or product call, something *expensive to reverse* (a
+   public interface, a wire format, a released name), or something that would
+   redraw the destination.
+
+Cheap-to-reverse decisions are the agent's even when they are close, because the
+recovery is a later commit — and a close call is recorded as one on the ticket,
+so reopening an agent-decided ticket to re-decide it is normal rather than a
+conflict. When it does ask, the question is a decision brief: what it tried, the
+live options, its recommendation, and what a reversal would cost. "Your call" is
+a valid answer.
+
+Two more things follow from where it sits. Escalations that go unanswered
+**park** — it does not quietly fall through to deciding alone, which is the whole
+difference between this mode and `auto`. And, like `wf`, it **plans by default**:
+the map ends where the way is clear, and it drives builds through `wf-tdd` and
+`wf-review` only where the map's `## Notes` or a `steer:` line grants execution.
+That grant is the difference between a run that costs a conversation and a run
+that costs a fleet of subagents.
+
 ### Resuming: picking a conversation back up
 
 A node you have launched an agent on before carries a `⏎` in the list, and its
@@ -714,6 +752,7 @@ picker leads with a **resume** row:
 │                                                                             │
 │  ▶ resume        claude --continue   20m ago · pick the conversation back up│
 │    interactive   /wf-tdd             you are in the loop; it grills you     │
+│    mid           /wf-mid             it decides what it can, asks the rest  │
 │    auto          /wf-auto            the agent decides alone and drives it  │
 │    plain         claude              no skill; a bare session on the branch │
 │                                                                             │
@@ -765,7 +804,7 @@ directories. Coming back on another machine is what the breadcrumbs on the
 ticket are for.
 
 **A node launches and a project creates, and neither does the other's job.** A
-cluster header is a *map*, so its picker is the three modes and wraps, exactly
+cluster header is a *map*, so its picker is the mode rows and wraps, exactly
 like a ticket's — the only difference between the two is what they aim at. The
 creation rows used to ride along on the header, on the grounds that a header was
 the only repo-level stop there was; a project row is a better one, and having
@@ -795,10 +834,12 @@ on what was found — which is what makes the create path work on the first fram
 | `wayfinder:build` | ready · building · needs attention | interactive | `<sigil>wf-tdd <n>` |
 | `wayfinder:build` | in review | interactive | `<sigil>wf-review <n>` |
 | research · prototype · grilling · task | any unfinished stage | interactive | `<sigil>wf <map> <n>` |
+| anything | any unfinished stage | mid | `<sigil>wf-mid <map> [<n>]` |
 | anything | any unfinished stage | auto | `<sigil>wf-auto <map> [<n>]` |
 | anything | any unfinished stage | plain | the selected agent, with no skill; anything typed is the whole prompt |
 | a project row | — | new task | `<sigil>wf-one <task>` |
 | a project row | — | new map | `<sigil>wf [<seed>]` |
+| a project row | — | new map, mid | `<sigil>wf-mid [<seed>]` |
 | a project row | — | new map, auto | `<sigil>wf-auto [<seed>]` |
 | a ticket | done | — | nothing — not launchable |
 
@@ -1165,7 +1206,8 @@ Neither flag can turn a `warn` row into a deletion.
 ### `wf reap --finished` — the cleanup an autonomous run ends with
 
 `wf-auto` walks a map on its own, and a run that works six tickets leaves six
-workspaces. Its last act is to collect the ones it finished:
+workspaces. Its last act is to collect the ones it finished — as does a `wf-mid`
+run that was granted execution, on whatever build tickets it closed:
 
 ```
 $ wf reap --finished blooop/wayfinder#151 blooop/wayfinder#160

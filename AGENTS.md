@@ -58,19 +58,20 @@ Two things to know about it:
 
 ## The skills are part of this repo
 
-`skills/` holds the five prompts `wf` execs — `wf`, `wf-auto`, `wf-one`,
-`wf-tdd`, `wf-review`. They are not documentation *about* `wf`; they are what it
-runs, named literally in `launch::route`, and the package installs them beside
-the binary so the two cannot drift (`src/skills.rs` says why at length).
+`skills/` holds the six prompts `wf` execs — `wf`, `wf-mid`, `wf-auto`,
+`wf-one`, `wf-tdd`, `wf-review`. They are not documentation *about* `wf`; they
+are what it runs, named literally in `launch::route`, and the package installs
+them beside the binary so the two cannot drift (`src/skills.rs` says why at
+length).
 
 Three consequences for anyone editing here:
 
 - **Editing a skill is editing `wf`'s behaviour.** A change to
   `skills/wf/SKILL.md` ships in the next release exactly as a change to
   `src/` does, and belongs in the same PR as whatever routing change motivated
-  it. `skills/wf-one/SKILL.md` and `wf-auto` link
+  it. `skills/wf-one/SKILL.md`, `wf-mid` and `wf-auto` link
   `../wf/GITHUB_TRACKER.md` and `../wf/LIFECYCLE.md` by relative
-  path, so the five move as a set and the layout under `skills/` is load-bearing.
+  path, so the six move as a set and the layout under `skills/` is load-bearing.
 - **Adding a `Route` means saying which skill it invokes — or that it invokes
   none.** `skills::BUNDLED` lists what ships and `Route::bundled_skill()` is the
   exhaustive answer to which of them a route names; a unit test sweeps

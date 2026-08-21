@@ -49,7 +49,7 @@ Breadcrumb the ticket at each stage transition and gate result — `**breadcrumb
 
 ## Don't let it fan out
 
-The one rule that keeps this skill small: **this map never gets a second ticket.** If the work turns out to need decisions made, or to be too big for one ticket, that is the signal it was never single-ticket work. Say so, leave a `### handoff` on the ticket, and hand it to `wf` (to chart properly, with you) or `wf-auto` (to chart and drive it alone). Don't grow this map into a real one — a map charted backwards out of work already underway is the thing wayfinding exists to avoid.
+The one rule that keeps this skill small: **this map never gets a second ticket.** If the work turns out to need decisions made, or to be too big for one ticket, that is the signal it was never single-ticket work. Say so, leave a `### handoff` on the ticket, and hand it to `wf` (to chart properly, with you), `wf-mid` (to chart it mostly alone, asking only about the decisions that are genuinely yours) or `wf-auto` (to chart and drive it alone). Don't grow this map into a real one — a map charted backwards out of work already underway is the thing wayfinding exists to avoid.
 
 Decisions small enough to take alone are yours, in this order when they collide: **long-term maintainability**, **simplicity** (smallest thing that works; deleting beats adding), **constructive modeling** (illegal states unrepresentable — `/constructive-modeling` where a type is at stake), **test-first**. Note in a breadcrumb which one decided anything non-obvious. Anything needing credentials, a purchase, or a human-only action parks with a handoff.
 

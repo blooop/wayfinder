@@ -55,7 +55,7 @@ use crate::launch::Agent;
 /// refuse to link over theirs if they made one (#104).
 ///
 /// Renaming this list is what [`sweep`] exists to clean up after.
-pub const BUNDLED: [&str; 5] = ["wf", "wf-auto", "wf-one", "wf-tdd", "wf-review"];
+pub const BUNDLED: [&str; 6] = ["wf", "wf-auto", "wf-mid", "wf-one", "wf-tdd", "wf-review"];
 
 /// Overrides the bundle location. The escape hatch for a build that is not
 /// installed — `wf-next` copied onto `PATH`, or a test — and the way to point
@@ -1403,7 +1403,7 @@ mod tests {
         // route missing from the cycle would be silently skipped above.
         assert_eq!(
             Route::all().len(),
-            6,
+            7,
             "every route must be in the cycle `Route::all` walks"
         );
     }

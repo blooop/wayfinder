@@ -663,3 +663,52 @@ fn every_bundled_skill_documents_the_context_in_its_grammar() {
         );
     }
 }
+
+/// The ordered principle list under one skill doc's `## The principles`
+/// heading: the bold name of each numbered item, in the order the doc numbers
+/// them. Order is the whole content of the list — "when two pull opposite ways,
+/// the earlier wins" — so it is kept, not sorted away.
+fn principles(name: &str) -> Vec<String> {
+    let doc = skill_doc(name);
+    let section = doc
+        .split("## The principles")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{name} declares the principles it decides by"))
+        .split("\n## ")
+        .next()
+        .expect("split always yields a first piece");
+    section
+        .lines()
+        .filter_map(|line| {
+            let numbered = line.trim_start();
+            numbered
+                .split_once(". **")
+                .filter(|(n, _)| n.chars().all(char::is_numeric) && !n.is_empty())
+                .and_then(|(_, rest)| rest.split_once("**"))
+                .map(|(name, _)| name.to_string())
+        })
+        .collect()
+}
+
+/// `wf-mid` decides by `wf-auto`'s principles, in `wf-auto`'s order — the same
+/// standing voice, so a map can be handed between the two skills without its
+/// route changing character half way along it.
+///
+/// Pinned as a list rather than a phrase, because the failure this guards
+/// against is silent: an edit that adds a principle to one doc, or reorders the
+/// two that most often collide, leaves both files reading perfectly well while
+/// the same ticket now resolves differently depending on which skill picked it
+/// up. The tiebreak order is load-bearing and only a comparison can hold it.
+#[test]
+fn wf_mid_decides_by_the_same_principles_in_the_same_order_as_wf_auto() {
+    let auto = principles("wf-auto");
+    assert!(
+        auto.len() >= 4,
+        "the extraction found nothing to compare: {auto:?}"
+    );
+    assert_eq!(
+        principles("wf-mid"),
+        auto,
+        "wf-mid and wf-auto must decide by one list, in one order"
+    );
+}

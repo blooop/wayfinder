@@ -14,7 +14,7 @@ Same artifact as `wf` — one map issue with decision tickets as its children �
 - **Answers come from principles, not questions.** The principles below are the human's standing voice. Every resolution cites the one that decided it.
 - **Execution is in scope by default.** `wf` plans and hands off; here the map runs all the way to merged work, so `wayfinder:build` tickets are ordinary citizens and the map is the single place every ticket — decision and build alike — is tracked.
 
-This is for work with **fog in it** — open questions between here and the destination. One piece of already-known work wants `wf-one` instead: a single-ticket map, same gates, no charting.
+This is for work with **fog in it** — open questions between here and the destination. One piece of already-known work wants `wf-one` instead: a single-ticket map, same gates, no charting. A map whose decisions are *mostly* obvious wants `wf-mid`: the same principles, but it stops to ask about the few that are taste, scope, or expensive to reverse rather than deciding them for you.
 
 ## The principles
 
