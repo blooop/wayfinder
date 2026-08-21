@@ -213,9 +213,9 @@ impl Route {
         match self {
             Route::Tdd => Route::Review,
             Route::Review => Route::Wayfinder,
-            Route::Wayfinder => Route::WayfinderAuto,
-            Route::WayfinderAuto => Route::WayfinderMid,
-            Route::WayfinderMid => Route::One,
+            Route::Wayfinder => Route::WayfinderMid,
+            Route::WayfinderMid => Route::WayfinderAuto,
+            Route::WayfinderAuto => Route::One,
             Route::One => Route::Plain,
             Route::Plain => Route::Tdd,
         }
@@ -345,7 +345,7 @@ pub enum CreationKind {
 
 impl CreationKind {
     /// Every kind, in picker order. Written out rather than derived from an
-    /// `after` cycle: three variants with one call site is below the size
+    /// `after` cycle: four variants with one call site is below the size
     /// where the cycle device earns its ceremony.
     pub fn all() -> Vec<CreationKind> {
         vec![
@@ -3765,10 +3765,10 @@ mod tests {
 
     #[test]
     fn plain_launches_a_session_with_no_skill_in_it() {
-        // The third mode collapses the table the way `auto` does, and for the
-        // opposite reason: `auto` picks one skill for every node, `plain` picks
-        // none. Which node it was aimed at cannot change that, so every cell
-        // answers the same.
+        // The last mode collapses the table the way `auto` and `mid` do, and
+        // for the opposite reason: they pick one skill for every node, `plain`
+        // picks none. Which node it was aimed at cannot change that, so every
+        // cell answers the same.
         for ticket_type in DECISION_TYPES.into_iter().chain([TicketType::Build]) {
             for stage in LAUNCHABLE {
                 assert_eq!(

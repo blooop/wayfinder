@@ -56,7 +56,8 @@ this: `wf` reached 0.6.0 still routing `defer` at a `/wf` section that
 notice.
 
 Six skills ship: `wf`, `wf-mid`, `wf-auto`, `wf-one`, `wf-tdd` and `wf-review` —
-the five `wf` can exec, plus the single-ticket sibling that shares their
+every one of them a route `wf` execs: five reached from a node's launch picker,
+and `wf-one` from a project row's `new task`. They share one
 `GITHUB_TRACKER.md` and `LIFECYCLE.md`. A unit test asserts every route's skill
 name is one of them, so a route can never name a skill the package does not
 ship.
