@@ -141,6 +141,13 @@ trait Keys {
 struct Typed;
 
 impl Keys for Typed {
+    // No `.await` in here, and there cannot be one: this is the arm that blocks
+    // the thread inside `poll`, which is the whole reason the trait is `async`
+    // (see [`Keys`]). `unused_async_trait_impl` — new in clippy 1.98 — reads the
+    // body alone and cannot see the obligation the trait imposes; taking its
+    // suggestion would mean hand-desugaring a `Future` to satisfy a lint about
+    // tidiness.
+    #[allow(clippy::unused_async_trait_impl)]
     async fn next_press(&mut self, _app: &App, timeout: Duration) -> Result<Option<KeyEvent>> {
         if !event::poll(timeout)? {
             return Ok(None);
