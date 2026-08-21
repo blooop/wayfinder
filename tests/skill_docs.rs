@@ -712,3 +712,45 @@ fn wf_mid_decides_by_the_same_principles_in_the_same_order_as_wf_auto() {
         "wf-mid and wf-auto must decide by one list, in one order"
     );
 }
+
+/// The skill names in the README's `wf skills` sample, in the order it prints
+/// them: the indented rows of the fenced block under the paragraph that
+/// introduces the report.
+fn documented_status_rows() -> Vec<String> {
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+        .expect("the README ships in this repo");
+    let block = readme
+        .split_once("`wf skills` reports a copy that is not")
+        .expect("the README shows what `wf skills` reports")
+        .1
+        .split("```")
+        .nth(1)
+        .expect("as a fenced sample");
+    block
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("  ")
+                .filter(|row| !row.starts_with(' '))
+                .and_then(|row| row.split_whitespace().next())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// The sample report lists the skills `wf skills` actually walks, in the order
+/// it actually walks them — [`wf::skills::BUNDLED`], which is what both
+/// `status` and `install` iterate.
+///
+/// Order, not just membership: the sample is a screen a reader compares their
+/// own terminal against, and one that interleaves the names differently reads
+/// as a different build rather than as a stale doc. `wf-mid` was first written
+/// into this block in the position the prose lists it in, which is not the
+/// position the binary prints it in.
+#[test]
+fn the_documented_status_report_lists_the_bundle_in_its_own_order() {
+    let bundled: Vec<String> = wf::skills::BUNDLED
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!(documented_status_rows(), bundled);
+}

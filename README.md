@@ -97,8 +97,8 @@ links   /home/you/.claude/skills
 copy    /home/you/.claude/wf-skills (what the links point at)
 
   wf              ok
-  wf-mid          ok
   wf-auto         ok
+  wf-mid          ok
   wf-one          outdated — the copy is not this build's
   wf-tdd          stale — links to /home/you/projects/wayfinder/skills
   wf-review       not a link — another tool owns this one
