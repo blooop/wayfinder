@@ -141,6 +141,14 @@ trait Keys {
 struct Typed;
 
 impl Keys for Typed {
+    // No `.await` here, and there cannot be one: `poll` and `read` are
+    // crossterm's blocking calls, and blocking the thread inside them *is*
+    // this impl's behaviour (see the trait's own note above). The `async` is
+    // the trait's, not this function's — dropping it would mean dropping it
+    // from the trait, which the probe's impl needs to sleep. Newer clippy
+    // reads an await-free async trait impl as an accident; here it is the
+    // arrangement being described.
+    #[allow(clippy::unused_async)]
     async fn next_press(&mut self, _app: &App, timeout: Duration) -> Result<Option<KeyEvent>> {
         if !event::poll(timeout)? {
             return Ok(None);
