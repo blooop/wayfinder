@@ -754,3 +754,38 @@ fn the_documented_status_report_lists_the_bundle_in_its_own_order() {
         .collect();
     assert_eq!(documented_status_rows(), bundled);
 }
+
+/// The skills the conda recipe names in `package_contents`, which is the check
+/// that a built package really carries them.
+fn packaged_skills() -> BTreeSet<String> {
+    let recipe =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/recipe/recipe.yaml"))
+            .expect("the recipe ships in this repo");
+    recipe
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("- share/wf/skills/")?
+                .strip_suffix("/SKILL.md")
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// The package's own file list is the bundle: every skill `wf` can exec is
+/// named there, and nothing is named that does not ship.
+///
+/// The recipe says a package that quietly shipped one fewer "must fail here
+/// rather than at the moment an agent is launched" — and until this test that
+/// claim held only for whoever remembered to edit the list. Dropping the
+/// `wf-mid` line left the whole suite green, and the symptom lands a release
+/// later as `Unknown command: /wf-mid` inside a devcontainer, which is the one
+/// place nobody is reading a build log.
+#[test]
+fn every_bundled_skill_is_named_in_the_package_contents() {
+    let bundled: BTreeSet<String> = wf::skills::BUNDLED
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!(packaged_skills(), bundled);
+}
