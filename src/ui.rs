@@ -2200,6 +2200,31 @@ mod tests {
     }
 
     #[test]
+    fn no_mode_row_widens_the_picker_past_the_terminal_that_fits_the_rest() {
+        // 83 columns is what the picker's widest row has always needed — the
+        // route column plus `the agent decides alone and drives it to done`.
+        // A blurb longer than that does not wrap; the popup is clamped to the
+        // frame and the tail of the row is simply gone, so the row that says
+        // what a mode *does* is the one that loses its ending. The `mid` row
+        // arrived six columns over that budget, which clipped it on every
+        // terminal between 83 and 88 columns where nothing clipped before.
+        let app = {
+            let mut app = fixture_app();
+            down(&mut app, 2);
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            app
+        };
+        let screen = render_at(83, &app);
+        for mode in crate::launch::Mode::all() {
+            assert!(
+                screen.contains(mode.blurb()),
+                "{} is clipped at 83 columns:\n{screen}",
+                mode.label()
+            );
+        }
+    }
+
+    #[test]
     fn a_ticket_picker_draws_no_creation_rows() {
         // The other half of the rule: a ticket is not a repo-level stop, so
         // its picker is the modes and nothing else.
@@ -2241,7 +2266,7 @@ mod tests {
         assert!(screen.contains("/wf-auto"), "{screen}");
         // The middle row's blurb is the whole reason it is a separate mode:
         // it decides what it can and asks about what it cannot.
-        assert!(screen.contains("asks only what it cannot"), "{screen}");
+        assert!(screen.contains("asks what it can't"), "{screen}");
         // The skill-free mode (#112) reads as what it execs — a bare `claude`,
         // no slash command — and says what picking it costs you. The route
         // column is asserted too: it is the half of the row that says what will

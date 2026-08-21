@@ -638,7 +638,7 @@ the two things still undecided — which agent runs it, and who resolves the nod
 ┌ launch Claude · blooop/wayfinder · #65 Author the wf-tdd skill ───────┐
 │                                                                         │
 │  ▶ interactive   /wf-tdd   you are in the loop; it grills you           │
-│    mid           /wf-mid   it decides what it can and asks only what it…│
+│    mid           /wf-mid   it decides what it can, asks what it can't   │
 │    auto          /wf-auto  the agent decides alone and drives it to done│
 │    plain         claude    no skill; a bare session on the node's branch│
 │                                                                         │

@@ -284,7 +284,7 @@ impl Mode {
     pub fn blurb(self) -> &'static str {
         match self {
             Mode::Interactive => "you are in the loop; it grills you",
-            Mode::Mid => "it decides what it can and asks only what it cannot",
+            Mode::Mid => "it decides what it can, asks what it can't",
             Mode::Auto => "the agent decides alone and drives it to done",
             Mode::Plain => "no skill; a bare session on the node's branch",
         }
