@@ -65,8 +65,10 @@ jobs:
       # the runner's own checkout as much as anything.
       - uses: actions/checkout@v7
 
-      - name: Install the Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # No version named here: rustup installs what `rust-toolchain.toml` pins,
+      # components included. The long version of why is in `ci.yml`.
+      - name: Install the Rust toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain
 
       - name: Cache cargo's registry and the target directory
         uses: Swatinem/rust-cache@v2

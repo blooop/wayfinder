@@ -148,6 +148,7 @@ cargo clippy --all-targets --all-features --locked
 cargo test --locked --lib --bins --examples
 cargo test --locked --test skill_docs
 cargo test --locked --test devcontainer_prebuild
+cargo test --locked --test toolchain_pin
 cargo test --locked --test offline_green
 cargo test --locked --test live_fetch -- common::
 cargo test --locked --all-targets --no-run

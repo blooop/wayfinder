@@ -53,10 +53,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The compiler comes from rustup, exactly as in `ci.yml`. pixi supplies
-      # `dl` and nothing else — see the header of `pixi.toml`.
-      - name: Install the Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # The compiler comes from rustup, exactly as in `ci.yml`, and no version is
+      # named here: rustup installs what `rust-toolchain.toml` pins, components
+      # included. pixi supplies `dl` and nothing else — see the header of
+      # `pixi.toml`.
+      - name: Install the Rust toolchain rust-toolchain.toml pins
+        run: rustup show active-toolchain
 
       - name: Cache cargo's registry and the target directory
         uses: Swatinem/rust-cache@v2

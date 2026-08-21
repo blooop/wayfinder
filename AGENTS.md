@@ -115,6 +115,7 @@ RUSTFLAGS=-D\ warnings RUSTDOCFLAGS=-D\ warnings sh -c '
   cargo test --locked --lib --bins --examples &&
   cargo test --locked --test skill_docs &&
   cargo test --locked --test devcontainer_prebuild &&
+  cargo test --locked --test toolchain_pin &&
   cargo test --locked --test offline_green &&
   cargo test --locked --test live_fetch -- common:: &&
   cargo doc --no-deps --all-features --locked'
@@ -124,15 +125,40 @@ Run the whole chain before pushing, `cargo fmt --all` first — a formatting dif
 fails the build before any of the interesting checks get a chance to run.
 
 The `tests/live_*.rs` files are excluded from that test command on purpose: they
-talk to real GitHub, drive a real pty, or want a chosen `devlaunch`. Three
+talk to real GitHub, drive a real pty, or want a chosen `devlaunch`. Four
 binaries under `tests/` are exceptions and run in the chain (and in CI) like any
-unit test, because all three are offline checks on files-as-behavior:
+unit test, because all four are offline checks on files-as-behavior:
 `tests/skill_docs.rs` (shape checks on the skill docs' snippets),
 `tests/devcontainer_prebuild.rs` (the contract between the devcontainer configs
 and the workflow that publishes the prebuilt image to GHCR — see the comments in
-`.devcontainer/devcontainer.json`), and `tests/offline_green.rs` (the guard on
-the exclusion itself: it reads `tests/live_*.rs` and fails if any test in them
-is missing `#[ignore]`).
+`.devcontainer/devcontainer.json`), `tests/toolchain_pin.rs` (the guard that
+keeps `rust-toolchain.toml` the only place a Rust version is written — see
+**The Rust version is pinned in one place** below), and `tests/offline_green.rs`
+(the guard on the exclusion itself: it reads `tests/live_*.rs` and fails if any
+test in them is missing `#[ignore]`).
+
+### The Rust version is pinned in one place
+
+`rust-toolchain.toml` names the compiler, and nothing else in the repository
+names one. Three of the four consumers get that for free, because rustup reads
+the file for any cargo command inside the checkout: your shell, the
+devcontainer, and the GitHub runners — which is why no workflow installs a
+toolchain any more, and why `mcr.microsoft.com/devcontainers/rust:1-bookworm`'s
+floating `1` tag no longer decides which compiler a container builds with. The
+fourth is `recipe/recipe.yaml`, which resolves `rust` from conda-forge rather
+than rustup and so reads the file explicitly with `load_from_file`; that is what
+`--experimental` in `package.yml` is for.
+
+**Bumping it is one edit to `channel`, and it waits on conda-forge.** The pin is
+the newest version conda-forge packages, deliberately: the recipe compiles the
+binary that ships, so a toolchain CI can install but the release build cannot
+would mean testing with one compiler and shipping another. That gap is what let
+clippy 1.98 reject `main` on a day nobody committed anything while the package
+went on building fine (#173).
+
+`tests/toolchain_pin.rs` is what stops a second home appearing. It fails on a
+workflow that names a toolchain, on a recipe that goes back to a literal, and on
+a `package.yml` that drops the flag the recipe's read needs.
 
 ### The live tests are gated, not absent
 
