@@ -141,6 +141,20 @@ trait Keys {
 struct Typed;
 
 impl Keys for Typed {
+    // No `.await` here, and there cannot be one: `poll` and `read` are
+    // crossterm's blocking calls, and blocking the thread inside them *is*
+    // this impl's behaviour (see the trait's own note above). The `async` is
+    // the trait's, not this function's — dropping it would mean dropping it
+    // from the trait, which the probe's impl needs to sleep. Clippy 1.98 reads
+    // an await-free async trait impl as an accident; here it is the
+    // arrangement being described.
+    //
+    // `unknown_lints` rides along because the lint below does not exist before
+    // 1.98, and `recipe/recipe.yaml` builds on an older toolchain than CI's
+    // stable: without it, naming the lint fails the build everywhere it is not
+    // yet known. Both attributes go together or neither works.
+    #[allow(unknown_lints)]
+    #[allow(clippy::unused_async_trait_impl)]
     async fn next_press(&mut self, _app: &App, timeout: Duration) -> Result<Option<KeyEvent>> {
         if !event::poll(timeout)? {
             return Ok(None);

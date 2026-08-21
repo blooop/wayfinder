@@ -2566,6 +2566,7 @@ mod tests {
             mode,
             route: match mode {
                 Mode::Interactive => Route::Wayfinder,
+                Mode::Mid => Route::WayfinderMid,
                 Mode::Auto => Route::WayfinderAuto,
                 Mode::Plain => Route::Plain,
             },
@@ -2576,8 +2577,12 @@ mod tests {
         app.handle_key(key(KeyCode::Up));
         assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Auto)));
         app.handle_key(key(KeyCode::Up));
+        assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Mid)));
+        app.handle_key(key(KeyCode::Up));
         assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Interactive)));
         app.handle_key(key(KeyCode::Tab));
+        assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Mid)));
+        app.handle_key(key(KeyCode::Down));
         assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Auto)));
         app.handle_key(key(KeyCode::Down));
         assert_eq!(choice(&app), (Agent::Claude, launch(Mode::Plain)));
@@ -2648,10 +2653,12 @@ mod tests {
     fn picking_auto_in_the_overlay_launches_the_manager_with_steering() {
         // The acceptance shape (#96), through the picker: enter → move to the
         // `auto` row → type the steer → enter produces the manager skill
-        // carrying `steer: something`.
+        // carrying `steer: something`. Two downs, because `mid` sits between
+        // the default and `auto` on the one axis the rows are ordered by.
         let mut app = launchable_app();
         go_to(&mut app, "#6"); // wayfinder#6, one checkout
         app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
         type_str(&mut app, "something");
         let launch = match app.handle_key(key(KeyCode::Enter)) {
@@ -2672,7 +2679,8 @@ mod tests {
         let mut app = two_checkout_app();
         go_to(&mut app, "#103");
         app.handle_key(key(KeyCode::Enter)); // dotfiles#103: stage
-        app.handle_key(key(KeyCode::Down)); // to the auto row
+        app.handle_key(key(KeyCode::Down)); // past `mid`…
+        app.handle_key(key(KeyCode::Down)); // …to the auto row
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         assert!(matches!(app.overlay, Overlay::PickCheckout { .. }));
         let launch = match app.handle_key(key(KeyCode::Enter)) {
@@ -2695,7 +2703,8 @@ mod tests {
             let mut app = launchable_app();
             go_to(&mut app, "#6");
             app.handle_key(key(KeyCode::Enter));
-            app.handle_key(key(KeyCode::Down)); // to the auto row
+            app.handle_key(key(KeyCode::Down)); // past `mid`…
+            app.handle_key(key(KeyCode::Down)); // …to the auto row
             app
         };
         let wf = MapId::new("blooop/wayfinder", 1);
@@ -2932,6 +2941,7 @@ mod tests {
                 assert_eq!(staged.key(), "#1");
                 assert_eq!(staged.title(), "Map: wf", "the picker names the map");
                 assert_eq!(staged.route(Mode::Interactive), Some(Route::Wayfinder));
+                assert_eq!(staged.route(Mode::Mid), Some(Route::WayfinderMid));
                 assert_eq!(staged.route(Mode::Auto), Some(Route::WayfinderAuto));
             }
             other => panic!("expected the launch picker, got {other:?}"),
@@ -2949,7 +2959,8 @@ mod tests {
         let mut app = launchable_app();
         go_to(&mut app, "map #1");
         app.handle_key(key(KeyCode::Enter));
-        app.handle_key(key(KeyCode::Down)); // to the auto row
+        app.handle_key(key(KeyCode::Down)); // past `mid`…
+        app.handle_key(key(KeyCode::Down)); // …to the auto row
         let launch = match app.handle_key(key(KeyCode::Enter)) {
             Outcome::Launch(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
@@ -3011,8 +3022,8 @@ mod tests {
     #[test]
     fn a_mapless_repo_offers_creation_and_nothing_to_launch() {
         // There is no node here, so there is nothing to launch: the picker is
-        // the three creation rows alone. A launch row would name a skill with
-        // no argument to give it.
+        // the creation rows alone. A launch row would name a skill with no
+        // argument to give it.
         let mut app = mapless_app();
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
         match &app.overlay {
@@ -3024,6 +3035,7 @@ mod tests {
                     vec![
                         Candidate::Create(CreationKind::Task),
                         Candidate::Create(CreationKind::Map),
+                        Candidate::Create(CreationKind::MapMid),
                         Candidate::Create(CreationKind::MapAuto),
                     ]
                 );
@@ -3095,8 +3107,8 @@ mod tests {
     fn only_the_project_stop_reaches_the_creation_rows() {
         // Creation is a repo-level act, so the rows exist exactly where the
         // stop is a repo — and nowhere else. A cluster header is a *map*, so
-        // its picker walks the three modes and wraps, exactly as a ticket's
-        // does: the only difference between the two is what they aim at.
+        // its picker walks the modes and wraps, exactly as a ticket's does:
+        // the only difference between the two is what they aim at.
         let picked = |app: &App| match &app.overlay {
             Overlay::PickLaunch { candidate, .. } => *candidate,
             other => panic!("expected the launch picker, got {other:?}"),
@@ -3109,6 +3121,8 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         assert_eq!(picked(&app), Candidate::Create(CreationKind::Map));
         app.handle_key(key(KeyCode::Down));
+        assert_eq!(picked(&app), Candidate::Create(CreationKind::MapMid));
+        app.handle_key(key(KeyCode::Down));
         assert_eq!(picked(&app), Candidate::Create(CreationKind::MapAuto));
         app.handle_key(key(KeyCode::Down));
         assert_eq!(
@@ -3117,13 +3131,13 @@ mod tests {
             "and wraps: there is nothing else on a project's picker"
         );
 
-        // A header and a ticket both walk only the modes: three downs is a
-        // full lap on either.
+        // A header and a ticket both walk only the modes: a lap of `Mode::all`
+        // lands back on the default on either.
         for stop in ["map #1", "#6"] {
             let mut app = launchable_app();
             go_to(&mut app, stop);
             app.handle_key(key(KeyCode::Enter));
-            for _ in 0..3 {
+            for _ in 0..Mode::all().len() {
                 app.handle_key(key(KeyCode::Down));
             }
             assert!(

@@ -663,3 +663,129 @@ fn every_bundled_skill_documents_the_context_in_its_grammar() {
         );
     }
 }
+
+/// The ordered principle list under one skill doc's `## The principles`
+/// heading: the bold name of each numbered item, in the order the doc numbers
+/// them. Order is the whole content of the list — "when two pull opposite ways,
+/// the earlier wins" — so it is kept, not sorted away.
+fn principles(name: &str) -> Vec<String> {
+    let doc = skill_doc(name);
+    let section = doc
+        .split("## The principles")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{name} declares the principles it decides by"))
+        .split("\n## ")
+        .next()
+        .expect("split always yields a first piece");
+    section
+        .lines()
+        .filter_map(|line| {
+            let numbered = line.trim_start();
+            numbered
+                .split_once(". **")
+                .filter(|(n, _)| n.chars().all(char::is_numeric) && !n.is_empty())
+                .and_then(|(_, rest)| rest.split_once("**"))
+                .map(|(name, _)| name.to_string())
+        })
+        .collect()
+}
+
+/// `wf-mid` decides by `wf-auto`'s principles, in `wf-auto`'s order — the same
+/// standing voice, so a map can be handed between the two skills without its
+/// route changing character half way along it.
+///
+/// Pinned as a list rather than a phrase, because the failure this guards
+/// against is silent: an edit that adds a principle to one doc, or reorders the
+/// two that most often collide, leaves both files reading perfectly well while
+/// the same ticket now resolves differently depending on which skill picked it
+/// up. The tiebreak order is load-bearing and only a comparison can hold it.
+#[test]
+fn wf_mid_decides_by_the_same_principles_in_the_same_order_as_wf_auto() {
+    let auto = principles("wf-auto");
+    assert!(
+        auto.len() >= 4,
+        "the extraction found nothing to compare: {auto:?}"
+    );
+    assert_eq!(
+        principles("wf-mid"),
+        auto,
+        "wf-mid and wf-auto must decide by one list, in one order"
+    );
+}
+
+/// The skill names in the README's `wf skills` sample, in the order it prints
+/// them: the indented rows of the fenced block under the paragraph that
+/// introduces the report.
+fn documented_status_rows() -> Vec<String> {
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+        .expect("the README ships in this repo");
+    let block = readme
+        .split_once("`wf skills` reports a copy that is not")
+        .expect("the README shows what `wf skills` reports")
+        .1
+        .split("```")
+        .nth(1)
+        .expect("as a fenced sample");
+    block
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("  ")
+                .filter(|row| !row.starts_with(' '))
+                .and_then(|row| row.split_whitespace().next())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// The sample report lists the skills `wf skills` actually walks, in the order
+/// it actually walks them — [`wf::skills::BUNDLED`], which is what both
+/// `status` and `install` iterate.
+///
+/// Order, not just membership: the sample is a screen a reader compares their
+/// own terminal against, and one that interleaves the names differently reads
+/// as a different build rather than as a stale doc. `wf-mid` was first written
+/// into this block in the position the prose lists it in, which is not the
+/// position the binary prints it in.
+#[test]
+fn the_documented_status_report_lists_the_bundle_in_its_own_order() {
+    let bundled: Vec<String> = wf::skills::BUNDLED
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!(documented_status_rows(), bundled);
+}
+
+/// The skills the conda recipe names in `package_contents`, which is the check
+/// that a built package really carries them.
+fn packaged_skills() -> BTreeSet<String> {
+    let recipe =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/recipe/recipe.yaml"))
+            .expect("the recipe ships in this repo");
+    recipe
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("- share/wf/skills/")?
+                .strip_suffix("/SKILL.md")
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// The package's own file list is the bundle: every skill `wf` can exec is
+/// named there, and nothing is named that does not ship.
+///
+/// The recipe says a package that quietly shipped one fewer "must fail here
+/// rather than at the moment an agent is launched" — and until this test that
+/// claim held only for whoever remembered to edit the list. Dropping the
+/// `wf-mid` line left the whole suite green, and the symptom lands a release
+/// later as `Unknown command: /wf-mid` inside a devcontainer, which is the one
+/// place nobody is reading a build log.
+#[test]
+fn every_bundled_skill_is_named_in_the_package_contents() {
+    let bundled: BTreeSet<String> = wf::skills::BUNDLED
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!(packaged_skills(), bundled);
+}

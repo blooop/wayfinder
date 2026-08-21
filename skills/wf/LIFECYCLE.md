@@ -1,6 +1,6 @@
 # The manager protocol — a node's lifecycle, one fresh subagent per stage
 
-How a launched session drives a node (or a whole subtree of nodes) through its stages without anyone watching. This is referenced by the `wf-auto` skill and honored by `wf-tdd` and `wf-review`; nothing launches "the manager" directly — **the launched session is the manager**. wf itself never is: it exec'd and exited.
+How a launched session drives a node (or a whole subtree of nodes) through its stages without anyone watching. This is referenced by the `wf-auto` and `wf-mid` skills and honored by `wf-tdd` and `wf-review`; nothing launches "the manager" directly — **the launched session is the manager**. wf itself never is: it exec'd and exited.
 
 ## The stage lattice (decided on blooop/wayfinder#61)
 
@@ -16,7 +16,7 @@ Each **open PR** linked to the node maps to one stage:
 
 The node takes the **max over its open PRs** in the constant order `needs attention > in review > building`. No open PRs: any merged PR → done; otherwise derive from ticket state — ready (open, unblocked, unclaimed) / in progress (claimed) / done (closed). PR state dominates ticket state when present.
 
-Routing — what a stage launches: build nodes at ready/building/needs-attention → `wf-tdd`; build nodes at in-review → `wf-review`; decision-type nodes → the `wf` skill. Done is not launchable.
+Routing — what a stage launches: build nodes at ready/building/needs-attention → `wf-tdd`; build nodes at in-review → `wf-review`; decision-type nodes → the `wf` skill. Done is not launchable. That is the *interactive* table; the `mid` and `auto` modes collapse it, routing every node to their own skill, which then drives these stages itself.
 
 ## The protocol, per node
 

@@ -757,8 +757,8 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// options are rows now: each one names its mode, the skill that mode routes the
 /// staged node to, and who ends up deciding. Which is also why the route is
 /// drawn per option rather than once for the cursor's — the difference between
-/// `/wf`, `/wf-auto` and no skill at all (#112) *is* the choice being made, so
-/// every one of them is on screen.
+/// `/wf`, `/wf-mid`, `/wf-auto` and no skill at all (#112) *is* the choice
+/// being made, so every one of them is on screen.
 /// The agent is in the title rather than another row: it applies to every
 /// candidate, and horizontal keys can change it without moving the vertical
 /// cursor.
@@ -2190,6 +2190,7 @@ mod tests {
         assert!(screen.contains("/wf-one"), "{screen}");
         assert!(screen.contains("one tracked ticket"), "{screen}");
         assert!(screen.contains("new map"), "{screen}");
+        assert!(screen.contains("new map, mid"), "{screen}");
         assert!(screen.contains("new map, auto"), "{screen}");
         // The field is named for the row it fills: `task` on the first one,
         // which is the only thing telling you the text is not steering.
@@ -2199,9 +2200,34 @@ mod tests {
     }
 
     #[test]
+    fn no_mode_row_widens_the_picker_past_the_terminal_that_fits_the_rest() {
+        // 83 columns is what the picker's widest row has always needed — the
+        // route column plus `the agent decides alone and drives it to done`.
+        // A blurb longer than that does not wrap; the popup is clamped to the
+        // frame and the tail of the row is simply gone, so the row that says
+        // what a mode *does* is the one that loses its ending. The `mid` row
+        // arrived six columns over that budget, which clipped it on every
+        // terminal between 83 and 88 columns where nothing clipped before.
+        let app = {
+            let mut app = fixture_app();
+            down(&mut app, 2);
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            app
+        };
+        let screen = render_at(83, &app);
+        for mode in crate::launch::Mode::all() {
+            assert!(
+                screen.contains(mode.blurb()),
+                "{} is clipped at 83 columns:\n{screen}",
+                mode.label()
+            );
+        }
+    }
+
+    #[test]
     fn a_ticket_picker_draws_no_creation_rows() {
         // The other half of the rule: a ticket is not a repo-level stop, so
-        // its picker is the three modes and nothing else.
+        // its picker is the modes and nothing else.
         let app = {
             let mut app = fixture_app();
             down(&mut app, 2); // past the project row and the cluster header
@@ -2234,8 +2260,13 @@ mod tests {
         // on the interactive default.
         assert!(screen.contains("▶ interactive"), "{screen}");
         assert!(screen.contains("/wf "), "{screen}");
+        assert!(screen.contains("mid"), "{screen}");
+        assert!(screen.contains("/wf-mid"), "{screen}");
         assert!(screen.contains("auto"), "{screen}");
         assert!(screen.contains("/wf-auto"), "{screen}");
+        // The middle row's blurb is the whole reason it is a separate mode:
+        // it decides what it can and asks about what it cannot.
+        assert!(screen.contains("asks what it can't"), "{screen}");
         // The skill-free mode (#112) reads as what it execs — a bare `claude`,
         // no slash command — and says what picking it costs you. The route
         // column is asserted too: it is the half of the row that says what will
@@ -2256,14 +2287,19 @@ mod tests {
             "{screen}"
         );
         assert!(screen.contains("$wf "), "{screen}");
+        assert!(screen.contains("$wf-mid"), "{screen}");
         assert!(screen.contains("$wf-auto"), "{screen}");
 
         // Down moves the pick; the marker moves with it and nothing about the
         // route line is stale, since each row draws its own.
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let screen = render(&app);
-        assert!(screen.contains("▶ auto"), "{screen}");
+        assert!(screen.contains("▶ mid"), "{screen}");
         assert!(!screen.contains("▶ interactive"), "{screen}");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let screen = render(&app);
+        assert!(screen.contains("▶ auto"), "{screen}");
+        assert!(!screen.contains("▶ mid"), "{screen}");
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let screen = render(&app);
         assert!(screen.contains("▶ plain"), "{screen}");

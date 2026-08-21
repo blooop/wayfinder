@@ -154,6 +154,13 @@ pub enum Route {
     /// decisions settled against the skill's guiding principles, and the whole
     /// remaining lifecycle driven unattended (#96).
     WayfinderAuto,
+    /// `/wf-mid <map> [<n>]` — the same map with the human in it for the few
+    /// decisions that are genuinely theirs: the skill settles whatever its
+    /// principles settle and escalates only taste, scope, and what is
+    /// expensive to reverse. A third skill rather than a flag on either
+    /// neighbour, for the reason [`Mode`] gives: who decides is the whole
+    /// difference between these prompts, so it is spent at the exec.
+    WayfinderMid,
     /// `/wf-one <task>` — one tracked ticket, filed and driven by the skill:
     /// its own single-ticket map, `/wf-tdd` build, `/wf-review` review (#114).
     /// The only route reached by a creation candidate rather than a mode.
@@ -172,6 +179,7 @@ impl Route {
             Route::Review => Some("wf-review"),
             Route::Wayfinder => Some("wf"),
             Route::WayfinderAuto => Some("wf-auto"),
+            Route::WayfinderMid => Some("wf-mid"),
             Route::One => Some("wf-one"),
             Route::Plain => None,
         }
@@ -194,6 +202,7 @@ impl Route {
             Route::Review => "/wf-review",
             Route::Wayfinder => "/wf",
             Route::WayfinderAuto => "/wf-auto",
+            Route::WayfinderMid => "/wf-mid",
             Route::One => "/wf-one",
             Route::Plain => "claude",
         }
@@ -204,7 +213,8 @@ impl Route {
         match self {
             Route::Tdd => Route::Review,
             Route::Review => Route::Wayfinder,
-            Route::Wayfinder => Route::WayfinderAuto,
+            Route::Wayfinder => Route::WayfinderMid,
+            Route::WayfinderMid => Route::WayfinderAuto,
             Route::WayfinderAuto => Route::One,
             Route::One => Route::Plain,
             Route::Plain => Route::Tdd,
@@ -238,6 +248,13 @@ pub enum Mode {
     /// The default: the human is in the loop, and the session grills them.
     #[default]
     Interactive,
+    /// The agent settles what `/wf-mid`'s principles settle and asks about
+    /// the rest — the few decisions that are taste, scope, or expensive to
+    /// reverse. Sits between the two neighbours on the one axis this picker
+    /// is about: `interactive` spends the human's attention on every decision,
+    /// `auto` spends none of it, and neither is the right price for a map
+    /// whose decisions are mostly obvious and occasionally not.
+    Mid,
     /// The agent decides alone, under `/wf-auto`'s declared principles, and
     /// drives the node's remaining lifecycle unattended. Replaced `defer`,
     /// which routed to `/wf`'s own deferred mode before that skill existed
@@ -255,6 +272,7 @@ impl Mode {
     pub fn label(self) -> &'static str {
         match self {
             Mode::Interactive => "interactive",
+            Mode::Mid => "mid",
             Mode::Auto => "auto",
             Mode::Plain => "plain",
         }
@@ -266,6 +284,7 @@ impl Mode {
     pub fn blurb(self) -> &'static str {
         match self {
             Mode::Interactive => "you are in the loop; it grills you",
+            Mode::Mid => "it decides what it can, asks what it can't",
             Mode::Auto => "the agent decides alone and drives it to done",
             Mode::Plain => "no skill; a bare session on the node's branch",
         }
@@ -279,7 +298,8 @@ impl Mode {
     /// place to add it.
     fn after(self) -> Mode {
         match self {
-            Mode::Interactive => Mode::Auto,
+            Mode::Interactive => Mode::Mid,
+            Mode::Mid => Mode::Auto,
             Mode::Auto => Mode::Plain,
             Mode::Plain => Mode::Interactive,
         }
@@ -305,26 +325,35 @@ impl Mode {
 /// Which kind, not yet what: the typed text that completes it (the task, or a
 /// map seed) arrives at the second enter, as [`Creation`].
 ///
-/// Three hand-listed kinds rather than a creation × [`Mode`] product, because
-/// the product is dishonest: charting a map with no skill (`plain`) is
-/// meaningless, and a task's lifecycle is `/wf-one`'s own. These are exactly
-/// the combinations that mean something.
+/// Hand-listed kinds rather than a creation × [`Mode`] product, because the
+/// product is dishonest: charting a map with no skill (`plain`) is meaningless,
+/// and a task's lifecycle is `/wf-one`'s own. These are exactly the
+/// combinations that mean something — the three charting modes plus the task,
+/// and no cell for the one that would mean nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreationKind {
     /// One tracked ticket via `/wf-one`: filed, built, reviewed.
     Task,
     /// Chart a new map via `/wf`, with the human in the loop.
     Map,
+    /// Chart a new map via `/wf-mid`, mostly alone: it drafts the destination
+    /// and confirms it once, which is the highest-value question on any map.
+    MapMid,
     /// Chart a new map via `/wf-auto`, alone.
     MapAuto,
 }
 
 impl CreationKind {
     /// Every kind, in picker order. Written out rather than derived from an
-    /// `after` cycle: three variants with one call site is below the size
+    /// `after` cycle: four variants with one call site is below the size
     /// where the cycle device earns its ceremony.
     pub fn all() -> Vec<CreationKind> {
-        vec![CreationKind::Task, CreationKind::Map, CreationKind::MapAuto]
+        vec![
+            CreationKind::Task,
+            CreationKind::Map,
+            CreationKind::MapMid,
+            CreationKind::MapAuto,
+        ]
     }
 
     /// How the row reads in the picker.
@@ -332,6 +361,7 @@ impl CreationKind {
         match self {
             CreationKind::Task => "new task",
             CreationKind::Map => "new map",
+            CreationKind::MapMid => "new map, mid",
             CreationKind::MapAuto => "new map, auto",
         }
     }
@@ -341,6 +371,7 @@ impl CreationKind {
         match self {
             CreationKind::Task => "one tracked ticket, built and reviewed",
             CreationKind::Map => "chart a new map in this repo, with you",
+            CreationKind::MapMid => "chart a new map in this repo, asking little",
             CreationKind::MapAuto => "chart a new map in this repo, alone",
         }
     }
@@ -352,6 +383,7 @@ impl CreationKind {
         match self {
             CreationKind::Task => Route::One,
             CreationKind::Map => Route::Wayfinder,
+            CreationKind::MapMid => Route::WayfinderMid,
             CreationKind::MapAuto => Route::WayfinderAuto,
         }
     }
@@ -360,7 +392,7 @@ impl CreationKind {
     pub fn field(self) -> &'static str {
         match self {
             CreationKind::Task => "task",
-            CreationKind::Map | CreationKind::MapAuto => "seed",
+            CreationKind::Map | CreationKind::MapMid | CreationKind::MapAuto => "seed",
         }
     }
 
@@ -377,6 +409,7 @@ impl CreationKind {
                 task: text.to_string(),
             }),
             CreationKind::Map => Some(Creation::Map { seed: seed() }),
+            CreationKind::MapMid => Some(Creation::MapMid { seed: seed() }),
             CreationKind::MapAuto => Some(Creation::MapAuto { seed: seed() }),
         }
     }
@@ -391,6 +424,8 @@ pub enum Creation {
     Task { task: String },
     /// `/wf [<seed>]` — charting with the human; the seed is the loose idea.
     Map { seed: Option<String> },
+    /// `/wf-mid [<seed>]` — charting mostly alone.
+    MapMid { seed: Option<String> },
     /// `/wf-auto [<seed>]` — charting alone.
     MapAuto { seed: Option<String> },
 }
@@ -401,6 +436,7 @@ impl Creation {
         match self {
             Creation::Task { .. } => CreationKind::Task,
             Creation::Map { .. } => CreationKind::Map,
+            Creation::MapMid { .. } => CreationKind::MapMid,
             Creation::MapAuto { .. } => CreationKind::MapAuto,
         }
     }
@@ -417,6 +453,7 @@ impl Creation {
         match self {
             Creation::Task { task } => format!("{} {task}", Route::One.invocation(agent)),
             Creation::Map { seed } => seeded(&Route::Wayfinder.invocation(agent), seed),
+            Creation::MapMid { seed } => seeded(&Route::WayfinderMid.invocation(agent), seed),
             Creation::MapAuto { seed } => seeded(&Route::WayfinderAuto.invocation(agent), seed),
         }
     }
@@ -748,6 +785,13 @@ pub fn route(aim: &Aim, mode: Mode) -> Route {
     match (aim, mode) {
         (Aim::Map, Mode::Interactive) => Route::Wayfinder,
         (Aim::Map | Aim::Ticket { .. }, Mode::Auto) => Route::WayfinderAuto,
+        // `Mid` collapses the table for `Auto`'s reason: the launched session
+        // manages whatever the node needs — deciding, asking, and driving a
+        // build's stages through `wf-tdd` and `wf-review` itself — so the
+        // stage's own skill would do one stage and stop. Routing a build node
+        // to `Tdd` here would also draw two picker rows naming `/wf-tdd` with
+        // different blurbs, which is exactly what a per-row route prevents.
+        (Aim::Map | Aim::Ticket { .. }, Mode::Mid) => Route::WayfinderMid,
         // `Plain` collapses the table for the opposite reason `Auto` does:
         // `Auto` picks one skill for every node, `Plain` picks none, and
         // neither the aim nor the stage can change that.
@@ -967,7 +1011,7 @@ impl Staged {
     /// grounds that a header was the only repo-level stop there was; a project
     /// row is a *better* one, and having both would put "new map" on every
     /// header of a repo that has three maps open — three doors to one act,
-    /// none of them the repo. So the header's picker is the three modes again,
+    /// none of them the repo. So the header's picker is the mode rows again,
     /// exactly like a ticket's, and the only difference between them is what
     /// they aim at.
     ///
@@ -989,7 +1033,7 @@ impl Staged {
                 }))
                 .collect(),
             // A project names nothing that exists yet, so there is nothing to
-            // launch — only the three ways to start something.
+            // launch — only the ways to start something.
             StagedAt::Project => CreationKind::all()
                 .into_iter()
                 .map(Candidate::Create)
@@ -1765,7 +1809,10 @@ impl Launch {
             (Route::One, _) => return Some(skill),
             (_, Aim::Map) => format!("{skill} {}", map.id.number),
             (Route::Tdd | Route::Review, Aim::Ticket { number, .. }) => format!("{skill} {number}"),
-            (Route::Wayfinder | Route::WayfinderAuto, Aim::Ticket { number, .. }) => {
+            (
+                Route::Wayfinder | Route::WayfinderMid | Route::WayfinderAuto,
+                Aim::Ticket { number, .. },
+            ) => {
                 format!("{skill} {} {number}", map.id.number)
             }
             (Route::Plain, _) => return None,
@@ -2376,8 +2423,8 @@ mod tests {
                 agent: Agent::Claude
             }
         );
-        // And the three ways to start fresh are all still there, in order,
-        // one arrow away.
+        // And every way to start fresh is still there, in order, one arrow
+        // away.
         let modes: Vec<Candidate> = staged.candidates().into_iter().skip(1).collect();
         assert_eq!(modes, staged_with(None).candidates());
     }
@@ -2738,9 +2785,11 @@ mod tests {
     }
 
     #[test]
-    fn a_ticket_picker_lists_exactly_the_three_launch_modes() {
+    fn a_ticket_picker_lists_exactly_the_launch_modes() {
         // #114: creation is a repo-level act, and a ticket is not a repo-level
-        // stop — its picker stays the pure mode list, concerns unmerged.
+        // stop — its picker stays the pure mode list, concerns unmerged. The
+        // rows are `Mode::all` in its own order, so they read as rising
+        // autonomy rather than as the order the modes were added in.
         let staged = Staged::ticket(&ticket("blooop/wayfinder", 16), &map_ref(1), Stage::Ready)
             .expect("launchable");
         assert_eq!(
@@ -2749,6 +2798,10 @@ mod tests {
                 Candidate::Launch {
                     mode: Mode::Interactive,
                     route: Route::Wayfinder
+                },
+                Candidate::Launch {
+                    mode: Mode::Mid,
+                    route: Route::WayfinderMid
                 },
                 Candidate::Launch {
                     mode: Mode::Auto,
@@ -2778,6 +2831,10 @@ mod tests {
                     route: Route::Wayfinder
                 },
                 Candidate::Launch {
+                    mode: Mode::Mid,
+                    route: Route::WayfinderMid
+                },
+                Candidate::Launch {
                     mode: Mode::Auto,
                     route: Route::WayfinderAuto
                 },
@@ -2795,6 +2852,7 @@ mod tests {
             vec![
                 Candidate::Create(CreationKind::Task),
                 Candidate::Create(CreationKind::Map),
+                Candidate::Create(CreationKind::MapMid),
                 Candidate::Create(CreationKind::MapAuto),
             ]
         );
@@ -2804,7 +2862,7 @@ mod tests {
             .iter()
             .map(|c| c.invocation(Agent::Claude))
             .collect();
-        assert_eq!(shown, ["/wf-one", "/wf", "/wf-auto"]);
+        assert_eq!(shown, ["/wf-one", "/wf", "/wf-mid", "/wf-auto"]);
     }
 
     #[test]
@@ -2828,6 +2886,10 @@ mod tests {
     fn creation_rows_read_as_what_they_start() {
         assert_eq!(Candidate::Create(CreationKind::Task).label(), "new task");
         assert_eq!(Candidate::Create(CreationKind::Map).label(), "new map");
+        assert_eq!(
+            Candidate::Create(CreationKind::MapMid).label(),
+            "new map, mid"
+        );
         assert_eq!(
             Candidate::Create(CreationKind::MapAuto).label(),
             "new map, auto"
@@ -2853,6 +2915,7 @@ mod tests {
         );
         assert_eq!(Candidate::Create(CreationKind::Task).field(), "task");
         assert_eq!(Candidate::Create(CreationKind::Map).field(), "seed");
+        assert_eq!(Candidate::Create(CreationKind::MapMid).field(), "seed");
         assert_eq!(Candidate::Create(CreationKind::MapAuto).field(), "seed");
     }
 
@@ -2879,6 +2942,10 @@ mod tests {
             Some(Creation::Map {
                 seed: Some("a caching layer".to_string())
             })
+        );
+        assert_eq!(
+            CreationKind::MapMid.with_text(""),
+            Some(Creation::MapMid { seed: None })
         );
         assert_eq!(
             CreationKind::MapAuto.with_text(""),
@@ -2921,6 +2988,18 @@ mod tests {
                 .last()
                 .expect("prompt"),
             "/wf a caching layer"
+        );
+        assert_eq!(
+            creation_argv(CreationKind::MapMid, "")
+                .last()
+                .expect("prompt"),
+            "/wf-mid"
+        );
+        assert_eq!(
+            creation_argv(CreationKind::MapMid, "a caching layer")
+                .last()
+                .expect("prompt"),
+            "/wf-mid a caching layer"
         );
         assert_eq!(
             creation_argv(CreationKind::MapAuto, "")
@@ -3005,7 +3084,7 @@ mod tests {
         // mode nothing on screen can reach.
         assert_eq!(
             Mode::all(),
-            vec![Mode::Interactive, Mode::Auto, Mode::Plain]
+            vec![Mode::Interactive, Mode::Mid, Mode::Auto, Mode::Plain]
         );
         assert_eq!(
             Mode::all().first(),
@@ -3496,6 +3575,7 @@ mod tests {
         for (kind, text) in [
             (CreationKind::Task, "wire the exporter"),
             (CreationKind::Map, "a caching layer"),
+            (CreationKind::MapMid, "a caching layer"),
             (CreationKind::MapAuto, ""),
         ] {
             assert_eq!(ctx_of(&creation_argv(kind, text).join(" ")), None);
@@ -3651,11 +3731,44 @@ mod tests {
     }
 
     #[test]
+    fn mid_routes_every_node_to_wayfinder_mid() {
+        // `mid` collapses the table for `auto`'s reason: the launched session
+        // manages whatever the node needs — settling what the principles
+        // settle, asking where they don't, and handing a build's stages to
+        // `wf-tdd` and `wf-review` itself. Routing a build node to its stage
+        // skill instead would draw two picker rows naming the same skill,
+        // which is the one thing a per-row route exists to prevent.
+        for ticket_type in DECISION_TYPES.into_iter().chain([TicketType::Build]) {
+            for stage in LAUNCHABLE {
+                assert_eq!(
+                    route(&aim(ticket_type, stage), Mode::Mid),
+                    Route::WayfinderMid,
+                    "{ticket_type:?} at {stage:?}"
+                );
+            }
+        }
+        assert_eq!(route(&Aim::Map, Mode::Mid), Route::WayfinderMid);
+    }
+
+    #[test]
+    fn the_mid_route_names_the_wf_mid_skill() {
+        // The mode is a *skill*, not a flag on one, so the route has to name a
+        // prompt the package carries — the sweep over `Route::all` is what
+        // fails the build if it does not.
+        assert_eq!(Route::WayfinderMid.label(), "/wf-mid");
+        assert_eq!(Route::WayfinderMid.bundled_skill(), Some("wf-mid"));
+        assert!(
+            Route::all().contains(&Route::WayfinderMid),
+            "reachable in the cycle"
+        );
+    }
+
+    #[test]
     fn plain_launches_a_session_with_no_skill_in_it() {
-        // The third mode collapses the table the way `auto` does, and for the
-        // opposite reason: `auto` picks one skill for every node, `plain` picks
-        // none. Which node it was aimed at cannot change that, so every cell
-        // answers the same.
+        // The last mode collapses the table the way `auto` and `mid` do, and
+        // for the opposite reason: they pick one skill for every node, `plain`
+        // picks none. Which node it was aimed at cannot change that, so every
+        // cell answers the same.
         for ticket_type in DECISION_TYPES.into_iter().chain([TicketType::Build]) {
             for stage in LAUNCHABLE {
                 assert_eq!(

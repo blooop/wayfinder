@@ -133,10 +133,12 @@ tests:
         - wf
       files:
         # Named individually rather than as a glob: the routing table promises
-        # these four skills exist, so a package that quietly shipped three
-        # must fail here rather than at the moment an agent is launched.
+        # every one of these skills exists, so a package that quietly shipped
+        # one fewer must fail here rather than at the moment an agent is
+        # launched.
         - share/wf/skills/wf/SKILL.md
         - share/wf/skills/wf-auto/SKILL.md
+        - share/wf/skills/wf-mid/SKILL.md
         - share/wf/skills/wf-one/SKILL.md
         - share/wf/skills/wf-tdd/SKILL.md
         - share/wf/skills/wf-review/SKILL.md
