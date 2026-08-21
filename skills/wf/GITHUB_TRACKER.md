@@ -9,15 +9,13 @@ Every command below targets `$REPO` **explicitly**. Never let `gh` resolve the t
 ```bash
 REMOTE=origin   # the remote for the repo being mapped — see Forks if origin points at the parent
 REPO=$(git remote get-url "$REMOTE" | sed -E 's#^(ssh://)?(git@github\.com[:/]|https://github\.com/)##; s#\.git$##')
-gh repo view "$REPO" --json nameWithOwner,visibility,isFork,parent,hasIssuesEnabled \
-  --jq '"\(.nameWithOwner) \(.visibility)\(if .isFork then " fork-of:\(.parent.nameWithOwner)" else "" end)\(if .hasIssuesEnabled then "" else " ISSUES-DISABLED" end)"'
+gh repo view "$REPO" --json nameWithOwner,isFork,parent,hasIssuesEnabled \
+  --jq '"\(.nameWithOwner)\(if .isFork then " fork-of:\(.parent.nameWithOwner)" else "" end)\(if .hasIssuesEnabled then "" else " ISSUES-DISABLED" end)"'
 ```
 
 `$REMOTE` and `$REPO` are the session's two anchors: `$REPO` on every `gh` call, `$REMOTE` on every `git push`. Neither has a default worth trusting.
 
-Show that line to the human before the first write of a charting session and stop if it isn't the repo they meant — the map body carries the Destination and the whole fog sketch, so it is both the most revealing artifact in the flow and the first one created. If `origin` isn't a GitHub remote, use the local-markdown fallback at the bottom of this file rather than reaching for another repo.
-
-The `visibility` field is why that line includes it: if it reads `PUBLIC`, every issue this session files is world-readable. Call it out and get an explicit go-ahead before the first write — see **Keep the map inside its repo** in [SKILL.md](SKILL.md).
+Say that line to the human as the session's first words, then write — it is narration, not a gate. An invocation is a request for a map, so don't stall it on a confirmation; the pinning above is what keeps the writes in the right repo. If `origin` isn't a GitHub remote, use the local-markdown fallback at the bottom of this file rather than reaching for another repo.
 
 ## Forks
 

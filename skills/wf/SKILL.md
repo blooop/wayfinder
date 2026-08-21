@@ -35,8 +35,6 @@ The map belongs to **one** repo — the one being mapped — and every write goe
 
 **A fork is its own repo.** Its map, tickets, and research branches belong on the fork being mapped, never on its parent — `gh` and `git push` both drift upstream when left to their defaults, and the parent is the repo you have least claim on. See **Forks** in [GITHUB_TRACKER.md](GITHUB_TRACKER.md).
 
-A map is thinking out loud — a Destination, a fog sketch, half-formed questions — and the tracker of a public repo publishes all of it. If the resolved repo is **public**, say so and confirm with the human before the first write; see **Pin the repo first** in [GITHUB_TRACKER.md](GITHUB_TRACKER.md). That's a check on where tickets are *filed*, not on what they may discuss: research tickets search the open web with the real question, identifiers and all.
-
 ### The map body
 
 The whole map at low resolution, loaded once per session. Open tickets are **not** listed — they are open child issues, found by query.
@@ -141,7 +139,7 @@ User invokes with a loose idea.
 
 1. **Name the destination.** Run a `/grill-me` and `/constructive-modeling` session to pin down what this map is finding its way to — the spec, decision, or change. The destination fixes the scope, so it's settled first.
 2. **Map the frontier.** Grill again, **breadth-first** this time: fan out across the whole space rather than deep on any one thread, surfacing the open decisions and the first steps takeable now. **If this surfaces no fog** — the way to the destination is already clear, the whole journey small enough for one session — you don't need a map. Stop and ask the user how they'd like to proceed.
-3. **Create the map** (label `wayfinder:map`): Destination and Notes filled in, Decisions-so-far empty, the fog sketched into **Not yet specified**. **Pin and name the target repo first** — this is the session's first write, and it carries the Destination and the whole fog sketch (see [Keep the map inside its repo](#keep-the-map-inside-its-repo)).
+3. **Create the map** (label `wayfinder:map`): Destination and Notes filled in, Decisions-so-far empty, the fog sketched into **Not yet specified**. **Pin and name the target repo first** — this is the session's first write (see [Keep the map inside its repo](#keep-the-map-inside-its-repo)).
 4. **Create the tickets you can specify now** as child issues of the map — then wire blocking edges in a **second pass** (issues need ids before they can reference each other). Wiring sorts them into the frontier and the blocked; everything you can't yet specify stays in the fog — the **Not yet specified** section.
 5. **Fire the research subagents.** For each `research` ticket you just created, spin up a `/research` subagent to resolve it in parallel, capturing its findings on a throwaway `research/<name>` branch — pushed by name to the pinned remote, never with a bare `git push` — with a context pointer from the ticket.
 6. Stop — charting is one session's work; it hand-resolves nothing.
