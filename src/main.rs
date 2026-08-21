@@ -859,46 +859,64 @@ mod tests {
     }
 
     #[test]
-    fn the_cleanup_the_autonomous_skill_prints_is_one_this_binary_accepts() {
-        // The skills are what `wf` execs, so the command `wf-auto` tells an
-        // unattended run to end with is this binary's behaviour as much as the
-        // parser is — and the two ship in one package and can drift in one
-        // edit. So the documented line is read out of the skill and handed to
-        // the real parser, with its placeholders filled in and nothing else
-        // changed.
+    fn the_cleanup_every_skill_prints_is_one_this_binary_accepts() {
+        // The skills are what `wf` execs, so the command a skill tells a run to
+        // end with is this binary's behaviour as much as the parser is — and
+        // the two ship in one package and can drift in one edit. So the
+        // documented line is read out of every skill that prints one, and
+        // handed to the real parser with its placeholders filled in and
+        // nothing else changed.
         //
         // Both directions bite. Renaming the flag here without touching the
-        // skill leaves every autonomous run ending in a rejection; editing the
-        // skill to say `-f` — the one thing that must never be automatic —
-        // fails on the rejection the parser already makes.
-        let skill = include_str!("../skills/wf-auto/SKILL.md");
-        let block = skill
-            .split_once("## Clean up what this run finished")
-            .expect("wf-auto documents the cleanup step")
-            .1
-            .split("```")
-            .nth(1)
-            .expect("and gives it as a command block");
-        let filled = block
-            .replace(
-                "<owner/repo#n> [<owner/repo#n> ...]",
-                "blooop/wayfinder#151",
-            )
-            .trim()
-            .to_string();
-        assert_eq!(filled, "wf reap --finished blooop/wayfinder#151");
-        let typed: Vec<String> = filled
-            .split_whitespace()
-            .skip(1)
-            .map(String::from)
-            .collect();
+        // skills leaves those runs ending in a rejection; editing a skill to
+        // say `-f` — the one thing that must never be automatic — fails on the
+        // rejection the parser already makes.
+        //
+        // Swept over `BUNDLED` rather than naming one skill, because the
+        // second skill to print this command shipped with the line unchecked:
+        // `wf-mid` could have told every run it executed to end in a rejection
+        // and this file would still have been green.
+        let mut checked = 0;
+        for name in skills::BUNDLED {
+            let path = format!("{}/skills/{name}/SKILL.md", env!("CARGO_MANIFEST_DIR"));
+            let skill = std::fs::read_to_string(&path).expect("every bundled skill ships here");
+            let Some((_, after)) = skill.split_once("## Clean up what this run finished") else {
+                continue;
+            };
+            let block = after
+                .split("```")
+                .nth(1)
+                .expect("a documented cleanup step gives it as a command block");
+            let filled = block
+                .replace(
+                    "<owner/repo#n> [<owner/repo#n> ...]",
+                    "blooop/wayfinder#151",
+                )
+                .trim()
+                .to_string();
+            assert_eq!(
+                filled, "wf reap --finished blooop/wayfinder#151",
+                "in {name}"
+            );
+            let typed: Vec<String> = filled
+                .split_whitespace()
+                .skip(1)
+                .map(String::from)
+                .collect();
+            assert!(
+                matches!(
+                    parse_args(typed),
+                    Invocation::Reap(ReapScope::Finished(ref nodes)) if nodes.len() == 1
+                ),
+                "the command {name} prints is not one this binary parses as a \
+                 scoped cleanup: {filled}"
+            );
+            checked += 1;
+        }
+        // A sweep that found nothing to read would be green forever.
         assert!(
-            matches!(
-                parse_args(typed),
-                Invocation::Reap(ReapScope::Finished(ref nodes)) if nodes.len() == 1
-            ),
-            "the command wf-auto prints is not one this binary parses as a \
-             scoped cleanup: {filled}"
+            checked >= 2,
+            "two skills document the cleanup; the sweep found {checked}"
         );
     }
 
