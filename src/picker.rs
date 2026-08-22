@@ -461,15 +461,18 @@ pub async fn run_picker() -> Result<()> {
     let here = projects::discover_checkout(&cwd).await;
     let cache_path =
         projects::default_cache_path().context("cannot resolve the XDG cache directory")?;
-    let mut cache = ProjectsCache::load_or_default(&cache_path);
-    // Accretion needs a matching forget: a checkout that has been deleted must
-    // stop offering itself as somewhere an agent could run.
-    let pruned = cache.prune_missing();
-    if let Some((path, slug)) = &here {
-        cache.register(path.clone(), slug.clone());
-        cache.save(&cache_path)?;
-    } else if pruned {
-        cache.save(&cache_path)?;
+    let (cache, saved) = ProjectsCache::at_startup(
+        &cache_path,
+        here.as_ref()
+            .map(|(path, slug)| (path.as_path(), slug.as_str())),
+    );
+    // Reported, not fatal — the launcher runs on the registry it just loaded
+    // whether or not the machine can remember it, exactly as the handover write
+    // does. Printed *here*, before the alternate screen goes up, so it lands on
+    // the primary buffer: visible on the way in, and still there when `wf` puts
+    // that buffer back on the way out.
+    if let Err(err) = saved {
+        eprintln!("wf: could not save the projects cache: {err:#}");
     }
     let repos = cache.repos();
     // The head start (#28): the map numbers the last search found. Reading them
@@ -534,19 +537,19 @@ pub async fn run_picker() -> Result<()> {
             // it, and for everyone else launching is the only other act that
             // means "this is what I am working on".
             //
-            // Re-read before writing, exactly as the discovery task does: it
-            // writes the search's findings to this same file while the picker
-            // is up, so the copy loaded before the first frame is stale by
-            // now, and saving it would trade this stamp for next run's head
-            // start.
+            // Through the cache's write seam, which re-reads: the discovery
+            // task writes the search's findings to this same file while the
+            // picker is up, so the copy loaded before the first frame is stale
+            // by now, and writing it back would trade this stamp for next run's
+            // head start.
             //
             // Best-effort on purpose. A cache that will not write is not worth
             // refusing a launch over, and the only cost of losing this is one
             // project sitting lower in a list than it might have.
-            let mut cache = ProjectsCache::load_or_default(&cache_path);
-            let mut changed = cache.touch(launch.cwd());
-            // And record the conversation this launch is about to start, so a
-            // later run can offer the way back into it (#35).
+            //
+            // The session record rides along in the same edit — the
+            // conversation this launch is about to start, so a later run can
+            // offer the way back into it (#35).
             //
             // Written **here**, immediately before the terminal is restored
             // and the image replaced, because this is the last moment `wf`
@@ -555,16 +558,17 @@ pub async fn run_picker() -> Result<()> {
             // gets. A creation records nothing: it has no node to key on until
             // its skill files one.
             //
-            // Best-effort like the stamp above it, and for a smaller cost: a
-            // record that fails to write means the resume row is missing next
-            // time, not that anything is wrong with the launch.
-            if let Some(session) = launch.session() {
-                cache.record_session(session);
-                changed = true;
-            }
-            if changed {
-                let _ = cache.save(&cache_path);
-            }
+            // Best-effort like the stamp it travels with, and for a smaller
+            // cost: a record that fails to write means the resume row is
+            // missing next time, not that anything is wrong with the launch.
+            let _ = ProjectsCache::update(&cache_path, |cache| {
+                let mut changed = cache.touch(launch.cwd());
+                if let Some(session) = launch.session() {
+                    cache.record_session(session);
+                    changed = true;
+                }
+                changed
+            });
             // The prompts the selected agent is about to run. `wf skills
             // install` links its skills directory at a *copy* of the bundle,
             // and a copy is a thing that can fall behind a `pixi global update

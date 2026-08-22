@@ -28,9 +28,14 @@ async fn registering_this_checkout_finds_and_fetches_its_map() {
     let cache_file = std::env::temp_dir()
         .join(format!("wf-live-discovery-{}", std::process::id()))
         .join("projects.json");
-    let mut cache = ProjectsCache::load_or_default(&cache_file);
-    cache.register(toplevel.clone(), slug.clone());
-    cache.save(&cache_file).expect("save cache");
+    // Through the cache's one write seam, the way `wf` itself registers: there
+    // is no way to hand it a cache to write, only an edit to make to the one on
+    // disk.
+    let (_, saved) = ProjectsCache::update(&cache_file, |cache| {
+        cache.register(toplevel.clone(), slug.clone());
+        true
+    });
+    saved.expect("save cache");
     let reloaded = ProjectsCache::load_or_default(&cache_file);
     assert_eq!(reloaded.repos(), vec![slug.clone()]);
     assert_eq!(reloaded.checkouts[0].path, toplevel);
