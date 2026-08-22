@@ -58,7 +58,7 @@ query($owner: String!, $name: String!, $number: Int!) {
       title
       state
       updatedAt
-      labels(first: 20) { nodes { name } }
+      labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
       subIssues(first: 100) {
         nodes {
           number title state
@@ -114,7 +114,7 @@ struct MapIssue {
     /// the PR selection follows.
     #[serde(rename = "updatedAt", default)]
     updated_at: Option<String>,
-    labels: Nodes<Label>,
+    labels: Paged<Label>,
     #[serde(rename = "subIssues")]
     sub_issues: Paged<SubIssue>,
 }
@@ -361,7 +361,16 @@ fn parse_map(body: &[u8], id: &MapId) -> Result<Map> {
     // as stale, which is honest, instead of rendering some unrelated issue's
     // sub-issues as its map. The unconditional search corrects the number
     // moments later.
-    if !is_open(&issue.state) || !issue.labels.nodes.iter().any(|l| l.name == MAP_LABEL) {
+    //
+    // The label half of the proof needs the tracker's *whole* answer: a label
+    // page cut short cannot prove the label is gone, only a complete page
+    // without it can (#184). Without that qualifier, a map wearing more labels
+    // than one page holds was rejected here as "no longer a map" on every
+    // refresh, while discovery's label-scoped search — which no page cap can
+    // blind — kept re-finding it.
+    let map_label_disproven = !issue.labels.nodes.iter().any(|l| l.name == MAP_LABEL)
+        && !issue.labels.page_info.has_next_page;
+    if !is_open(&issue.state) || map_label_disproven {
         bail!(
             "{}#{} is no longer an open `{MAP_LABEL}` issue",
             id.repo,
@@ -698,6 +707,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_maps_own_label_count_can_never_unmap_it() {
+        // The worst of #184's three findings: a map wearing more labels than
+        // one page holds, with `wayfinder:map` not on the page the fetch got,
+        // used to fail re-verification as "no longer a map" — while discovery,
+        // whose label-scoped search is immune to the cap, kept re-finding it.
+        // Permanently, on every refresh.
+        //
+        // An unseen label on a *truncated* page proves nothing, so it keeps
+        // the map. Only a complete page without the label — the tracker's
+        // whole answer — may reject.
+        let body = map_response_with("OPEN", r#"{"name": "enhancement"}"#).replacen(
+            r#""labels": {"nodes": [{"name": "enhancement"}]},"#,
+            r#""labels": {"nodes": [{"name": "enhancement"}], "pageInfo": {"hasNextPage": true}},"#,
+            1,
+        );
+        let map = parse_map(body.as_bytes(), &wf_map_id())
+            .expect("a label page the tracker cut short cannot prove the label is gone");
+        assert_eq!(map.title, "Map: wf", "the map renders as itself");
+
+        // And the label page being cut short is not the *tree* being cut
+        // short: nothing ticket-bearing was truncated here.
+        assert!(!map.truncated, "a truncated label page is not a partial tree");
+    }
+
     /// One sub-issue carrying the full PR-badge matrix (#52).
     const PR_RESPONSE: &str = r#"{"data": {"repository": {"issue": {
         "title": "Map: wf",
@@ -911,6 +945,24 @@ mod tests {
                 "{field} no longer asks whether its page was all of it: {block}"
             );
         }
+    }
+
+    #[test]
+    fn the_maps_own_label_page_is_as_deep_as_the_tracker_allows() {
+        // The other half of the un-mapping fix: the parse forgives a truncated
+        // label page, and the query makes truncation implausible in the first
+        // place — 100 is the GraphQL page maximum, five times the old cap that
+        // a label-heavy map actually overflowed. The first `labels` selection
+        // in the query is the map issue's own, the one re-verification reads.
+        let block = connection_block(MAP_QUERY, "labels");
+        assert!(
+            block.starts_with("labels(first: 100)"),
+            "the map's label page shrank below the tracker's maximum: {block}"
+        );
+        assert!(
+            asks_its_own_page_info(block),
+            "the label page no longer says whether it was all of it: {block}"
+        );
     }
 
     #[test]
