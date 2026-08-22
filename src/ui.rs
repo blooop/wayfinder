@@ -999,13 +999,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     // workspace id is ~40 characters and there can be three of them. It goes
     // last and takes what the rest of the line has left, which is why the rest
     // of the line is measured first.
-    let spent = counts.chars().count()
+    // Everything is measured in display columns — `Span::raw(..).width()`, the
+    // metric ratatui renders in — never chars: the notice and the stall names
+    // carry ticket titles, which are arbitrary text, and a CJK char measured
+    // as one char occupies two columns, so a char count hands the reclaim note
+    // columns the line does not have and the tail falls off the right edge.
+    let cols = |text: &str| Span::raw(text).width();
+    let spent = cols(&counts)
         + 2
-        + parts
-            .iter()
-            .map(|part| part.chars().count() + 1)
-            .sum::<usize>()
-        + notice.chars().count();
+        + parts.iter().map(|part| cols(part) + 1).sum::<usize>()
+        + cols(&notice);
     let mut left = (count_area.width as usize).saturating_sub(spent);
     // Stalls are laid down before the reclaim note, but not at any price: what
     // is held back for the reclaim note is exactly the width at which it stops
@@ -1025,7 +1028,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         .map_or(0, |found| found.min_width() + 1);
     let stalled = app.liveness.hint(left.saturating_sub(reserved));
     if !stalled.is_empty() {
-        left = left.saturating_sub(stalled.chars().count() + 1);
+        left = left.saturating_sub(cols(&stalled) + 1);
         parts.push(stalled);
     }
     let note = reclaim_note(app, left);
@@ -1686,6 +1689,43 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_wide_notice_is_not_clipped_by_the_reclaim_note_beside_it() {
+        // The reclaim note takes whatever the rest of the line has not spent —
+        // so everything else has to be measured in the columns it will
+        // actually occupy. The notice (which carries ticket titles, arbitrary
+        // text) was measured in chars: a CJK notice under-measured by half,
+        // the note was handed columns the notice needed, and the line's tail —
+        // the notice itself — fell off the right edge.
+        let notice = "已经在隔离容器里启动了交互式会话";
+        let mut app = fixture_app();
+        app.notice = Some(notice.to_string());
+        app.reclaimable = Some(Reclaimable::for_test(
+            &[
+                "devlaunch-github-com-blooop-wayfinder-129",
+                "devlaunch-github-com-blooop-wayfinder-127",
+            ],
+            0,
+        ));
+        let drawn: String = notice
+            .chars()
+            .map(|c| format!("{c} "))
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        for width in [100u16, 120] {
+            let screen = render_at(width, &app);
+            let line = screen
+                .lines()
+                .find(|line| line.contains("reclaimable"))
+                .unwrap_or_else(|| panic!("{width}: no count line: {screen}"));
+            assert!(
+                line.contains(&drawn),
+                "{width}: the notice lost its tail to the reclaim note: {line}"
+            );
         }
     }
 
