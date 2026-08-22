@@ -218,7 +218,24 @@ impl Recording {
 /// If the child could not be run, or failed. A failed child is a failed probe:
 /// its assertions are the test's.
 pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
-    record_as_dl(test, dl_stdout, gh_stdout, SHIMMED_DL)
+    record_full(test, dl_stdout, None, gh_stdout, SHIMMED_DL)
+}
+
+/// [`record`], with a *second* listing the shimmed `dl` answers from its
+/// second fixture-serving call onward.
+///
+/// This exists for exactly one kind of claim: what the code under test does
+/// when the machine **moves between two reads** — the TOCTOU that #186 closes,
+/// where a container starts between the listing a plan was made from and the
+/// removal that plan authorises. A single-fixture shim cannot produce that
+/// world: it answers every call identically, so a re-take of the listing is
+/// indistinguishable from never re-taking it.
+///
+/// `--version` answers do not consume the first fixture — the shim answers
+/// those before it reaches the fixture at all — so `dl_then` arrives on the
+/// second call that actually asked for output, whichever argv that is.
+pub fn record_relisted(test: &str, dl_first: &str, dl_then: &str, gh_stdout: &str) -> Recording {
+    record_full(test, dl_first, Some(dl_then), gh_stdout, SHIMMED_DL)
 }
 
 /// [`record`], with the release the shimmed `dl` claims to be.
@@ -238,8 +255,21 @@ pub fn record(test: &str, dl_stdout: &str, gh_stdout: &str) -> Recording {
 ///
 /// [`DEVLAUNCH_FLOOR`]: crate::launch
 pub fn record_as_dl(test: &str, dl_stdout: &str, gh_stdout: &str, dl_version: &str) -> Recording {
+    record_full(test, dl_stdout, None, gh_stdout, dl_version)
+}
+
+fn record_full(
+    test: &str,
+    dl_stdout: &str,
+    dl_then: Option<&str>,
+    gh_stdout: &str,
+    dl_version: &str,
+) -> Recording {
     let dir = scratch(test);
     std::fs::write(dir.join("dl.out"), dl_stdout).expect("the dl fixture");
+    if let Some(then) = dl_then {
+        std::fs::write(dir.join("dl.out.again"), then).expect("the second dl fixture");
+    }
     std::fs::write(dir.join("gh.out"), gh_stdout).expect("the gh fixture");
     let log = dir.join("argv.log");
     std::fs::write(&log, "").expect("the log");
@@ -647,6 +677,14 @@ fn shim(dir: &Path, name: &str, dl_version: &str) {
     //
     // The answer is [`SHIMMED_DL`] for the same reason the fixtures name a
     // release: a probe is only evidence about a machine it could be.
+    // The `.again` block is what lets a probe watch the machine *move between
+    // two reads* (see [`record_relisted`]): when a second fixture exists, the
+    // first fixture-serving call leaves a `.seen` marker beside it and every
+    // later one answers from `.again` instead. The marker lives in the scratch
+    // dir, not the child's `HOME`, so `touched_no_files` does not read the
+    // shim's own bookkeeping as the run disturbing the machine. With no
+    // `.again` file the branch is never entered and the shim answers every
+    // call identically, as it always has.
     let body = r#"#!/bin/sh
 line=$({
   printf '%s' 'PROGRAM'
@@ -654,6 +692,10 @@ line=$({
 } | tr '\n' ' ')
 printf '%s\n' "$line" >> "$LOGVAR"
 if [ "$1" = "--version" ]; then printf '%s\n' 'PROGRAM VERSION'; exit 0; fi
+if [ -e 'FIXTURE.again' ]; then
+  if [ -e 'FIXTURE.seen' ]; then cat 'FIXTURE.again'; exit 0; fi
+  : > 'FIXTURE.seen'
+fi
 cat 'FIXTURE'
 "#
     .replace("PROGRAM", name)
