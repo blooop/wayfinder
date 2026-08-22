@@ -1996,7 +1996,7 @@ mod tests {
     #[test]
     fn the_chrome_has_count_prompt_and_hint_lines() {
         let screen = render(&fixture_app());
-        assert!(screen.contains("5/5"));
+        assert!(screen.contains("4/5"));
         assert!(screen.contains("> █"));
         assert!(screen.contains("enter launch"));
         assert!(screen.contains("tab structure"));
@@ -2018,7 +2018,7 @@ mod tests {
         let lines: Vec<&str> = screen.lines().collect();
         assert!(lines[0].contains("wf · blooop/wayfinder"), "{screen}");
         assert!(lines[1].contains("> █"), "{screen}");
-        assert!(lines[2].contains("5/5"), "{screen}");
+        assert!(lines[2].contains("4/5"), "{screen}");
         // The body follows, still opening on its own blank spacer line — which
         // now reads as the gap between the chrome and the first cluster.
         // The project row leads the body, with the spacer that separates it
@@ -2067,9 +2067,10 @@ mod tests {
         assert!(!screen.contains("Choose the stack"), "{screen}");
         assert!(!screen.contains("Supervising AFK agents"), "{screen}");
         assert!(!screen.contains("done"), "{screen}");
-        // Count line and prompt reflect the live query; the denominator is
-        // the map's tickets, not the leverage rows.
-        assert!(screen.contains("3/5"), "{screen}");
+        // Count line and prompt reflect the live query; both halves count
+        // tickets, not leverage rows — #14 is drawn twice but is one match,
+        // and the context row placing it is not a match at all.
+        assert!(screen.contains("2/5"), "{screen}");
         assert!(screen.contains("> bread█"), "{screen}");
         // Clearing the query restores the lens whole.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -2401,14 +2402,14 @@ mod tests {
 
         // The count line was never taken away — the picker covers the rows, not
         // the chrome that says how many there are.
-        assert!(screen.contains("5/5"), "{screen}");
+        assert!(screen.contains("4/5"), "{screen}");
 
         // Esc closes it and gives the whole screen back.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let screen = render(&app);
         assert!(!screen.contains("launch Claude"), "{screen}");
         assert!(!screen.contains("launch Codex"), "{screen}");
-        assert!(screen.contains("5/5"), "{screen}");
+        assert!(screen.contains("4/5"), "{screen}");
     }
 
     #[test]
@@ -2471,7 +2472,7 @@ mod tests {
         assert_eq!(failure_note(&app), "· blooop/dotfiles#4 failed");
         let screen = render(&app);
         assert!(
-            screen.contains("5/5  · blooop/dotfiles#4 failed"),
+            screen.contains("4/5  · blooop/dotfiles#4 failed"),
             "{screen}"
         );
 
@@ -2514,7 +2515,7 @@ mod tests {
             .record_arrival(&MapId::new("blooop/wayfinder", 1));
         let screen = render(&app);
         assert!(screen.contains("#6 Re-entry breadcrumbs"), "{screen}");
-        assert!(screen.contains("5/5  · loading maps 1/3"), "{screen}");
+        assert!(screen.contains("4/5  · loading maps 1/3"), "{screen}");
         // Rows exist, so the title names the project rather than the wait.
         assert!(screen.contains("wf · blooop/wayfinder"), "{screen}");
     }

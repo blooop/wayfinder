@@ -435,6 +435,9 @@ impl Survey {
 /// Generic over the key so the caller decides what identity *is* — since #50
 /// that is `(MapId, ticket number)`: the same ticket listed on two maps of one
 /// repo is two rows, and the map half is what keeps the cursor on the right one.
+/// Since #188 the caller's key also says *which drawing*: the leverage lens
+/// draws one ticket under every root that unblocks it, and matching the bare
+/// ticket teleported a cursor from the second drawing to the first.
 pub fn preserve_cursor<K: PartialEq>(
     old_selected: Option<&K>,
     old_index: usize,

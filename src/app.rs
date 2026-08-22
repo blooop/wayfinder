@@ -168,11 +168,30 @@ pub struct RowKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopKey {
     Map(MapId),
-    Ticket(RowKey),
+    /// A ticket row, plus **which drawing of it** — the leverage lens
+    /// deliberately draws one ticket under every root that unblocks it, so on
+    /// a DAG diamond the [`RowKey`] alone names two stops. Without the
+    /// occurrence, pinning "the row they chose" resolved to the *first*
+    /// matching drawing, teleporting a cursor parked on the second one on
+    /// every refetch (#188).
+    Ticket(RowKey, usize),
     Group(GroupId),
     /// A whole project, by repo slug — already index-free, like the
     /// map and group keys.
     Project(String),
+}
+
+impl StopKey {
+    /// The first drawing of the same stop — the identity to fall back to when
+    /// the exact drawing left the screen but the ticket did not (a lens
+    /// toggle, a root that closed). Only tickets are ever drawn twice, so the
+    /// other arms are already their own first occurrence.
+    fn first_occurrence(&self) -> StopKey {
+        match self {
+            StopKey::Ticket(row, _) => StopKey::Ticket(row.clone(), 0),
+            other => other.clone(),
+        }
+    }
 }
 
 /// Where the cursor is, and — the part that matters — **whether anyone put it
@@ -233,7 +252,17 @@ impl Pinned {
     fn resolve(&self, new_order: &[StopKey]) -> usize {
         match self {
             Pinned::Identity(key, fallback) => {
-                crate::refresh::preserve_cursor(Some(key), *fallback, new_order)
+                // The exact drawing when the new order still has it; else the
+                // first drawing of the same ticket — a swap that removed the
+                // root a duplicate hung under took the drawing, not the
+                // ticket, and the cursor's promise is the ticket. Only when
+                // both are gone does the positional fallback apply.
+                let key = if new_order.contains(key) {
+                    key.clone()
+                } else {
+                    key.first_occurrence()
+                };
+                crate::refresh::preserve_cursor(Some(&key), *fallback, new_order)
             }
             Pinned::Position(fallback) => {
                 crate::refresh::preserve_cursor(None, *fallback, new_order)
@@ -578,13 +607,26 @@ impl App {
     /// nine projects on it: a fetch that has not landed and a repo with
     /// nothing open would look identical to the screen being empty, and the
     /// number a query narrows would not be the number the query narrowed.
+    ///
+    /// On a project's screen both halves count **tickets**, so the numerator
+    /// dedups the drawn rows: the leverage lens deliberately draws a ticket
+    /// under *every* root that unblocks it, and counting rows there let a
+    /// diamond in the DAG claim more tickets shown than the map holds — the
+    /// same nodes-not-rows discipline the rollups already keep.
     pub fn counts(&self) -> (usize, usize) {
         match self.level {
             Level::Projects => (
                 self.stops().len(),
                 projects::mru_repos(&self.checkouts).len(),
             ),
-            Level::Project { .. } => (self.visible().len(), self.scoped().len()),
+            Level::Project { .. } => {
+                let shown: BTreeSet<(MapId, usize)> = self
+                    .visible()
+                    .into_iter()
+                    .map(|row| (row.map, row.index))
+                    .collect();
+                (shown.len(), self.scoped().len())
+            }
         }
     }
 
@@ -601,15 +643,33 @@ impl App {
         }
     }
 
-    /// A stop's durable identity: a ticket by (map, number), a map or a group
-    /// by its own id — both of which already name no indices.
-    fn stop_key(&self, stop: &Stop) -> StopKey {
-        match stop {
-            Stop::Map(id) => StopKey::Map(id.clone()),
-            Stop::Ticket(row) => StopKey::Ticket(self.row_key(row)),
-            Stop::Group(id) => StopKey::Group(id.clone()),
-            Stop::Project(repo) => StopKey::Project(repo.clone()),
+    /// Every stop's durable identity, in on-screen order: a ticket by
+    /// (map, number) plus which drawing of it this is, a map or a group by its
+    /// own id — which already name no indices.
+    ///
+    /// Computed over the whole list rather than stop-by-stop because the
+    /// occurrence *is* list context: a key derived from one stop alone cannot
+    /// know it is the second drawing of a diamond-duplicated ticket, and a key
+    /// that cannot say so pins two stops to one identity (#188).
+    fn stop_keys(&self) -> Vec<StopKey> {
+        let mut keys: Vec<StopKey> = Vec::new();
+        for at in self.stops() {
+            let key = match &at.stop {
+                Stop::Map(id) => StopKey::Map(id.clone()),
+                Stop::Ticket(row) => {
+                    let row_key = self.row_key(row);
+                    let occurrence = keys
+                        .iter()
+                        .filter(|k| matches!(k, StopKey::Ticket(prev, _) if *prev == row_key))
+                        .count();
+                    StopKey::Ticket(row_key, occurrence)
+                }
+                Stop::Group(id) => StopKey::Group(id.clone()),
+                Stop::Project(repo) => StopKey::Project(repo.clone()),
+            };
+            keys.push(key);
         }
+        keys
     }
 
     /// Cursor position clamped into the stop list. An untouched cursor is not a
@@ -659,9 +719,10 @@ impl App {
         })
     }
 
-    /// The cursor's stable identity.
+    /// The cursor's stable identity — read off the whole key list, since which
+    /// drawing the cursor is on is a fact about the list, not the stop.
     fn cursor_key(&self) -> Option<StopKey> {
-        self.cursor_stop().map(|stop| self.stop_key(&stop))
+        self.stop_keys().into_iter().nth(self.cursor_pos())
     }
 
     /// The stop to hold on to while the list is rebuilt underneath the cursor —
@@ -691,10 +752,15 @@ impl App {
     /// Hence the exhaustive match rather than `unwrap_or(0)`: the `None` is the
     /// case that matters here, so it is named instead of being given a value.
     fn point_at(&mut self, key: &StopKey) {
-        let found = self
-            .stops()
+        let keys = self.stop_keys();
+        // The exact drawing first; failing that, any drawing of the same
+        // ticket — a lens toggle deletes the duplicates the leverage screen
+        // drew, and losing the drawing must not mean losing the ticket.
+        let first = key.first_occurrence();
+        let found = keys
             .iter()
-            .position(|at| &self.stop_key(&at.stop) == key);
+            .position(|k| k == key)
+            .or_else(|| keys.iter().position(|k| *k == first));
         self.cursor = match found {
             Some(pos) => Cursor::Chosen(pos),
             None => Cursor::Untouched,
@@ -845,11 +911,7 @@ impl App {
         let Some(pinned) = pinned else {
             return;
         };
-        let new_order: Vec<StopKey> = self
-            .stops()
-            .iter()
-            .map(|at| self.stop_key(&at.stop))
-            .collect();
+        let new_order = self.stop_keys();
         self.cursor = Cursor::Chosen(pinned.resolve(&new_order));
     }
 
@@ -3470,6 +3532,111 @@ mod tests {
         assert_eq!(app.counts(), (2, 2), "wayfinder and dotfiles");
         type_str(&mut app, "dotf");
         assert_eq!(app.counts(), (1, 2), "narrowed, out of all of them");
+    }
+
+    /// A map with a diamond in its DAG: #14 needs both #6 and #9, and both
+    /// are takeable roots, so the leverage lens deliberately draws #14 under
+    /// each of them — four rows for three shown tickets (the done #2 is
+    /// folded away). The shape the count and cursor claims below are about.
+    fn diamond_app() -> App {
+        let mut clusters = BTreeMap::new();
+        clusters.insert(
+            MapId::new(PROJECT, 1),
+            Map {
+                title: "Map: diamond".to_string(),
+                last_activity: None,
+                tickets: vec![
+                    ticket(PROJECT, 2, "Choose the stack", false, true, vec![]),
+                    ticket(PROJECT, 6, "Re-entry breadcrumbs", true, false, vec![]),
+                    ticket(PROJECT, 9, "Main screen design", true, true, vec![]),
+                    ticket(PROJECT, 14, "Breadcrumb markers", true, false, vec![6, 9]),
+                ],
+                truncated: false,
+            },
+        );
+        app_on(PROJECT, clusters)
+    }
+
+    #[test]
+    fn a_ticket_a_diamond_draws_twice_is_counted_once() {
+        // The count line reads `shown/total` **of tickets** — the same
+        // nodes-not-rows discipline the rollups already keep. The diamond
+        // renders #14 twice, so counting drawn rows would claim four tickets
+        // shown out of four while the done one sits folded off screen.
+        let app = diamond_app();
+        assert_eq!(
+            app.visible().len(),
+            4,
+            "the lens draws four rows: #14 under both roots"
+        );
+        assert_eq!(
+            app.counts(),
+            (3, 4),
+            "three distinct tickets shown, of the map's four"
+        );
+    }
+
+    /// Positions in the stop list of every drawing of ticket `number` — plural
+    /// on purpose: on a diamond the same ticket is drawn more than once, and
+    /// which drawing the cursor is on is exactly what these tests are about.
+    fn drawings_of(app: &App, number: u64) -> Vec<usize> {
+        app.stops()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, at)| match &at.stop {
+                Stop::Ticket(row) if app.ticket(row).number == number => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_cursor_on_the_second_drawing_of_a_diamond_ticket_survives_a_swap() {
+        // Identity pinning exists so a refetch never teleports the selection —
+        // and an identity that cannot tell the two drawings of #14 apart
+        // teleports a cursor from the second drawing to the first on every
+        // swap, breaking the guarantee precisely on diamonds.
+        let mut app = diamond_app();
+        let drawings = drawings_of(&app, 14);
+        assert_eq!(drawings.len(), 2, "the diamond draws #14 twice");
+        app.cursor = Cursor::Chosen(drawings[1]);
+        let same = app.clusters.clone();
+        app.replace_clusters(same);
+        assert_eq!(
+            app.cursor_pos(),
+            drawings[1],
+            "the drawing that was chosen, not the first one"
+        );
+    }
+
+    #[test]
+    fn a_drawing_that_vanishes_degrades_to_the_ticket_not_the_top() {
+        // #9 closes, its root leaves the leverage screen and takes the second
+        // drawing of #14 with it — but the ticket is still drawn under #6, so
+        // the cursor follows the ticket rather than falling back to a bare
+        // position or the top of the list.
+        let mut app = diamond_app();
+        let drawings = drawings_of(&app, 14);
+        app.cursor = Cursor::Chosen(drawings[1]);
+        let mut swapped = app.clusters.clone();
+        let map = swapped
+            .get_mut(&MapId::new(PROJECT, 1))
+            .expect("the diamond map");
+        map.tickets[2] = ticket(PROJECT, 9, "Main screen design", false, true, vec![]);
+        app.replace_clusters(swapped);
+        assert_eq!(at(&app), "#14", "the ticket outlives its second drawing");
+    }
+
+    #[test]
+    fn a_lens_toggle_keeps_the_cursor_on_the_ticket_when_its_drawing_leaves() {
+        // The forest lens draws every ticket exactly once, so toggling away
+        // from the leverage screen deletes the second drawing. The ticket is
+        // still on screen, and the cursor's promise is the ticket.
+        let mut app = diamond_app();
+        let drawings = drawings_of(&app, 14);
+        app.cursor = Cursor::Chosen(drawings[1]);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(at(&app), "#14", "the other lens still shows the ticket");
     }
 
     #[test]
