@@ -1084,6 +1084,7 @@ mod tests {
         Map {
             title: "Map: wf".to_string(),
             last_activity: None,
+            truncated: false,
             tickets: vec![
                 t(2, "Choose the stack", false, true, vec![]),
                 t(6, "Re-entry breadcrumbs", true, false, vec![]),
@@ -1778,6 +1779,7 @@ mod tests {
             Map {
                 title: "Map: the archive".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: vec![ticket(
                     "blooop/wayfinder",
                     103,
@@ -1816,6 +1818,7 @@ mod tests {
             Map {
                 title: "Map: the selection view".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: vec![ticket(
                     "blooop/wayfinder",
                     50,
@@ -1854,6 +1857,7 @@ mod tests {
             Map {
                 title: "Map: the archive".to_string(),
                 last_activity: Activity::parse("2026-08-06T12:00:00Z"),
+                truncated: false,
                 tickets: vec![ticket(
                     "blooop/wayfinder",
                     88,
@@ -1869,6 +1873,7 @@ mod tests {
             Map {
                 title: "Map: the selection view".to_string(),
                 last_activity: Activity::parse("2026-08-01T12:00:00Z"),
+                truncated: false,
                 tickets: vec![ticket(
                     "blooop/wayfinder",
                     50,
@@ -2445,6 +2450,7 @@ mod tests {
             Map {
                 title: "Map: wf".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: (1..=30)
                     .map(|n| {
                         ticket(
@@ -2464,6 +2470,7 @@ mod tests {
             Map {
                 title: "Map: the selection view".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: vec![ticket(
                     "blooop/wayfinder",
                     50,

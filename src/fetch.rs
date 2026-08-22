@@ -115,12 +115,34 @@ struct MapIssue {
     updated_at: Option<String>,
     labels: Nodes<Label>,
     #[serde(rename = "subIssues")]
-    sub_issues: Nodes<SubIssue>,
+    sub_issues: Paged<SubIssue>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct Nodes<T> {
     pub(crate) nodes: Vec<T>,
+}
+
+/// A connection read *with* the tracker's word on whether the page was all of
+/// it (#184) — for the ticket-bearing connections, where a missing node is a
+/// missing ticket or a missing blocking edge, not a cosmetic gap. [`Nodes`]
+/// stays the shape for the connections whose truncation changes nothing a
+/// consumer would assert on; giving every reader the flag would invite readers
+/// that do not need it.
+#[derive(Deserialize)]
+struct Paged<T> {
+    nodes: Vec<T>,
+    /// Defaulted so a response without the selection (an older fixture, a
+    /// GitHub edition without it) reads as "no claim of more" — the same rule
+    /// every other optional selection here follows.
+    #[serde(rename = "pageInfo", default)]
+    page_info: PageInfo,
+}
+
+#[derive(Deserialize, Default)]
+struct PageInfo {
+    #[serde(rename = "hasNextPage", default)]
+    has_next_page: bool,
 }
 
 impl<T> Default for Nodes<T> {
@@ -137,7 +159,7 @@ struct SubIssue {
     labels: Nodes<Label>,
     assignees: Nodes<Assignee>,
     #[serde(rename = "blockedBy")]
-    blocked_by: Nodes<Blocker>,
+    blocked_by: Paged<Blocker>,
     /// Defaulted so a response without the selection (older fixtures, a
     /// GitHub edition without the field) parses as "no linked PRs" rather
     /// than failing the whole map.
@@ -346,11 +368,16 @@ fn parse_map(body: &[u8], id: &MapId) -> Result<Map> {
         );
     }
 
+    // Truncation folds over the whole read: the sub-issue page itself, and
+    // every ticket's blocker page. Any one of them cut short means the tree —
+    // or the classification drawn from its edges — is partial (#184).
+    let mut truncated = issue.sub_issues.page_info.has_next_page;
     let mut tickets: Vec<Ticket> = issue
         .sub_issues
         .nodes
         .into_iter()
         .map(|sub| {
+            truncated |= sub.blocked_by.page_info.has_next_page;
             // One pass over the same edges yields both facts: the open subset
             // is status, the whole set is structure (#50).
             let open_blockers: Vec<u64> = sub
@@ -391,6 +418,7 @@ fn parse_map(body: &[u8], id: &MapId) -> Result<Map> {
         // Interpreted here and nowhere inward, like every other tracker string.
         last_activity: issue.updated_at.as_deref().and_then(Activity::parse),
         tickets,
+        truncated,
     })
 }
 
@@ -769,6 +797,57 @@ mod tests {
         let old = parse_map(MAP_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
         assert_eq!(old.last_activity, None);
         assert_eq!(old.tickets.len(), 3, "the rest of the map is unaffected");
+    }
+
+    /// The tracker's own word that a page was not all of it, on each
+    /// ticket-bearing connection in turn — the two ways a map can arrive
+    /// silently partial (#184).
+    fn truncated_response(sub_issues_more: bool, blockers_more: bool) -> String {
+        format!(
+            r#"{{"data": {{"repository": {{"issue": {{
+            "title": "Map: wf",
+            "state": "OPEN",
+            "labels": {{"nodes": [{{"name": "wayfinder:map"}}]}},
+            "subIssues": {{
+                "nodes": [
+                    {{"number": 19, "title": "Build 6", "state": "OPEN",
+                     "labels": {{"nodes": []}},
+                     "assignees": {{"nodes": []}},
+                     "blockedBy": {{"nodes": [{{"number": 3, "state": "OPEN"}}],
+                                   "pageInfo": {{"hasNextPage": {blockers_more}}}}}}}
+                ],
+                "pageInfo": {{"hasNextPage": {sub_issues_more}}}
+            }}
+        }}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_map_the_tracker_could_not_send_all_of_says_it_arrived_truncated() {
+        // A 101st sub-issue or a 51st blocker does not fit the page, and until
+        // #184 the map rendered without it and without a trace. The parse now
+        // keeps the tracker's own word on it: either connection reporting a
+        // next page marks the whole map truncated.
+        for (subs, blockers) in [(true, false), (false, true), (true, true)] {
+            let map = parse_map(truncated_response(subs, blockers).as_bytes(), &wf_map_id())
+                .expect("a truncated map still parses — partial beats absent");
+            assert!(
+                map.truncated,
+                "subIssues more: {subs}, blockers more: {blockers} — the map must say so"
+            );
+        }
+        let map = parse_map(truncated_response(false, false).as_bytes(), &wf_map_id())
+            .expect("parse");
+        assert!(!map.truncated, "full pages are not a truncation");
+    }
+
+    #[test]
+    fn a_response_without_page_info_reads_as_complete() {
+        // Older fixtures and GitHub editions without the selection: absent is
+        // "no claim of more", not "more" — the same defaulting rule the PR
+        // selection follows.
+        let map = parse_map(MAP_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
+        assert!(!map.truncated);
     }
 
     #[test]
