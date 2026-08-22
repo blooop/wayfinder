@@ -3551,6 +3551,7 @@ mod tests {
                     ticket(PROJECT, 9, "Main screen design", true, true, vec![]),
                     ticket(PROJECT, 14, "Breadcrumb markers", true, false, vec![6, 9]),
                 ],
+                truncated: false,
             },
         );
         app_on(PROJECT, clusters)
