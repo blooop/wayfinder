@@ -4651,8 +4651,7 @@ mod tests {
             std::fs::create_dir_all(&entry).expect("entry");
             let file = entry.join(program);
             std::fs::write(&file, "#!/bin/sh\n").expect("candidate");
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode))
-                .expect("mode");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).expect("mode");
             entry
         }
     }

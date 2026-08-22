@@ -300,7 +300,7 @@ fn spawn_load(id: MapId, tx: mpsc::UnboundedSender<LoadEvent>) -> JoinHandle<()>
 /// Find every open `wayfinder:map` across the cached repos, off the path to
 /// the first frame (#27).
 ///
-/// It **retries** rather than giving up — on [`retry_delay`]'s doubling
+/// It **retries** rather than giving up — on `retry_delay`'s doubling
 /// schedule, [`RETRY_INTERVAL`] first — and that is now the only recovery a
 /// session has. A single failed search would otherwise leave `wf` empty for
 /// the whole run with no way back: the only other thing that fetches is the

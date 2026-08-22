@@ -651,9 +651,7 @@ pub fn refresh(target: &Target) -> Result<Vec<(String, Healed)>> {
             // A target that could not be read is `Stale(None)`, and falls to
             // the arm below: with nothing to prove ownership of, the sweep has
             // no permission to touch it.
-            Link::Stale(Some(points_at)) if is_ours(&points_at, &bundle) => {
-                Some(Some(points_at))
-            }
+            Link::Stale(Some(points_at)) if is_ours(&points_at, &bundle) => Some(Some(points_at)),
             Link::Stale(_) | Link::Unmanaged => continue,
         };
         // Always the copy before the link, so a link this function creates
