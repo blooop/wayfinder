@@ -544,6 +544,13 @@ pub struct Map {
     /// ([`Activity`]) — the cluster sort key.
     pub last_activity: Option<Activity>,
     pub tickets: Vec<Ticket>,
+    /// The tracker said a ticket-bearing page was not all of it (#184): a
+    /// 101st sub-issue or a 51st blocking edge did not fit the fetch, so
+    /// `tickets` — and the classification drawn from the edges — is partial.
+    /// Carried on the map rather than swallowed, because the only honest
+    /// render of a partial tree is one that says so; the count line is where
+    /// it is said.
+    pub truncated: bool,
 }
 
 impl Map {
@@ -1066,12 +1073,14 @@ mod tests {
         let live = Map {
             title: "Map: wf".to_string(),
             last_activity: None,
+            truncated: false,
             tickets: vec![ticket(2, false, vec![]), ticket(6, true, vec![])],
         };
         assert!(live.has_open_work());
         let finished = Map {
             title: "Map: wf".to_string(),
             last_activity: None,
+            truncated: false,
             tickets: vec![ticket(2, false, vec![]), ticket(6, false, vec![])],
         };
         assert!(!finished.has_open_work(), "every ticket done is finished");
@@ -1080,6 +1089,7 @@ mod tests {
         let empty = Map {
             title: "Map: wf".to_string(),
             last_activity: None,
+            truncated: false,
             tickets: vec![],
         };
         assert!(!empty.has_open_work());
@@ -1122,6 +1132,7 @@ mod tests {
         let map = Map {
             title: "Map: selection view".to_string(),
             last_activity: None,
+            truncated: false,
             tickets: vec![
                 ticket(48, false, vec![]),
                 ticket(50, true, vec![48]),
@@ -1152,6 +1163,7 @@ mod tests {
         let map = Map {
             title: "Map: wf".to_string(),
             last_activity: None,
+            truncated: false,
             tickets: vec![ticket(6, true, vec![]), claimed, blocked, done],
         };
         assert_eq!(

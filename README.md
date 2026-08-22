@@ -67,8 +67,11 @@ Every name carries the `wf` prefix because both `~/.claude/skills` and
 you have. Unprefixed, `tdd` and `review` are names `wf` would *squat on* rather
 than merely occupy: while it held one, you could not have your own. `wf skills
 install` clears the links an older `wf` left under its old names, and touches
-nothing else — it removes a link only when the link points into a `wf` bundle,
-so a skill of yours can never match however dead it looks.
+nothing else — it removes a link only where the link points at something nothing
+but `wf` writes: the copy below, or a path ending `share/wf/skills`, which is
+`wf`'s own packaging layout. A skill of yours can never match however dead it
+looks, and neither can one of yours that `wf` was merely *pointed at*: a link
+into whatever directory `WF_SKILLS_DIR` names is not evidence `wf` wrote it.
 
 `wf skills install` **symlinks**, so a name under either skills directory is
 `wf`'s only when `wf` put it there and a real directory can go on meaning
@@ -76,6 +79,15 @@ so a skill of yours can never match however dead it looks.
 `~/.claude/wf-skills` and `~/.codex/wf-skills`, **copies** of the package's
 bundle kept beside their links, reached *relatively* —
 `wf-tdd -> ../wf-skills/wf-tdd`.
+
+The copy directory is held to the same rule as a name under `skills/`, and it
+has to be, because `wf` *prunes* it — anything in there that this build does not
+ship is a leftover of an older one. So it prunes only a `wf-skills` it can show
+it made, by the record it writes inside it when it creates it. Find one already
+there carrying no such record — a directory or a link into your dotfiles, made
+by you or by another tool — and `wf skills install` reports it and stops, having
+written nothing anywhere, and every launch leaves it alone too. Move it aside
+and run the install again.
 
 That indirection exists for containers. An isolated Claude launch
 ([Isolation](#isolation-claude-runs-in-the-repos-devcontainer)) mounts your
@@ -1161,12 +1173,23 @@ decides. Needs `dl` **0.0.21 or newer** for the JSON listing.
 Kept, always: workspaces `dl` did not create (they are not `wf`'s, whatever
 their branch looks like), branches that are not `wayfinder/<repo>-<n>` for that
 repo, tickets with an open or draft PR (in review is where review fixes happen),
-tickets someone has claimed that no PR has come of, and anything **running** — a
-ticket closing is no evidence that the session in the container ended.
+tickets someone has claimed that no PR has come of, tickets with more linked PRs
+than `wf` read, and anything **running** — a ticket closing is no evidence that
+the session in the container ended.
 
 The claim is the *last* thing read, not the first: it settles a ticket nothing
 has come of yet, and it does not outrank the PRs. A claimed ticket whose PR
 merged is finished work, and reap collects it like any other.
+
+**A ticket with more linked PRs than `wf` read is kept saying so.** The linked-PR
+rollup is asked for one bounded page and GitHub answers it oldest-first, so on a
+ticket with more references than the page holds the one that falls off is the
+newest — which on a `wf` ticket is the PR still open. Read from that page alone
+such a ticket is a row of merges and nothing in flight, which is exactly the
+reading that reaps. So `wf` asks whether the page was all of it, and a page that
+was not is not evidence at all: the row says there is more of this than it read
+and the workspace stays. It does not fetch the rest — a sixth PR on one ticket is
+rare, and a kept row costs a glance where a second round trip costs every run.
 
 **A `dl` that says nothing is not a `dl` saying nothing is at risk.** From
 devlaunch **0.0.24** the listing answers `unsaved` for every clone `dl` made,
@@ -1265,6 +1288,33 @@ gets both. That is a deliberate trade for zero-friction auth, taken with eyes
 open ([#73](https://github.com/blooop/wayfinder/issues/73)); the repos this
 exists to serve want `network=host`, X11 and device passthrough anyway, which
 gives away as much again. Don't point `wf` at a repo you have not read.
+
+**The tracker's text is an input to the agent, and only its mechanics are
+defended.** A launch embeds what the picker read straight into the prompt it
+execs: the map's title and the ticket's title, verbatim, in the
+[`ctx:` block](#launching) it hands the skill. The skill's own first move is
+then to read the ticket — body, comment trail and
+all — so the surface is wider than the block: everything anyone can write on a
+tracker you point `wf` at reaches an agent running with permissions bypassed,
+and under `wf-auto` there is nobody reading along. Titles are the part `wf`
+itself hands over, and a title is writable by anyone who can open an issue.
+
+**The escaping is airtight and the meaning is not.** The block is one argv
+entry built by a JSON serializer, quoted once more for the single seam that
+reparses it, so no title can end the argument early, add a flag, or reach a
+shell — a real `sh` rebuilds a launch's argv byte for byte in the test suite,
+against a title carrying a single quote, a command substitution and a double
+quote. What nothing here can check is what the text *says*. A title that reads
+like an instruction is still just a title, and an agent that reads it is being
+talked to by whoever wrote it.
+
+So the posture is [#73](https://github.com/blooop/wayfinder/issues/73)'s, one
+layer out: **don't point `wf` at a tracker you have not read.** That trade was
+about hostile code in a repo you launch into; this is hostile prose on a ticket
+you launch from, and the same answer covers both, because a run holding your
+`~/.claude` and your `GH_TOKEN` is one you had to decide to start. Reading the
+rows is the whole check, and the picker is where it is cheapest: every title
+that will reach the prompt is on the screen you pick from.
 
 ### Working while you are away
 

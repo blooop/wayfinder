@@ -155,6 +155,38 @@ impl Session {
     }
 }
 
+/// A scratch path in the same directory as `path`, for a write that will be
+/// renamed over it.
+///
+/// Same directory on purpose: a rename is only atomic within one filesystem,
+/// and a temp directory elsewhere would silently degrade to copy-then-replace —
+/// exactly the torn write this seam exists to remove. Hidden, so a cache
+/// directory does not visibly grow scratch files while a save is in flight.
+///
+/// # Errors
+///
+/// A path with no file name — a directory, or a root — which is not something
+/// a cache can be saved to.
+fn scratch_beside(path: &Path) -> Result<PathBuf> {
+    /// Distinguishes two saves *within* one process. The pid alone separates
+    /// instances; the picker also saves from a discovery task while the launch
+    /// path may be saving from the main thread.
+    static SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let name = path.file_name().with_context(|| {
+        format!(
+            "{} is not a file the cache can be written to",
+            path.display()
+        )
+    })?;
+    let nth = SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(path.with_file_name(format!(
+        ".{}.{}.{nth}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    )))
+}
+
 /// Now, in seconds since the Unix epoch — `0` on a clock set before it, which
 /// no ordering can do anything sensible with anyway and which sorts as the
 /// oldest known use rather than as unknown.
@@ -238,7 +270,101 @@ impl ProjectsCache {
             .unwrap_or_default()
     }
 
+    /// **The one way anything writes this file**: load the registry as it is on
+    /// disk now, apply `edit` to that, and persist it if `edit` says it changed
+    /// anything.
+    ///
+    /// Read-modify-write rather than save-my-copy, because there are always
+    /// several writers — the startup registration, the discovery task's
+    /// findings, the stamp and session record a handover writes, and any second
+    /// `wf` the human is running in another terminal. A `wf` that has been up
+    /// for a while holds a registry from startup, and writing *that* back is
+    /// how a registration disappears with nothing failing: last writer wins,
+    /// and it wins with a copy that predates everyone else's work. Taking the
+    /// edit instead of the cache is what makes that unsayable — there is no
+    /// signature here that accepts a stale copy.
+    ///
+    /// It is not a lock, and does not pretend to be: two instances editing in
+    /// the same instant can still interleave. It shortens the window from "as
+    /// long as this `wf` has been running" to "the length of one read plus one
+    /// write", which is the difference between routine loss and a race nobody
+    /// will meet.
+    ///
+    /// Returns the registry as it now stands, and separately whether persisting
+    /// it worked — loading cannot fail (a missing or corrupt cache is simply
+    /// empty), so there is always a cache to carry on with, and each caller
+    /// decides for itself what a failed *write* is worth. None of them think it
+    /// is worth refusing to launch over; the startup one reports it and goes on.
+    /// An `edit` that changed nothing writes nothing, and that is `Ok`.
+    pub fn update(path: &Path, edit: impl FnOnce(&mut Self) -> bool) -> (Self, Result<()>) {
+        let mut cache = Self::load_or_default(path);
+        if !edit(&mut cache) {
+            return (cache, Ok(()));
+        }
+        let saved = cache.save(path);
+        (cache, saved)
+    }
+
+    /// The bookkeeping a run does as it starts, as one edit through
+    /// [`update`](Self::update): forget the checkouts that are gone, and
+    /// register the one `wf` was run inside, if it was run inside one.
+    ///
+    /// Both halves in a single read-modify-write because they are one answer to
+    /// one question — what the projects are, now — and because a run that only
+    /// *forgets* still has something to write. `here` is `None` when `wf` was
+    /// started somewhere that is not a checkout of a GitHub repo, which is not
+    /// an error: such a place is simply not a project.
+    ///
+    /// The write is **reported, not raised**, and that is the whole reason this
+    /// is a function rather than three lines in the launcher. A cache that will
+    /// not save costs this machine one stamp; refusing to start costs the human
+    /// their launcher, on a read-only `HOME` or a full disk where the registry
+    /// they want is already loaded and perfectly usable. Losing the write is the
+    /// same trade the handover write has always made, and the two paths now make
+    /// it the same way.
+    pub fn at_startup(path: &Path, here: Option<(&Path, &str)>) -> (Self, Result<()>) {
+        Self::update(path, |cache| {
+            // Accretion needs a matching forget: a checkout that has been
+            // deleted must stop offering itself as somewhere an agent could run.
+            let forgot = cache.prune_missing();
+            match here {
+                // Registering is always a change even when the checkout is
+                // already known — the stamp moves, and that stamp is what puts
+                // this project at the top of the list next time.
+                Some((checkout, repo)) => {
+                    cache.register(checkout.to_path_buf(), repo.to_string());
+                    true
+                }
+                None => forgot,
+            }
+        })
+    }
+
     /// Persist the cache, creating parent directories as needed.
+    ///
+    /// Private, and reachable only through [`update`](Self::update): a caller
+    /// that can hand this an arbitrary cache can hand it one loaded minutes ago
+    /// and erase everything written since. The seam above is the public way to
+    /// write, so that is not a discipline anybody has to remember.
+    ///
+    /// **Written beside and renamed over**, never into the file itself, because
+    /// several writers share this path and `load_or_default` cannot tell a torn
+    /// read from a corrupt file. Truncate-then-write left a window in which
+    /// another `wf` — the discovery task, a launch handing over, a second
+    /// instance — loaded the empty default, and *its* next save wrote that
+    /// emptiness back over every checkout, seed and session on the machine. A
+    /// rename within one directory is atomic, so a reader sees the whole
+    /// previous registry or the whole new one and there is no third answer.
+    ///
+    /// The temp name carries the writing process and a counter within it, so
+    /// two savers racing cannot land on the same scratch file and hand each
+    /// other half a registry through it.
+    ///
+    /// What this deliberately does *not* buy is durability across a crash:
+    /// there is no `fsync` before the rename, so a machine that loses power
+    /// mid-save may come back to either version. That is the right trade for a
+    /// cache whose whole cost of loss is re-opening each project once, and
+    /// paying for it would put a disk flush on the path to the first frame.
     ///
     /// # Errors
     ///
@@ -246,13 +372,21 @@ impl ProjectsCache {
     /// [`load_or_default`](Self::load_or_default) swallows its errors because a
     /// cache that will not load is merely empty; one that will not *save*
     /// silently loses the registration this run just made, so it is reported.
-    pub fn save(&self, path: &Path) -> Result<()> {
+    fn save(&self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("creating cache dir {}", dir.display()))?;
         }
         let json = serde_json::to_vec_pretty(self)?;
-        std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+        let temp = scratch_beside(path)?;
+        std::fs::write(&temp, json).with_context(|| format!("writing {}", temp.display()))?;
+        if let Err(err) = std::fs::rename(&temp, path) {
+            // Leaving the scratch file behind would litter a cache directory
+            // nobody ever cleans, and the failure being reported is the rename.
+            std::fs::remove_file(&temp).ok();
+            return Err(err).with_context(|| format!("replacing {}", path.display()));
+        }
+        Ok(())
     }
 
     /// Register (or refresh) a touched checkout. Sorted by path so the
@@ -533,6 +667,244 @@ mod tests {
         let loaded = ProjectsCache::load_or_default(&file);
         assert_eq!(loaded, cache);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A registry big enough that a truncate-then-write is observably torn: a
+    /// reader that lands inside the window sees an empty or half-parsed file,
+    /// which [`ProjectsCache::load_or_default`] reports as "no projects at
+    /// all".
+    fn a_crowded_registry() -> ProjectsCache {
+        let mut cache = ProjectsCache::default();
+        for i in 0..500 {
+            cache.register(
+                p(&format!("/data/proj/checkout-{i}")),
+                format!("blooop/r{i}"),
+            );
+        }
+        cache
+    }
+
+    #[test]
+    fn a_reader_in_another_instance_never_sees_a_half_written_registry() {
+        // The loss this guards against is total, not partial: a torn read
+        // parses as corrupt, loads as empty, and that instance's next save
+        // writes the empty registry back over every checkout, seed and session
+        // on the machine. So the claim is not "rarely torn" but "never": a
+        // reader only ever sees a whole registry, whatever a writer is doing.
+        let dir = std::env::temp_dir().join(format!("wf-test-torn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("projects.json");
+        let cache = a_crowded_registry();
+        let expected = cache.checkouts.len();
+        cache.save(&file).expect("seed");
+
+        let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer = {
+            let (file, writing) = (file.clone(), std::sync::Arc::clone(&writing));
+            std::thread::spawn(move || {
+                for _ in 0..150 {
+                    cache.save(&file).expect("save");
+                }
+                writing.store(false, std::sync::atomic::Ordering::Release);
+            })
+        };
+        let mut torn = 0;
+        let mut reads = 0;
+        while writing.load(std::sync::atomic::Ordering::Acquire) {
+            reads += 1;
+            if ProjectsCache::load_or_default(&file).checkouts.len() != expected {
+                torn += 1;
+            }
+        }
+        writer.join().expect("writer");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            reads > 0,
+            "the reader never got a turn, so nothing was tested"
+        );
+        assert_eq!(
+            torn, 0,
+            "{torn} of {reads} reads saw a registry that was not there"
+        );
+    }
+
+    #[test]
+    fn an_edit_lands_on_the_registry_that_is_on_disk_now() {
+        // Last-writer-wins is how a registration disappears without anything
+        // failing: a `wf` that has been up a while holds the registry as it
+        // was at startup, and writing that copy back erases everything every
+        // other instance registered in the meantime.
+        let dir = std::env::temp_dir().join(format!("wf-test-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("projects.json");
+
+        // The copy this instance loaded at startup, about to go stale.
+        let at_startup = ProjectsCache::load_or_default(&file);
+        assert!(at_startup.checkouts.is_empty());
+
+        // Another instance registers a checkout of its own while we hold it.
+        let (_, saved) = ProjectsCache::update(&file, |cache| {
+            cache.register(p("/data/proj/theirs"), "blooop/theirs".to_string());
+            true
+        });
+        saved.expect("save");
+
+        // Now we record our own. The seam applies the edit to what is on disk,
+        // so their registration is still there afterwards.
+        let (after, saved) = ProjectsCache::update(&file, |cache| {
+            cache.register(p("/data/proj/ours"), "blooop/ours".to_string());
+            true
+        });
+        saved.expect("save");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(after.repos(), ["blooop/ours", "blooop/theirs"]);
+        assert_eq!(after.checkouts.len(), 2);
+    }
+
+    #[test]
+    fn a_startup_that_cannot_write_still_gives_the_launcher_a_registry() {
+        // The asymmetry this removes: the handover write was deliberately
+        // best-effort while the startup write was fatal, so a full disk or a
+        // read-only HOME did not cost you a stamp — it stopped `wf` from
+        // starting at all. A registry that cannot be *remembered* is still a
+        // registry this run can be driven with, and the failure is the
+        // caller's to report.
+        let dir = std::env::temp_dir().join(format!("wf-test-unwritable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file where the cache directory would have to be: nothing can
+        // create a directory under it, whoever is running.
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"").unwrap();
+        let file = blocker.join("wf").join("projects.json");
+
+        let here = (dir.clone(), "blooop/wayfinder".to_string());
+        let (cache, saved) =
+            ProjectsCache::at_startup(&file, Some((here.0.as_path(), here.1.as_str())));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(cache.repos(), ["blooop/wayfinder"]);
+        assert!(
+            saved.is_err(),
+            "a save that did not happen must be reported, not swallowed"
+        );
+    }
+
+    #[test]
+    fn startup_forgets_deleted_checkouts_and_registers_the_one_wf_was_run_in() {
+        // Both halves of the accretion bookkeeping in one edit, so a run that
+        // only forgets still writes: the deleted checkout must stop offering
+        // itself as somewhere an agent could run, whether or not this `wf` was
+        // started inside a project.
+        let dir = std::env::temp_dir().join(format!("wf-test-startup-{}", std::process::id()));
+        let live = dir.join("live-checkout");
+        std::fs::create_dir_all(&live).unwrap();
+        let file = dir.join("projects.json");
+        let (_, saved) = ProjectsCache::update(&file, |cache| {
+            cache.register(live.clone(), "blooop/live".to_string());
+            cache.register(dir.join("deleted-checkout"), "blooop/gone".to_string());
+            true
+        });
+        saved.expect("seed");
+
+        let (forgotten, saved) = ProjectsCache::at_startup(&file, None);
+        saved.expect("forgetting is a change worth writing");
+        assert_eq!(forgotten.repos(), ["blooop/live"]);
+
+        let (registered, saved) =
+            ProjectsCache::at_startup(&file, Some((live.as_path(), "blooop/live")));
+        saved.expect("save");
+        let on_disk = ProjectsCache::load_or_default(&file);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(registered.repos(), ["blooop/live"]);
+        assert_eq!(on_disk, registered);
+    }
+
+    #[test]
+    fn a_startup_with_nothing_to_record_writes_nothing() {
+        // `wf` run outside any checkout, with a registry that is all still
+        // there: there is no new fact, so the file is left exactly as it was.
+        let dir = std::env::temp_dir().join(format!("wf-test-startup-idle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("projects.json");
+        let compact = format!(
+            r#"{{"checkouts":[{{"path":{:?},"repo":"blooop/live","used":7}}]}}"#,
+            dir.to_string_lossy()
+        );
+        std::fs::write(&file, compact.as_bytes()).unwrap();
+
+        let (cache, saved) = ProjectsCache::at_startup(&file, None);
+        saved.expect("nothing to write is not a failure to write");
+        let bytes = std::fs::read(&file).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(cache.repos(), ["blooop/live"]);
+        assert_eq!(bytes, compact.as_bytes());
+    }
+
+    #[test]
+    fn an_edit_that_changes_nothing_leaves_the_file_alone() {
+        // The handover path writes at the last moment `wf` exists, with the
+        // terminal already on its way to the agent: an edit that turned out to
+        // change nothing must not spend a write there. Hand-written compact
+        // JSON is the detector — a rewrite would come back pretty-printed.
+        let dir = std::env::temp_dir().join(format!("wf-test-nowrite-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("projects.json");
+        let compact = br#"{"checkouts":[{"path":"/data/proj/wayfinder","repo":"blooop/wayfinder","used":7}]}"#;
+        std::fs::write(&file, compact).unwrap();
+
+        let (unchanged, saved) = ProjectsCache::update(&file, |_| false);
+        saved.expect("nothing to write is not a failure to write");
+        let bytes = std::fs::read(&file).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(unchanged.repos(), ["blooop/wayfinder"]);
+        assert_eq!(bytes, compact.to_vec());
+    }
+
+    #[test]
+    fn a_save_replaces_the_file_rather_than_rewriting_it_in_place() {
+        // The deterministic half of the claim above, and the reason it holds:
+        // the old file is never opened for writing, so a reader already
+        // holding it keeps reading the whole previous registry until it lets
+        // go. A hard link stands in for that reader.
+        let dir = std::env::temp_dir().join(format!("wf-test-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("projects.json");
+        let mut before = ProjectsCache::default();
+        before.register(p("/data/proj/wayfinder"), "blooop/wayfinder".to_string());
+        before.save(&file).expect("save");
+
+        let held = dir.join("held-open.json");
+        std::fs::hard_link(&file, &held).expect("hard link");
+        let mut after = before.clone();
+        after.register(p("/data/k1/kinisi_ros"), "kinisi/kinisi_ros".to_string());
+        after.save(&file).expect("save");
+
+        assert_eq!(ProjectsCache::load_or_default(&file), after);
+        assert_eq!(
+            ProjectsCache::load_or_default(&held),
+            before,
+            "the previous registry was overwritten under a reader still holding it"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_save_leaves_nothing_behind_beside_the_cache() {
+        // The temp file a save writes through is an implementation detail of
+        // this seam and must not become litter in a cache directory nobody
+        // ever cleans.
+        let dir = std::env::temp_dir().join(format!("wf-test-litter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("projects.json");
+        let mut cache = ProjectsCache::default();
+        cache.register(p("/data/proj/wayfinder"), "blooop/wayfinder".to_string());
+        cache.save(&file).expect("save");
+        cache.save(&file).expect("save again");
+        let left: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(left, vec![file]);
     }
 
     #[test]
