@@ -67,8 +67,11 @@ Every name carries the `wf` prefix because both `~/.claude/skills` and
 you have. Unprefixed, `tdd` and `review` are names `wf` would *squat on* rather
 than merely occupy: while it held one, you could not have your own. `wf skills
 install` clears the links an older `wf` left under its old names, and touches
-nothing else — it removes a link only when the link points into a `wf` bundle,
-so a skill of yours can never match however dead it looks.
+nothing else — it removes a link only where the link points at something nothing
+but `wf` writes: the copy below, or a path ending `share/wf/skills`, which is
+`wf`'s own packaging layout. A skill of yours can never match however dead it
+looks, and neither can one of yours that `wf` was merely *pointed at*: a link
+into whatever directory `WF_SKILLS_DIR` names is not evidence `wf` wrote it.
 
 `wf skills install` **symlinks**, so a name under either skills directory is
 `wf`'s only when `wf` put it there and a real directory can go on meaning
@@ -76,6 +79,15 @@ so a skill of yours can never match however dead it looks.
 `~/.claude/wf-skills` and `~/.codex/wf-skills`, **copies** of the package's
 bundle kept beside their links, reached *relatively* —
 `wf-tdd -> ../wf-skills/wf-tdd`.
+
+The copy directory is held to the same rule as a name under `skills/`, and it
+has to be, because `wf` *prunes* it — anything in there that this build does not
+ship is a leftover of an older one. So it prunes only a `wf-skills` it can show
+it made, by the record it writes inside it when it creates it. Find one already
+there carrying no such record — a directory or a link into your dotfiles, made
+by you or by another tool — and `wf skills install` reports it and stops, having
+written nothing anywhere, and every launch leaves it alone too. Move it aside
+and run the install again.
 
 That indirection exists for containers. An isolated Claude launch
 ([Isolation](#isolation-claude-runs-in-the-repos-devcontainer)) mounts your
