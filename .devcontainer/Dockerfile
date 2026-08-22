@@ -28,6 +28,15 @@
 # machine and impossible on the next, with nothing saying why.
 # `tests/devcontainer_prebuild.rs` holds the pin and the install location.
 #
+# It is the largest single binary in here and the number belongs next to the
+# decision: 78 MB, taking the tool layer from 93 MB to 171 MB, measured against
+# the published image on 2026-08-22. The paragraph at the top of this file
+# rejects cargo-chef and sccache on exactly this ground, so this download has to
+# answer that argument rather than sidestep it — and it does, because what the
+# rejected mechanisms would have bought was 9 seconds, while what this buys is a
+# PR-blocking check being runnable at all on a machine whose dotfiles happen not
+# to carry pixi.
+#
 # `zellij` is here for a different reason and it is worth saying so, because
 # this comment used to justify it by a test file that no longer exists: `wf`
 # stopped launching zellij sessions in 9ae2897 and no code or test in this repo
