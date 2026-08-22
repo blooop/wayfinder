@@ -370,6 +370,46 @@ pub fn installed_from(target: &Target) -> Option<PathBuf> {
     (!recorded.is_empty()).then(|| PathBuf::from(recorded))
 }
 
+/// What sits where the copy of the bundle goes, and whether `wf` can prove it
+/// put it there.
+///
+/// The distinction is the whole permission argument for [`prune_mirror`], which
+/// deletes every entry it does not recognise. `create_dir_all` cannot tell a
+/// directory it just made from one it merely found, so a `~/.claude/wf-skills`
+/// a user or another tool already had was *adopted* by the first install and
+/// then emptied by it (#187) — and the module's own promise, that a name is
+/// `wf`'s only when `wf` put it there, was false on exactly that path.
+///
+/// Provenance is the record [`install`] already writes, so the answer is
+/// evidence rather than an assumption: [`MIRROR`] and [`SOURCE`] arrived in one
+/// commit, so a copy `wf` made has always carried one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mirror {
+    /// Nothing is there. An install creates it, so what it then holds is
+    /// `wf`'s — and a link into it is `wf`'s to reclaim.
+    Absent,
+    /// A directory carrying `wf`'s own record of the bundle it was copied
+    /// from. The only shape [`install`] may prune.
+    Ours,
+    /// Something is there that carries no such record. Reported and left
+    /// exactly as found, the way a real directory under `skills/` already is:
+    /// deleting what it did not create is not `wf`'s call to make.
+    Adopted,
+}
+
+impl Mirror {
+    /// What the copy directory amounts to right now.
+    fn inspect(target: &Target) -> Mirror {
+        if std::fs::symlink_metadata(&target.mirror).is_err() {
+            return Mirror::Absent;
+        }
+        if installed_from(target).is_none() {
+            return Mirror::Adopted;
+        }
+        Mirror::Ours
+    }
+}
+
 /// Classify one link. `symlink_metadata` rather than `metadata`, so a link is
 /// seen as a link instead of as whatever it points at — the whole distinction
 /// this function exists to draw.
@@ -494,6 +534,19 @@ pub enum Outcome {
     NotInBundle,
 }
 
+/// What an install amounted to — one answer for the whole run, because a copy
+/// directory `wf` cannot prove it made stops all of it rather than one skill's
+/// share of it: the links are written *into* that copy, so there is no such
+/// thing as installing five skills correctly beside a copy somebody else owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Installed {
+    /// The copy is `wf`'s, and here is what each bundled skill did.
+    Done(Vec<(String, Outcome)>),
+    /// Something else owns the copy directory: nothing was written, linked or
+    /// removed anywhere. See [`Mirror::Adopted`].
+    CopyUnmanaged,
+}
+
 /// Copy every bundled skill beside `target`'s links and link each one to its
 /// copy, creating both directories if needed.
 ///
@@ -501,16 +554,35 @@ pub enum Outcome {
 /// alone rather than rewritten, and a copy that already matches the bundle is
 /// not re-copied, so running it twice is indistinguishable from running it once.
 ///
+/// The one thing it will not do is install *at all* where the copy directory is
+/// one `wf` cannot prove it made — [`Installed::CopyUnmanaged`], reported and
+/// nothing touched, because the alternative is adopting somebody's directory
+/// and then pruning it.
+///
 /// # Errors
 ///
 /// When a directory cannot be created, a copy cannot be written, or a link
 /// cannot be replaced. A skill that is merely *blocked* or absent from the
 /// bundle is not an error — it is an [`Outcome`], so one bad skill never costs
 /// the other four their install.
-pub fn install(bundle: &Bundle, target: &Target) -> Result<Vec<(String, Outcome)>> {
+pub fn install(bundle: &Bundle, target: &Target) -> Result<Installed> {
+    // Asked before anything is created, because creating it is what makes the
+    // answer unknowable: past `create_dir_all` there is nothing left to tell a
+    // directory `wf` made from one it adopted.
+    if Mirror::inspect(target) == Mirror::Adopted {
+        return Ok(Installed::CopyUnmanaged);
+    }
     for dir in [&target.links, &target.mirror] {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     }
+    // Written before a single skill is copied, and unconditionally: from here
+    // on, *this* is the bundle the copy tracks and the launches that follow
+    // refresh it from there — and it is also what makes the copy provably
+    // `wf`'s, so an install interrupted halfway leaves a directory the next one
+    // still recognises as its own rather than as somebody else's to keep off.
+    let record = target.mirror.join(SOURCE);
+    std::fs::write(&record, format!("{}\n", bundle.path.display()))
+        .with_context(|| format!("cannot record the skills source in {}", record.display()))?;
     let mut done = Vec::new();
     for name in BUNDLED {
         let source = bundle.path.join(name);
@@ -554,12 +626,7 @@ pub fn install(bundle: &Bundle, target: &Target) -> Result<Vec<(String, Outcome)
         done.push((name.to_string(), outcome));
     }
     prune_mirror(&target.mirror)?;
-    // Written last, and unconditionally: from here on, *this* is the bundle the
-    // copy tracks, and the launches that follow refresh it from there.
-    let record = target.mirror.join(SOURCE);
-    std::fs::write(&record, format!("{}\n", bundle.path.display()))
-        .with_context(|| format!("cannot record the skills source in {}", record.display()))?;
-    Ok(done)
+    Ok(Installed::Done(done))
 }
 
 /// What a launch put right on one skill's behalf — reported rather than
@@ -675,9 +742,12 @@ pub fn refresh(target: &Target) -> Result<Vec<(String, Healed)>> {
 
 /// Drop copies of skills this build no longer ships, leaving the source record.
 ///
-/// Unlike [`sweep`], which has to *prove* a link is `wf`'s before removing it,
-/// everything in here is `wf`'s by construction: the mirror is a directory `wf`
-/// creates, fills and owns, and nothing else has a reason to write to it.
+/// Everything in here is `wf`'s — but by *evidence*, not by construction, and
+/// the difference is a defect this comment once papered over: the mirror is a
+/// directory `wf` creates and fills, and `create_dir_all` was just as happy to
+/// adopt one it found. So this is reached only past [`Mirror::inspect`], which
+/// is [`install`]'s proof that the directory it is about to empty is the one
+/// `wf` recorded making (#187).
 ///
 /// # Errors
 ///
@@ -871,6 +941,17 @@ mod tests {
         std::fs::write(dir.join("SKILL.md"), body).expect("SKILL.md");
     }
 
+    /// The per-skill outcomes of an install that was allowed to proceed. Every
+    /// test that reads them goes through this, so the arm where the copy
+    /// directory is not `wf`'s can never be mistaken for a clean install — it
+    /// is asserted only where it is the subject.
+    fn done(installed: Installed) -> Vec<(String, Outcome)> {
+        match installed {
+            Installed::Done(done) => done,
+            Installed::CopyUnmanaged => panic!("the copy directory is wf's own here"),
+        }
+    }
+
     /// Copy a tree the way a bind mount presents one: at a different absolute
     /// path, with symlinks carried across as symlinks rather than followed.
     /// This is how the container is reproduced in a unit test.
@@ -897,7 +978,7 @@ mod tests {
         let bundle = scratch.bundle(&[]);
         let target = scratch.target();
 
-        let first = install(&bundle, &target).expect("install");
+        let first = done(install(&bundle, &target).expect("install"));
         assert!(
             first
                 .iter()
@@ -910,7 +991,7 @@ mod tests {
 
         // Twice is once: nothing is relinked and nothing is re-copied, so a
         // link is never briefly absent and no run reports work it did not do.
-        let second = install(&bundle, &target).expect("reinstall");
+        let second = done(install(&bundle, &target).expect("reinstall"));
         assert!(
             second.iter().all(|(_, o)| *o == Outcome::AlreadyCurrent),
             "{second:?}"
@@ -967,7 +1048,7 @@ mod tests {
             link_state("wf", &target.links().join("wf")),
             Link::Stale(old.clone())
         );
-        let done = install(&bundle, &target).expect("install");
+        let done = done(install(&bundle, &target).expect("install"));
         let wf_skill = done.iter().find(|(n, _)| n == "wf").expect("entry");
         assert_eq!(wf_skill.1, Outcome::Linked { was: Some(old) });
         assert_eq!(link_state("wf", &target.links().join("wf")), Link::Current);
@@ -1015,7 +1096,7 @@ mod tests {
 
         // And `install` says so rather than reporting a no-op.
         write_skill(&bundle.path, "wf-tdd", "---\n---\nnewer still\n");
-        let done = install(&bundle, &target).expect("install");
+        let done = done(install(&bundle, &target).expect("install"));
         assert_eq!(
             done.iter().find(|(n, _)| n == "wf-tdd").expect("entry").1,
             Outcome::Refreshed
@@ -1210,7 +1291,7 @@ mod tests {
         std::fs::create_dir_all(&real).expect("real dir");
         std::fs::write(real.join("SKILL.md"), "someone else's").expect("write");
 
-        let done = install(&bundle, &target).expect("install");
+        let done = done(install(&bundle, &target).expect("install"));
         let tdd = done.iter().find(|(n, _)| n == "wf-tdd").expect("entry");
         assert_eq!(tdd.1, Outcome::Blocked);
         assert!(real.join("SKILL.md").is_file(), "the file must survive");
@@ -1246,7 +1327,7 @@ mod tests {
         let bundle = scratch.bundle(&["wf-review"]);
         let target = scratch.target();
 
-        let done = install(&bundle, &target).expect("install");
+        let done = done(install(&bundle, &target).expect("install"));
         let review = done.iter().find(|(n, _)| n == "wf-review").expect("entry");
         assert_eq!(review.1, Outcome::NotInBundle);
         assert!(!target.links().join("wf-review").exists());
@@ -1322,6 +1403,40 @@ mod tests {
         install(&bundle, &target).expect("reinstall");
         assert!(!orphan.exists());
         assert!(target.mirror().join("wf-tdd").is_dir(), "and only that");
+    }
+
+    #[test]
+    fn a_copy_directory_wf_did_not_make_is_reported_and_left_alone() {
+        // #187: `create_dir_all` cannot tell a directory it just made from one
+        // it merely found, so a `wf-skills` a user or another tool already had
+        // was *adopted* by the first install — and then emptied by the prune
+        // that assumes everything in there is wf's by construction. Provenance
+        // is the record install already writes, so the answer is evidence.
+        let scratch = Scratch::new("adopted");
+        let bundle = scratch.bundle(&[]);
+        let target = scratch.target();
+        let theirs = target.mirror().join("their-skill");
+        std::fs::create_dir_all(&theirs).expect("somebody else's directory");
+        std::fs::write(theirs.join("SKILL.md"), "mine\n").expect("their prompt");
+
+        assert_eq!(
+            install(&bundle, &target).expect("install"),
+            Installed::CopyUnmanaged,
+            "an install that cannot prove the copy is wf's does nothing at all"
+        );
+        assert_eq!(
+            std::fs::read_to_string(theirs.join("SKILL.md")).expect("still theirs"),
+            "mine\n",
+            "the prune must not reach a directory wf did not make"
+        );
+        assert!(
+            !target.mirror().join(SOURCE).exists(),
+            "and nothing is recorded in it, which would claim it next time"
+        );
+        assert!(
+            !target.links().join("wf-tdd").exists(),
+            "nor is a link written into a copy that is not wf's"
+        );
     }
 
     #[test]

@@ -274,7 +274,23 @@ fn run_skills(install: bool) -> Result<()> {
             // ships under a new spelling, and clearing the old link first keeps
             // the two steps from racing over the same directory entry.
             let swept = skills::sweep(&bundle, &target)?;
-            let done = skills::install(&bundle, &target)?;
+            // A copy directory `wf` cannot prove it made stops the install
+            // whole, so it is reported once — against the path in question —
+            // rather than six times over skills none of which was touched.
+            let done = match skills::install(&bundle, &target)? {
+                skills::Installed::Done(done) => done,
+                skills::Installed::CopyUnmanaged => {
+                    let _ = writeln!(
+                        out,
+                        "  NOT INSTALLED — {} already exists and carries no record wf \
+                         wrote, so wf did not make it. Nothing was touched. Move it aside \
+                         (chezmoi may own it) and run this again",
+                        target.mirror().display()
+                    );
+                    blocked = true;
+                    Vec::new()
+                }
+            };
             for link in &swept {
                 let _ = writeln!(
                     out,
