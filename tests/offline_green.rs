@@ -19,6 +19,7 @@
 //! under that glob the walk below would walk itself and demand its own gating,
 //! which would gate the guard out of the run it exists to guard.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// One `tests/live_*.rs` source: its file name, and its text.
@@ -228,4 +229,155 @@ fn every_test_attribute_in_a_live_source_is_one_this_guard_can_see() {
              shape, or write the test the way the rest of the file does"
         );
     }
+}
+
+/// One file of this repository, by its path relative to the crate root.
+fn repo_file(relative: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{relative} ships in this repo: {e}"))
+}
+
+/// Every test binary cargo builds out of `tests/`, by the name `--test` selects
+/// it with.
+///
+/// Read off the directory for the same reason `live_sources` is, and both forms
+/// cargo auto-discovers rather than only the common one: `tests/<name>.rs`, and
+/// `tests/<name>/main.rs`. The directory form is the one the walk above admits
+/// it goes blind to, and blindness is the whole hazard here — a target no walk
+/// sees is a target this guard silently vouches for. A directory with no
+/// `main.rs` is not a target at all (`tests/common/` is a module the live
+/// binaries include), so it is not one this guard demands a workflow line for.
+fn test_targets() -> Vec<String> {
+    let tests = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"));
+    let mut targets: Vec<String> = std::fs::read_dir(&tests)
+        .expect("this repo's tests directory")
+        .map(|entry| entry.expect("a readable directory entry").path())
+        .filter_map(|path| {
+            let name = path.file_stem()?.to_string_lossy().into_owned();
+            if path.is_dir() {
+                path.join("main.rs").is_file().then_some(name)
+            } else {
+                path.extension()
+                    .is_some_and(|extension| extension == "rs")
+                    .then_some(name)
+            }
+        })
+        .collect();
+    targets.sort();
+    targets
+}
+
+/// Where a test binary can be enrolled: a file that names binaries on a
+/// `cargo test` command line, and what makes the commands in it run.
+///
+/// The third entry is a different kind of thing from the first two, and saying
+/// so is the point of pairing each path with a reason. `ci.yml` and `live.yml`
+/// carry their own triggers, so a `--test` line in either is a line GitHub
+/// executes. `pixi.toml` carries no trigger whatsoever: its tasks run because
+/// `devlaunch-contract.yml` calls them by name, one indirection away. That
+/// makes this list a claim rather than an observation, which is why
+/// `the_pixi_manifest_is_a_runner_only_because_a_workflow_reaches_it` re-checks
+/// the call instead of trusting the row.
+const RUNNERS: &[(&str, &str)] = &[
+    (
+        ".github/workflows/ci.yml",
+        "one `cargo test --test <name>` step, beside the offline binaries already there",
+    ),
+    (
+        ".github/workflows/live.yml",
+        "a `--test <name>` line in the gated set it selects with `--ignored`",
+    ),
+    (
+        "pixi.toml",
+        "a task `devlaunch-contract.yml` calls, for anything wanting a chosen `dl`",
+    ),
+];
+
+/// The test binaries one runner's text names.
+///
+/// Comment lines come out first, and that is load-bearing rather than tidy:
+/// this repo's workflows and its pixi manifest are mostly prose, and the prose
+/// discusses the very binaries being counted — `ci.yml` explains at length why
+/// `live.yml` names its binaries one by one. Counted raw, a comment would
+/// enrol a binary nothing runs, which is precisely the failure this guard
+/// exists to catch, arriving through the guard itself.
+///
+/// The trailing space in the pattern is doing real work too: `--test-threads=1`
+/// appears in both files that run gated tests and names no binary.
+fn binaries_named_in(text: &str) -> BTreeSet<String> {
+    let mut named = BTreeSet::new();
+    for line in text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+    {
+        let mut rest = line;
+        while let Some(index) = rest.find("--test ") {
+            rest = &rest[index + "--test ".len()..];
+            let end = rest
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            if end > 0 {
+                named.insert(rest[..end].to_string());
+            }
+        }
+    }
+    named
+}
+
+/// Every enrolled test binary, and which runners name it.
+fn enrolment() -> BTreeMap<String, Vec<&'static str>> {
+    let mut enrolled: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
+    for (path, _) in RUNNERS {
+        for binary in binaries_named_in(&repo_file(path)) {
+            enrolled.entry(binary).or_default().push(path);
+        }
+    }
+    enrolled
+}
+
+/// Every test binary under `tests/` is named by a command something runs.
+///
+/// The sibling above guards the attribute half of enrolment; this guards the
+/// half AGENTS.md used to hand back to a human. A `tests/foo.rs` with no
+/// `live_` prefix compiles under `ci.yml`'s `--no-run` step, carries no
+/// `#[ignore]` for the walk above to want, and is selected by no workflow: it
+/// is run by nothing and flagged by nothing. That is the "an assertion nothing
+/// runs is not an assertion" hole this repo closes everywhere else, reopened
+/// one meta-level up — a whole binary of assertions, rather than one test,
+/// quietly not running.
+#[test]
+fn every_test_binary_is_named_by_a_workflow_that_runs_it() {
+    let targets = test_targets();
+    let enrolled = enrolment();
+    assert!(
+        !targets.is_empty(),
+        "no test binaries were found under `tests/`, so this guard just passed \
+         without looking at anything"
+    );
+    assert!(
+        !enrolled.is_empty(),
+        "no runner names a single test binary, which means the scan below \
+         stopped recognising how they are enrolled rather than that enrolment \
+         is gone: {RUNNERS:?}"
+    );
+
+    let orphans: Vec<String> = targets
+        .iter()
+        .filter(|target| !enrolled.contains_key(*target))
+        .map(|target| format!("tests/{target}"))
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "these test binaries are run by nothing. They compile — `ci.yml`'s \
+         `--all-targets --no-run` step sees to that — so rot is caught, but \
+         every assertion inside them is dead weight nobody is told about, \
+         which is worse than not having written them. Enrol each one, in \
+         whichever of these fits what it needs:\n  {}\nOrphans:\n  {}",
+        RUNNERS
+            .iter()
+            .map(|(path, how)| format!("{path}: {how}"))
+            .collect::<Vec<_>>()
+            .join("\n  "),
+        orphans.join("\n  ")
+    );
 }
