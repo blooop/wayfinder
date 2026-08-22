@@ -63,12 +63,12 @@ const READABLE: usize = 8;
 /// gets clipped: the names are budgeted around them.
 const POINTER: &str = " — wf reap";
 
-/// One id, shortened in the middle to `max` characters if it is longer.
+/// One id, shortened in the middle to `max` columns if it is wider.
 ///
 /// Both ends survive because both carry meaning: `dl` puts the tool and the
 /// repo at the front and the ticket number at the back, and the number is what
 /// tells two workspaces of one project apart. The tail therefore gets the odd
-/// character when the budget is odd.
+/// column when the budget is odd.
 fn abbreviate(id: &str, max: usize) -> String {
     if crate::cols(id) <= max {
         return id.to_string();
