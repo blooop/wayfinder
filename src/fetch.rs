@@ -58,13 +58,13 @@ query($owner: String!, $name: String!, $number: Int!) {
       title
       state
       updatedAt
-      labels(first: 20) { nodes { name } }
+      labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
       subIssues(first: 100) {
         nodes {
           number title state
           labels(first: 10) { nodes { name } }
           assignees(first: 5) { nodes { login } }
-          blockedBy(first: 50) { nodes { number state } }
+          blockedBy(first: 50) { nodes { number state } pageInfo { hasNextPage } }
           closedByPullRequestsReferences(first: 5, includeClosedPrs: true) {
             nodes {
               number state isDraft reviewDecision
@@ -74,6 +74,7 @@ query($owner: String!, $name: String!, $number: Int!) {
             pageInfo { hasNextPage }
           }
         }
+        pageInfo { hasNextPage }
       }
     }
   }
@@ -113,14 +114,36 @@ struct MapIssue {
     /// the PR selection follows.
     #[serde(rename = "updatedAt", default)]
     updated_at: Option<String>,
-    labels: Nodes<Label>,
+    labels: Paged<Label>,
     #[serde(rename = "subIssues")]
-    sub_issues: Nodes<SubIssue>,
+    sub_issues: Paged<SubIssue>,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct Nodes<T> {
     pub(crate) nodes: Vec<T>,
+}
+
+/// A connection read *with* the tracker's word on whether the page was all of
+/// it (#184) — for the ticket-bearing connections, where a missing node is a
+/// missing ticket or a missing blocking edge, not a cosmetic gap. [`Nodes`]
+/// stays the shape for the connections whose truncation changes nothing a
+/// consumer would assert on; giving every reader the flag would invite readers
+/// that do not need it.
+#[derive(Deserialize)]
+struct Paged<T> {
+    nodes: Vec<T>,
+    /// Defaulted so a response without the selection (an older fixture, a
+    /// GitHub edition without it) reads as "no claim of more" — the same rule
+    /// every other optional selection here follows.
+    #[serde(rename = "pageInfo", default)]
+    page_info: PageInfo,
+}
+
+#[derive(Deserialize, Default)]
+struct PageInfo {
+    #[serde(rename = "hasNextPage", default)]
+    has_next_page: bool,
 }
 
 impl<T> Default for Nodes<T> {
@@ -137,7 +160,7 @@ struct SubIssue {
     labels: Nodes<Label>,
     assignees: Nodes<Assignee>,
     #[serde(rename = "blockedBy")]
-    blocked_by: Nodes<Blocker>,
+    blocked_by: Paged<Blocker>,
     /// Defaulted so a response without the selection (older fixtures, a
     /// GitHub edition without the field) parses as "no linked PRs" rather
     /// than failing the whole map.
@@ -338,7 +361,16 @@ fn parse_map(body: &[u8], id: &MapId) -> Result<Map> {
     // as stale, which is honest, instead of rendering some unrelated issue's
     // sub-issues as its map. The unconditional search corrects the number
     // moments later.
-    if !is_open(&issue.state) || !issue.labels.nodes.iter().any(|l| l.name == MAP_LABEL) {
+    //
+    // The label half of the proof needs the tracker's *whole* answer: a label
+    // page cut short cannot prove the label is gone, only a complete page
+    // without it can (#184). Without that qualifier, a map wearing more labels
+    // than one page holds was rejected here as "no longer a map" on every
+    // refresh, while discovery's label-scoped search — which no page cap can
+    // blind — kept re-finding it.
+    let map_label_disproven = !issue.labels.nodes.iter().any(|l| l.name == MAP_LABEL)
+        && !issue.labels.page_info.has_next_page;
+    if !is_open(&issue.state) || map_label_disproven {
         bail!(
             "{}#{} is no longer an open `{MAP_LABEL}` issue",
             id.repo,
@@ -346,11 +378,16 @@ fn parse_map(body: &[u8], id: &MapId) -> Result<Map> {
         );
     }
 
+    // Truncation folds over the whole read: the sub-issue page itself, and
+    // every ticket's blocker page. Any one of them cut short means the tree —
+    // or the classification drawn from its edges — is partial (#184).
+    let mut truncated = issue.sub_issues.page_info.has_next_page;
     let mut tickets: Vec<Ticket> = issue
         .sub_issues
         .nodes
         .into_iter()
         .map(|sub| {
+            truncated |= sub.blocked_by.page_info.has_next_page;
             // One pass over the same edges yields both facts: the open subset
             // is status, the whole set is structure (#50).
             let open_blockers: Vec<u64> = sub
@@ -391,6 +428,7 @@ fn parse_map(body: &[u8], id: &MapId) -> Result<Map> {
         // Interpreted here and nowhere inward, like every other tracker string.
         last_activity: issue.updated_at.as_deref().and_then(Activity::parse),
         tickets,
+        truncated,
     })
 }
 
@@ -669,6 +707,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_maps_own_label_count_can_never_unmap_it() {
+        // The worst of #184's three findings: a map wearing more labels than
+        // one page holds, with `wayfinder:map` not on the page the fetch got,
+        // used to fail re-verification as "no longer a map" — while discovery,
+        // whose label-scoped search is immune to the cap, kept re-finding it.
+        // Permanently, on every refresh.
+        //
+        // An unseen label on a *truncated* page proves nothing, so it keeps
+        // the map. Only a complete page without the label — the tracker's
+        // whole answer — may reject.
+        let body = map_response_with("OPEN", r#"{"name": "enhancement"}"#).replacen(
+            r#""labels": {"nodes": [{"name": "enhancement"}]},"#,
+            r#""labels": {"nodes": [{"name": "enhancement"}], "pageInfo": {"hasNextPage": true}},"#,
+            1,
+        );
+        let map = parse_map(body.as_bytes(), &wf_map_id())
+            .expect("a label page the tracker cut short cannot prove the label is gone");
+        assert_eq!(map.title, "Map: wf", "the map renders as itself");
+
+        // And the label page being cut short is not the *tree* being cut
+        // short: nothing ticket-bearing was truncated here.
+        assert!(
+            !map.truncated,
+            "a truncated label page is not a partial tree"
+        );
+    }
+
     /// One sub-issue carrying the full PR-badge matrix (#52).
     const PR_RESPONSE: &str = r#"{"data": {"repository": {"issue": {
         "title": "Map: wf",
@@ -769,6 +835,224 @@ mod tests {
         let old = parse_map(MAP_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
         assert_eq!(old.last_activity, None);
         assert_eq!(old.tickets.len(), 3, "the rest of the map is unaffected");
+    }
+
+    /// The tracker's own word that a page was not all of it, on each
+    /// ticket-bearing connection in turn — the two ways a map can arrive
+    /// silently partial (#184).
+    fn truncated_response(sub_issues_more: bool, blockers_more: bool) -> String {
+        format!(
+            r#"{{"data": {{"repository": {{"issue": {{
+            "title": "Map: wf",
+            "state": "OPEN",
+            "labels": {{"nodes": [{{"name": "wayfinder:map"}}]}},
+            "subIssues": {{
+                "nodes": [
+                    {{"number": 19, "title": "Build 6", "state": "OPEN",
+                     "labels": {{"nodes": []}},
+                     "assignees": {{"nodes": []}},
+                     "blockedBy": {{"nodes": [{{"number": 3, "state": "OPEN"}}],
+                                   "pageInfo": {{"hasNextPage": {blockers_more}}}}}}}
+                ],
+                "pageInfo": {{"hasNextPage": {sub_issues_more}}}
+            }}
+        }}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_map_the_tracker_could_not_send_all_of_says_it_arrived_truncated() {
+        // A 101st sub-issue or a 51st blocker does not fit the page, and until
+        // #184 the map rendered without it and without a trace. The parse now
+        // keeps the tracker's own word on it: either connection reporting a
+        // next page marks the whole map truncated.
+        for (subs, blockers) in [(true, false), (false, true), (true, true)] {
+            let map = parse_map(truncated_response(subs, blockers).as_bytes(), &wf_map_id())
+                .expect("a truncated map still parses — partial beats absent");
+            assert!(
+                map.truncated,
+                "subIssues more: {subs}, blockers more: {blockers} — the map must say so"
+            );
+        }
+        let map =
+            parse_map(truncated_response(false, false).as_bytes(), &wf_map_id()).expect("parse");
+        assert!(!map.truncated, "full pages are not a truncation");
+    }
+
+    #[test]
+    fn a_response_without_page_info_reads_as_complete() {
+        // Older fixtures and GitHub editions without the selection: absent is
+        // "no claim of more", not "more" — the same defaulting rule the PR
+        // selection follows.
+        let map = parse_map(MAP_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
+        assert!(!map.truncated);
+    }
+
+    /// One field of a GraphQL selection: the arguments it was called with, and
+    /// the fields selected under it — which is to say, the shape an answer to
+    /// that selection has.
+    #[derive(Default)]
+    struct Selected {
+        arguments: String,
+        fields: std::collections::BTreeMap<String, Selected>,
+    }
+
+    impl Selected {
+        /// The field reached by following `path` from here, or `None` if the
+        /// query does not select it *there*.
+        ///
+        /// Position is the whole point. The sub-issue block contains the
+        /// linked-PR block, whose own `pageInfo` (#183) would answer on behalf
+        /// of a connection that never asked if the question were "does this
+        /// name appear anywhere below".
+        fn at(&self, path: &[&str]) -> Option<&Selected> {
+            match path {
+                [] => Some(self),
+                [step, rest @ ..] => self.fields.get(*step)?.at(rest),
+            }
+        }
+
+        /// The field at `path`, created empty if the walk has not reached it
+        /// yet — how the parse below fills the tree in as it descends.
+        fn under(&mut self, path: &[String]) -> &mut Selected {
+            let mut at = self;
+            for step in path {
+                at = at.fields.entry(step.clone()).or_default();
+            }
+            at
+        }
+    }
+
+    /// Read the subset of GraphQL selection syntax [`MAP_QUERY`] is written in
+    /// — names, optional `(arguments)`, optional nested `{ blocks }` — as the
+    /// tree of fields it selects.
+    ///
+    /// Derived rather than matched, and that is the point of it. A guard that
+    /// searches the query text for a spelling is satisfied by any text carrying
+    /// that spelling: `pageInfo { endCursor }` passed a guard looking for
+    /// `pageInfo` while answering none of the questions the parse asks of it.
+    /// Walking the tree asks the parse's own question instead — is this field
+    /// selected at this path — which no rewording can answer by accident.
+    ///
+    /// Panics on unbalanced braces, because a guard that gives up quietly on a
+    /// query it cannot read is a guard that stops guarding the moment the query
+    /// is reworded.
+    fn selected(text: &str) -> Selected {
+        let mut root = Selected::default();
+        let mut path: Vec<String> = Vec::new();
+        let mut last: Option<String> = None;
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '{' => path.push(last.take().expect("a block follows the field it selects")),
+                '}' => {
+                    path.pop().expect("a block was opened before it closed");
+                    last = None;
+                }
+                // Arguments say nothing about the shape of the answer, but they
+                // do say how much of it there is, which is its own assertion
+                // below.
+                '(' => {
+                    let mut arguments = String::new();
+                    for skipped in chars.by_ref() {
+                        if skipped == ')' {
+                            break;
+                        }
+                        arguments.push(skipped);
+                    }
+                    let named = last
+                        .clone()
+                        .expect("arguments follow the field they qualify");
+                    root.under(&path).fields.entry(named).or_default().arguments = arguments;
+                }
+                ch if ch.is_alphanumeric() || ch == '_' => {
+                    let mut name = String::from(ch);
+                    while chars
+                        .peek()
+                        .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+                    {
+                        name.push(chars.next().expect("peeked"));
+                    }
+                    root.under(&path).fields.entry(name.clone()).or_default();
+                    last = Some(name);
+                }
+                _ => {}
+            }
+        }
+        assert!(path.is_empty(), "unbalanced braces in {text}");
+        root
+    }
+
+    #[test]
+    fn the_query_asks_for_every_page_boundary_the_parse_reads() {
+        // The truncation tests above feed `parse_map` hand-written fixtures, so
+        // they cannot notice the live query never requesting the field — the
+        // same hole #132 closed for reap's batch, guarded the same way: against
+        // the query text. Drop the boundary from any of these three and every
+        // map fetched live reads as complete forever, silently, which is
+        // exactly the pre-#184 behaviour.
+        //
+        // `hasNextPage` by name, at the path the parse reads it from, because
+        // that field *is* the answer: `Paged::page_info` and
+        // `PageInfo::has_next_page` both default, so a `pageInfo` block
+        // selecting anything else — `endCursor`, say — deserialises as a silent
+        // "no claim of more". Asserting the connection asks for `pageInfo` is
+        // not enough; that reword left all 443 tests green.
+        let query = selected(MAP_QUERY);
+        for path in [
+            &[
+                "query",
+                "repository",
+                "issue",
+                "labels",
+                "pageInfo",
+                "hasNextPage",
+            ][..],
+            &[
+                "query",
+                "repository",
+                "issue",
+                "subIssues",
+                "pageInfo",
+                "hasNextPage",
+            ][..],
+            &[
+                "query",
+                "repository",
+                "issue",
+                "subIssues",
+                "nodes",
+                "blockedBy",
+                "pageInfo",
+                "hasNextPage",
+            ][..],
+        ] {
+            assert!(
+                query.at(path).is_some(),
+                "the query no longer asks for {}, so nothing it fetches can \
+                 report a page cut short: {MAP_QUERY}",
+                path.join(".")
+            );
+        }
+    }
+
+    #[test]
+    fn the_maps_own_label_page_is_as_deep_as_the_tracker_allows() {
+        // The other half of the un-mapping fix: the parse forgives a truncated
+        // label page, and the query makes truncation implausible in the first
+        // place — 100 is the GraphQL page maximum, five times the old cap that
+        // a label-heavy map actually overflowed. Addressed by path rather than
+        // by "the first `labels` in the text", so the sub-issue labels selected
+        // further down cannot be mistaken for the map issue's own.
+        let query = selected(MAP_QUERY);
+        let labels = query
+            .at(&["query", "repository", "issue", "labels"])
+            .expect("the map query selects the map issue's own labels");
+        assert_eq!(
+            labels.arguments.trim(),
+            "first: 100",
+            "the map's label page shrank below the tracker's maximum: {MAP_QUERY}"
+        );
     }
 
     #[test]
