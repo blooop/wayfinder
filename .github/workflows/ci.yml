@@ -123,14 +123,24 @@ jobs:
       - name: The Rust pin has one home
         run: cargo test --locked --test toolchain_pin
 
-      # The guard on the exclusion every step around it depends on: the live
-      # binaries are safe to leave out of the unit-test step only because each
-      # of their tests carries `#[ignore]`, and a new one that forgets it is
-      # invisible both here and in `live.yml`, which selects with `--ignored`.
-      # This walks `tests/live_*.rs` and reads the attributes off the source,
-      # which is the only place the omission is visible — running the tests
-      # cannot see it, since running them is the symptom.
-      - name: The live tests are all gated
+      # The guard on the exclusion every step around it depends on, and on the
+      # enrolment that makes the steps above mean anything. The live binaries
+      # are safe to leave out of the unit-test step only because each of their
+      # tests carries `#[ignore]`, and a new one that forgets it is invisible
+      # both here and in `live.yml`, which selects with `--ignored`. Reading the
+      # attributes off the source is the only place that omission is visible —
+      # running the tests cannot see it, since running them is the symptom.
+      #
+      # It also walks every test binary under `tests/` and fails on any that no
+      # command in this file, in `live.yml` or in a `pixi.toml` task the contract
+      # workflow calls ever runs (#189). That closes the hole one level above the
+      # rest of this job: the `--no-run` step below keeps a new `tests/foo.rs`
+      # compiling, so it looks tended while running nowhere — a whole binary of
+      # assertions nobody is told about, which is the "an assertion no workflow
+      # runs is not an assertion" rule the steps above each invoke, applied to
+      # the steps themselves. This step is the reason the guard is not its own
+      # first victim.
+      - name: The live tests are gated and every test binary is enrolled
         run: cargo test --locked --test offline_green
 
       # The live fixture's own diagnostic — offline like its three siblings
