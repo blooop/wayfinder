@@ -578,13 +578,26 @@ impl App {
     /// nine projects on it: a fetch that has not landed and a repo with
     /// nothing open would look identical to the screen being empty, and the
     /// number a query narrows would not be the number the query narrowed.
+    ///
+    /// On a project's screen both halves count **tickets**, so the numerator
+    /// dedups the drawn rows: the leverage lens deliberately draws a ticket
+    /// under *every* root that unblocks it, and counting rows there let a
+    /// diamond in the DAG claim more tickets shown than the map holds — the
+    /// same nodes-not-rows discipline the rollups already keep.
     pub fn counts(&self) -> (usize, usize) {
         match self.level {
             Level::Projects => (
                 self.stops().len(),
                 projects::mru_repos(&self.checkouts).len(),
             ),
-            Level::Project { .. } => (self.visible().len(), self.scoped().len()),
+            Level::Project { .. } => {
+                let shown: BTreeSet<(MapId, usize)> = self
+                    .visible()
+                    .into_iter()
+                    .map(|row| (row.map, row.index))
+                    .collect();
+                (shown.len(), self.scoped().len())
+            }
         }
     }
 
@@ -3455,6 +3468,47 @@ mod tests {
         assert_eq!(app.counts(), (2, 2), "wayfinder and dotfiles");
         type_str(&mut app, "dotf");
         assert_eq!(app.counts(), (1, 2), "narrowed, out of all of them");
+    }
+
+    /// A map with a diamond in its DAG: #14 needs both #6 and #9, and both
+    /// are takeable roots, so the leverage lens deliberately draws #14 under
+    /// each of them — four rows for three shown tickets (the done #2 is
+    /// folded away). The shape the count and cursor claims below are about.
+    fn diamond_app() -> App {
+        let mut clusters = BTreeMap::new();
+        clusters.insert(
+            MapId::new(PROJECT, 1),
+            Map {
+                title: "Map: diamond".to_string(),
+                last_activity: None,
+                tickets: vec![
+                    ticket(PROJECT, 2, "Choose the stack", false, true, vec![]),
+                    ticket(PROJECT, 6, "Re-entry breadcrumbs", true, false, vec![]),
+                    ticket(PROJECT, 9, "Main screen design", true, true, vec![]),
+                    ticket(PROJECT, 14, "Breadcrumb markers", true, false, vec![6, 9]),
+                ],
+            },
+        );
+        app_on(PROJECT, clusters)
+    }
+
+    #[test]
+    fn a_ticket_a_diamond_draws_twice_is_counted_once() {
+        // The count line reads `shown/total` **of tickets** — the same
+        // nodes-not-rows discipline the rollups already keep. The diamond
+        // renders #14 twice, so counting drawn rows would claim four tickets
+        // shown out of four while the done one sits folded off screen.
+        let app = diamond_app();
+        assert_eq!(
+            app.visible().len(),
+            4,
+            "the lens draws four rows: #14 under both roots"
+        );
+        assert_eq!(
+            app.counts(),
+            (3, 4),
+            "three distinct tickets shown, of the map's four"
+        );
     }
 
     #[test]
