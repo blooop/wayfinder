@@ -602,8 +602,8 @@ fn the_readme_states_the_tracker_injection_posture() {
          defended.** A launch embeds what the picker read straight into the prompt it \
          execs: the map's title and the ticket's title, verbatim, in the [`ctx:` \
          block](#launching) it hands the skill. The skill's own first move is then to \
-         read the ticket — body, comment trail and \
-         all — so the surface is wider than the block: everything anyone can write on a \
+         read the ticket — body, comment trail and all — so the surface is wider than \
+         the block: everything anyone can write on a \
          tracker you point `wf` at reaches an agent running with permissions bypassed, \
          and under `wf-auto` there is nobody reading along. Titles are the part `wf` \
          itself hands over, and a title is writable by anyone who can open an issue."
@@ -622,12 +622,12 @@ fn the_readme_states_the_tracker_injection_posture() {
     assert_eq!(
         readme_paragraph("So the posture is [#73]"),
         "So the posture is [#73](https://github.com/blooop/wayfinder/issues/73)'s, one \
-         layer out: **don't point `wf` at a tracker you have not read.** That trade was about hostile code in a repo you launch into; \
-         this is hostile prose on a ticket you launch from, and the same answer covers \
-         both, because a run holding your `~/.claude` and your `GH_TOKEN` is one you had \
-         to decide to start. Reading the rows is the whole check, and the picker is \
-         where it is cheapest: every title that will reach the prompt is on the screen \
-         you pick from."
+         layer out: **don't point `wf` at a tracker you have not read.** That trade was \
+         about hostile code in a repo you launch into; this is hostile prose on a ticket \
+         you launch from, and the same answer covers both, because a run holding your \
+         `~/.claude` and your `GH_TOKEN` is one you had to decide to start. Reading the \
+         rows is the whole check, and the picker is where it is cheapest: every title \
+         that will reach the prompt is on the screen you pick from."
     );
 }
 
