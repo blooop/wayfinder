@@ -324,9 +324,15 @@ pub fn spawn_discovery(
         loop {
             match fetch::find_maps(&repos).await {
                 Ok(found) => {
-                    let mut cache = ProjectsCache::load_or_default(&cache_path);
-                    cache.record_search(&repos, &found);
-                    let _ = cache.save(&cache_path);
+                    // Through the cache's one write seam, which re-reads before
+                    // it writes: the picker is writing this same file while
+                    // this search runs, so a copy loaded here is already a
+                    // guess about what else has happened. Best-effort, as the
+                    // doc above says — a failed write costs a head start.
+                    let _ = ProjectsCache::update(&cache_path, |cache| {
+                        cache.record_search(&repos, &found);
+                        true
+                    });
                     let _ = tx.send(LoadEvent::Discovered(found));
                     return; // the set of open maps is fixed for this run
                 }

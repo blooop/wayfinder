@@ -189,9 +189,36 @@ shims. Three consequences worth knowing before you touch any of this:
   `#[ignore]` it makes a bare `cargo test` fail on any machine lacking what it
   wants; with it and nothing else, it is a test that never runs anywhere.
   `live.yml` names its test binaries one by one for that reason — enrolment is
-  a deliberate line, not a side effect. The attribute half is checked rather
-  than remembered: `tests/offline_green.rs` walks `tests/live_*.rs` and fails
-  on any test that is missing it. The workflow half is still on you.
+  a deliberate line, not a side effect. Both halves are checked rather than
+  remembered, and by the same file: `tests/offline_green.rs` walks
+  `tests/live_*.rs` and fails on any test missing the attribute, and it walks
+  every test binary under `tests/` and fails on any that no workflow names.
+  A deliberate line, still — the guard makes you write it, it does not write
+  it for you.
+
+### Every test binary is enrolled or the build fails
+
+The rule is wider than the live tests and it holds for any `tests/*.rs`: a test
+binary that no command anywhere runs fails `offline_green` (#189). Three places
+count as running one, and a binary has to be named in one of them — `ci.yml`
+for an offline check, `live.yml` for the gh-live set, or a `pixi.toml` task the
+contract workflow calls for anything wanting a chosen `dl`. Four things to know
+before adding a test file:
+
+- **Compiling is not running.** `ci.yml`'s `--all-targets --no-run` step keeps
+  every binary building, so rot is caught either way — which is exactly why the
+  gap was invisible. A new `tests/foo.rs` compiled, ran nowhere, and looked
+  fine.
+- **A comment does not enrol anything.** The guard strips full-line comments
+  before looking, because the workflows here are mostly prose and the prose
+  names test binaries.
+- **A rename is caught from the other side too.** A `--test` argument naming no
+  file fails at the commit that moved the file, rather than in whichever
+  workflow was holding the stale line.
+- **`pixi.toml` counts only while a workflow still calls its task.** The
+  manifest has no trigger of its own; `devlaunch-contract.yml` calling
+  `contract` is the whole reason a binary named there is run, and that call is
+  asserted rather than assumed.
 
 ## The devlaunch contract
 
