@@ -738,6 +738,22 @@ fn now_secs() -> u64 {
 }
 
 /// A centered box `width`×`height` (clamped) inside `area`.
+/// A popup's outer width: the widest body row or the border title, whichever
+/// is wider, plus the frame around them. Both are measured in *display
+/// columns* — the same metric ratatui renders in — because GitHub titles are
+/// arbitrary text and a CJK or emoji title is one char, two columns: measured
+/// in chars (or worse, bytes) the border clipped its own title. This is the
+/// one place a popup is measured, so the two pickers cannot drift back onto
+/// two conventions.
+fn popup_width(lines: &[Line<'_>], title: &str) -> u16 {
+    lines
+        .iter()
+        .map(|l| l.width() as u16 + 4)
+        .chain(std::iter::once(Span::raw(title).width() as u16 + 4))
+        .max()
+        .unwrap_or(40)
+}
+
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let [area] = Layout::horizontal([Constraint::Length(width.min(area.width))])
         .flex(Flex::Center)
@@ -833,12 +849,7 @@ fn draw_launch_picker(
         staged.title()
     );
     let title = title.trim_end().to_string() + " ";
-    let width = lines
-        .iter()
-        .map(|l| l.width() as u16 + 4)
-        .chain(std::iter::once(title.chars().count() as u16 + 4))
-        .max()
-        .unwrap_or(40);
+    let width = popup_width(&lines, &title);
     let area = centered(frame.area(), width, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -903,18 +914,14 @@ fn draw_checkout_picker(frame: &mut Frame<'_>, launches: &[Launch], cursor: usiz
     // This asks *which checkout*, so the ticket only needs identifying — its
     // title is already on the row behind the prompt.
     let key = launches.first().map(Launch::key).unwrap_or_default();
-    let width = lines
-        .iter()
-        .map(|l| l.width() as u16 + 4)
-        .chain(std::iter::once(key.len() as u16 + 30))
-        .max()
-        .unwrap_or(40);
+    let title = format!(" which checkout runs {key}? ");
+    let width = popup_width(&lines, &title);
     let area = centered(frame.area(), width, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
-                .title(format!(" which checkout runs {key}? "))
+                .title(title)
                 .border_style(Style::new().fg(Color::Cyan)),
         ),
         area,
@@ -2175,6 +2182,42 @@ mod tests {
     }
 
     #[test]
+    fn the_checkout_picker_title_survives_a_non_ascii_key() {
+        // The checkout picker's width once measured the key in *bytes* plus a
+        // magic margin — a third convention beside display columns and char
+        // counts, which happened never to clip only because bytes over-count
+        // every wide char. It measures the actual title in display columns
+        // now, like every other popup; this pins that a non-ASCII key renders
+        // whole so no cheaper metric can come back.
+        let repo = "blooop/测试仓库";
+        let mut map = wf_map();
+        for t in &mut map.tickets {
+            t.repo = repo.to_string();
+        }
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new(repo, 1), map);
+        let mut app = app_on(repo, clusters).with_checkouts(vec![
+            crate::projects::Checkout::new(
+                std::path::PathBuf::from("/data/k1/repo"),
+                repo.to_string(),
+            ),
+            crate::projects::Checkout::new(
+                std::path::PathBuf::from("/data/k2/repo"),
+                repo.to_string(),
+            ),
+        ]);
+        down(&mut app, 2); // past the project row and the cluster header
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // stage
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // resolve
+        let screen = render_at(120, &app);
+        // Wide chars read back from the buffer with their continuation cells.
+        assert!(
+            screen.contains("which checkout runs 测 试 仓 库 #6?"),
+            "{screen}"
+        );
+    }
+
+    #[test]
     fn a_project_picker_draws_the_creation_rows_with_their_own_skills() {
         // Creation is an act on a repo, so the rows live on the one stop that
         // is a repo — and every row still names the skill it execs, including
@@ -2222,6 +2265,39 @@ mod tests {
                 mode.label()
             );
         }
+    }
+
+    #[test]
+    fn a_cjk_title_widens_the_picker_to_what_it_actually_displays() {
+        // GitHub titles are arbitrary text, and a CJK char is one char but two
+        // columns. The popup width was taking `chars().count()` for the title
+        // while measuring its body rows in display columns — so a CJK-heavy
+        // title under-measured by half and the border clipped its tail.
+        let title = "弹窗标题宽度必须按显示宽度而不是字符数来测量才能容纳";
+        let mut map = wf_map();
+        map.tickets[1].title = title.to_string(); // #6, the launchable row
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        let mut app = app_on("blooop/wayfinder", clusters);
+        down(&mut app, 2); // past the project row and the cluster header
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = render_at(120, &app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("launch Claude"))
+            .unwrap_or_else(|| panic!("no picker title: {screen}"));
+        // The buffer dump spells a wide char as the char plus its continuation
+        // cell, so the whole title reads back space-separated.
+        let drawn: String = title
+            .chars()
+            .map(|c| format!("{c} "))
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        assert!(
+            line.contains(&drawn),
+            "the title is clipped by its own popup: {line}"
+        );
     }
 
     #[test]
