@@ -123,6 +123,16 @@ jobs:
       - name: The Rust pin has one home
         run: cargo test --locked --test toolchain_pin
 
+      # The fourth config-as-behavior binary: the red-run alert subscribes to
+      # `live.yml` and `devlaunch-contract.yml` by their *display names*, a
+      # string GitHub never validates, so a rename of either workflow would
+      # disconnect the alert with no symptom anywhere — except here, where the
+      # subscription is compared to the watched files' own `name:` fields. The
+      # same binary drives the reconciliation script against a recording `gh`,
+      # offline like its siblings.
+      - name: The red-run alert stays wired to what it watches
+        run: cargo test --locked --test red_run_alert
+
       # The guard on the exclusion every step around it depends on: the live
       # binaries are safe to leave out of the unit-test step only because each
       # of their tests carries `#[ignore]`, and a new one that forgets it is
@@ -133,7 +143,7 @@ jobs:
       - name: The live tests are all gated
         run: cargo test --locked --test offline_green
 
-      # The live fixture's own diagnostic — offline like its three siblings
+      # The live fixture's own diagnostic — offline like its five siblings
       # above — which decides what a failing live test tells
       # you about a missing GH_TOKEN. It is split from the environment it reads
       # precisely so it can be asserted — and an assertion no workflow runs is

@@ -1,0 +1,108 @@
+name: red-run alert
+
+# A red non-blocking run summons somebody (#190). Two legs of this repo's CI
+# are non-blocking on purpose — `live.yml` runs after the merge because it
+# asserts the tracker's present contents, and `devlaunch-contract.yml`'s
+# weekly re-solve is the only thing that can discover a devlaunch release
+# published since the lock — which means both depend entirely on a human
+# noticing a red run. Nothing did the noticing. This workflow reconciles one
+# tracking issue per watched workflow: filed when a run goes red, commented
+# rather than duplicated while it stays red, closed on the next green of the
+# same class.
+on:
+  workflow_run:
+    # By *display name*, because that is the only thing `workflow_run` can
+    # subscribe by — a rename of either watched workflow would disconnect this
+    # silently. `tests/red_run_alert.rs` derives these strings from the watched
+    # files' own `name:` fields, so a rename either moves both ends or fails CI.
+    workflows: ["live", "devlaunch contract"]
+    # `completed` and only `completed`: it is the one type that carries a
+    # conclusion, and a run that has not concluded has nothing to reconcile.
+    types: [completed]
+
+# Read-only for the workflow as a whole; the one grant beyond that sits on the
+# job that needs it, matching `package.yml` and `devcontainer.yml`. What the
+# split buys is the blast radius of a step added later: it could read this
+# public repo, not file or close issues on it.
+permissions:
+  contents: read
+
+concurrency:
+  # One fixed group — not keyed on the ref or the event — because the
+  # reconciliation below is a search-then-act on a single tracker issue, and
+  # two completions racing through it is exactly how "one open issue per
+  # workflow" becomes two. `cancel-in-progress: false` keeps the reconciliation
+  # that is already running.
+  #
+  # What this does *not* buy, stated exactly, because the obvious reading is
+  # wrong: reconciliations do not all queue up behind each other. GitHub holds
+  # at most one pending run per group, so a third completion arriving while one
+  # runs and one waits cancels the *waiting* one. That is survivable here, and
+  # only here: the run being cancelled is never the newest, and reconciliation
+  # converges on the current state rather than appending to a log — so the
+  # newest completion always gets its say, and what a burst loses is at most an
+  # interim "Still red" comment.
+  group: red-run-alert
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: file, update or close the tracking issue
+    # The subscription above is wider than the promise, so the job narrows it
+    # to the runs nothing else stands behind. `live` counts only on `main`:
+    # its push trigger only fires there, and a `workflow_dispatch` aimed at a
+    # topic branch is somebody's experiment, not the world moving. The
+    # contract workflow counts only from its weekly schedule: every other leg
+    # blocks a pull request, so a red one is already holding the merge it
+    # belongs to, and the scheduled re-solve is the single leg whose red means
+    # devlaunch moved — the one nobody is otherwise summoned to.
+    #
+    # The head-repository clause comes first because it is the only one a fork
+    # cannot choose. A fork's default branch is `main`, so a fork pull request
+    # that adds a `pull_request:` leg to `live.yml` produces a run named `live`
+    # with `head_branch == 'main'` and a conclusion the fork's own code
+    # decides. That run reaches this job, which holds `issues: write` on *this*
+    # repo — and a forged `success` would not merely file noise, it would close
+    # a genuinely red summons. Guarding both legs rather than only the live one:
+    # `event == 'schedule'` is unforgeable today, but a guard that has to be
+    # re-derived per leg is a guard the next leg forgets.
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository
+      && ((github.event.workflow_run.name == 'live'
+            && github.event.workflow_run.head_branch == 'main')
+        || (github.event.workflow_run.name == 'devlaunch contract'
+            && github.event.workflow_run.event == 'schedule'))
+    runs-on: ubuntu-latest
+    # Job-scoped and exhaustive: a job-level `permissions` replaces the
+    # workflow-level one entirely, so the read the checkout needs is restated
+    # here beside the one write this whole workflow exists for.
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # Only for the script below — this job builds nothing.
+      - uses: actions/checkout@v7
+
+      # The decision logic lives in a script rather than in this block so that
+      # `tests/red_run_alert.rs` can run it for real against a recording `gh`
+      # stub — the create-vs-comment-vs-close behavior is asserted there, and
+      # the same test holds this env block and the script's reads to match in
+      # both directions: the key names against what the script actually reads,
+      # and each *expression* against the run it has to describe.
+      #
+      # That second half is the one worth stating. In a `workflow_run` run the
+      # context carries two runs — the watched one under
+      # `github.event.workflow_run`, and this alert's own under the bare
+      # `github.*` keys — so every variable below has to name the first.
+      # `${{ github.workflow }}` in place of the run's `name` is always
+      # `red-run alert`, which would quietly collapse both watched legs into a
+      # single summons titled for the alert itself; and `html_url` rather than
+      # `url`, because the summons points a human at a run page, not at JSON.
+      - name: Reconcile the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          REPO: ${{ github.repository }}
+        run: .github/scripts/red_run_alert.sh

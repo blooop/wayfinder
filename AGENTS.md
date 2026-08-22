@@ -116,6 +116,7 @@ RUSTFLAGS=-D\ warnings RUSTDOCFLAGS=-D\ warnings sh -c '
   cargo test --locked --test skill_docs &&
   cargo test --locked --test devcontainer_prebuild &&
   cargo test --locked --test toolchain_pin &&
+  cargo test --locked --test red_run_alert &&
   cargo test --locked --test offline_green &&
   cargo test --locked --test live_fetch -- common:: &&
   cargo doc --no-deps --all-features --locked'
@@ -125,15 +126,19 @@ Run the whole chain before pushing, `cargo fmt --all` first — a formatting dif
 fails the build before any of the interesting checks get a chance to run.
 
 The `tests/live_*.rs` files are excluded from that test command on purpose: they
-talk to real GitHub, drive a real pty, or want a chosen `devlaunch`. Four
+talk to real GitHub, drive a real pty, or want a chosen `devlaunch`. Five
 binaries under `tests/` are exceptions and run in the chain (and in CI) like any
-unit test, because all four are offline checks on files-as-behavior:
+unit test, because all five are offline checks on files-as-behavior:
 `tests/skill_docs.rs` (shape checks on the skill docs' snippets),
 `tests/devcontainer_prebuild.rs` (the contract between the devcontainer configs
 and the workflow that publishes the prebuilt image to GHCR — see the comments in
 `.devcontainer/devcontainer.json`), `tests/toolchain_pin.rs` (the guard that
 keeps `rust-toolchain.toml` the only place a Rust version is written — see
-**The Rust version is pinned in one place** below), and `tests/offline_green.rs`
+**The Rust version is pinned in one place** below), `tests/red_run_alert.rs`
+(the contract of `.github/workflows/red-run-alert.yml`: that its `workflow_run`
+subscription matches the watched workflows' declared names, and that its
+reconciliation script files, updates and closes the tracking issue — driven
+against a recording `gh` stub), and `tests/offline_green.rs`
 (the guard on the exclusion itself: it reads `tests/live_*.rs` and fails if any
 test in them is missing `#[ignore]`).
 
