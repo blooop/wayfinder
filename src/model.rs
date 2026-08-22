@@ -277,7 +277,7 @@ pub enum TicketType {
     Grilling,
     /// `wayfinder:prototype` — HITL by definition (someone has to look at it).
     Prototype,
-    /// The ticket carries none of the four types `wf` knows. Covers both a
+    /// The ticket carries none of the types `wf` knows. Covers both a
     /// ticket with no `wayfinder:*` label at all and one labelled with
     /// something newer than this binary — one meaning ("no recognised type"),
     /// not a sentinel standing in for several.

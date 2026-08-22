@@ -43,9 +43,10 @@ use crate::model::{Map, MapId, MapSet};
 use crate::projects::ProjectsCache;
 use crate::reclaim::Reading;
 
-/// How long the map search waits before trying again. The only recurring timer
-/// left: nothing polls, but a search that never answers would leave `wf`
-/// permanently empty.
+/// The map search's first wait, and the unit every later one doubles from —
+/// `retry_delay` carries the schedule and the ceiling it stops at. The only
+/// recurring timer left: nothing polls, but a search that never answers would
+/// leave `wf` permanently empty.
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(4);
 
 /// One map's load. Two states, because with the conditional probe gone
@@ -300,11 +301,11 @@ fn spawn_load(id: MapId, tx: mpsc::UnboundedSender<LoadEvent>) -> JoinHandle<()>
 /// Find every open `wayfinder:map` across the cached repos, off the path to
 /// the first frame (#27).
 ///
-/// It **retries** on [`RETRY_INTERVAL`] rather than giving up, and that is now
-/// the only recovery a session has. A single failed search would otherwise
-/// leave `wf` empty for the whole run with no way back: the only other thing
-/// that fetches is the cached seed, a cold start has none, and no key asks
-/// again.
+/// It **retries** rather than giving up — on `retry_delay`'s doubling
+/// schedule, [`RETRY_INTERVAL`] first — and that is now the only recovery a
+/// session has. A single failed search would otherwise leave `wf` empty for
+/// the whole run with no way back: the only other thing that fetches is the
+/// cached seed, a cold start has none, and no key asks again.
 ///
 /// It runs **unconditionally**, warm cache or cold (#28). The cache is a head
 /// start, never a skip: this is the one thing that can add a map opened since
@@ -321,6 +322,7 @@ pub fn spawn_discovery(
     tx: mpsc::UnboundedSender<LoadEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut failures = 0u32;
         loop {
             match fetch::find_maps(&repos).await {
                 Ok(found) => {
@@ -337,11 +339,25 @@ pub fn spawn_discovery(
                     return; // the set of open maps is fixed for this run
                 }
                 Err(_) if tx.send(LoadEvent::SearchFailed).is_err() => return, // UI is gone
-                Err(_) => {}
+                Err(_) => failures += 1,
             }
-            tokio::time::sleep(RETRY_INTERVAL).await;
+            tokio::time::sleep(retry_delay(failures)).await;
         }
     })
+}
+
+/// How long the map search waits after its `failures`-th consecutive miss.
+///
+/// Doubles from [`RETRY_INTERVAL`] and stops growing at sixteen times it,
+/// because the two kinds of miss want opposite treatments and this cannot tell
+/// them apart: a network blip deserves the quick retry the early steps give,
+/// while a structural failure — no `gh` on PATH, an unauthenticated one — used
+/// to cost a respawned `gh` process every four seconds for the whole session.
+/// The ceiling keeps the recovery property — a `gh auth login` run mid-session
+/// is still found, one capped wait later rather than never — at a session-long
+/// cost of roughly one process a minute instead of fifteen.
+fn retry_delay(failures: u32) -> Duration {
+    RETRY_INTERVAL * 2u32.saturating_pow(failures.saturating_sub(1)).min(16)
 }
 
 /// Take the background reading of what a `wf reap` would claim, off the path to
@@ -454,6 +470,26 @@ pub fn preserve_cursor<K: PartialEq>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_retries_back_off_by_doubling() {
+        // The first retry is the old cadence — a blip costs nothing extra —
+        // and each miss after that doubles the wait.
+        assert_eq!(retry_delay(1), Duration::from_secs(4));
+        assert_eq!(retry_delay(2), Duration::from_secs(8));
+        assert_eq!(retry_delay(3), Duration::from_secs(16));
+        assert_eq!(retry_delay(4), Duration::from_secs(32));
+    }
+
+    #[test]
+    fn the_backoff_stops_growing_at_its_ceiling() {
+        // A structurally broken `gh` settles at one respawn a minute for the
+        // rest of the session — never more, and never so rare that a mid-run
+        // `gh auth login` goes unnoticed.
+        assert_eq!(retry_delay(5), Duration::from_secs(64));
+        assert_eq!(retry_delay(6), Duration::from_secs(64));
+        assert_eq!(retry_delay(u32::MAX), Duration::from_secs(64));
+    }
 
     /// A reading that never answers — the reading `wf` must be able to draw
     /// over. A `pending` future rather than a long sleep, so "the picker did

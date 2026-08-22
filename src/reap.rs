@@ -1147,7 +1147,7 @@ pub async fn workspaces() -> Result<Vec<Workspace>> {
         );
     }
     let mut workspaces = parse_workspaces(&output.stdout)?;
-    answered_where_dl_answers(&mut workspaces, devlaunch_answers_unsaved());
+    answered_where_dl_answers(&mut workspaces, devlaunch_answers_unsaved().await);
     Ok(workspaces)
 }
 

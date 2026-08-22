@@ -74,8 +74,8 @@ const CODEX_HOME_ENV: &str = "CODEX_HOME";
 /// agent's config directory (`~/.claude/wf-skills` or `~/.codex/wf-skills`).
 ///
 /// A sibling of `skills/` rather than a directory inside it, because the agents
-/// read *every* directory under `skills/` — a copy in there would register five
-/// more skills under a second set of names.
+/// read *every* directory under `skills/` — a copy in there would register the
+/// whole bundle again under a second set of names.
 pub const MIRROR: &str = "wf-skills";
 
 /// Where the copy came from, recorded inside it: the bundle directory the last
@@ -277,8 +277,11 @@ enum Link {
     /// A symlink, but not that one — an older `wf`'s link into a package
     /// prefix, a checkout someone pointed at once, or an absolute path into the
     /// copy that would dangle in a container. Relinking is safe: nothing but a
-    /// link is lost.
-    Stale(PathBuf),
+    /// link is lost. `None` when the target itself could not be read — still a
+    /// link and still safely replaceable, but with nothing to report or to
+    /// prove ownership of, and carried as the absence it is rather than as an
+    /// empty path a report would print.
+    Stale(Option<PathBuf>),
     /// A real directory. Somebody else owns this — chezmoi, a hand-edit, a
     /// plugin — so `wf` reports it and does not touch it. Deleting a directory
     /// it did not create is not `wf`'s call to make.
@@ -316,8 +319,9 @@ pub enum State {
     /// `copied_from` is what [`install`] recorded, and `None` means a copy old
     /// enough to predate the record.
     Outdated { copied_from: Option<PathBuf> },
-    /// A symlink pointing somewhere else entirely.
-    Stale(PathBuf),
+    /// A symlink pointing somewhere else entirely — or, `None`, one whose
+    /// target could not be read at all.
+    Stale(Option<PathBuf>),
     /// A real directory another tool owns.
     Unmanaged,
     /// Nothing there.
@@ -437,8 +441,8 @@ fn link_state(name: &str, link: &Path) -> Link {
     }
     match std::fs::read_link(link) {
         Ok(target) if target == Target::link_target(name) => Link::Current,
-        Ok(target) => Link::Stale(target),
-        Err(_) => Link::Stale(PathBuf::new()),
+        Ok(target) => Link::Stale(Some(target)),
+        Err(_) => Link::Stale(None),
     }
 }
 
@@ -573,7 +577,7 @@ pub enum Installed {
 /// When a directory cannot be created, a copy cannot be written, or a link
 /// cannot be replaced. A skill that is merely *blocked* or absent from the
 /// bundle is not an error — it is an [`Outcome`], so one bad skill never costs
-/// the other four their install.
+/// the rest their install.
 pub fn install(bundle: &Bundle, target: &Target) -> Result<Installed> {
     // Asked before anything is created, because creating it is what makes the
     // answer unknowable: past `create_dir_all` there is nothing left to tell a
@@ -618,14 +622,18 @@ pub fn install(bundle: &Bundle, target: &Target) -> Result<Installed> {
             Link::Current => Outcome::AlreadyCurrent,
             Link::Unmanaged => unreachable!("handled above"),
             state => {
+                // A stale link is removed whether or not its target could be
+                // read — either way it is only a link, and only a link is
+                // lost. `was` keeps the target where there is one to name.
                 let was = match state {
-                    Link::Stale(target) => Some(target),
+                    Link::Stale(target) => {
+                        std::fs::remove_file(&link).with_context(|| {
+                            format!("cannot replace the link {}", link.display())
+                        })?;
+                        target
+                    }
                     _ => None,
                 };
-                if was.is_some() {
-                    std::fs::remove_file(&link)
-                        .with_context(|| format!("cannot replace the link {}", link.display()))?;
-                }
                 std::os::unix::fs::symlink(Target::link_target(name), &link).with_context(
                     || format!("cannot link {} → {}", link.display(), copy.display()),
                 )?;
@@ -724,7 +732,10 @@ pub fn refresh(target: &Target) -> Result<Vec<(String, Healed)>> {
             // into the package prefix every `wf` before #110 wrote — the one
             // that resolves on the host and dangles in the container — and it
             // can never match a link somebody else left, however dead it looks.
-            Link::Stale(points_at) if is_ours(&points_at, mirror) => Some(Some(points_at)),
+            // A target that could not be read is `Stale(None)`, and falls to
+            // the arm below: with nothing to prove ownership of, `refresh` has
+            // no permission to touch it.
+            Link::Stale(Some(points_at)) if is_ours(&points_at, mirror) => Some(Some(points_at)),
             Link::Stale(_) | Link::Unmanaged => continue,
         };
         // Always the copy before the link, so a link this function creates
@@ -894,22 +905,7 @@ pub fn report(bundle: &Bundle, target: &Target) -> String {
     // disagreed would be the worst possible output for this command.
     let statuses = status(bundle, target);
     for Status { name, state } in &statuses {
-        let line = match state {
-            State::Current => "ok".to_string(),
-            // Where from, when that is known and is not where this build's
-            // bundle is: "outdated" alone leaves you guessing between a package
-            // update you have not launched since and a checkout you installed
-            // from months ago, and the fix is different.
-            State::Outdated { copied_from } => match copied_from {
-                Some(source) if *source != bundle.path => {
-                    format!("outdated — the copy came from {}", source.display())
-                }
-                _ => "outdated — the copy is not this build's".to_string(),
-            },
-            State::Stale(points_at) => format!("stale — links to {}", points_at.display()),
-            State::Unmanaged => "not a link — another tool owns this one".to_string(),
-            State::Missing => "missing".to_string(),
-        };
+        let line = state_line(state, &bundle.path);
         let _ = writeln!(out, "  {name:<15} {line}");
     }
     if statuses.iter().all(|s| s.state.is_current()) {
@@ -918,6 +914,27 @@ pub fn report(bundle: &Bundle, target: &Target) -> String {
         out.push_str("\nRun `wf skills install` to link them.\n");
     }
     out
+}
+
+/// One state as the line `wf skills status` prints for it.
+fn state_line(state: &State, bundle_path: &Path) -> String {
+    match state {
+        State::Current => "ok".to_string(),
+        // Where from, when that is known and is not where this build's
+        // bundle is: "outdated" alone leaves you guessing between a package
+        // update you have not launched since and a checkout you installed
+        // from months ago, and the fix is different.
+        State::Outdated { copied_from } => match copied_from {
+            Some(source) if source != bundle_path => {
+                format!("outdated — the copy came from {}", source.display())
+            }
+            _ => "outdated — the copy is not this build's".to_string(),
+        },
+        State::Stale(Some(points_at)) => format!("stale — links to {}", points_at.display()),
+        State::Stale(None) => "stale — the link's target could not be read".to_string(),
+        State::Unmanaged => "not a link — another tool owns this one".to_string(),
+        State::Missing => "missing".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1067,6 +1084,25 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_link_whose_target_cannot_be_read_is_reported_without_a_path() {
+        // A failed `read_link` used to be carried as `Stale(PathBuf::new())`,
+        // and the status line printed "stale — links to " with nothing after
+        // it. There is no target to name, and the line says that instead.
+        assert_eq!(
+            state_line(&State::Stale(None), Path::new("/bundle")),
+            "stale — the link's target could not be read"
+        );
+        // The ordinary stale link still names where it points.
+        assert_eq!(
+            state_line(
+                &State::Stale(Some(PathBuf::from("/somewhere/else"))),
+                Path::new("/bundle")
+            ),
+            "stale — links to /somewhere/else"
+        );
+    }
+
+    #[test]
     fn a_link_into_the_package_bundle_is_stale_and_gets_repointed() {
         // What every `wf` up to this one wrote, and what is on every machine
         // that has run `wf skills install`: an absolute link into the prefix.
@@ -1079,7 +1115,7 @@ mod tests {
 
         assert_eq!(
             link_state("wf", &target.links().join("wf")),
-            Link::Stale(old.clone())
+            Link::Stale(Some(old.clone()))
         );
         let done = done(install(&bundle, &target).expect("install"));
         let wf_skill = done.iter().find(|(n, _)| n == "wf").expect("entry");
