@@ -29,6 +29,13 @@
 //! is why [`Verdict::Warn`] exists and why [`doomed`] is the single place that
 //! decides what actually goes.
 //!
+//! One reading is not on that lattice at all, and it is the reason [`PrRollup`]
+//! exists: the linked-PR page the tracker sends is bounded, and a node with
+//! more references than it holds loses the newest of them — the PR still open
+//! (#183). So the *completeness* of that page travels with it, and a page that
+//! was not all of it is not evidence about the node in either direction. It
+//! keeps, and the row says why.
+//!
 //! Two commands come out of that one decision, and they differ only in who is
 //! reading. [`run`] is `wf reap`: every workspace on the machine, a plan
 //! printed, a prompt. [`cleanup`] is what an autonomous run ends with (#151):
@@ -440,6 +447,41 @@ impl PrOutcome {
     }
 }
 
+/// A node's linked PRs *and whether that was all of them* — one value, because
+/// they are one fact and reading either without the other is #183.
+///
+/// `closedByPullRequestsReferences` is asked for a bounded first page, and
+/// GitHub answers it oldest-first. So the reference a node with more links than
+/// the page holds loses is the **newest** one, which on a `wf` node is the PR
+/// still open: the page shows five merges, [`node_fact`] reads
+/// [`NodeFact::DoneByMerge`], and [`plan`] deletes a workspace with work in
+/// flight. The page and its completeness therefore travel together and neither
+/// is a default — a caller that has not established which it holds cannot
+/// build one of these.
+///
+/// **The remainder is not fetched.** Reap's posture everywhere else is to fail
+/// toward keeping, a sixth linked PR on one node is rare, and a kept row that
+/// says why costs a human one glance where a second round trip costs every run
+/// a page of latency it almost never needs. Paginating would also be a second
+/// definition of the rollup, one the screen does not share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrRollup<'a> {
+    /// The tracker said there is no next page: these are the node's PRs.
+    Whole(&'a [PrOutcome]),
+    /// The tracker said there is more. These are *a* page of the node's PRs,
+    /// and the ones missing are the newest.
+    Truncated(&'a [PrOutcome]),
+}
+
+impl PrRollup<'_> {
+    /// The page itself, for the arms that read the same whichever this is.
+    fn page(&self) -> &[PrOutcome] {
+        match self {
+            PrRollup::Whole(prs) | PrRollup::Truncated(prs) => prs,
+        }
+    }
+}
+
 /// What the tracker says about one node, in the terms reap decides by.
 ///
 /// Six unconfusable values where a boolean "is it closed" used to be, so that
@@ -482,6 +524,18 @@ pub enum NodeFact {
     Claimed,
     /// Open, no PRs, unclaimed: nothing has come of this node.
     Unstarted,
+    /// Open, and the tracker had more linked PRs than it handed over (#183).
+    ///
+    /// Not a state of the node — a statement about the *evidence*, which is why
+    /// it carries no PR number: the reference that would name the node's
+    /// current state is precisely the one that did not arrive. It is here
+    /// rather than folded into [`NodeFact::InFlight`] because those are
+    /// different sentences to print and, more to the point, [`InFlight`] is a
+    /// positive reading that a later change could reasonably learn to reap on;
+    /// "I did not see all of it" must never become that.
+    ///
+    /// [`InFlight`]: NodeFact::InFlight
+    RollupTruncated,
 }
 
 /// Read one node the way reap decides by it — the stage lattice's table,
@@ -491,16 +545,27 @@ pub enum NodeFact {
 /// merged sibling (a multi-PR ticket between merges is still being worked), a
 /// merge outranks the closed PRs beside it, and only a node with no PR
 /// evidence at all falls through to the claim.
-pub fn node_fact(state: TicketState, is_assigned: bool, prs: &[PrOutcome]) -> NodeFact {
+///
+/// A [`PrRollup::Truncated`] page interrupts that order in exactly one place —
+/// after the two answers it cannot overturn, before every answer it can. The
+/// ticket's own `state` is not the rollup's to contradict, and a live PR *on*
+/// the page already dominates every arm below it, so an unread reference can
+/// only agree with one; everything after that point would be reading the last
+/// word off a page that is not the last page.
+pub fn node_fact(state: TicketState, is_assigned: bool, prs: PrRollup<'_>) -> NodeFact {
     if state == TicketState::Closed {
         return NodeFact::Closed;
     }
-    let earliest = |pick: fn(&PrOutcome) -> Option<u64>| prs.iter().filter_map(pick).min();
+    let page = prs.page();
+    let earliest = |pick: fn(&PrOutcome) -> Option<u64>| page.iter().filter_map(pick).min();
     if let Some(pr) = earliest(|o| match o {
         PrOutcome::InFlight { pr } => Some(*pr),
         _ => None,
     }) {
         return NodeFact::InFlight { pr };
+    }
+    if let PrRollup::Truncated(_) = prs {
+        return NodeFact::RollupTruncated;
     }
     if let Some(pr) = earliest(|o| match o {
         PrOutcome::Merged { pr } => Some(*pr),
@@ -510,7 +575,7 @@ pub fn node_fact(state: TicketState, is_assigned: bool, prs: &[PrOutcome]) -> No
     }
     // Everything left is closed-unmerged, so the highest number is the last
     // word anyone had on this node.
-    if let Some(pr) = prs
+    if let Some(pr) = page
         .iter()
         .filter_map(|o| match o {
             PrOutcome::ClosedUnmerged { pr } => Some(*pr),
@@ -698,6 +763,16 @@ pub fn plan(
                 id,
                 reason: format!("{name} is still open"),
             },
+            // A `Keep` and not a `Warn`, even though a `Warn` deletes nothing
+            // either: `Warn` is reap advising a human to look, and there is
+            // nothing here for them to weigh — the missing evidence is missing
+            // for them too, and the row would be advice nobody can act on. It
+            // also names no discard, because nothing is being discarded and
+            // `-f` does not change what was read.
+            NodeFact::RollupTruncated => Verdict::Keep {
+                id,
+                reason: format!("{name} has more linked PRs than wf read — keeping"),
+            },
         });
     }
     verdicts
@@ -884,6 +959,14 @@ fn unfinished(name: &str, fact: Option<&NodeFact>) -> Option<String> {
         Some(NodeFact::Unstarted) => {
             Some(format!("{name} is still open, unclaimed and with no PR"))
         }
+        // Louder here than in `plan`, and deliberately: with a human reading
+        // the list "keeping, there is more of this than I read" is enough, but
+        // an unattended run claiming it drove this node to done cannot check
+        // that claim against evidence it did not receive, so the step stops
+        // rather than collect the workspace on a partial page.
+        Some(NodeFact::RollupTruncated) => Some(format!(
+            "{name} is still open, with more linked PRs than wf read"
+        )),
         None => Some(format!("the tracker was not asked about {name}")),
     }
 }
@@ -1159,6 +1242,7 @@ const NODE_FACT_SELECTION: &str = "\
           statusCheckRollup { state }
           repository { nameWithOwner }
         }
+        pageInfo { hasNextPage }
       }";
 
 /// One repo's batch: every wanted issue in one query.
@@ -1192,7 +1276,37 @@ struct IssueFacts {
     /// Defaulted for the same reason the map query defaults it: a GitHub
     /// edition without the field reads as "no linked PRs" rather than failing.
     #[serde(rename = "closedByPullRequestsReferences", default)]
-    closed_by_prs: Nodes<PrNode>,
+    closed_by_prs: PrReferences,
+}
+
+/// The linked-PR connection as the wire hands it over — the page, and the
+/// tracker's own word on whether the page was all of it (#183).
+///
+/// Its own type rather than [`Nodes`], which carries no `pageInfo`: the screen
+/// reads the same connection and does not yet ask this question, and giving the
+/// shared shape a field only one reader uses would put reap's answer where a
+/// second reader could quietly grow to depend on it.
+#[derive(Deserialize, Default)]
+struct PrReferences {
+    #[serde(default)]
+    nodes: Vec<PrNode>,
+    #[serde(rename = "pageInfo", default)]
+    page_info: PageInfo,
+}
+
+/// GraphQL's cursor block, of which one field is asked for.
+///
+/// **`false` is the right default and only because of what asks.** `hasNextPage`
+/// is selected in the same breath as the nodes it describes, so a response
+/// without it is one that predates the ask — every hand-written fixture in this
+/// file, and nothing a live GitHub sends. Defaulting to `true` would read all of
+/// them as truncated and say nothing true about the tracker; a real edition that
+/// could not answer the field would fail the query outright rather than answer
+/// around it.
+#[derive(Deserialize, Default)]
+struct PageInfo {
+    #[serde(rename = "hasNextPage", default)]
+    has_next_page: bool,
 }
 
 /// The parse boundary for one repo's batch, kept apart from the process call so
@@ -1224,6 +1338,14 @@ fn parse_node_facts(body: &[u8], repo: &str, numbers: &[u64]) -> Result<BTreeMap
                 PrOutcome::project(pr.number, link.as_ref().map(|l| &l.status))
             })
             .collect();
+        // The one place the tracker's `hasNextPage` becomes a fact about the
+        // node, so that nothing downstream of here holds a page without holding
+        // what it is a page of.
+        let rollup = if issue.closed_by_prs.page_info.has_next_page {
+            PrRollup::Truncated(&prs)
+        } else {
+            PrRollup::Whole(&prs)
+        };
         facts.insert(
             Node {
                 repo: repo.to_string(),
@@ -1232,7 +1354,7 @@ fn parse_node_facts(body: &[u8], repo: &str, numbers: &[u64]) -> Result<BTreeMap
             node_fact(
                 TicketState::read(&issue.state),
                 !issue.assignees.nodes.is_empty(),
-                &prs,
+                rollup,
             ),
         );
     }
@@ -1603,22 +1725,125 @@ mod tests {
         ];
         for (name, prs, claimed, unclaimed) in cases {
             assert_eq!(
-                node_fact(TicketState::Live, true, &prs),
+                node_fact(TicketState::Live, true, PrRollup::Whole(&prs)),
                 claimed,
                 "open, assigned, {name}"
             );
             assert_eq!(
-                node_fact(TicketState::Live, false, &prs),
+                node_fact(TicketState::Live, false, PrRollup::Whole(&prs)),
                 unclaimed,
                 "open, unassigned, {name}"
             );
             for assigned in [true, false] {
                 assert_eq!(
-                    node_fact(TicketState::Closed, assigned, &prs),
+                    node_fact(TicketState::Closed, assigned, PrRollup::Whole(&prs)),
                     NodeFact::Closed,
                     "closed, assigned={assigned}, {name}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_rollup_the_page_could_not_hold_is_never_read_as_done() {
+        // #183. The linked-PR rollup is asked for a fixed first page and GitHub
+        // answers it oldest-first, so the reference that falls off a node with
+        // more links than the page holds is the *newest* one — which on a `wf`
+        // node is the PR still open. Read from that page alone the node is five
+        // merges and nothing in flight, which is `DoneByMerge`, which reaps a
+        // workspace whose work is in flight. That is the one direction this
+        // module may not be wrong in.
+        let merges: Vec<PrOutcome> = [10, 11, 12, 13, 14]
+            .iter()
+            .map(|n| PrOutcome::project(*n, Some(&PrStatus::Merged)))
+            .collect();
+        assert_eq!(
+            node_fact(TicketState::Live, false, PrRollup::Whole(&merges)),
+            NodeFact::DoneByMerge { pr: 10 },
+            "a rollup that was all of it still reads exactly as it always did"
+        );
+        for assigned in [true, false] {
+            assert_eq!(
+                node_fact(TicketState::Live, assigned, PrRollup::Truncated(&merges)),
+                NodeFact::RollupTruncated,
+                "same page, but there is more of it (assigned={assigned})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_rollup_yields_to_the_two_answers_it_cannot_overturn() {
+        // Truncation does not mean "know nothing" — it means the page is not
+        // the node's last word. Two answers were never the page's to give, and
+        // both survive it.
+        //
+        // A closed ticket is the *ticket's* own word, read before any PR is,
+        // and how many references hang off it says nothing about it. Deferring
+        // there would strand every closed ticket that ever collected six PRs.
+        let merges: Vec<PrOutcome> = [10, 11, 12, 13, 14]
+            .iter()
+            .map(|n| PrOutcome::project(*n, Some(&PrStatus::Merged)))
+            .collect();
+        for assigned in [true, false] {
+            assert_eq!(
+                node_fact(TicketState::Closed, assigned, PrRollup::Truncated(&merges)),
+                NodeFact::Closed
+            );
+        }
+        // And a PR visible *on* the page and still in flight already outranks
+        // every other arm, so a reference behind the page can only agree with
+        // it — there is no reading a sixth PR could add that moves the answer
+        // off "still open". Saying "cannot tell" over an open PR the binary can
+        // point at would be a worse row, not a safer one.
+        let with_one_live = [
+            PrOutcome::project(10, Some(&PrStatus::Merged)),
+            PrOutcome::project(14, Some(&open_pr())),
+        ];
+        assert_eq!(
+            node_fact(
+                TicketState::Live,
+                false,
+                PrRollup::Truncated(&with_one_live)
+            ),
+            NodeFact::InFlight { pr: 14 }
+        );
+        // Including the unreadable-PR arm, which is in flight for the same
+        // fail-toward-keeping reason and must not be demoted to "cannot tell".
+        let with_one_unreadable = [
+            PrOutcome::project(10, Some(&PrStatus::Merged)),
+            PrOutcome::project(14, None),
+        ];
+        assert_eq!(
+            node_fact(
+                TicketState::Live,
+                false,
+                PrRollup::Truncated(&with_one_unreadable)
+            ),
+            NodeFact::InFlight { pr: 14 }
+        );
+    }
+
+    #[test]
+    fn a_truncated_rollup_outranks_every_arm_that_is_not_already_a_keep() {
+        // The other side of the test above: every arm the page *could* have
+        // produced that does not already keep defers to the unread remainder.
+        // `Superseded` only warns, so nothing is deleted on it — but its row
+        // claims to know what became of the node, and over an unread page that
+        // claim is a guess. The row saying "there is more of this than I read"
+        // is the true one, and it is the one whose advice ("reap by hand if
+        // so") is not being offered on half the evidence.
+        for page in [
+            vec![PrOutcome::project(43, Some(&PrStatus::Closed))],
+            vec![
+                PrOutcome::project(33, Some(&PrStatus::Merged)),
+                PrOutcome::project(43, Some(&PrStatus::Closed)),
+            ],
+        ] {
+            assert_eq!(
+                node_fact(TicketState::Live, false, PrRollup::Truncated(&page)),
+                NodeFact::RollupTruncated,
+                "{page:?}"
+            );
         }
     }
 
@@ -1655,9 +1880,13 @@ mod tests {
                 NodeFact::Superseded { pr: 43 },
             ),
         ] {
-            assert_eq!(node_fact(unknown, true, &prs), claimed, "assigned, {prs:?}");
             assert_eq!(
-                node_fact(unknown, false, &prs),
+                node_fact(unknown, true, PrRollup::Whole(&prs)),
+                claimed,
+                "assigned, {prs:?}"
+            );
+            assert_eq!(
+                node_fact(unknown, false, PrRollup::Whole(&prs)),
                 unclaimed,
                 "unassigned, {prs:?}"
             );
@@ -1675,7 +1904,7 @@ mod tests {
             PrOutcome::project(37, Some(&PrStatus::Draft)),
         ];
         assert_eq!(
-            node_fact(TicketState::Live, false, &in_flight),
+            node_fact(TicketState::Live, false, PrRollup::Whole(&in_flight)),
             NodeFact::InFlight { pr: 37 }
         );
         let merged = [
@@ -1683,7 +1912,7 @@ mod tests {
             PrOutcome::project(91, Some(&PrStatus::Merged)),
         ];
         assert_eq!(
-            node_fact(TicketState::Live, false, &merged),
+            node_fact(TicketState::Live, false, PrRollup::Whole(&merged)),
             NodeFact::DoneByMerge { pr: 91 }
         );
         let superseded = [
@@ -1691,7 +1920,7 @@ mod tests {
             PrOutcome::project(97, Some(&PrStatus::Closed)),
         ];
         assert_eq!(
-            node_fact(TicketState::Live, false, &superseded),
+            node_fact(TicketState::Live, false, PrRollup::Whole(&superseded)),
             NodeFact::Superseded { pr: 97 }
         );
     }
@@ -2467,10 +2696,17 @@ mod tests {
         );
     }
 
-    /// One repo's batch, shaped exactly like the live one: seven aliased
+    /// One repo's batch, shaped exactly like the live one: eight aliased
     /// issues covering every arm the fact derivation can land on, plus the two
     /// answers #132 found nothing reading — a state this binary was never
-    /// taught, and a node carrying both a merge and a rejection.
+    /// taught, and a node carrying both a merge and a rejection — and the one
+    /// #183 found nothing reading: a rollup whose page filled.
+    ///
+    /// `i87` is the only node here that carries `pageInfo`, and it carries the
+    /// truthful one for a full page: five references and the tracker saying
+    /// there is another. Every other node's rollup fits, so leaving the block
+    /// off them is what a live answer looks like as much as a shorter fixture
+    /// is. See [`PageInfo`] for why absent means whole.
     const BATCH_RESPONSE: &str = r#"{"data": {"repository": {
         "i80": {"state": "OPEN", "assignees": {"nodes": []},
                 "closedByPullRequestsReferences": {"nodes": [
@@ -2497,15 +2733,49 @@ mod tests {
                    "repository": {"nameWithOwner": "blooop/devlaunch"}},
                   {"number": 43, "state": "CLOSED", "isDraft": false,
                    "reviewDecision": null, "statusCheckRollup": null,
-                   "repository": {"nameWithOwner": "blooop/devlaunch"}}]}}
+                   "repository": {"nameWithOwner": "blooop/devlaunch"}}]}},
+        "i87": {"state": "OPEN", "assignees": {"nodes": []},
+                "closedByPullRequestsReferences": {"nodes": [
+                  {"number": 90, "state": "MERGED", "isDraft": false,
+                   "reviewDecision": null, "statusCheckRollup": {"state": "SUCCESS"},
+                   "repository": {"nameWithOwner": "blooop/devlaunch"}},
+                  {"number": 91, "state": "MERGED", "isDraft": false,
+                   "reviewDecision": null, "statusCheckRollup": {"state": "SUCCESS"},
+                   "repository": {"nameWithOwner": "blooop/devlaunch"}},
+                  {"number": 92, "state": "MERGED", "isDraft": false,
+                   "reviewDecision": null, "statusCheckRollup": {"state": "SUCCESS"},
+                   "repository": {"nameWithOwner": "blooop/devlaunch"}},
+                  {"number": 93, "state": "MERGED", "isDraft": false,
+                   "reviewDecision": null, "statusCheckRollup": {"state": "SUCCESS"},
+                   "repository": {"nameWithOwner": "blooop/devlaunch"}},
+                  {"number": 94, "state": "MERGED", "isDraft": false,
+                   "reviewDecision": null, "statusCheckRollup": {"state": "SUCCESS"},
+                   "repository": {"nameWithOwner": "blooop/devlaunch"}}],
+                  "pageInfo": {"hasNextPage": true}}}
     }}}"#;
+
+    /// The `i87` half of [`BATCH_RESPONSE`] with the tracker saying the page
+    /// *was* all of it — the same five merges, read as the finished node they
+    /// then are.
+    ///
+    /// Derived from the fixture by flipping the one word rather than written
+    /// out beside it, so the two bodies cannot drift into differing by anything
+    /// else and the assertions built on them stay a claim about that word.
+    fn rollup_all_of_it() -> String {
+        let whole = BATCH_RESPONSE.replace(r#""hasNextPage": true"#, r#""hasNextPage": false"#);
+        assert_ne!(
+            whole, BATCH_RESPONSE,
+            "the fixture stopped saying there is more"
+        );
+        whole
+    }
 
     #[test]
     fn one_batch_answers_every_node_of_a_repo() {
         let facts = parse_node_facts(
             BATCH_RESPONSE.as_bytes(),
             "blooop/devlaunch",
-            &[80, 81, 82, 83, 84, 85, 86],
+            &[80, 81, 82, 83, 84, 85, 86, 87],
         )
         .expect("the batch parses");
         assert_eq!(
@@ -2530,8 +2800,79 @@ mod tests {
                     node("blooop/devlaunch", 86),
                     NodeFact::DoneByMerge { pr: 33 }
                 ),
+                // Five merges and the tracker saying there is a sixth
+                // reference it did not send. Read from the page alone this is
+                // #86 again — a merge and nothing in flight — and that is the
+                // reading #183 exists to refuse.
+                (node("blooop/devlaunch", 87), NodeFact::RollupTruncated),
             ])
         );
+    }
+
+    #[test]
+    fn a_full_rollup_page_keeps_the_workspace_all_the_way_from_the_wire() {
+        // #183, at the only end that matters. The parse tests above hand a
+        // `NodeFact` to an assertion; this one starts at the bytes `gh` would
+        // print and ends at `doomed`, the single definition of what is
+        // destroyed — because the hazard is not a misread fact, it is a
+        // workspace with an open PR's work in it being deleted.
+        //
+        // The pairing is the test. `pageInfo` is the *only* difference between
+        // the two bodies: same node, same five merged references, same
+        // everything the page carries. So one of these reaping and the other
+        // keeping is the tracker's word about the page being read, and nothing
+        // else could account for it.
+        let ws = [workspace(
+            "wf-87",
+            "blooop/devlaunch",
+            "wayfinder/devlaunch-87",
+        )];
+        let whole = parse_node_facts(rollup_all_of_it().as_bytes(), "blooop/devlaunch", &[87])
+            .expect("the batch parses");
+        assert_eq!(
+            whole[&node("blooop/devlaunch", 87)],
+            NodeFact::DoneByMerge { pr: 90 },
+            "a page that was all of it is the ordinary finished node"
+        );
+        let planned = plan(&ws, &whole, false);
+        let reaped: Vec<&str> = doomed(&planned).into_iter().map(Verdict::id).collect();
+        assert_eq!(reaped, vec!["wf-87"], "and its workspace still goes");
+
+        let truncated = parse_node_facts(BATCH_RESPONSE.as_bytes(), "blooop/devlaunch", &[87])
+            .expect("the batch parses");
+        assert_eq!(
+            truncated[&node("blooop/devlaunch", 87)],
+            NodeFact::RollupTruncated
+        );
+        // `-f` too: the hazard is what may be destroyed at all, and a guard
+        // only the unsaved-work refusal was hiding is no guard the moment
+        // someone types the flag that waives it.
+        for insist in [false, true] {
+            let verdicts = plan(&ws, &truncated, insist);
+            assert!(
+                doomed(&verdicts).is_empty(),
+                "insist={insist}: a rollup wf did not see all of reached the deleting arm"
+            );
+            assert_eq!(
+                verdicts.iter().map(Verdict::reason).collect::<Vec<_>>(),
+                vec!["devlaunch#87 has more linked PRs than wf read — keeping"],
+                "insist={insist}: the row has to say why it is being kept"
+            );
+        }
+    }
+
+    #[test]
+    fn the_batch_asks_whether_the_pr_rollup_was_all_of_it() {
+        // The one field whose absence from the *query* is silent everywhere
+        // else. A response that never carries `hasNextPage` reads as a whole
+        // rollup — which it must, since that is every older fixture — so a
+        // query that stopped asking would put every over-long node straight
+        // back on the deleting path with nothing going red. The prune test
+        // below is the load-bearing half (it derives `i87`'s answer from this
+        // selection, so dropping the field there changes the fact); this is the
+        // half that names what went missing.
+        let query = node_facts_query(&[80]);
+        assert!(query.contains("pageInfo { hasNextPage }"), "{query}");
     }
 
     #[test]
@@ -2884,7 +3225,10 @@ mod tests {
             prune(issue, &asked);
         }
 
-        let numbers = [80, 81, 82, 83, 84, 85, 86];
+        // #87 included deliberately: it is the one node whose fact depends on
+        // `pageInfo`, so taking that field out of the selection prunes it out
+        // of the answer and #87 reads as done-by-merge here (#183).
+        let numbers = [80, 81, 82, 83, 84, 85, 86, 87];
         let from_the_selection =
             parse_node_facts(body.to_string().as_bytes(), "blooop/devlaunch", &numbers)
                 .expect("a response carrying exactly the selected fields parses");
@@ -2923,12 +3267,16 @@ mod tests {
         // whoever rewords it re-reads the rule above before saying so again.
         let claimed_and_merged = [PrOutcome::project(33, Some(&PrStatus::Merged))];
         assert_eq!(
-            node_fact(TicketState::Live, true, &claimed_and_merged),
+            node_fact(
+                TicketState::Live,
+                true,
+                PrRollup::Whole(&claimed_and_merged)
+            ),
             NodeFact::DoneByMerge { pr: 33 },
             "a claim does not outrank a merge"
         );
         assert_eq!(
-            node_fact(TicketState::Live, true, &[]),
+            node_fact(TicketState::Live, true, PrRollup::Whole(&[])),
             NodeFact::Claimed,
             "and it does settle a ticket nothing has come of"
         );
@@ -2943,6 +3291,48 @@ mod tests {
         assert!(
             always.contains("tickets someone has claimed that no PR has come of"),
             "the keep list must qualify the claim it names: {always}"
+        );
+    }
+
+    #[test]
+    fn the_readme_names_the_keep_a_page_that_filled_earns() {
+        // The same pairing as the test above, for #183's keep. This one has to
+        // be in the published list rather than only in the code, because it is
+        // the one keep a reader cannot predict from the lattice: a ticket with
+        // five merged PRs and nothing in flight is *described* by this README
+        // as finished work, and `wf` keeping it anyway looks like a bug until
+        // the list says the page is the reason.
+        let five_merges: Vec<PrOutcome> = (90..95)
+            .map(|n| PrOutcome::project(n, Some(&PrStatus::Merged)))
+            .collect();
+        assert_eq!(
+            node_fact(TicketState::Live, false, PrRollup::Whole(&five_merges)),
+            NodeFact::DoneByMerge { pr: 90 },
+            "the finished reading the list already promises"
+        );
+        assert_eq!(
+            node_fact(TicketState::Live, false, PrRollup::Truncated(&five_merges)),
+            NodeFact::RollupTruncated,
+            "and the keep that overrides it, which the list therefore owes a line"
+        );
+
+        // Whitespace-flattened before matching, because the README is prose
+        // wrapped at a column: the sentence this looks for is one the next
+        // reflow may split across a line, and a test that fires on rewrapping
+        // teaches its readers to stop believing it.
+        let always: String = include_str!("../README.md")
+            .split_once("Kept, always:")
+            .expect("the README lists what a reap keeps unconditionally")
+            .1
+            .split_once("\n\n")
+            .expect("that list is one paragraph")
+            .0
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            always.contains("tickets with more linked PRs than `wf` read"),
+            "the keep list must name the page that filled: {always}"
         );
     }
 
@@ -3298,6 +3688,7 @@ mod tests {
             NodeFact::InFlight { .. } => 3,
             NodeFact::Claimed => 4,
             NodeFact::Unstarted => 5,
+            NodeFact::RollupTruncated => 6,
         }
     }
 
@@ -3316,10 +3707,11 @@ mod tests {
             (NodeFact::InFlight { pr: 13 }, Fate::Stops),
             (NodeFact::Claimed, Fate::Stops),
             (NodeFact::Unstarted, Fate::Stops),
+            (NodeFact::RollupTruncated, Fate::Stops),
         ];
         assert_eq!(
             cases.iter().map(|(fact, _)| arm(fact)).collect::<Vec<_>>(),
-            (0..6).collect::<Vec<_>>(),
+            (0..7).collect::<Vec<_>>(),
             "every arm of NodeFact needs a case here, in the order `arm` lists them"
         );
         for (fact, expected) in cases {
@@ -3340,7 +3732,11 @@ mod tests {
         // one #138 held this back for: there is no reader between an unknown
         // word and a deletion, so the reading has to land on an arm that keeps
         // whatever the word turns out to mean.
-        let fact = node_fact(TicketState::read("TRANSFERRED"), false, &[]);
+        let fact = node_fact(
+            TicketState::read("TRANSFERRED"),
+            false,
+            PrRollup::Whole(&[]),
+        );
         assert_eq!(fact, NodeFact::Unstarted, "an unreadable state stays live");
         let workspaces = [pushed("wf-151", 151)];
         let known = facts([(node("blooop/wayfinder", 151), fact)]);
@@ -3356,7 +3752,11 @@ mod tests {
         // parse declines is in flight, which is the tracker saying the node is
         // still open — so the step stops rather than deleting on a word this
         // binary was never taught, and the workspace costs the run nothing.
-        let fact = node_fact(TicketState::Live, false, &[PrOutcome::project(9, None)]);
+        let fact = node_fact(
+            TicketState::Live,
+            false,
+            PrRollup::Whole(&[PrOutcome::project(9, None)]),
+        );
         assert_eq!(fact, NodeFact::InFlight { pr: 9 });
         let workspaces = [pushed("wf-151", 151)];
         let known = facts([(node("blooop/wayfinder", 151), fact)]);
@@ -3379,14 +3779,18 @@ mod tests {
         let workspaces = [pushed("wf-151", 151)];
         let known = facts([(
             node("blooop/wayfinder", 151),
-            node_fact(TicketState::Live, false, &merged_and_closed),
+            node_fact(
+                TicketState::Live,
+                false,
+                PrRollup::Whole(&merged_and_closed),
+            ),
         )]);
         assert_eq!(going(&cleanup_of(&workspaces, &known, &[151])), ["wf-151"]);
 
         let closed_only = [PrOutcome::project(162, Some(&PrStatus::Closed))];
         let known = facts([(
             node("blooop/wayfinder", 151),
-            node_fact(TicketState::Live, false, &closed_only),
+            node_fact(TicketState::Live, false, PrRollup::Whole(&closed_only)),
         )]);
         assert!(
             matches!(cleanup_of(&workspaces, &known, &[151]), Cleanup::Abort(_)),
