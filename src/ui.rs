@@ -1152,6 +1152,17 @@ mod tests {
         out
     }
 
+    /// How the buffer dump spells a wide string: each wide char reads back
+    /// with its continuation cell, so the chars come out space-separated.
+    fn wide(text: &str) -> String {
+        let mut out = String::new();
+        for c in text.chars() {
+            out.push(c);
+            out.push(' ');
+        }
+        out.trim_end().to_string()
+    }
+
     /// The fixture app, with a conversation left on `number`.
     fn app_resuming(number: u64) -> App {
         fixture_app().with_sessions(vec![crate::projects::Session::new(
@@ -1708,12 +1719,7 @@ mod tests {
             ],
             0,
         ));
-        let drawn: String = notice
-            .chars()
-            .map(|c| format!("{c} "))
-            .collect::<String>()
-            .trim_end()
-            .to_string();
+        let drawn = wide(notice);
         for width in [100u16, 120] {
             let screen = render_at(width, &app);
             let line = screen
@@ -2324,14 +2330,7 @@ mod tests {
             .lines()
             .find(|line| line.contains("launch Claude"))
             .unwrap_or_else(|| panic!("no picker title: {screen}"));
-        // The buffer dump spells a wide char as the char plus its continuation
-        // cell, so the whole title reads back space-separated.
-        let drawn: String = title
-            .chars()
-            .map(|c| format!("{c} "))
-            .collect::<String>()
-            .trim_end()
-            .to_string();
+        let drawn = wide(title);
         assert!(
             line.contains(&drawn),
             "the title is clipped by its own popup: {line}"
