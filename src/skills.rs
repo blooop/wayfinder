@@ -699,7 +699,8 @@ pub fn refresh(target: &Target) -> Result<Vec<(String, Healed)>> {
     // The same proof [`install`] demands before it writes here, for the same
     // reason: a copy `wf` cannot show it made is somebody else's tree, and a
     // launch recopying into it would rewrite their files on the way past.
-    if Mirror::inspect(target) != Mirror::Ours {
+    let mirror = Mirror::inspect(target);
+    if mirror != Mirror::Ours {
         return Ok(Vec::new());
     }
     let Some(bundle) = installed_from(target).filter(|source| source.is_dir()) else {
@@ -723,7 +724,7 @@ pub fn refresh(target: &Target) -> Result<Vec<(String, Healed)>> {
             // into the package prefix every `wf` before #110 wrote — the one
             // that resolves on the host and dangles in the container — and it
             // can never match a link somebody else left, however dead it looks.
-            Link::Stale(points_at) if is_ours(&points_at, &bundle) => Some(Some(points_at)),
+            Link::Stale(points_at) if is_ours(&points_at, mirror) => Some(Some(points_at)),
             Link::Stale(_) | Link::Unmanaged => continue,
         };
         // Always the copy before the link, so a link this function creates
@@ -794,17 +795,29 @@ fn prune_mirror(mirror: &Path) -> Result<Vec<PathBuf>> {
 /// it points at a place nothing but `wf` ever links to, so a skill the user
 /// wrote, a plugin's, or a link some other tool left behind can never match
 /// however dead it looks.
-fn is_ours(target: &Path, bundle: &Path) -> bool {
+///
+/// Which is why *pointing into the bundle* is no longer one of those places. It
+/// used to be, to cover a pre-copy install made from a checkout — but the bundle
+/// is whatever directory `$WF_SKILLS_DIR` names, and pointing `wf` at a
+/// directory is not evidence `wf` wrote what is in it: a skill of your own,
+/// hand-linked into your own directory under a name this build does not ship,
+/// matched (#187). The two shapes left are ones nothing else produces, and the
+/// cost is exact: a link an old `wf` wrote into a *checkout* bundle is no longer
+/// reclaimed or swept. That is a dangling link left alone, which is the side to
+/// err on.
+fn is_ours(target: &Path, mirror: Mirror) -> bool {
     let Some(parent) = target.parent() else {
         return false;
     };
-    // What this build writes: relative, into the copy beside the links.
-    parent == Path::new("..").join(MIRROR)
-        // What older builds wrote: straight into a bundle. The first covers
-        // `$WF_SKILLS_DIR` pointing at a checkout, whose path ends in `skills`
-        // and not in `share/wf/skills`; the suffix covers every installed
-        // prefix, including the older ones this is here to clear.
-        || parent == bundle
+    // What this build writes: relative, into the copy beside the links — and
+    // only while that copy is one `wf` can show it made, or the shape is proof
+    // of nothing but a name somebody else chose. A copy that is *gone* still
+    // counts: a relative link into a `wf-skills` that is not there is residue
+    // nothing but `wf` leaves.
+    (parent == Path::new("..").join(MIRROR) && mirror != Mirror::Adopted)
+        // What older builds wrote: straight into an installed prefix. A path
+        // ending `share/wf/skills` is `wf`'s own packaging layout, and clearing
+        // those is what #104's rename left to do.
         || parent.ends_with("share/wf/skills")
 }
 
@@ -825,10 +838,14 @@ fn is_ours(target: &Path, bundle: &Path) -> bool {
 ///
 /// When the links directory cannot be read, or a link cannot be removed. A
 /// missing directory is not an error — there is nothing to sweep.
-pub fn sweep(bundle: &Bundle, target: &Target) -> Result<Vec<PathBuf>> {
+pub fn sweep(target: &Target) -> Result<Vec<PathBuf>> {
     let Ok(entries) = std::fs::read_dir(&target.links) else {
         return Ok(Vec::new());
     };
+    // Read once, before anything is removed: what the copy directory is settles
+    // whether a link naming it is `wf`'s at all, and nothing in a loop that only
+    // deletes links can change the answer.
+    let mirror = Mirror::inspect(target);
     let mut swept = Vec::new();
     for entry in entries {
         let entry = entry.with_context(|| format!("cannot read {}", target.links.display()))?;
@@ -846,7 +863,7 @@ pub fn sweep(bundle: &Bundle, target: &Target) -> Result<Vec<PathBuf>> {
         let Ok(points_at) = std::fs::read_link(&link) else {
             continue;
         };
-        if !is_ours(&points_at, &bundle.path) {
+        if !is_ours(&points_at, mirror) {
             continue;
         }
         std::fs::remove_file(&link)
@@ -1382,7 +1399,7 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, target.links().join("other-tool"))
             .expect("other link");
 
-        let mut swept = sweep(&bundle, &target).expect("sweep");
+        let mut swept = sweep(&target).expect("sweep");
         swept.sort();
 
         assert_eq!(
@@ -1485,6 +1502,50 @@ mod tests {
             !theirs.join("wf-tdd").exists(),
             "with nothing of wf's copied into it"
         );
+    }
+
+    #[test]
+    fn a_link_into_a_directory_wf_was_merely_pointed_at_is_not_swept() {
+        // `$WF_SKILLS_DIR` names any directory you like, including one full of
+        // your own skills — and "the link points into the bundle" was enough to
+        // make sweep delete it. Pointing `wf` at a directory is not evidence
+        // `wf` wrote what is in it, so the bundle path cannot be what makes a
+        // link sweepable.
+        let scratch = Scratch::new("their-bundle");
+        let bundle = scratch.bundle(&[]);
+        let target = scratch.target();
+        done(install(&bundle, &target).expect("install"));
+
+        write_skill(&bundle.path, "grill-me", "---\n---\n");
+        let theirs = target.links().join("grill-me");
+        std::os::unix::fs::symlink(bundle.path.join("grill-me"), &theirs).expect("their link");
+
+        assert!(sweep(&target).expect("sweep").is_empty());
+        assert!(
+            theirs.symlink_metadata().is_ok(),
+            "a skill of theirs, in a directory of theirs, under a name wf does not ship"
+        );
+    }
+
+    #[test]
+    fn a_link_into_a_copy_directory_wf_did_not_make_is_not_swept() {
+        // The link shape is `wf`'s own, so it reads as `wf`'s — but only while
+        // the copy it names is one `wf` recorded making. Adopted, the name is
+        // somebody's own choice and the link is theirs.
+        let scratch = Scratch::new("their-copy");
+        let target = scratch.target();
+        std::fs::create_dir_all(target.mirror().join("mine")).expect("their copy directory");
+        let link = target.links().join("mine");
+        std::os::unix::fs::symlink(Target::link_target("mine"), &link).expect("their link");
+
+        assert!(sweep(&target).expect("sweep").is_empty());
+        assert!(link.symlink_metadata().is_ok(), "not wf's to remove");
+
+        // With the copy gone the same shape is `wf`'s residue again: nothing
+        // but `wf` writes a relative link into a `wf-skills` that is not there,
+        // and leaving it would put sweep back where #104 found it.
+        std::fs::remove_dir_all(target.mirror()).expect("their tree, moved aside");
+        assert_eq!(sweep(&target).expect("sweep"), vec![link]);
     }
 
     #[test]

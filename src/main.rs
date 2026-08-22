@@ -273,7 +273,7 @@ fn run_skills(install: bool) -> Result<()> {
             // Before linking, not after: a swept name could be one this build
             // ships under a new spelling, and clearing the old link first keeps
             // the two steps from racing over the same directory entry.
-            let swept = skills::sweep(&bundle, &target)?;
+            let swept = skills::sweep(&target)?;
             // A copy directory `wf` cannot prove it made stops the install
             // whole, so it is reported once — against the path in question —
             // rather than six times over skills none of which was touched.
