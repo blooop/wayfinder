@@ -43,9 +43,10 @@ use crate::model::{Map, MapId, MapSet};
 use crate::projects::ProjectsCache;
 use crate::reclaim::Reading;
 
-/// How long the map search waits before trying again. The only recurring timer
-/// left: nothing polls, but a search that never answers would leave `wf`
-/// permanently empty.
+/// The map search's first wait, and the unit every later one doubles from —
+/// `retry_delay` carries the schedule and the ceiling it stops at. The only
+/// recurring timer left: nothing polls, but a search that never answers would
+/// leave `wf` permanently empty.
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(4);
 
 /// One map's load. Two states, because with the conditional probe gone
@@ -346,9 +347,9 @@ pub fn spawn_discovery(
 /// them apart: a network blip deserves the quick retry the early steps give,
 /// while a structural failure — no `gh` on PATH, an unauthenticated one — used
 /// to cost a respawned `gh` process every four seconds for the whole session.
-/// The ceiling keeps the recovery property (a `gh auth login` run mid-session
-/// is still found within the minute) at a session-long cost of one process a
-/// minute instead of fifteen.
+/// The ceiling keeps the recovery property — a `gh auth login` run mid-session
+/// is still found, one capped wait later rather than never — at a session-long
+/// cost of roughly one process a minute instead of fifteen.
 fn retry_delay(failures: u32) -> Duration {
     RETRY_INTERVAL * 2u32.saturating_pow(failures.saturating_sub(1)).min(16)
 }

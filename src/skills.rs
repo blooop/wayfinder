@@ -74,8 +74,8 @@ const CODEX_HOME_ENV: &str = "CODEX_HOME";
 /// agent's config directory (`~/.claude/wf-skills` or `~/.codex/wf-skills`).
 ///
 /// A sibling of `skills/` rather than a directory inside it, because the agents
-/// read *every* directory under `skills/` — a copy in there would register five
-/// more skills under a second set of names.
+/// read *every* directory under `skills/` — a copy in there would register the
+/// whole bundle again under a second set of names.
 pub const MIRROR: &str = "wf-skills";
 
 /// Where the copy came from, recorded inside it: the bundle directory the last
@@ -510,7 +510,7 @@ pub enum Outcome {
 /// When a directory cannot be created, a copy cannot be written, or a link
 /// cannot be replaced. A skill that is merely *blocked* or absent from the
 /// bundle is not an error — it is an [`Outcome`], so one bad skill never costs
-/// the other four their install.
+/// the rest their install.
 pub fn install(bundle: &Bundle, target: &Target) -> Result<Vec<(String, Outcome)>> {
     for dir in [&target.links, &target.mirror] {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
@@ -649,7 +649,7 @@ pub fn refresh(target: &Target) -> Result<Vec<(String, Healed)>> {
             // that resolves on the host and dangles in the container — and it
             // can never match a link somebody else left, however dead it looks.
             // A target that could not be read is `Stale(None)`, and falls to
-            // the arm below: with nothing to prove ownership of, the sweep has
+            // the arm below: with nothing to prove ownership of, `refresh` has
             // no permission to touch it.
             Link::Stale(Some(points_at)) if is_ours(&points_at, &bundle) => Some(Some(points_at)),
             Link::Stale(_) | Link::Unmanaged => continue,
