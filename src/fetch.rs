@@ -64,7 +64,7 @@ query($owner: String!, $name: String!, $number: Int!) {
           number title state
           labels(first: 10) { nodes { name } }
           assignees(first: 5) { nodes { login } }
-          blockedBy(first: 50) { nodes { number state } }
+          blockedBy(first: 50) { nodes { number state } pageInfo { hasNextPage } }
           closedByPullRequestsReferences(first: 5, includeClosedPrs: true) {
             nodes {
               number state isDraft reviewDecision
@@ -74,6 +74,7 @@ query($owner: String!, $name: String!, $number: Int!) {
             pageInfo { hasNextPage }
           }
         }
+        pageInfo { hasNextPage }
       }
     }
   }
@@ -848,6 +849,68 @@ mod tests {
         // selection follows.
         let map = parse_map(MAP_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
         assert!(!map.truncated);
+    }
+
+    /// The brace-balanced block a named connection selects in `query` —
+    /// `field(…) { … }` from the first `{` to its close. Panics if the field
+    /// is missing or its braces never balance, because a guard that returns
+    /// `None` quietly is a guard that stops guarding when the query is
+    /// reworded.
+    fn connection_block<'q>(query: &'q str, field: &str) -> &'q str {
+        let from = query
+            .find(field)
+            .unwrap_or_else(|| panic!("the query no longer selects {field}"));
+        let mut depth = 0usize;
+        for (offset, ch) in query[from..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth
+                        .checked_sub(1)
+                        .unwrap_or_else(|| panic!("unbalanced braces in {query}"));
+                    if depth == 0 {
+                        return &query[from..=from + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{field}'s block never closes in {query}")
+    }
+
+    /// Whether `block` selects `pageInfo` on the connection itself — at brace
+    /// depth 1, not anywhere in the nested tree. Depth matters: the sub-issue
+    /// block *contains* the linked-PR block, whose own `pageInfo` (#183) would
+    /// otherwise satisfy this test on behalf of a connection that never asked.
+    fn asks_its_own_page_info(block: &str) -> bool {
+        let mut depth = 0usize;
+        let mut at = 0;
+        while let Some(found) = block[at..].find("pageInfo") {
+            depth += block[at..at + found].matches('{').count();
+            depth -= block[at..at + found].matches('}').count();
+            if depth == 1 {
+                return true;
+            }
+            at += found + "pageInfo".len();
+        }
+        false
+    }
+
+    #[test]
+    fn the_query_asks_for_every_page_boundary_the_parse_reads() {
+        // The truncation tests above feed `parse_map` hand-written fixtures,
+        // so they cannot notice the live query never requesting the field —
+        // the same hole #132 closed for reap's batch, guarded the same way:
+        // against the query text. Drop `pageInfo` from either ticket-bearing
+        // connection and every map fetched live reads as complete forever,
+        // silently, which is exactly the pre-#184 behaviour.
+        for field in ["subIssues", "blockedBy"] {
+            let block = connection_block(MAP_QUERY, field);
+            assert!(
+                asks_its_own_page_info(block),
+                "{field} no longer asks whether its page was all of it: {block}"
+            );
+        }
     }
 
     #[test]
