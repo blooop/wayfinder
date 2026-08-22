@@ -737,6 +737,22 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// A popup's outer width: the widest body row or the border title, whichever
+/// is wider, plus the frame around them. Both are measured in *display
+/// columns* — [`cols`](crate::cols) for the title, and `Line::width` for a
+/// row, which is the same table summed over the row's spans — because GitHub
+/// titles are arbitrary text and a CJK or emoji title is one char, two
+/// columns: measured in chars (or worse, bytes) the border clipped its own
+/// title. This is the one place a popup is measured, so the two pickers cannot
+/// drift back onto two conventions.
+///
+/// A popup with no body rows is as wide as its title, which is why there is no
+/// fallback width: the title is always there to fall back *to*.
+fn popup_width(lines: &[Line<'_>], title: &str) -> u16 {
+    let body = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+    body.max(crate::cols(title) as u16) + 4
+}
+
 /// A centered box `width`×`height` (clamped) inside `area`.
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let [area] = Layout::horizontal([Constraint::Length(width.min(area.width))])
@@ -833,12 +849,7 @@ fn draw_launch_picker(
         staged.title()
     );
     let title = title.trim_end().to_string() + " ";
-    let width = lines
-        .iter()
-        .map(|l| l.width() as u16 + 4)
-        .chain(std::iter::once(title.chars().count() as u16 + 4))
-        .max()
-        .unwrap_or(40);
+    let width = popup_width(&lines, &title);
     let area = centered(frame.area(), width, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -903,18 +914,14 @@ fn draw_checkout_picker(frame: &mut Frame<'_>, launches: &[Launch], cursor: usiz
     // This asks *which checkout*, so the ticket only needs identifying — its
     // title is already on the row behind the prompt.
     let key = launches.first().map(Launch::key).unwrap_or_default();
-    let width = lines
-        .iter()
-        .map(|l| l.width() as u16 + 4)
-        .chain(std::iter::once(key.len() as u16 + 30))
-        .max()
-        .unwrap_or(40);
+    let title = format!(" which checkout runs {key}? ");
+    let width = popup_width(&lines, &title);
     let area = centered(frame.area(), width, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
-                .title(format!(" which checkout runs {key}? "))
+                .title(title)
                 .border_style(Style::new().fg(Color::Cyan)),
         ),
         area,
@@ -992,13 +999,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     // workspace id is ~40 characters and there can be three of them. It goes
     // last and takes what the rest of the line has left, which is why the rest
     // of the line is measured first.
-    let spent = counts.chars().count()
-        + 2
-        + parts
-            .iter()
-            .map(|part| part.chars().count() + 1)
-            .sum::<usize>()
-        + notice.chars().count();
+    // Every width on this line is display columns — `crate::cols`, the same
+    // table ratatui renders with — never chars: a CJK char is one char and two
+    // columns, so a char count hands the reclaim note columns the line does
+    // not have and the tail falls off the right edge. The notice carries
+    // ticket titles, a stall name carries a repo name, and a reclaim id is
+    // whatever `dl` listed — all of it arbitrary text.
+    //
+    // The convention does not stop at this arithmetic: the two segments that
+    // *fit themselves* to what is left — `Liveness::hint` and
+    // `Reclaimable::hint` — measure in the same columns, which is why the
+    // budgets handed to them below mean what they say.
+    let cols = crate::cols;
+    let spent =
+        cols(&counts) + 2 + parts.iter().map(|part| cols(part) + 1).sum::<usize>() + cols(&notice);
     let mut left = (count_area.width as usize).saturating_sub(spent);
     // Stalls are laid down before the reclaim note, but not at any price: what
     // is held back for the reclaim note is exactly the width at which it stops
@@ -1018,7 +1032,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         .map_or(0, |found| found.min_width() + 1);
     let stalled = app.liveness.hint(left.saturating_sub(reserved));
     if !stalled.is_empty() {
-        left = left.saturating_sub(stalled.chars().count() + 1);
+        left = left.saturating_sub(cols(&stalled) + 1);
         parts.push(stalled);
     }
     let note = reclaim_note(app, left);
@@ -1142,6 +1156,17 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    /// How the buffer dump spells a wide string: each wide char reads back
+    /// with its continuation cell, so the chars come out space-separated.
+    fn wide(text: &str) -> String {
+        let mut out = String::new();
+        for c in text.chars() {
+            out.push(c);
+            out.push(' ');
+        }
+        out.trim_end().to_string()
     }
 
     /// The fixture app, with a conversation left on `number`.
@@ -1683,6 +1708,73 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_stalled_name_does_not_clip_the_reclaim_note_beside_it() {
+        // The same claim as the fragment test above, against a repo name whose
+        // chars are two columns each. Stall names are laid down before the
+        // reclaim note and spend from the same budget, so a name measured in
+        // chars spends twice what it was given and the note pays: two of these
+        // plus a reclaimable set rendered `· 2 stalled: 测试仓库仓库#9, +1
+        // more · 2 recla`. Repo names come from GitHub, so this is input and
+        // not a hypothetical.
+        let mut app = fixture_app();
+        app.liveness = crate::liveness::Liveness::for_test(
+            &[],
+            &[("blooop/测试仓库仓库", 9), ("blooop/测试仓库仓库", 14)],
+        );
+        app.reclaimable = Some(Reclaimable::for_test(
+            &["devlaunch-github-blooop-wayfinder-127-ladepomi", "wf-80-x"],
+            1,
+        ));
+        for width in 40..=130u16 {
+            let screen = render_at(width, &app);
+            let line = screen.lines().nth(2).expect("a count line");
+            let inner: String = line.chars().skip(1).take(width as usize - 2).collect();
+            for whole in ["reclaimable", "stalled"] {
+                for cut in 1..whole.len() {
+                    assert!(
+                        !inner.trim_end().ends_with(&whole[..cut]),
+                        "{width}: {whole:?} was clipped to {:?}: {:?}",
+                        &whole[..cut],
+                        inner.trim_end()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_notice_is_not_clipped_by_the_reclaim_note_beside_it() {
+        // The reclaim note takes whatever the rest of the line has not spent —
+        // so everything else has to be measured in the columns it will
+        // actually occupy. The notice (which carries ticket titles, arbitrary
+        // text) was measured in chars: a CJK notice under-measured by half,
+        // the note was handed columns the notice needed, and the line's tail —
+        // the notice itself — fell off the right edge.
+        let notice = "已经在隔离容器里启动了交互式会话";
+        let mut app = fixture_app();
+        app.notice = Some(notice.to_string());
+        app.reclaimable = Some(Reclaimable::for_test(
+            &[
+                "devlaunch-github-com-blooop-wayfinder-129",
+                "devlaunch-github-com-blooop-wayfinder-127",
+            ],
+            0,
+        ));
+        let drawn = wide(notice);
+        for width in [100u16, 120] {
+            let screen = render_at(width, &app);
+            let line = screen
+                .lines()
+                .find(|line| line.contains("reclaimable"))
+                .unwrap_or_else(|| panic!("{width}: no count line: {screen}"));
+            assert!(
+                line.contains(&drawn),
+                "{width}: the notice lost its tail to the reclaim note: {line}"
+            );
+        }
+    }
+
+    #[test]
     fn the_first_frame_says_nothing_about_reclaimable_workspaces() {
         // The reading is a `dl` subprocess and a GraphQL call behind the
         // screen. Until it lands — and forever, if it failed or found nothing —
@@ -2175,6 +2267,42 @@ mod tests {
     }
 
     #[test]
+    fn the_checkout_picker_title_survives_a_non_ascii_key() {
+        // The checkout picker's width once measured the key in *bytes* plus a
+        // magic margin — a third convention beside display columns and char
+        // counts, which happened never to clip only because bytes over-count
+        // every wide char. It measures the actual title in display columns
+        // now, like every other popup; this pins that a non-ASCII key renders
+        // whole so no cheaper metric can come back.
+        let repo = "blooop/测试仓库";
+        let mut map = wf_map();
+        for t in &mut map.tickets {
+            t.repo = repo.to_string();
+        }
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new(repo, 1), map);
+        let mut app = app_on(repo, clusters).with_checkouts(vec![
+            crate::projects::Checkout::new(
+                std::path::PathBuf::from("/data/k1/repo"),
+                repo.to_string(),
+            ),
+            crate::projects::Checkout::new(
+                std::path::PathBuf::from("/data/k2/repo"),
+                repo.to_string(),
+            ),
+        ]);
+        down(&mut app, 2); // past the project row and the cluster header
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // stage
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // resolve
+        let screen = render_at(120, &app);
+        // Wide chars read back from the buffer with their continuation cells.
+        assert!(
+            screen.contains("which checkout runs 测 试 仓 库 #6?"),
+            "{screen}"
+        );
+    }
+
+    #[test]
     fn a_project_picker_draws_the_creation_rows_with_their_own_skills() {
         // Creation is an act on a repo, so the rows live on the one stop that
         // is a repo — and every row still names the skill it execs, including
@@ -2222,6 +2350,32 @@ mod tests {
                 mode.label()
             );
         }
+    }
+
+    #[test]
+    fn a_cjk_title_widens_the_picker_to_what_it_actually_displays() {
+        // GitHub titles are arbitrary text, and a CJK char is one char but two
+        // columns. The popup width was taking `chars().count()` for the title
+        // while measuring its body rows in display columns — so a CJK-heavy
+        // title under-measured by half and the border clipped its tail.
+        let title = "弹窗标题宽度必须按显示宽度而不是字符数来测量才能容纳";
+        let mut map = wf_map();
+        map.tickets[1].title = title.to_string(); // #6, the launchable row
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        let mut app = app_on("blooop/wayfinder", clusters);
+        down(&mut app, 2); // past the project row and the cluster header
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let screen = render_at(120, &app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("launch Claude"))
+            .unwrap_or_else(|| panic!("no picker title: {screen}"));
+        let drawn = wide(title);
+        assert!(
+            line.contains(&drawn),
+            "the title is clipped by its own popup: {line}"
+        );
     }
 
     #[test]

@@ -83,3 +83,11 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
+# The same grapheme walk nucleo-matcher builds its haystacks with (it is
+# nucleo's own dependency): the filter has to segment identically to map the
+# grapheme indices nucleo reports back onto the chars the screen underlines by.
+unicode-segmentation = "1"
+# The same table ratatui measures spans with (it is ratatui's own dependency):
+# the modules that fit text to a column budget are not UI modules and must not
+# reach for a `Span` to ask how wide a string is. See `cols`.
+unicode-width = "0.2"

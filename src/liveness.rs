@@ -194,6 +194,12 @@ impl Liveness {
     /// somebody to press enter in a list is spending the scarcest characters on
     /// the line saying nothing.
     ///
+    /// `width` is columns of terminal, not characters — [`cols`](crate::cols)
+    /// is what the ladder below measures with. A node's name is
+    /// `short_repo#number` and the repo half comes from GitHub, so a name two
+    /// columns to the char is ordinary input, and counting its chars would
+    /// hand the reclaim note columns this segment had already spent.
+    ///
     /// The width is a budget, and this segment is laid down before the reclaim
     /// note — so on a narrowing line the reap pointer and the warned aside go
     /// while stalls are still naming nodes. Deliberate, and the one trade in
@@ -219,11 +225,11 @@ impl Liveness {
                 format!(", +{rest} more")
             };
             let line = format!("{head}: {}{more}", names[..count].join(", "));
-            if line.chars().count() <= width {
+            if crate::cols(&line) <= width {
                 return line;
             }
         }
-        if head.chars().count() <= width {
+        if crate::cols(&head) <= width {
             return head;
         }
         String::new()
@@ -462,6 +468,28 @@ mod tests {
             "· 3 stalled",
             "the count survives after the names are gone"
         );
+    }
+
+    /// The same ladder against a wide name. The number the caller hands down is
+    /// columns of terminal — it is what the count line has left — so a repo
+    /// name whose chars are two columns wide spends twice what it was given,
+    /// and the reclaim note beside it is what loses the difference: two of
+    /// these plus a reclaimable set rendered `· 2 stalled: ..., +1 more · 2
+    /// recla`, the fragment the count line's own test exists to forbid.
+    #[test]
+    fn the_budget_is_columns_of_terminal_even_when_a_stalled_name_is_wide() {
+        let live = Liveness::for_test(
+            &[],
+            &[("blooop/测试仓库仓库", 9), ("blooop/测试仓库仓库", 14)],
+        );
+        for width in 0..60 {
+            let hint = live.hint(width);
+            assert!(
+                crate::cols(&hint) <= width,
+                "width {width} produced {} columns: {hint:?}",
+                crate::cols(&hint)
+            );
+        }
     }
 
     #[test]
