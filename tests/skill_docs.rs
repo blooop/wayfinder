@@ -600,8 +600,9 @@ fn the_readme_states_the_tracker_injection_posture() {
         readme_paragraph("**The tracker's text is an input"),
         "**The tracker's text is an input to the agent, and only its mechanics are \
          defended.** A launch embeds what the picker read straight into the prompt it \
-         execs: the map's title and the ticket's title, verbatim, in that `ctx:` block. \
-         The skill's own first move is then to read the ticket — body, comment trail and \
+         execs: the map's title and the ticket's title, verbatim, in the [`ctx:` \
+         block](#launching) it hands the skill. The skill's own first move is then to \
+         read the ticket — body, comment trail and \
          all — so the surface is wider than the block: everything anyone can write on a \
          tracker you point `wf` at reaches an agent running with permissions bypassed, \
          and under `wf-auto` there is nobody reading along. Titles are the part `wf` \
