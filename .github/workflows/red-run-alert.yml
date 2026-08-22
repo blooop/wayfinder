@@ -1,0 +1,77 @@
+name: red-run alert
+
+# A red non-blocking run summons somebody (#190). Two legs of this repo's CI
+# are non-blocking on purpose — `live.yml` runs after the merge because it
+# asserts the tracker's present contents, and `devlaunch-contract.yml`'s
+# weekly re-solve is the only thing that can discover a devlaunch release
+# published since the lock — which means both depend entirely on a human
+# noticing a red run. Nothing did the noticing. This workflow reconciles one
+# tracking issue per watched workflow: filed when a run goes red, commented
+# rather than duplicated while it stays red, closed on the next green of the
+# same class.
+on:
+  workflow_run:
+    # By *display name*, because that is the only thing `workflow_run` can
+    # subscribe by — a rename of either watched workflow would disconnect this
+    # silently. `tests/red_run_alert.rs` derives these strings from the watched
+    # files' own `name:` fields, so a rename either moves both ends or fails CI.
+    workflows: ["live", "devlaunch contract"]
+    # `completed` and only `completed`: it is the one type that carries a
+    # conclusion, and a run that has not concluded has nothing to reconcile.
+    types: [completed]
+
+# Read-only for the workflow as a whole; the one grant beyond that sits on the
+# job that needs it, matching `package.yml` and `devcontainer.yml`. What the
+# split buys is the blast radius of a step added later: it could read this
+# public repo, not file or close issues on it.
+permissions:
+  contents: read
+
+concurrency:
+  # Serialised, never cancelled: the reconciliation below is a search-then-act
+  # on the tracker, and two completions racing through it is exactly how "one
+  # open issue per workflow" becomes two. One fixed group — not keyed on the
+  # ref or the event — so every reconciliation queues behind the last.
+  group: red-run-alert
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    name: file, update or close the tracking issue
+    # The subscription above is wider than the promise, so the job narrows it
+    # to the runs nothing else stands behind. `live` counts only on `main`:
+    # its push trigger only fires there, and a `workflow_dispatch` aimed at a
+    # topic branch is somebody's experiment, not the world moving. The
+    # contract workflow counts only from its weekly schedule: every other leg
+    # blocks a pull request, so a red one is already holding the merge it
+    # belongs to, and the scheduled re-solve is the single leg whose red means
+    # devlaunch moved — the one nobody is otherwise summoned to.
+    if: >-
+      (github.event.workflow_run.name == 'live'
+        && github.event.workflow_run.head_branch == 'main')
+      || (github.event.workflow_run.name == 'devlaunch contract'
+        && github.event.workflow_run.event == 'schedule')
+    runs-on: ubuntu-latest
+    # Job-scoped and exhaustive: a job-level `permissions` replaces the
+    # workflow-level one entirely, so the read the checkout needs is restated
+    # here beside the one write this whole workflow exists for.
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # Only for the script below — this job builds nothing.
+      - uses: actions/checkout@v7
+
+      # The decision logic lives in a script rather than in this block so that
+      # `tests/red_run_alert.rs` can run it for real against a recording `gh`
+      # stub — the create-vs-comment-vs-close behavior is asserted there, and
+      # the same test holds this env block and the script's reads to exactly
+      # match each other.
+      - name: Reconcile the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          REPO: ${{ github.repository }}
+        run: .github/scripts/red_run_alert.sh
