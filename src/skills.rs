@@ -399,11 +399,19 @@ enum Mirror {
 
 impl Mirror {
     /// What the copy directory amounts to right now.
+    ///
+    /// `symlink_metadata`, so the second adoption shape is caught too: a
+    /// `wf-skills` that is a *link* into somebody's dotfile tree takes a
+    /// `create_dir_all` without complaint, and then every copy lands in their
+    /// tree and the prune deletes out of it. `wf` only ever makes a real
+    /// directory here, so a link is proof it did not — which is why the record
+    /// is not consulted first: a link carrying one is a link carrying somebody
+    /// else's file.
     fn inspect(target: &Target) -> Mirror {
-        if std::fs::symlink_metadata(&target.mirror).is_err() {
+        let Ok(meta) = std::fs::symlink_metadata(&target.mirror) else {
             return Mirror::Absent;
-        }
-        if installed_from(target).is_none() {
+        };
+        if !meta.is_dir() || installed_from(target).is_none() {
             return Mirror::Adopted;
         }
         Mirror::Ours
@@ -542,8 +550,9 @@ pub enum Outcome {
 pub enum Installed {
     /// The copy is `wf`'s, and here is what each bundled skill did.
     Done(Vec<(String, Outcome)>),
-    /// Something else owns the copy directory: nothing was written, linked or
-    /// removed anywhere. See [`Mirror::Adopted`].
+    /// Something already sits where the copy goes and carries no record `wf`
+    /// wrote — a directory, or a link into one, that somebody else made.
+    /// Nothing was written, linked or removed anywhere.
     CopyUnmanaged,
 }
 
@@ -677,7 +686,8 @@ pub enum Healed {
 /// created here points at a copy of the recorded source like every other.
 ///
 /// Nothing else is touched: a machine that never ran `wf skills install`, a
-/// directory chezmoi owns, a link pointing somewhere `wf` never links, and a
+/// copy directory `wf` cannot prove it made, a directory chezmoi
+/// owns, a link pointing somewhere `wf` never links, and a
 /// recorded source that has since been deleted are all left exactly as they are
 /// — a prompt one release behind still beats no prompt at all, and a name that
 /// is not `wf`'s is not `wf`'s to take.
@@ -686,6 +696,12 @@ pub enum Healed {
 ///
 /// When a copy cannot be rewritten, or a link cannot be created.
 pub fn refresh(target: &Target) -> Result<Vec<(String, Healed)>> {
+    // The same proof [`install`] demands before it writes here, for the same
+    // reason: a copy `wf` cannot show it made is somebody else's tree, and a
+    // launch recopying into it would rewrite their files on the way past.
+    if Mirror::inspect(target) != Mirror::Ours {
+        return Ok(Vec::new());
+    }
     let Some(bundle) = installed_from(target).filter(|source| source.is_dir()) else {
         return Ok(Vec::new());
     };
@@ -1436,6 +1452,38 @@ mod tests {
         assert!(
             !target.links().join("wf-tdd").exists(),
             "nor is a link written into a copy that is not wf's"
+        );
+    }
+
+    #[test]
+    fn a_copy_directory_that_is_a_link_is_never_wfs() {
+        // The other adoption shape the same `create_dir_all` swallowed:
+        // `~/.claude/wf-skills` pointing into a dotfile tree. It succeeds on a
+        // link, so every copy lands in somebody's tree and the prune deletes
+        // out of it. `wf` only ever *makes a directory* here, so a link is
+        // proof it did not — even one whose target carries a record, which is
+        // otherwise the only proof there is.
+        let scratch = Scratch::new("linked-copy");
+        let bundle = scratch.bundle(&[]);
+        let target = scratch.target();
+        let theirs = scratch.0.join("their-dotfiles/skills");
+        std::fs::create_dir_all(theirs.join("their-skill")).expect("their tree");
+        std::fs::write(theirs.join(SOURCE), format!("{}\n", bundle.path.display()))
+            .expect("a record that came along with their tree");
+        std::os::unix::fs::symlink(&theirs, target.mirror()).expect("their link");
+
+        assert_eq!(
+            install(&bundle, &target).expect("install"),
+            Installed::CopyUnmanaged
+        );
+        assert!(
+            refresh(&target).expect("refresh").is_empty(),
+            "and no launch writes through it either"
+        );
+        assert!(theirs.join("their-skill").is_dir(), "their tree, as found");
+        assert!(
+            !theirs.join("wf-tdd").exists(),
+            "with nothing of wf's copied into it"
         );
     }
 
