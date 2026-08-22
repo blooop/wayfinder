@@ -158,6 +158,29 @@ fn the_alert_reacts_only_to_the_runs_nothing_else_stands_behind() {
     );
 }
 
+/// Every guard above reads a field of the *watched* run, and a fork pull
+/// request gets to choose most of them. A fork's default branch is `main`, so
+/// a fork that adds a `pull_request:` leg to `live.yml` produces a run named
+/// `live` whose `head_branch` is `main` and whose conclusion the fork's own
+/// code decides — and this repo is public with first-time-contributor approval
+/// only, so a prior contributor needs nobody's click. The consequence is worse
+/// than a spurious summons: a forged `success` reaches the reconciling job,
+/// which holds `issues: write` on the *base* repo, and **closes** a genuinely
+/// red summons. The one field a fork cannot forge is which repository the run
+/// belongs to, so that is what the job is required to check — and requiring it
+/// of both legs rather than only the live one, because a guard that has to be
+/// re-derived per leg is a guard the next leg forgets.
+#[test]
+fn a_run_from_a_fork_can_neither_file_nor_withdraw_a_summons() {
+    let jobs = top_level_block(&workflow(ALERT), "jobs");
+    assert!(
+        jobs.contains("github.event.workflow_run.head_repository.full_name == github.repository"),
+        "only runs belonging to this repository are reconciled — every other \
+         field of a watched run is a fork's to choose, and a forged green \
+         would withdraw a real summons:\n{jobs}"
+    );
+}
+
 /// The reconciliation script, run for real against a recording `gh`.
 ///
 /// The stub answers `gh issue list` with whatever the caller says the tracker
@@ -313,25 +336,68 @@ fn a_green_run_with_nothing_open_writes_nothing() {
     );
 }
 
-/// A cancelled run is neither red nor green — the trigger's `completed` type
-/// delivers it anyway — and it must move nothing: filing on it would summon
-/// somebody to a run that was superseded, and closing on it would withdraw a
-/// summons on no evidence. Both directions are asserted, each against the
-/// tracker state where the wrong write is possible.
+/// Red is not spelled one way. A red X on the Actions tab is `failure`,
+/// `timed_out` *or* `startup_failure`, and both of the latter are reachable on
+/// the very legs this alert watches: `live.yml` declares no `timeout-minutes`,
+/// so the leg whose whole job is asserting wall-clock budgets overruns into
+/// GitHub's own timeout rather than into a test assertion, and a workflow that
+/// stops parsing concludes `startup_failure` before there is a step to fail. A
+/// summons that answers only to the literal string `failure` leaves exactly
+/// those two unnoticed — the failure this whole workflow exists to foreclose,
+/// reintroduced one string comparison in.
 #[test]
-fn a_cancelled_run_is_neither_red_nor_green() {
-    let with_summons = reconcile("cancelled_open", "live", "cancelled", "42\n");
-    assert!(
-        !with_summons
-            .iter()
-            .any(|call| !call.starts_with("issue list")),
-        "an open summons survives a cancelled run: {with_summons:?}"
-    );
-    let without = reconcile("cancelled_quiet", "live", "cancelled", "");
-    assert!(
-        !without.iter().any(|call| !call.starts_with("issue list")),
-        "a cancelled run files nothing: {without:?}"
-    );
+fn every_red_conclusion_summons_somebody() {
+    for conclusion in ["failure", "timed_out", "startup_failure"] {
+        let calls = reconcile(&format!("red_{conclusion}"), "live", conclusion, "");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("issue create"))
+                .count(),
+            1,
+            "`{conclusion}` renders as a red run and files a summons: {calls:?}"
+        );
+        let open = reconcile(
+            &format!("red_open_{conclusion}"),
+            "live",
+            conclusion,
+            "42\n",
+        );
+        assert_eq!(
+            open.iter()
+                .filter(|call| call.starts_with("issue comment 42"))
+                .count(),
+            1,
+            "and it updates the standing summons rather than withdrawing it: \
+             {open:?}"
+        );
+    }
+}
+
+/// A cancelled or skipped run is neither red nor green — the trigger's
+/// `completed` type delivers both anyway — and neither may move anything:
+/// filing on one would summon somebody to a run that was superseded, and
+/// closing on one would withdraw a summons on no evidence at all. Both
+/// directions are asserted for each, against the tracker state where the wrong
+/// write is possible. These two exclusions are also what keeps the test above
+/// honest: red is defined as "not green", so a conclusion not named here
+/// becomes a summons.
+#[test]
+fn a_run_with_no_verdict_is_neither_red_nor_green() {
+    for conclusion in ["cancelled", "skipped"] {
+        let with_summons = reconcile(&format!("{conclusion}_open"), "live", conclusion, "42\n");
+        assert!(
+            !with_summons
+                .iter()
+                .any(|call| !call.starts_with("issue list")),
+            "an open summons survives a {conclusion} run: {with_summons:?}"
+        );
+        let without = reconcile(&format!("{conclusion}_quiet"), "live", conclusion, "");
+        assert!(
+            !without.iter().any(|call| !call.starts_with("issue list")),
+            "a {conclusion} run files nothing: {without:?}"
+        );
+    }
 }
 
 /// Each watched workflow reconciles against its own issue: the title embeds
@@ -361,6 +427,106 @@ fn each_watched_workflow_has_a_summons_of_its_own() {
     );
 }
 
+/// The reconciliation is a search-then-act on one issue, so two of them
+/// running at once is how "one open issue per workflow" becomes two — the
+/// exact outcome the ticket names as the thing to avoid. A single fixed
+/// concurrency group is what forecloses it, and nothing else in this file
+/// notices if it goes: deleting the block leaves every behavioural test above
+/// green, because they drive the script one call at a time and the race lives
+/// above the script entirely.
+#[test]
+fn two_completions_cannot_reconcile_at_once() {
+    let group = top_level_block(&workflow(ALERT), "concurrency");
+    assert!(
+        group.contains("group: red-run-alert") && !group.contains("${{"),
+        "one fixed group, not keyed on the ref or the event — a group per run \
+         serialises nothing:\n{group}"
+    );
+    assert!(
+        group.contains("cancel-in-progress: false"),
+        "the reconciliation already running is the one holding the tracker \
+         mid-decision; cancelling it is what leaves a duplicate:\n{group}"
+    );
+}
+
+/// The lookup's flag surface, which the tests above cannot see: the stub
+/// answers `issue list` whatever follows, so the flags that decide *which*
+/// issues can match are asserted here or nowhere. `--state open` is the one
+/// that carries weight, and dropping it to `--state all` is a silent break
+/// rather than a loud one — a *closed* summons matches the exact title just as
+/// well, so a leg that re-reddens after a green comments on an issue nobody is
+/// watching and never files a fresh one. Reopening is a human's call; from
+/// this script's side a closed summons is not a summons.
+#[test]
+fn the_lookup_asks_only_for_a_summons_that_is_still_open() {
+    let calls = reconcile("lookup_state", "live", "failure", "");
+    let lookup = calls
+        .iter()
+        .find(|call| call.starts_with("issue list"))
+        .expect("the reconciliation starts from what the tracker holds");
+    assert!(
+        lookup.contains("--state open"),
+        "only an open issue can be the standing summons: {lookup}"
+    );
+}
+
+/// The `NAME: value` pairs a job block hands a step. Uppercase-with-underscore
+/// names only, which is unambiguous in a workflow file: every key YAML itself
+/// owns is lowercase or kebab-case, so anything shouting is an environment
+/// variable.
+fn handed_env(jobs: &str) -> Vec<(&str, &str)> {
+    jobs.lines()
+        .filter_map(|line| {
+            let (name, value) = line.trim().split_once(':')?;
+            (!name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+                .then_some((name, value.trim()))
+        })
+        .collect()
+}
+
+/// Which run each variable describes — the half of the env contract that
+/// comparing key *names* cannot see, and the half where being wrong is
+/// invisible. In a `workflow_run` run the context holds *two* runs: the
+/// watched one, under `github.event.workflow_run`, and the alert's own, under
+/// the bare `github.*` keys. Every variable here has to name the first. The
+/// mistake is one token wide and silent in both directions:
+/// `${{ github.workflow }}` in place of the watched run's `name` is always
+/// `red-run alert`, so both watched legs reconcile against a single summons
+/// titled for the alert itself — which is exactly what
+/// `each_watched_workflow_has_a_summons_of_its_own` says is foreclosed, and it
+/// stays green because that test drives the script with a name the test picked
+/// rather than one the job derived. `html_url` likewise: `url` is the REST
+/// endpoint, so the summons would point a human at JSON.
+///
+/// Asserted as literals, as `tests/devcontainer_prebuild.rs` asserts the
+/// published image tag in both of the files that must agree on it.
+#[test]
+fn every_variable_describes_the_watched_run_and_not_the_alerts_own() {
+    let jobs = top_level_block(&workflow(ALERT), "jobs");
+    let handed = handed_env(&jobs);
+    for (name, expression) in [
+        // `github.token`, not a PAT: the job-scoped `issues: write` above is
+        // the whole permission story, and a secret would route around it.
+        ("GH_TOKEN", "${{ github.token }}"),
+        ("WORKFLOW_NAME", "${{ github.event.workflow_run.name }}"),
+        ("CONCLUSION", "${{ github.event.workflow_run.conclusion }}"),
+        ("RUN_URL", "${{ github.event.workflow_run.html_url }}"),
+        // The one that is legitimately about the alert's own run: the tracker
+        // written to is this repo, which is also where the alert lives.
+        ("REPO", "${{ github.repository }}"),
+    ] {
+        let handed_value = handed
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| *value);
+        assert_eq!(
+            handed_value,
+            Some(expression),
+            "the job hands {name} the expression that names the watched run"
+        );
+    }
+}
+
 /// The two halves tested above only meet if the job really invokes the script
 /// and their environment contract holds in both directions: a variable the
 /// script reads but the job never sets is an empty title or a `set -u` abort
@@ -368,6 +534,11 @@ fn each_watched_workflow_has_a_summons_of_its_own() {
 /// script silently stopped honouring. `GH_TOKEN` is the one deliberate
 /// asymmetry — the job hands it for `gh` itself to consume, so no line of the
 /// script names it.
+///
+/// This is the *names*, and names alone; which run each one describes is
+/// `every_variable_describes_the_watched_run_and_not_the_alerts_own` above,
+/// because a set of key names is identical whether the values are right or
+/// point at the alert's own run.
 #[test]
 fn the_job_hands_the_script_exactly_what_it_reads() {
     let jobs = top_level_block(&workflow(ALERT), "jobs");
@@ -389,16 +560,16 @@ fn the_job_hands_the_script_exactly_what_it_reads() {
         );
     }
 
-    let mut handed: Vec<&str> = jobs
-        .lines()
-        .filter_map(|line| {
-            let name = line.trim().split(':').next()?;
-            (!name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
-                .then_some(name)
-        })
+    let mut handed: Vec<&str> = handed_env(&jobs)
+        .into_iter()
+        .map(|(name, _)| name)
         .filter(|name| *name != "GH_TOKEN")
         .collect();
     handed.sort_unstable();
+    // Deduped like `read` below. A job with two steps could legitimately hand
+    // the same variable twice, and without this the comparison fails on the
+    // repeat rather than on anything either side got wrong.
+    handed.dedup();
 
     let script = repo_file(SCRIPT);
     let mut read: Vec<&str> = script

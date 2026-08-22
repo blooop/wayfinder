@@ -28,10 +28,20 @@ permissions:
   contents: read
 
 concurrency:
-  # Serialised, never cancelled: the reconciliation below is a search-then-act
-  # on the tracker, and two completions racing through it is exactly how "one
-  # open issue per workflow" becomes two. One fixed group — not keyed on the
-  # ref or the event — so every reconciliation queues behind the last.
+  # One fixed group — not keyed on the ref or the event — because the
+  # reconciliation below is a search-then-act on a single tracker issue, and
+  # two completions racing through it is exactly how "one open issue per
+  # workflow" becomes two. `cancel-in-progress: false` keeps the reconciliation
+  # that is already running.
+  #
+  # What this does *not* buy, stated exactly, because the obvious reading is
+  # wrong: reconciliations do not all queue up behind each other. GitHub holds
+  # at most one pending run per group, so a third completion arriving while one
+  # runs and one waits cancels the *waiting* one. That is survivable here, and
+  # only here: the run being cancelled is never the newest, and reconciliation
+  # converges on the current state rather than appending to a log — so the
+  # newest completion always gets its say, and what a burst loses is at most an
+  # interim "Still red" comment.
   group: red-run-alert
   cancel-in-progress: false
 
@@ -46,11 +56,22 @@ jobs:
     # blocks a pull request, so a red one is already holding the merge it
     # belongs to, and the scheduled re-solve is the single leg whose red means
     # devlaunch moved — the one nobody is otherwise summoned to.
+    #
+    # The head-repository clause comes first because it is the only one a fork
+    # cannot choose. A fork's default branch is `main`, so a fork pull request
+    # that adds a `pull_request:` leg to `live.yml` produces a run named `live`
+    # with `head_branch == 'main'` and a conclusion the fork's own code
+    # decides. That run reaches this job, which holds `issues: write` on *this*
+    # repo — and a forged `success` would not merely file noise, it would close
+    # a genuinely red summons. Guarding both legs rather than only the live one:
+    # `event == 'schedule'` is unforgeable today, but a guard that has to be
+    # re-derived per leg is a guard the next leg forgets.
     if: >-
-      (github.event.workflow_run.name == 'live'
-        && github.event.workflow_run.head_branch == 'main')
-      || (github.event.workflow_run.name == 'devlaunch contract'
-        && github.event.workflow_run.event == 'schedule')
+      github.event.workflow_run.head_repository.full_name == github.repository
+      && ((github.event.workflow_run.name == 'live'
+            && github.event.workflow_run.head_branch == 'main')
+        || (github.event.workflow_run.name == 'devlaunch contract'
+            && github.event.workflow_run.event == 'schedule'))
     runs-on: ubuntu-latest
     # Job-scoped and exhaustive: a job-level `permissions` replaces the
     # workflow-level one entirely, so the read the checkout needs is restated
@@ -65,8 +86,18 @@ jobs:
       # The decision logic lives in a script rather than in this block so that
       # `tests/red_run_alert.rs` can run it for real against a recording `gh`
       # stub — the create-vs-comment-vs-close behavior is asserted there, and
-      # the same test holds this env block and the script's reads to exactly
-      # match each other.
+      # the same test holds this env block and the script's reads to match in
+      # both directions: the key names against what the script actually reads,
+      # and each *expression* against the run it has to describe.
+      #
+      # That second half is the one worth stating. In a `workflow_run` run the
+      # context carries two runs — the watched one under
+      # `github.event.workflow_run`, and this alert's own under the bare
+      # `github.*` keys — so every variable below has to name the first.
+      # `${{ github.workflow }}` in place of the run's `name` is always
+      # `red-run alert`, which would quietly collapse both watched legs into a
+      # single summons titled for the alert itself; and `html_url` rather than
+      # `url`, because the summons points a human at a run page, not at JSON.
       - name: Reconcile the tracking issue
         env:
           GH_TOKEN: ${{ github.token }}

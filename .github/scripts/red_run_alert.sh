@@ -28,7 +28,27 @@ open_issue="$(gh issue list --repo "${REPO}" --state open --limit 100 \
   --json number,title \
   --jq ".[] | select(.title == \"${title}\") | .number" | head -n 1)"
 
-if [ "${CONCLUSION}" = failure ]; then
+# Red is defined by exclusion — everything that is not one of the three named
+# below — rather than as the single string `failure`. Three conclusions are not
+# red: a green run, and the two non-verdicts, cancelled and skipped, which are
+# evidence of neither red nor green. Every other conclusion GitHub can hand us
+# draws a red X on the Actions tab, and two of those are live on the watched
+# legs: `live.yml` declares no `timeout-minutes`, so the leg that asserts
+# wall-clock budgets overruns into `timed_out` rather than into a failing
+# assertion, and a workflow that stops parsing concludes `startup_failure`
+# before there is a step to fail. Matching on `failure` alone left both of
+# those summoning nobody, which is this workflow's whole subject reintroduced
+# one string comparison in.
+#
+# Naming the exclusions is also safe in a way that naming the inclusions is
+# not: a conclusion GitHub adds later summons somebody by default, and for a
+# leg whose entire point is noticing, that is the right way to be wrong.
+case "${CONCLUSION}" in
+  success | cancelled | skipped) red=false ;;
+  *) red=true ;;
+esac
+
+if [ "${red}" = true ]; then
   if [ -z "${open_issue}" ]; then
     gh issue create --repo "${REPO}" --title "${title}" \
       --body "A non-blocking run of \`${WORKFLOW_NAME}\` went red: ${RUN_URL}
@@ -39,10 +59,10 @@ Nothing blocks on this leg, so this issue is the summons. It is updated (not dup
       --body "Still red: ${RUN_URL}"
   fi
 else
-  # Green, and only green: the trigger's `types: [completed]` also delivers
-  # cancelled and skipped runs, and those are neither evidence of red nor of
-  # green — closing a summons on a cancelled run would withdraw it on no
-  # evidence at all.
+  # Green, and only green, withdraws the summons. The `else` above also holds
+  # the two non-verdicts, and closing on a cancelled run would withdraw a
+  # summons on no evidence at all — so the close is guarded by `success`
+  # itself rather than by "not red".
   if [ "${CONCLUSION}" = success ] && [ -n "${open_issue}" ]; then
     gh issue close "${open_issue}" --repo "${REPO}" \
       --comment "Green again: ${RUN_URL}"
