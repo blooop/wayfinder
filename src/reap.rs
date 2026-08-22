@@ -399,6 +399,56 @@ pub fn doomed(verdicts: &[Verdict]) -> Vec<&Verdict> {
         .collect()
 }
 
+/// Re-apply the running guard to the doomed set, against a listing taken
+/// *after* the plan was answered and immediately before the first removal.
+///
+/// The guard in [`plan`] reads the listing [`run`] opened with, and the y/N
+/// prompt then blocks for as long as the human takes — so "not running" is a
+/// fact about a moment arbitrarily far in the past by the time anything is
+/// deleted. `dl` re-checks *unsaved work* at `rm` time (that refusal is
+/// load-bearing, see [`remove`]); nothing downstream re-checks *running*, so
+/// this does, and a row that became running in the window is kept and named
+/// like any other keeping arm rather than torn down on a stale reading (#186).
+///
+/// Only the running bit is re-read — deliberately not the tracker facts. The
+/// plan the human approved is the plan that runs; a tracker that moved during
+/// the prompt changes what a *next* reap would say, not what this one was
+/// authorised to do. The container check is different in kind: it protects a
+/// live session, the one thing on this path that cannot be re-fetched after
+/// the fact.
+///
+/// A doomed row *absent* from the fresh listing still goes: "it does not
+/// exist" is `dl`'s answer to give at `rm` time, in `dl`'s own words.
+///
+/// Generic over the doomed set's element because the two deleting paths carry
+/// different ones — [`run`] a `&Verdict`, [`cleanup`] a [`Cleared`] — and this
+/// guard must be the same guard on both; `id` says where an element keeps its
+/// workspace id.
+fn recheck_running<T>(
+    going: Vec<T>,
+    fresh: &[Workspace],
+    id: impl Fn(&T) -> &str,
+) -> (Vec<T>, Vec<Verdict>) {
+    let running: BTreeSet<&str> = fresh
+        .iter()
+        .filter(|w| w.is_running())
+        .map(|w| w.id.as_str())
+        .collect();
+    let mut still = Vec::new();
+    let mut spared = Vec::new();
+    for row in going {
+        if running.contains(id(&row)) {
+            spared.push(Verdict::Keep {
+                id: id(&row).to_string(),
+                reason: "started running since the plan — stop it first".to_string(),
+            });
+        } else {
+            still.push(row);
+        }
+    }
+    (still, spared)
+}
+
 /// What one linked PR says about whether its node is still alive — reap's
 /// projection of the badge reading, not a second reading of the tracker.
 ///
@@ -1371,6 +1421,22 @@ pub async fn run(yes: bool, insist: bool) -> Result<()> {
         }
     }
 
+    // The plan's running guard read a listing that is now as old as the human
+    // took to answer, so it is re-taken here — after the answer, before the
+    // first removal — and a doomed row whose container came up in the window
+    // is spared and named (#186). A listing that cannot be re-taken fails the
+    // whole command: `wf` gone blind between plan and removal must not delete
+    // on the reading it had while it could still see.
+    let fresh = self::workspaces().await?;
+    let (going, spared) = recheck_running(going, &fresh, |v| v.id());
+    for keep in &spared {
+        emit(&format!("  keep  {}  ({})\n", keep.id(), keep.reason()));
+    }
+    if going.is_empty() {
+        emit("nothing to reap\n");
+        return Ok(());
+    }
+
     // One at a time, reporting each: `dl <ws> rm` tears down a container, and a
     // failure part-way through leaves a set the next run has to be able to make
     // sense of. Failures are collected rather than propagated at the first one,
@@ -1442,6 +1508,17 @@ pub async fn cleanup(scope: &BTreeSet<Node>) -> Result<()> {
         ),
         Cleanup::Proceed { going, kept } => (going, kept),
     };
+
+    // The same recheck [`run`] makes, for the same window one size smaller:
+    // between the listing the decision read and the first removal sit the
+    // tracker round-trip and the decision itself, and a session started there
+    // is a live container. Kept as an ordinary keep, not an abort — a running
+    // container of a finished ticket already is one (see [`decide`]) — and it
+    // ends green for the reason the unpushed-work keep does: nothing about it
+    // says the run's reading went wrong (#186).
+    let fresh = self::workspaces().await?;
+    let (going, spared) = recheck_running(going, &fresh, Cleared::id);
+    let kept: Vec<Verdict> = kept.into_iter().chain(spared).collect();
 
     // What stayed, before what goes, for the reason [`run`] prints its plan in
     // that order: the workspace somebody expected to be collected and that was
@@ -2465,6 +2542,56 @@ mod tests {
                 reason: "still running — stop it first".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn a_doomed_workspace_that_started_running_during_the_prompt_is_kept_and_named() {
+        // The TOCTOU this closes (#186): the plan read "not running" from the
+        // listing `run` opened with, and the y/N prompt then blocked for as
+        // long as the human took. A session started in that window is a live
+        // container the stale plan would tear down.
+        let doomed = Verdict::Reap {
+            id: "wf-129".to_string(),
+            reason: "wayfinder#129 is closed".to_string(),
+        };
+        let mut fresh = workspace("wf-129", "blooop/wayfinder", "wayfinder/wayfinder-129");
+        fresh.state = Some("Running".to_string());
+        let (going, spared) = recheck_running(vec![&doomed], &[fresh], |v| v.id());
+        assert!(going.is_empty(), "a row that became running never goes");
+        assert_eq!(
+            spared,
+            vec![Verdict::Keep {
+                id: "wf-129".to_string(),
+                reason: "started running since the plan — stop it first".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_doomed_workspace_still_down_when_the_prompt_answers_still_goes() {
+        let doomed = Verdict::Reap {
+            id: "wf-129".to_string(),
+            reason: "wayfinder#129 is closed".to_string(),
+        };
+        let fresh = workspace("wf-129", "blooop/wayfinder", "wayfinder/wayfinder-129");
+        let (going, spared) = recheck_running(vec![&doomed], &[fresh], |v| v.id());
+        assert_eq!(going, vec![&doomed]);
+        assert!(spared.is_empty());
+    }
+
+    #[test]
+    fn a_doomed_workspace_gone_from_the_fresh_listing_still_goes_to_dl() {
+        // A workspace removed by hand while the prompt waited. "It does not
+        // exist" is `dl`'s answer to give at `rm` time, in `dl`'s words —
+        // inventing a keep for it here would report a workspace as protected
+        // that is in fact gone.
+        let doomed = Verdict::Reap {
+            id: "wf-129".to_string(),
+            reason: "wayfinder#129 is closed".to_string(),
+        };
+        let (going, spared) = recheck_running(vec![&doomed], &[], |v| v.id());
+        assert_eq!(going, vec![&doomed]);
+        assert!(spared.is_empty());
     }
 
     /// One repo's batch, shaped exactly like the live one: seven aliased
@@ -3525,6 +3652,49 @@ mod tests {
         run.touched_no_files();
     }
 
+    #[test]
+    fn a_workspace_that_started_running_while_the_prompt_waited_is_spared() {
+        // The TOCTOU end to end (#186). The first listing dooms
+        // `wf-129-closed`; by the time the plan is confirmed, a session has
+        // started in it — the second listing is the same machine with that one
+        // state changed. Before the fix this run removed a live container on
+        // the strength of the first read.
+        let relisted = crate::probe::DL_LISTING.replacen(
+            r#""branch":"wayfinder/wayfinder-129","state":"Stopped""#,
+            r#""branch":"wayfinder/wayfinder-129","state":"Running""#,
+            1,
+        );
+        assert_ne!(
+            relisted,
+            crate::probe::DL_LISTING,
+            "the fixture no longer says what this test edits"
+        );
+        let run = crate::probe::record_relisted(
+            "reap::tests::reap_run_probe",
+            crate::probe::DL_LISTING,
+            &relisted,
+            crate::probe::GH_FACTS,
+        );
+        // Green, not an error: a workspace protected by its own container is
+        // the guard working, and the human already read a plan that named it.
+        assert_eq!(
+            run.printed(),
+            ["the reap finished"],
+            "the run ended green: {}",
+            run.stdout
+        );
+        run.destroyed_nothing();
+        // Named as a keep, in the recheck's own words — the human approved a
+        // deletion that then did not happen, and a silent sparing reads as a
+        // reap that lied about what it did.
+        assert!(
+            run.stdout
+                .contains("keep  wf-129-closed  (started running since the plan — stop it first)"),
+            "the spared row is named: {}",
+            run.stdout
+        );
+    }
+
     /// The autonomous cleanup taken for real, scoped to `wayfinder#129` — the
     /// one node of [`probe::DL_LISTING`](crate::probe::DL_LISTING) whose ticket
     /// is closed, standing in for the ticket a run just drove to done.
@@ -3661,6 +3831,48 @@ mod tests {
             run.stdout.matches("wf-129-closed").count(),
             1,
             "and said it once, as that row: {}",
+            run.stdout
+        );
+    }
+
+    #[test]
+    fn a_finished_workspace_that_started_running_before_collection_is_kept() {
+        // The same window as the interactive sibling above, on the unattended
+        // path: between the listing the decision read and the first removal
+        // sit the tracker round-trip and the decision itself, and a session
+        // started in that window is a live container. Narrower than a prompt,
+        // but the same shape (#186).
+        let relisted = crate::probe::DL_LISTING.replacen(
+            r#""branch":"wayfinder/wayfinder-129","state":"Stopped""#,
+            r#""branch":"wayfinder/wayfinder-129","state":"Running""#,
+            1,
+        );
+        assert_ne!(
+            relisted,
+            crate::probe::DL_LISTING,
+            "the fixture no longer says what this test edits"
+        );
+        let run = crate::probe::record_relisted(
+            "reap::tests::cleanup_probe",
+            crate::probe::DL_LISTING,
+            &relisted,
+            crate::probe::GH_FACTS,
+        );
+        // Green, like the unpushed-work keep: a workspace protected by its own
+        // container is the ordinary ending of a run whose session is still up,
+        // not a surprise to stop the step for.
+        assert_eq!(
+            run.printed(),
+            ["the cleanup finished"],
+            "the run ended green: {}",
+            run.stdout
+        );
+        run.destroyed_nothing();
+        assert!(
+            run.stdout.contains(
+                "kept     wf-129-closed  (started running since the plan — stop it first)"
+            ),
+            "the kept row is named: {}",
             run.stdout
         );
     }
