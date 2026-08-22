@@ -1,10 +1,11 @@
 //! The devcontainer prebuild contract (#150).
 //!
 //! Offline by design, like `skill_docs.rs` and for the same reason: the seam is
-//! the config text itself. What a workspace boots from, and what the publishing
-//! workflow is allowed to write to, are promises made in two files that no
-//! compiler reads — so they are asserted here rather than discovered by a cold
-//! `devpod up` on somebody's laptop.
+//! the config text itself. What a workspace boots from, what the image has to
+//! carry for a workspace to be usable, and what the publishing workflow is
+//! allowed to write to, are promises made in three files that no compiler reads
+//! — so they are asserted here rather than discovered by a cold `devpod up` on
+//! somebody's laptop.
 
 use serde_json::Value;
 
