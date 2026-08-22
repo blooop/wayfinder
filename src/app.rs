@@ -1469,6 +1469,7 @@ mod tests {
             Map {
                 title: "Map: wf".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: vec![
                     ticket(
                         "blooop/wayfinder",
@@ -1510,6 +1511,7 @@ mod tests {
             Map {
                 title: "Map: dotfiles".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: vec![ticket(
                     "blooop/dotfiles",
                     103,
@@ -1530,6 +1532,7 @@ mod tests {
             Map {
                 title: format!("Map: {repo}"),
                 last_activity: stamp.map(|s| Activity::parse(s).expect("fixture stamp parses")),
+                truncated: false,
                 tickets: vec![ticket(repo, 1, "only ticket", open, false, vec![])],
             },
         )
@@ -1719,6 +1722,7 @@ mod tests {
                     ticket(PROJECT, 1, "takeable", true, false, vec![]),
                     ticket(PROJECT, 2, "finished", false, false, vec![]),
                 ],
+                truncated: false,
             },
         )])
     }
@@ -1780,6 +1784,7 @@ mod tests {
             Map {
                 title: "Map: late arrival".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: vec![ticket(PROJECT, 200, "zzz sleeper", true, false, vec![])],
             },
         );
@@ -1816,6 +1821,7 @@ mod tests {
                     Activity::parse("2026-08-07T00:00:00Z").expect("fixture stamp parses"),
                 ),
                 tickets: vec![ticket(PROJECT, 200, "breadwinner", true, false, vec![])],
+                truncated: false,
             },
         );
         app.replace_clusters(fresher);
@@ -1931,6 +1937,7 @@ mod tests {
             Map {
                 title: "Map: wf".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: vec![
                     ticket("blooop/wayfinder", 6, "root", true, false, vec![]),
                     ticket("blooop/wayfinder", 7, "dep a", true, false, vec![6]),
@@ -1963,6 +1970,7 @@ mod tests {
             Map {
                 title: "Map: endgame".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: vec![
                     ticket("blooop/bencher", 1, "done", false, false, vec![]),
                     ticket("blooop/bencher", 10, "root, chained", true, false, vec![]),
@@ -2100,6 +2108,7 @@ mod tests {
             Map {
                 title: "Map: endgame".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: vec![
                     ticket("blooop/bencher", 1069, "root", true, false, vec![]),
                     ticket(
@@ -2505,6 +2514,7 @@ mod tests {
                 Map {
                     title: format!("Map: {map_number}"),
                     last_activity: None,
+                    truncated: false,
                     tickets: vec![ticket(
                         "blooop/wayfinder",
                         6,
@@ -3317,6 +3327,7 @@ mod tests {
                 Map {
                     title: "Map: the spine".to_string(),
                     last_activity: None,
+                    truncated: false,
                     tickets: vec![t],
                 },
             );
@@ -3420,6 +3431,7 @@ mod tests {
             Map {
                 title: "Map: wf".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: vec![ticket("blooop/wayfinder", 6, "t6", true, false, vec![])],
             },
         );
@@ -3428,6 +3440,7 @@ mod tests {
             Map {
                 title: "Map: selection view".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: vec![ticket("blooop/wayfinder", 50, "t50", true, false, vec![])],
             },
         );
@@ -3436,6 +3449,7 @@ mod tests {
             Map {
                 title: "Map: dotfiles".to_string(),
                 last_activity: None,
+                truncated: false,
                 tickets: vec![ticket("blooop/dotfiles", 103, "t103", true, false, vec![])],
             },
         );
@@ -3456,6 +3470,7 @@ mod tests {
                 Map {
                     title: "Map: dotfiles".to_string(),
                     last_activity: None,
+                    truncated: false,
                     tickets: vec![ticket(
                         &format!("{owner}/dotfiles"),
                         5,

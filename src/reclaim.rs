@@ -383,7 +383,7 @@ mod tests {
     }
 
     /// Every arm of `NodeFact`, so the table below cannot quietly stop covering
-    /// one when a seventh is added — the match makes that a compile error.
+    /// one when an eighth is added — the match makes that a compile error.
     fn every_node_fact() -> Vec<NodeFact> {
         let all = vec![
             NodeFact::Closed,
@@ -392,6 +392,7 @@ mod tests {
             NodeFact::InFlight { pr: 99 },
             NodeFact::Claimed,
             NodeFact::Unstarted,
+            NodeFact::RollupTruncated,
         ];
         for fact in &all {
             match fact {
@@ -400,7 +401,8 @@ mod tests {
                 | NodeFact::Superseded { .. }
                 | NodeFact::InFlight { .. }
                 | NodeFact::Claimed
-                | NodeFact::Unstarted => {}
+                | NodeFact::Unstarted
+                | NodeFact::RollupTruncated => {}
             }
         }
         all

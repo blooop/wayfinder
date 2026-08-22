@@ -1138,6 +1138,7 @@ mod tests {
         Map {
             title: "Map: fixture".to_string(),
             last_activity: None,
+            truncated: false,
             tickets,
         }
     }
@@ -1472,6 +1473,7 @@ mod tests {
         let m = Map {
             title: "Map: fixture".to_string(),
             last_activity: None,
+            truncated: false,
             tickets: vec![
                 ticket(6, true, false, vec![]),
                 ticket(7, true, false, vec![999]),
@@ -1614,6 +1616,7 @@ mod tests {
         let m = Map {
             title: "Map: fixture".to_string(),
             last_activity: None,
+            truncated: false,
             tickets: vec![
                 ticket(6, true, false, vec![]),
                 ticket(7, true, false, vec![999]),
