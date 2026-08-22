@@ -15,9 +15,29 @@
 //! attribute, which no run of the tests can notice — the failure is precisely
 //! that they run when they should not, or never run at all.
 //!
+//! **Enrolment is the other half of the same promise (#189), and it lives here
+//! too.** The attribute decides whether a test runs in the default set; a line
+//! in a workflow decides whether the binary holding it is ever run at all, and
+//! that half was prose in AGENTS.md handed back to whoever wrote the test. It
+//! failed the same way and worse: a `tests/foo.rs` with no `live_` prefix wants
+//! no `#[ignore]`, compiles under `ci.yml`'s `--no-run` step, and is selected
+//! by no workflow — run by nothing and flagged by nothing, a whole binary of
+//! assertions rather than one test. "An assertion nothing runs is not an
+//! assertion" is the rule this repo closes everywhere else; this is that hole
+//! one meta-level up, and it is the same kind of invisible-to-a-test-run
+//! failure as the attribute, so it is read off the same kind of text.
+//!
 //! This binary is deliberately not named `live_*`. It is not a live test, and
 //! under that glob the walk below would walk itself and demand its own gating,
 //! which would gate the guard out of the run it exists to guard.
+//!
+//! Two things follow from guarding enrolment in a binary that is itself
+//! enrolled. It reports its own orphaning, which is worth nothing — an
+//! unenrolled `offline_green` is a guard nothing runs, and only `ci.yml`'s step
+//! makes it say so. And every guard here is preventive: on a clean tree they
+//! all pass, so each was proved against the tree state it exists to reject
+//! before being trusted, and the ones that could be pinned on constructed text
+//! rather than on the real files are.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -31,8 +51,12 @@ use std::path::PathBuf;
 /// Top-level `tests/live_*.rs` files only, and that scope is load-bearing: the
 /// tests compiled in through `mod common;` are deliberately unignored (they
 /// are the offline fixture diagnostics), and a directory-style target
-/// (`tests/live_x/main.rs`) would sit outside this walk — adding one means
-/// teaching this function to descend, or the guard goes quietly blind to it.
+/// (`tests/live_x/main.rs`) sits outside this walk — adding one means teaching
+/// this function to descend, or the guard goes quietly blind to it. That last
+/// is no longer left to whoever adds one:
+/// `no_live_binary_hides_from_the_ignore_walk_in_the_directory_form` compares
+/// this walk against every target cargo actually builds and fails on the
+/// difference, so the blind spot is a red run rather than a comment.
 fn live_sources() -> Vec<(String, String)> {
     let tests = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"));
     let mut sources: Vec<(String, String)> = std::fs::read_dir(&tests)
