@@ -155,6 +155,38 @@ impl Session {
     }
 }
 
+/// A scratch path in the same directory as `path`, for a write that will be
+/// renamed over it.
+///
+/// Same directory on purpose: a rename is only atomic within one filesystem,
+/// and a temp directory elsewhere would silently degrade to copy-then-replace —
+/// exactly the torn write this seam exists to remove. Hidden, so a cache
+/// directory does not visibly grow scratch files while a save is in flight.
+///
+/// # Errors
+///
+/// A path with no file name — a directory, or a root — which is not something
+/// a cache can be saved to.
+fn scratch_beside(path: &Path) -> Result<PathBuf> {
+    /// Distinguishes two saves *within* one process. The pid alone separates
+    /// instances; the picker also saves from a discovery task while the launch
+    /// path may be saving from the main thread.
+    static SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let name = path.file_name().with_context(|| {
+        format!(
+            "{} is not a file the cache can be written to",
+            path.display()
+        )
+    })?;
+    let nth = SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(path.with_file_name(format!(
+        ".{}.{}.{nth}.tmp",
+        name.to_string_lossy(),
+        std::process::id()
+    )))
+}
+
 /// Now, in seconds since the Unix epoch — `0` on a clock set before it, which
 /// no ordering can do anything sensible with anyway and which sorts as the
 /// oldest known use rather than as unknown.
@@ -240,6 +272,25 @@ impl ProjectsCache {
 
     /// Persist the cache, creating parent directories as needed.
     ///
+    /// **Written beside and renamed over**, never into the file itself, because
+    /// several writers share this path and `load_or_default` cannot tell a torn
+    /// read from a corrupt file. Truncate-then-write left a window in which
+    /// another `wf` — the discovery task, a launch handing over, a second
+    /// instance — loaded the empty default, and *its* next save wrote that
+    /// emptiness back over every checkout, seed and session on the machine. A
+    /// rename within one directory is atomic, so a reader sees the whole
+    /// previous registry or the whole new one and there is no third answer.
+    ///
+    /// The temp name carries the writing process and a counter within it, so
+    /// two savers racing cannot land on the same scratch file and hand each
+    /// other half a registry through it.
+    ///
+    /// What this deliberately does *not* buy is durability across a crash:
+    /// there is no `fsync` before the rename, so a machine that loses power
+    /// mid-save may come back to either version. That is the right trade for a
+    /// cache whose whole cost of loss is re-opening each project once, and
+    /// paying for it would put a disk flush on the path to the first frame.
+    ///
     /// # Errors
     ///
     /// An unwritable cache directory or file. The counterpart
@@ -252,7 +303,15 @@ impl ProjectsCache {
                 .with_context(|| format!("creating cache dir {}", dir.display()))?;
         }
         let json = serde_json::to_vec_pretty(self)?;
-        std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+        let temp = scratch_beside(path)?;
+        std::fs::write(&temp, json).with_context(|| format!("writing {}", temp.display()))?;
+        if let Err(err) = std::fs::rename(&temp, path) {
+            // Leaving the scratch file behind would litter a cache directory
+            // nobody ever cleans, and the failure being reported is the rename.
+            std::fs::remove_file(&temp).ok();
+            return Err(err).with_context(|| format!("replacing {}", path.display()));
+        }
+        Ok(())
     }
 
     /// Register (or refresh) a touched checkout. Sorted by path so the
@@ -533,6 +592,113 @@ mod tests {
         let loaded = ProjectsCache::load_or_default(&file);
         assert_eq!(loaded, cache);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A registry big enough that a truncate-then-write is observably torn: a
+    /// reader that lands inside the window sees an empty or half-parsed file,
+    /// which [`ProjectsCache::load_or_default`] reports as "no projects at
+    /// all".
+    fn a_crowded_registry() -> ProjectsCache {
+        let mut cache = ProjectsCache::default();
+        for i in 0..500 {
+            cache.register(
+                p(&format!("/data/proj/checkout-{i}")),
+                format!("blooop/r{i}"),
+            );
+        }
+        cache
+    }
+
+    #[test]
+    fn a_reader_in_another_instance_never_sees_a_half_written_registry() {
+        // The loss this guards against is total, not partial: a torn read
+        // parses as corrupt, loads as empty, and that instance's next save
+        // writes the empty registry back over every checkout, seed and session
+        // on the machine. So the claim is not "rarely torn" but "never": a
+        // reader only ever sees a whole registry, whatever a writer is doing.
+        let dir = std::env::temp_dir().join(format!("wf-test-torn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("projects.json");
+        let cache = a_crowded_registry();
+        let expected = cache.checkouts.len();
+        cache.save(&file).expect("seed");
+
+        let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer = {
+            let (file, writing) = (file.clone(), std::sync::Arc::clone(&writing));
+            std::thread::spawn(move || {
+                for _ in 0..150 {
+                    cache.save(&file).expect("save");
+                }
+                writing.store(false, std::sync::atomic::Ordering::Release);
+            })
+        };
+        let mut torn = 0;
+        let mut reads = 0;
+        while writing.load(std::sync::atomic::Ordering::Acquire) {
+            reads += 1;
+            if ProjectsCache::load_or_default(&file).checkouts.len() != expected {
+                torn += 1;
+            }
+        }
+        writer.join().expect("writer");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            reads > 0,
+            "the reader never got a turn, so nothing was tested"
+        );
+        assert_eq!(
+            torn, 0,
+            "{torn} of {reads} reads saw a registry that was not there"
+        );
+    }
+
+    #[test]
+    fn a_save_replaces_the_file_rather_than_rewriting_it_in_place() {
+        // The deterministic half of the claim above, and the reason it holds:
+        // the old file is never opened for writing, so a reader already
+        // holding it keeps reading the whole previous registry until it lets
+        // go. A hard link stands in for that reader.
+        let dir = std::env::temp_dir().join(format!("wf-test-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("projects.json");
+        let mut before = ProjectsCache::default();
+        before.register(p("/data/proj/wayfinder"), "blooop/wayfinder".to_string());
+        before.save(&file).expect("save");
+
+        let held = dir.join("held-open.json");
+        std::fs::hard_link(&file, &held).expect("hard link");
+        let mut after = before.clone();
+        after.register(p("/data/k1/kinisi_ros"), "kinisi/kinisi_ros".to_string());
+        after.save(&file).expect("save");
+
+        assert_eq!(ProjectsCache::load_or_default(&file), after);
+        assert_eq!(
+            ProjectsCache::load_or_default(&held),
+            before,
+            "the previous registry was overwritten under a reader still holding it"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_save_leaves_nothing_behind_beside_the_cache() {
+        // The temp file a save writes through is an implementation detail of
+        // this seam and must not become litter in a cache directory nobody
+        // ever cleans.
+        let dir = std::env::temp_dir().join(format!("wf-test-litter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("projects.json");
+        let mut cache = ProjectsCache::default();
+        cache.register(p("/data/proj/wayfinder"), "blooop/wayfinder".to_string());
+        cache.save(&file).expect("save");
+        cache.save(&file).expect("save again");
+        let left: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(left, vec![file]);
     }
 
     #[test]
