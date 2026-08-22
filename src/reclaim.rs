@@ -70,16 +70,37 @@ const POINTER: &str = " — wf reap";
 /// tells two workspaces of one project apart. The tail therefore gets the odd
 /// character when the budget is odd.
 fn abbreviate(id: &str, max: usize) -> String {
-    let len = id.chars().count();
-    if len <= max {
+    if crate::cols(id) <= max {
         return id.to_string();
     }
     let keep = max.saturating_sub(1);
     let tail = keep.div_ceil(2);
-    let head = keep - tail;
-    let front: String = id.chars().take(head).collect();
-    let back: String = id.chars().skip(len - tail).collect();
+    let front = clip(id.chars(), keep - tail);
+    // Taken from the back, then put back in reading order.
+    let back: String = clip(id.chars().rev(), tail).chars().rev().collect();
     format!("{front}…{back}")
+}
+
+/// As much of `chars` as fits `budget` columns, in the order given.
+///
+/// Columns and not chars, because the only budget in this module is a line's
+/// leftover width: a wide char that only half fits is a char that does not
+/// fit, and a slice taken by count is one that overruns the segments beside
+/// it. Stopping a column short of an odd budget is the right answer — there is
+/// no half-column to spend it on.
+fn clip(chars: impl Iterator<Item = char>, budget: usize) -> String {
+    let mut buf = [0u8; 4];
+    let mut out = String::new();
+    let mut spent = 0;
+    for ch in chars {
+        let width = crate::cols(ch.encode_utf8(&mut buf));
+        if spent + width > budget {
+            break;
+        }
+        spent += width;
+        out.push(ch);
+    }
+    out
 }
 
 /// What a reap would claim, ready to say on one line.
@@ -155,11 +176,14 @@ impl Reclaimable {
     /// much yielding is enough. Below it the reader gets `· 2 reclaima`, which
     /// is not a word.
     pub fn min_width(&self) -> usize {
-        format!("· {} reclaimable", self.ids.len()).chars().count()
+        crate::cols(&format!("· {} reclaimable", self.ids.len()))
     }
 
-    /// The count-line segment, in `width` characters: how many, which ones,
-    /// and what to type.
+    /// The count-line segment, in `width` columns of terminal: how many, which
+    /// ones, and what to type. Columns rather than characters throughout —
+    /// [`cols`](crate::cols) is the only metric in here — because a workspace
+    /// id is whatever `dl` listed and this segment goes last on a shared line,
+    /// so its overrun is the one that falls off the right edge.
     ///
     /// The warned count is a parenthesised aside so the leading number cannot
     /// be read as including it — the whole point of the `Warn` arm is that
@@ -200,7 +224,7 @@ impl Reclaimable {
             0 => String::new(),
             n => format!(" (+{n} to check by hand)"),
         };
-        let fixed = head.chars().count() + aside.chars().count() + POINTER.chars().count();
+        let fixed = crate::cols(&head) + crate::cols(&aside) + crate::cols(POINTER);
         // ": " is the cost of naming anything at all.
         let room = width.saturating_sub(fixed + 2);
         let say = |names: &str| format!("{head}: {names}{aside}{POINTER}");
@@ -212,7 +236,7 @@ impl Reclaimable {
                 spelt.push(format!("+{} more", self.ids.len() - count));
             }
             let names = spelt.join(", ");
-            if names.chars().count() <= room {
+            if crate::cols(&names) <= room {
                 return say(&names);
             }
         }
@@ -223,7 +247,7 @@ impl Reclaimable {
             1 => String::new(),
             n => format!(", +{} more", n - 1),
         };
-        let left = room.saturating_sub(rest.chars().count());
+        let left = room.saturating_sub(crate::cols(&rest));
         if left >= READABLE {
             return say(&format!("{}{rest}", abbreviate(&self.ids[0], left)));
         }
@@ -235,11 +259,11 @@ impl Reclaimable {
         // *neighbouring* segments of the count line.
         for tail in [format!("{aside}{POINTER}"), POINTER.to_string()] {
             let line = format!("{head}{tail}");
-            if line.chars().count() <= width {
+            if crate::cols(&line) <= width {
                 return line;
             }
         }
-        head.chars().take(width).collect()
+        clip(head.chars(), width)
     }
 }
 
@@ -671,10 +695,10 @@ mod tests {
                 for width in 0..=140 {
                     let hint = found.hint(width);
                     assert!(
-                        hint.chars().count() <= width,
+                        crate::cols(&hint) <= width,
                         "{count} ids, {warned} warned, width {width}: {hint:?} is \
-                         {} characters",
-                        hint.chars().count()
+                         {} columns",
+                        crate::cols(&hint)
                     );
                 }
             }
@@ -704,7 +728,27 @@ mod tests {
         assert_eq!(abbreviate("devlaunch-wayfinder-127", 12), "devla…er-127");
         for max in 2..30 {
             let out = abbreviate("devlaunch-github-com-blooop-wayfinder-127", max);
-            assert_eq!(out.chars().count(), max, "{max}: {out}");
+            assert_eq!(crate::cols(&out), max, "{max}: {out}");
+        }
+    }
+
+    /// `max` is columns, because the only caller is spending a line's leftover
+    /// width. A wide char is one char and two columns, so a name fitted by
+    /// counting chars is a name that overruns — and this segment goes last on
+    /// the count line, so its overrun is the one that falls off the edge. The
+    /// budget is never overspent, and each end gives up at most one column —
+    /// a two-column char cannot half-fill the last column of an odd split, and
+    /// stopping a column short is right where spilling over is not.
+    #[test]
+    fn abbreviating_spends_the_budget_in_columns_not_characters() {
+        let id = "工作区-github-com-blooop-测试仓库-127";
+        for max in 2..30 {
+            let out = abbreviate(id, max);
+            assert!(crate::cols(&out) <= max, "{max}: {out:?} overruns");
+            assert!(
+                crate::cols(&out) + 2 >= max,
+                "{max}: {out:?} gives up more than the two ends can waste"
+            );
         }
     }
 

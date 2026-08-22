@@ -737,23 +737,23 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// A centered box `width`×`height` (clamped) inside `area`.
 /// A popup's outer width: the widest body row or the border title, whichever
 /// is wider, plus the frame around them. Both are measured in *display
-/// columns* — the same metric ratatui renders in — because GitHub titles are
-/// arbitrary text and a CJK or emoji title is one char, two columns: measured
-/// in chars (or worse, bytes) the border clipped its own title. This is the
-/// one place a popup is measured, so the two pickers cannot drift back onto
-/// two conventions.
+/// columns* — [`cols`](crate::cols) for the title, and `Line::width` for a
+/// row, which is the same table summed over the row's spans — because GitHub
+/// titles are arbitrary text and a CJK or emoji title is one char, two
+/// columns: measured in chars (or worse, bytes) the border clipped its own
+/// title. This is the one place a popup is measured, so the two pickers cannot
+/// drift back onto two conventions.
+///
+/// A popup with no body rows is as wide as its title, which is why there is no
+/// fallback width: the title is always there to fall back *to*.
 fn popup_width(lines: &[Line<'_>], title: &str) -> u16 {
-    lines
-        .iter()
-        .map(|l| l.width() as u16 + 4)
-        .chain(std::iter::once(Span::raw(title).width() as u16 + 4))
-        .max()
-        .unwrap_or(40)
+    let body = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+    body.max(crate::cols(title) as u16) + 4
 }
 
+/// A centered box `width`×`height` (clamped) inside `area`.
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let [area] = Layout::horizontal([Constraint::Length(width.min(area.width))])
         .flex(Flex::Center)
@@ -999,12 +999,18 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     // workspace id is ~40 characters and there can be three of them. It goes
     // last and takes what the rest of the line has left, which is why the rest
     // of the line is measured first.
-    // Everything is measured in display columns — `Span::raw(..).width()`, the
-    // metric ratatui renders in — never chars: the notice and the stall names
-    // carry ticket titles, which are arbitrary text, and a CJK char measured
-    // as one char occupies two columns, so a char count hands the reclaim note
-    // columns the line does not have and the tail falls off the right edge.
-    let cols = |text: &str| Span::raw(text).width();
+    // Every width on this line is display columns — `crate::cols`, the same
+    // table ratatui renders with — never chars: a CJK char is one char and two
+    // columns, so a char count hands the reclaim note columns the line does
+    // not have and the tail falls off the right edge. The notice carries
+    // ticket titles, a stall name carries a repo name, and a reclaim id is
+    // whatever `dl` listed — all of it arbitrary text.
+    //
+    // The convention does not stop at this arithmetic: the two segments that
+    // *fit themselves* to what is left — `Liveness::hint` and
+    // `Reclaimable::hint` — measure in the same columns, which is why the
+    // budgets handed to them below mean what they say.
+    let cols = crate::cols;
     let spent =
         cols(&counts) + 2 + parts.iter().map(|part| cols(part) + 1).sum::<usize>() + cols(&notice);
     let mut left = (count_area.width as usize).saturating_sub(spent);
@@ -1694,6 +1700,41 @@ mod tests {
                     assert!(
                         !inner.trim_end().ends_with(fragment),
                         "{width}: {whole:?} was clipped to {fragment:?}: {:?}",
+                        inner.trim_end()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_stalled_name_does_not_clip_the_reclaim_note_beside_it() {
+        // The same claim as the fragment test above, against a repo name whose
+        // chars are two columns each. Stall names are laid down before the
+        // reclaim note and spend from the same budget, so a name measured in
+        // chars spends twice what it was given and the note pays: two of these
+        // plus a reclaimable set rendered `· 2 stalled: 测试仓库仓库#9, +1
+        // more · 2 recla`. Repo names come from GitHub, so this is input and
+        // not a hypothetical.
+        let mut app = fixture_app();
+        app.liveness = crate::liveness::Liveness::for_test(
+            &[],
+            &[("blooop/测试仓库仓库", 9), ("blooop/测试仓库仓库", 14)],
+        );
+        app.reclaimable = Some(Reclaimable::for_test(
+            &["devlaunch-github-blooop-wayfinder-127-ladepomi", "wf-80-x"],
+            1,
+        ));
+        for width in 40..=130u16 {
+            let screen = render_at(width, &app);
+            let line = screen.lines().nth(2).expect("a count line");
+            let inner: String = line.chars().skip(1).take(width as usize - 2).collect();
+            for whole in ["reclaimable", "stalled"] {
+                for cut in 1..whole.len() {
+                    assert!(
+                        !inner.trim_end().ends_with(&whole[..cut]),
+                        "{width}: {whole:?} was clipped to {:?}: {:?}",
+                        &whole[..cut],
                         inner.trim_end()
                     );
                 }
