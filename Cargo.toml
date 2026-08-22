@@ -83,3 +83,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
+# The same grapheme walk nucleo-matcher builds its haystacks with (it is
+# nucleo's own dependency): the filter has to segment identically to map the
+# grapheme indices nucleo reports back onto the chars the screen underlines by.
+unicode-segmentation = "1"

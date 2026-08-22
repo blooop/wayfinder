@@ -23,6 +23,7 @@ use std::fmt;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::model::{Map, Ticket};
 
@@ -64,6 +65,14 @@ fn haystack(ticket: &Ticket) -> String {
 ///
 /// A pattern of nothing but negations (`!bread`) lands on no characters at all,
 /// and vacuously passes: there is nothing there to be loose about.
+///
+/// Judged in *grapheme* space: `chars` is one codepoint per grapheme — the
+/// haystack exactly as nucleo matched it — and `indices` are nucleo's own.
+/// That is deliberate rather than incidental: judged against the raw chars, a
+/// decomposed accent (a combining mark is not alphanumeric) would open a word
+/// start in the middle of "naïve", and the loose match this rule exists to
+/// refuse would be back for exactly the titles this module was just taught to
+/// survive.
 fn tight(chars: &[char], indices: &[u32]) -> bool {
     let matched = |i: usize| indices.binary_search(&(i as u32)).is_ok();
     indices.iter().all(|&i| {
@@ -144,28 +153,70 @@ impl Query {
     /// project list that matched loosely would be the second matching
     /// vocabulary this rule exists to prevent.
     pub fn text(&mut self, text: &str) -> Option<(u32, Vec<usize>)> {
-        let (score, indices) = self.matched(text)?;
-        Some((score, indices.into_iter().map(|i| i as usize).collect()))
+        self.matched(text)
     }
 
-    /// The pattern against one haystack: the score and the char indices it
+    /// The pattern against one haystack: the score and the *char* indices it
     /// landed on, sorted, unique and tight — or `None`. The one place a match
     /// is decided, so [`Query::hit`] and [`Query::text`] cannot come to differ
-    /// about what counts as one.
-    fn matched(&mut self, hay: &str) -> Option<(u32, Vec<u32>)> {
+    /// about what counts as one — and the one boundary where nucleo's indices
+    /// are translated into the screen's, so nowhere else has to know they were
+    /// ever anything but char indices.
+    ///
+    /// Nucleo matches one codepoint per grapheme (its `Utf32Str::new` keeps
+    /// only the first), so the indices it reports are *grapheme* indices. The
+    /// haystack is segmented here rather than by `Utf32Str::new` for a second
+    /// reason: that constructor falls back to matching the raw *bytes*
+    /// whenever every grapheme's first codepoint is ASCII — a decomposed
+    /// accent takes exactly that path — and byte indices past the accent point
+    /// past the end of the chars they are supposed to name, which was an
+    /// out-of-bounds panic in the tightness check, not merely a skewed
+    /// underline.
+    fn matched(&mut self, hay: &str) -> Option<(u32, Vec<usize>)> {
+        self.buf.clear();
+        self.buf.extend(
+            hay.graphemes(true)
+                .map(|g| g.chars().next().expect("graphemes are non-empty")),
+        );
+        // The ASCII arm is nucleo's fast path, taken on nucleo's own terms: an
+        // ASCII haystack segments to itself, so both arms match the same text.
+        let utf32 = if hay.is_ascii() {
+            Utf32Str::Ascii(hay.as_bytes())
+        } else {
+            Utf32Str::Unicode(&self.buf)
+        };
         let mut indices = Vec::new();
-        let score = self.pattern.indices(
-            Utf32Str::new(hay, &mut self.buf),
-            &mut self.matcher,
-            &mut indices,
-        )?;
+        let score = self.pattern.indices(utf32, &mut self.matcher, &mut indices)?;
         // Nucleo makes no promise about order and can repeat an index across
         // atoms of a multi-atom pattern; both the tightness rule and the screen
         // walk these in step with the characters, so they have to be sorted and
         // unique before either does.
         indices.sort_unstable();
         indices.dedup();
-        tight(&hay.chars().collect::<Vec<char>>(), &indices).then_some((score, indices))
+        if !tight(&self.buf, &indices) {
+            return None;
+        }
+        // Grapheme indices → char indices, walking the graphemes once. A
+        // matched grapheme lights every char it spans — an underline over half
+        // a flag emoji is not a thing the screen can draw — and everything
+        // after a multi-codepoint grapheme lands where the chars actually are.
+        let lit = if hay.is_ascii() {
+            indices.into_iter().map(|i| i as usize).collect()
+        } else {
+            let mut lit = Vec::with_capacity(indices.len());
+            let mut matched = indices.into_iter().peekable();
+            let mut char_at = 0;
+            for (g, grapheme) in hay.graphemes(true).enumerate() {
+                let len = grapheme.chars().count();
+                if matched.peek() == Some(&(g as u32)) {
+                    matched.next();
+                    lit.extend(char_at..char_at + len);
+                }
+                char_at += len;
+            }
+            lit
+        };
+        Some((score, lit))
     }
 
     /// The match, with the characters it landed on — and `None` when it landed
@@ -179,7 +230,7 @@ impl Query {
             score,
             ..Hit::default()
         };
-        for i in indices.into_iter().map(|i| i as usize) {
+        for i in indices {
             if i < repo_len {
                 hit.in_repo.push(i);
             } else if i > repo_len {
@@ -351,6 +402,55 @@ mod tests {
             (
                 "«w»«a»«y»«f»inder".to_string(),
                 "#«6» Re-entry breadcrumbs".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_multi_codepoint_grapheme_does_not_skew_the_highlights_after_it() {
+        // Nucleo hands back *grapheme* indices (its haystack keeps one
+        // codepoint per grapheme), while the screen underlines by char. A flag
+        // emoji is two codepoints in one grapheme, so before the conversion
+        // every index after it landed one char early — here, on the space and
+        // five letters instead of on "Launch".
+        let t = ticket("blooop/wayfinder", 6, "🇺🇸 Launch review");
+        assert_eq!(
+            landed(&t, "launch"),
+            (
+                "wayfinder".to_string(),
+                "#6 🇺🇸 «L»«a»«u»«n»«c»«h» review".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_matched_grapheme_is_lit_whole() {
+        // A grapheme matches as one unit, so it lights as one glyph: every
+        // char it spans is lit, or the screen would underline half a flag.
+        let t = ticket("blooop/wayfinder", 6, "🇺🇸 Launch review");
+        assert_eq!(
+            landed(&t, "🇺🇸"),
+            (
+                "wayfinder".to_string(),
+                "#6 «🇺»«🇸» Launch review".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_decomposed_accent_neither_panics_nor_shifts_the_marks() {
+        // The sharpest corner of the conversion: when every grapheme's *first*
+        // codepoint is ASCII (a decomposed accent), nucleo's own constructor
+        // falls back to matching the raw bytes, and byte indices past the
+        // accent point past the end of the chars they are supposed to name —
+        // an out-of-bounds panic in the tightness check, not just a skewed
+        // underline. Building the haystack ourselves keeps it off that path.
+        let t = ticket("blooop/wayfinder", 6, "Cafe\u{301} menu");
+        assert_eq!(
+            landed(&t, "menu"),
+            (
+                "wayfinder".to_string(),
+                "#6 Cafe\u{301} «m»«e»«n»«u»".to_string()
             )
         );
     }
