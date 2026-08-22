@@ -729,7 +729,10 @@ mod tests {
 
         // And the label page being cut short is not the *tree* being cut
         // short: nothing ticket-bearing was truncated here.
-        assert!(!map.truncated, "a truncated label page is not a partial tree");
+        assert!(
+            !map.truncated,
+            "a truncated label page is not a partial tree"
+        );
     }
 
     /// One sub-issue carrying the full PR-badge matrix (#52).
@@ -871,8 +874,8 @@ mod tests {
                 "subIssues more: {subs}, blockers more: {blockers} — the map must say so"
             );
         }
-        let map = parse_map(truncated_response(false, false).as_bytes(), &wf_map_id())
-            .expect("parse");
+        let map =
+            parse_map(truncated_response(false, false).as_bytes(), &wf_map_id()).expect("parse");
         assert!(!map.truncated, "full pages are not a truncation");
     }
 

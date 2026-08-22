@@ -586,6 +586,24 @@ pub fn failure_note(app: &App) -> String {
     }
 }
 
+/// The `· … truncated` segment on the count line (#184): a map the tracker
+/// could not send all of — more sub-issues or blocking edges than one page
+/// holds, per [`Map`]'s `truncated` — named where the reader is, because the
+/// body draws a normal-looking tree either way and this line is the only
+/// place left to say the tree is partial.
+///
+/// Shaped exactly like [`failure_note`], its nearest kin: both are persistent
+/// facts about a whole map that the rows cannot carry, one map is named, more
+/// collapse to a count.
+pub fn truncated_note(app: &App) -> String {
+    let mut truncated = app.clusters.iter().filter(|(_, map)| map.truncated);
+    match (truncated.next(), truncated.count()) {
+        (None, _) => String::new(),
+        (Some((id, _)), 0) => format!("· {}#{} truncated", id.repo, id.number),
+        (Some(_), more) => format!("· {} maps truncated", more + 1),
+    }
+}
+
 /// The `· N reclaimable: …` segment on the count line (#137): what a
 /// `wf reap` would claim, once the background reading has landed.
 ///
@@ -976,10 +994,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     // staged — the staged launch is a modal now (#62's line became
     // [`draw_launch_picker`]), and a modal does not need the row it covers to
     // move out of its way.
-    let mut parts: Vec<String> = [app.startup.hint(), failure_note(app), idle_note(&plan)]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect();
+    let mut parts: Vec<String> = [
+        app.startup.hint(),
+        failure_note(app),
+        truncated_note(app),
+        idle_note(&plan),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect();
     let (shown, total) = app.counts();
     let counts = format!("  {shown}/{total}");
     let notice = app
@@ -1766,6 +1789,64 @@ mod tests {
                 "{width}: and a workspace is still named: {line}"
             );
         }
+    }
+
+    /// A map the tracker could not send all of is named on the count line
+    /// (#184): the body draws a perfectly normal tree either way, so this
+    /// segment is the only trace that tickets — or the blocking edges their
+    /// classification is drawn from — are missing from it.
+    #[test]
+    fn the_count_line_says_when_a_map_arrived_truncated() {
+        let mut clusters = BTreeMap::new();
+        let mut map = wf_map();
+        map.truncated = true;
+        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        let app = app_on("blooop/wayfinder", clusters);
+        let screen = render(&app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("truncated"))
+            .unwrap_or_else(|| panic!("no truncation segment: {screen}"));
+        assert!(
+            line.contains("blooop/wayfinder#1 truncated"),
+            "one truncated map is named, like one failed map is: {line}"
+        );
+
+        // A complete map says nothing — silence is the ordinary case.
+        let mut clusters = BTreeMap::new();
+        clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
+        let app = app_on("blooop/wayfinder", clusters);
+        assert!(!render(&app).contains("truncated"));
+    }
+
+    #[test]
+    fn several_truncated_maps_collapse_to_a_count() {
+        let mut clusters = BTreeMap::new();
+        let mut first = wf_map();
+        first.truncated = true;
+        clusters.insert(MapId::new("blooop/wayfinder", 1), first);
+        clusters.insert(
+            MapId::new("blooop/wayfinder", 47),
+            Map {
+                title: "Map: the selection view".to_string(),
+                last_activity: None,
+                truncated: true,
+                tickets: vec![ticket(
+                    "blooop/wayfinder",
+                    50,
+                    "Build: clusters",
+                    true,
+                    false,
+                    vec![],
+                )],
+            },
+        );
+        let app = app_on("blooop/wayfinder", clusters);
+        let screen = render(&app);
+        assert!(
+            screen.contains("· 2 maps truncated"),
+            "several collapse to a count, like failures do: {screen}"
+        );
     }
 
     #[test]
