@@ -2012,8 +2012,7 @@ fn executable(candidate: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     candidate
         .metadata()
-        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 /// A launch prompt with the JSON of every `ctx:` block replaced by `…` (#124).
