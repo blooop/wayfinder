@@ -4,10 +4,10 @@
   // A prebuilt image, not a build from `Dockerfile` — blooop/wayfinder#43 is
   // settled and this is its answer (blooop/wayfinder#150). What a prebuild saves
   // was never the crate build: a cold `cargo build` here is 9 seconds
-  // (blooop/wayfinder#39). It is the *image* build — the pinned `gh`, `zellij`
-  // and agent-CLI downloads in `Dockerfile`, which every branch's first `dl`
-  // paid for again. `devcontainer.yml` publishes this tag on any push to `main`
-  // that touches this directory.
+  // (blooop/wayfinder#39). It is the *image* build — the pinned `gh`, `zellij`,
+  // `pixi` and agent-CLI downloads in `Dockerfile`, which every branch's first
+  // `dl` paid for again. `devcontainer.yml` publishes this tag on any push to
+  // `main` that touches this directory.
   //
   // `image:` rather than the `build:` block plus `cacheFrom`, which is what #43
   // expected, and the difference is a probed fact rather than a preference:

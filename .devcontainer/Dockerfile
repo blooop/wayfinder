@@ -9,7 +9,7 @@
 # could save. If that number ever grows into the minutes, this is the file to
 # revisit — see blooop/wayfinder#39 for the measurements.
 #
-# What it *does* carry is three binaries, for two different reasons.
+# What it *does* carry is four binaries, for three different reasons.
 #
 # `gh` and the agent CLI are things `wf` itself shells out to and discovers on
 # PATH, so a workspace without them cannot run `wf` at all. They are not here
@@ -18,6 +18,24 @@
 # reason (see the Checks section of README.md). Running that gated set inside a
 # workspace is a thing you can choose to do — `cargo test -- --ignored` — and
 # `gh` being present is what makes the choice available.
+#
+# `pixi` is here for the other half of the gated set: the devlaunch contract
+# lanes (`pixi run suite`, `pixi run -e <env> contract`), which block every
+# pull request and which `pixi.toml` exists solely to run. Those lanes are how
+# an agent working inside a workspace reproduces the PR gate before pushing,
+# and before this pin they were runnable only when the developer's dotfiles
+# happened to install a pixi of their own — the same check reproducible on one
+# machine and impossible on the next, with nothing saying why.
+# `tests/devcontainer_prebuild.rs` holds the pin and the install location.
+#
+# It is the largest single binary in here and the number belongs next to the
+# decision: 78 MB, taking the tool layer from 93 MB to 171 MB, measured against
+# the published image on 2026-08-22. The paragraph at the top of this file
+# rejects cargo-chef and sccache on exactly this ground, so this download has to
+# answer that argument rather than sidestep it — and it does, because what the
+# rejected mechanisms would have bought was 9 seconds, while what this buys is a
+# PR-blocking check being runnable at all on a machine whose dotfiles happen not
+# to carry pixi.
 #
 # `zellij` is here for a different reason and it is worth saying so, because
 # this comment used to justify it by a test file that no longer exists: `wf`
@@ -39,6 +57,7 @@ FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
 # that two workspaces created from the same image *start* from the same version.
 ARG GH_VERSION=2.97.0
 ARG ZELLIJ_VERSION=0.44.3
+ARG PIXI_VERSION=0.77.0
 ARG CLAUDE_VERSION=2.1.223
 
 # One layer, and the tarballs are deleted in it: an unpacked tarball left behind
@@ -47,8 +66,8 @@ ARG CLAUDE_VERSION=2.1.223
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
-      amd64) gh_arch=linux_amd64; zj_arch=x86_64-unknown-linux-musl ;; \
-      arm64) gh_arch=linux_arm64; zj_arch=aarch64-unknown-linux-musl ;; \
+      amd64) gh_arch=linux_amd64; musl_arch=x86_64-unknown-linux-musl ;; \
+      arm64) gh_arch=linux_arm64; musl_arch=aarch64-unknown-linux-musl ;; \
       *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
     esac; \
     tmp="$(mktemp -d)"; \
@@ -57,11 +76,18 @@ RUN set -eux; \
     tar -xzf "$tmp/gh.tar.gz" -C "$tmp"; \
     install -Dm755 "$tmp/gh_${GH_VERSION}_${gh_arch}/bin/gh" /usr/local/bin/gh; \
     curl -fsSL -o "$tmp/zellij.tar.gz" \
-      "https://github.com/zellij-org/zellij/releases/download/v${ZELLIJ_VERSION}/zellij-${zj_arch}.tar.gz"; \
+      "https://github.com/zellij-org/zellij/releases/download/v${ZELLIJ_VERSION}/zellij-${musl_arch}.tar.gz"; \
     tar -xzf "$tmp/zellij.tar.gz" -C "$tmp"; \
     install -Dm755 "$tmp/zellij" /usr/local/bin/zellij; \
+    # pixi publishes the bare binary beside its tarball; taking it directly is
+    # one fewer unpack in the layer. /usr/local/bin, not ~/.pixi/bin: the image
+    # must not squat on the prefix a developer's own dotfiles may populate, and
+    # the tests distinguish the two by exactly that path.
+    curl -fsSL -o "$tmp/pixi" \
+      "https://github.com/prefix-dev/pixi/releases/download/v${PIXI_VERSION}/pixi-${musl_arch}"; \
+    install -Dm755 "$tmp/pixi" /usr/local/bin/pixi; \
     rm -rf "$tmp"; \
-    gh --version; zellij --version
+    gh --version; zellij --version; pixi --version
 
 # The agent CLI installs per-user into ~/.local/bin, so it is installed as the
 # user that will run it. `~/.claude` is a bind mount from the host (see

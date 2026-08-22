@@ -1,8 +1,9 @@
 name: Devcontainer image
 
 # Publishes the image every `dl blooop/wayfinder@<branch>` boots from, so that
-# the pinned `gh`, `zellij` and agent-CLI downloads in `.devcontainer/Dockerfile`
-# are paid for once here instead of once per branch on every developer's machine.
+# the pinned `gh`, `zellij`, `pixi` and agent-CLI downloads in
+# `.devcontainer/Dockerfile` are paid for once here instead of once per branch on
+# every developer's machine.
 # The crate build was never the cost — a cold `cargo build` is 9 seconds
 # (blooop/wayfinder#39) — which is why this publishes a thin image and warms no
 # cargo cache at all (blooop/wayfinder#38, reaffirmed on #43).

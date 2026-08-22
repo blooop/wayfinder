@@ -1,10 +1,11 @@
 //! The devcontainer prebuild contract (#150).
 //!
 //! Offline by design, like `skill_docs.rs` and for the same reason: the seam is
-//! the config text itself. What a workspace boots from, and what the publishing
-//! workflow is allowed to write to, are promises made in two files that no
-//! compiler reads — so they are asserted here rather than discovered by a cold
-//! `devpod up` on somebody's laptop.
+//! the config text itself. What a workspace boots from, what the image has to
+//! carry for a workspace to be usable, and what the publishing workflow is
+//! allowed to write to, are promises made in three files that no compiler reads
+//! — so they are asserted here rather than discovered by a cold `devpod up` on
+//! somebody's laptop.
 
 use serde_json::Value;
 
@@ -392,6 +393,56 @@ fn the_workflow_publishes_exactly_the_reference_the_default_config_boots_from() 
          by a mechanism they do not see (a line continuation, a \
          build-push-action step) is outside it, and outside what a test can \
          hold against someone who already has push access"
+    );
+}
+
+/// The image carries a pinned `pixi`, because without one a workspace cannot
+/// run the PR gates.
+///
+/// `devlaunch-contract.yml` blocks every pull request with `pixi run suite`
+/// and the four `pixi run -e <env> contract` lanes — that is the entire reason
+/// `pixi.toml` exists (its header says so). The image already carries `gh` on
+/// exactly this reasoning: not because `wf` needs it at build time, but because
+/// its presence is what makes running the gated tests inside a workspace *a
+/// choice* rather than an impossibility (the Dockerfile's own words). `pixi`
+/// was the one tool that reasoning missed: it used to arrive only when the
+/// developer's personal dotfiles happened to install one into `~/.pixi/bin`,
+/// which made a PR-blocking check reproducible inside a workspace on one
+/// machine and silently impossible on the next — probed on 2026-08-22 inside a
+/// fresh `dl blooop/wayfinder` workspace, where every contract lane passed and
+/// `command -v pixi` answered from the dotfiles' prefix, not the image.
+///
+/// Three facts are held, each against a failure that stays green without it:
+/// the version is a pinned literal (a floating install drifts on rebuild, which
+/// is what every other pin in that file exists to prevent); the download URL
+/// embeds the pin (the gh/zellij pattern — a wrong version cannot resolve, so
+/// the pin cannot silently buy nothing); and the binary lands in
+/// `/usr/local/bin` (a home-directory install would be shadowed by, and
+/// confusable with, the dotfiles prefix this test exists to stop depending on).
+#[test]
+fn the_image_carries_a_pinned_pixi_so_a_workspace_can_run_the_pr_gates() {
+    let dockerfile = repo_file(".devcontainer/Dockerfile");
+
+    let pin = dockerfile
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("ARG PIXI_VERSION="))
+        .expect("the Dockerfile pins pixi with `ARG PIXI_VERSION=<version>`");
+    assert!(
+        !pin.is_empty() && pin.chars().all(|c| c.is_ascii_digit() || c == '.'),
+        "the pin is a literal version, not a channel name: {pin:?}"
+    );
+
+    assert!(
+        dockerfile.contains("releases/download/v${PIXI_VERSION}/pixi-"),
+        "the download URL embeds the pin, so a wrong version fails the build \
+         instead of resolving to something else"
+    );
+
+    assert!(
+        dockerfile.contains("/usr/local/bin/pixi"),
+        "pixi is installed to /usr/local/bin — on PATH for every user, and \
+         distinct from the ~/.pixi/bin prefix a developer's dotfiles may also \
+         populate"
     );
 }
 
