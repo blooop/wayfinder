@@ -1955,7 +1955,12 @@ impl Launch {
     }
 }
 
-/// Find `program` on `$PATH`, skipping empty entries.
+/// Find `program` on `$PATH`, skipping empty entries and any candidate the OS
+/// would not execute.
+///
+/// The execute bit matters because this stands in for execvp, which keeps
+/// searching past a file it cannot run — so a stray non-executable `claude`
+/// early on PATH must not fail a launch the OS would have made.
 ///
 /// A name containing a separator is a path already and is taken as given —
 /// that is the caller naming a file, not `$PATH` resolution.
@@ -1965,15 +1970,33 @@ impl Launch {
 /// wants only a path to run `--version` on and treats a miss as "no `dl` here",
 /// which [`Isolation::detect`] answers with [`Isolation::Host`].
 fn resolve_on_path(program: &str) -> Result<PathBuf, anyhow::Error> {
+    resolve_in(program, &std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// [`resolve_on_path`] against a given `PATH` value — the part with rules worth
+/// testing, split from the one line that reads the environment so the tests
+/// never have to mutate it under a parallel suite.
+fn resolve_in(program: &str, path: &std::ffi::OsStr) -> Result<PathBuf, anyhow::Error> {
     if program.contains('/') {
         return Ok(PathBuf::from(program));
     }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
+    std::env::split_paths(path)
         .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| executable(candidate))
         .ok_or_else(|| anyhow::anyhow!("`{program}` is not on PATH — is it installed?"))
+}
+
+/// Would execvp accept this candidate? A regular file with any execute bit
+/// set. Mode bits rather than `access(2)`'s exact answer, which is the same
+/// approximation `which` makes — close enough for a search whose miss is
+/// reported, and whose false positive still fails loudly at the `exec` itself.
+fn executable(candidate: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    candidate
+        .metadata()
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// A launch prompt with the JSON of every `ctx:` block replaced by `…` (#124).
@@ -4590,5 +4613,58 @@ mod tests {
             Targets::One(launch) => assert_eq!(launch.key(), "wayfinder#2"),
             other => panic!("a done ticket still launches, got {other:?}"),
         }
+    }
+
+    /// A scratch directory of PATH entries, removed on drop. Real files rather
+    /// than a mock, because the question under test — would the OS execute
+    /// this candidate? — is a fact about an inode's mode bits.
+    struct FakePath(PathBuf);
+
+    impl FakePath {
+        fn new(name: &str) -> FakePath {
+            let dir = std::env::temp_dir().join(format!("wf-launch-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            FakePath(dir)
+        }
+
+        /// One PATH entry holding one file named `program`, with `mode`.
+        fn entry(&self, dir: &str, program: &str, mode: u32) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let entry = self.0.join(dir);
+            std::fs::create_dir_all(&entry).expect("entry");
+            let file = entry.join(program);
+            std::fs::write(&file, "#!/bin/sh\n").expect("candidate");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode))
+                .expect("mode");
+            entry
+        }
+    }
+
+    impl Drop for FakePath {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn path_resolution_skips_a_candidate_the_os_would_not_execute() {
+        // execvp keeps searching past a file it cannot execute; a stray
+        // non-executable `claude` early on PATH must not fail a launch the OS
+        // would have made.
+        let scratch = FakePath::new("skips-non-executable");
+        let decoy = scratch.entry("decoy", "agent", 0o644);
+        let real = scratch.entry("real", "agent", 0o755);
+        let path = std::env::join_paths([&decoy, &real]).expect("a PATH");
+        let resolved = resolve_in("agent", &path).expect("the executable is on PATH");
+        assert_eq!(resolved, real.join("agent"));
+    }
+
+    #[test]
+    fn a_name_found_only_as_a_non_executable_file_is_not_on_path() {
+        let scratch = FakePath::new("only-non-executable");
+        let decoy = scratch.entry("decoy", "agent", 0o644);
+        let path = std::env::join_paths([&decoy]).expect("a PATH");
+        assert!(resolve_in("agent", &path).is_err());
     }
 }
