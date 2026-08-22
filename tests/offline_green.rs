@@ -381,3 +381,30 @@ fn every_test_binary_is_named_by_a_workflow_that_runs_it() {
         orphans.join("\n  ")
     );
 }
+
+/// Nothing is enrolled that does not exist.
+///
+/// The other direction of the same contract, and the one a rename leaves
+/// behind: `--test gone_away` makes `cargo test` fail loudly, so this would be
+/// caught — but only by the workflow holding the stale line, and `live.yml`
+/// runs after a merge while `pixi.toml`'s tasks run in a workflow whose red
+/// runs already mean "the other repo moved". Caught here, it is caught at the
+/// commit that renamed the file, in the same run as the forward sweep, and by
+/// the same reading of the same two facts.
+#[test]
+fn no_runner_names_a_test_binary_that_does_not_exist() {
+    let targets: BTreeSet<String> = test_targets().into_iter().collect();
+    let stale: Vec<String> = enrolment()
+        .iter()
+        .filter(|(binary, _)| !targets.contains(*binary))
+        .map(|(binary, runners)| format!("{binary} (named in {})", runners.join(", ")))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these `--test` arguments name no test binary in this repo, so the \
+         command carrying them cannot run at all — a rename that moved the \
+         file and left the enrolment, most likely. Point each at the binary \
+         it meant, or drop the argument:\n  {}",
+        stale.join("\n  ")
+    );
+}
