@@ -408,3 +408,192 @@ fn no_runner_names_a_test_binary_that_does_not_exist() {
         stale.join("\n  ")
     );
 }
+
+/// The scan above reads commands, not the prose around them.
+///
+/// The self-check the two sweeps rest on, and they rest on it heavily: both
+/// ask whether a name appears, so anything that over-reports enrolment turns
+/// the forward sweep into a green light wired to nothing — the failure it was
+/// written to prevent, wearing its own badge. Two limits of the scan are
+/// pinned here rather than trusted, on text written in this test so the check
+/// keeps meaning what it says however the real files are edited: a comment
+/// enrols nothing, and `--test-threads` is not a binary called `threads`. The
+/// third assertion is the direct one — a name no file anywhere writes is not
+/// enrolled — because a scan that reported everything as enrolled would pass
+/// both sweeps in silence.
+#[test]
+fn the_scan_reads_commands_rather_than_the_prose_around_them() {
+    assert!(
+        binaries_named_in("      # run: cargo test --locked --test discussed_only\n").is_empty(),
+        "a commented-out or discussed command enrols nothing. The workflows in \
+         this repo are mostly prose and the prose names test binaries; if a \
+         comment counts, the forward sweep above can be satisfied by a \
+         sentence rather than by a step"
+    );
+    assert_eq!(
+        binaries_named_in("run: cargo test --test real_one -- --ignored --test-threads=1"),
+        BTreeSet::from([String::from("real_one")]),
+        "`--test-threads` names no binary, and both files that run gated tests \
+         pass it"
+    );
+    assert!(
+        !enrolment().contains_key("wayfinder_189_no_runner_names_this"),
+        "a binary no file in this repo mentions came back enrolled, so the scan \
+         is reporting enrolment it cannot have read and both sweeps above are \
+         green for no reason"
+    );
+}
+
+/// Every workflow in this repository, as `(file name, contents)`.
+///
+/// Read from the directory rather than from a list, on the same principle as
+/// every other walk in this file: a workflow added later is searched by having
+/// been added.
+fn workflows() -> Vec<(String, String)> {
+    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.github/workflows"));
+    let mut found: Vec<(String, String)> = std::fs::read_dir(&dir)
+        .expect("this repo's workflow directory")
+        .map(|entry| entry.expect("a readable directory entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "yml"))
+        .map(|path| {
+            let name = path
+                .file_name()
+                .expect("a path read from a directory has a file name")
+                .to_string_lossy()
+                .into_owned();
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{name} is readable: {e}"));
+            (name, text)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// The pixi task one command line calls, if it is a `pixi run`.
+///
+/// `-e <environment>` is skipped rather than counted: the environment decides
+/// which `dl` the task meets, not which task runs, and the contract workflow
+/// calls the same task in four of them.
+fn pixi_task_called_on(line: &str) -> Option<String> {
+    let mut tokens = line.split_whitespace().skip_while(|token| *token != "pixi");
+    tokens.next()?;
+    if tokens.next()? != "run" {
+        return None;
+    }
+    let mut next = tokens.next()?;
+    if next == "-e" {
+        tokens.next()?;
+        next = tokens.next()?;
+    }
+    Some(next.to_string())
+}
+
+/// The pixi manifest counts as a runner only because a workflow calls it.
+///
+/// `RUNNERS` lists three files, and this one is the odd one out: the two
+/// workflows carry their own triggers, so a `--test` line in either is a line
+/// GitHub runs, while `pixi.toml` has no trigger at all. Its `--test` lines run
+/// only because `devlaunch-contract.yml` names the task holding them. Drop that
+/// call and the manifest becomes a file full of commands nothing invokes — at
+/// which point the forward sweep above would go on reporting the binaries it
+/// names as enrolled, which is exactly the lie this whole file exists to catch.
+/// So the delegation is asserted, not assumed.
+#[test]
+fn the_pixi_manifest_is_a_runner_only_because_a_workflow_reaches_it() {
+    let tasks_that_run_tests: BTreeSet<String> = repo_file("pixi.toml")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#') && line.contains("--test "))
+        .filter_map(|line| Some(line.split('=').next()?.trim().to_string()))
+        .filter(|name| !name.is_empty())
+        .collect();
+    assert!(
+        !tasks_that_run_tests.is_empty(),
+        "no pixi task names a test binary any more, so `pixi.toml` has no \
+         business in `RUNNERS` — either the contract run moved somewhere else, \
+         or the way tasks are written changed under the read above"
+    );
+
+    let called: BTreeSet<String> = workflows()
+        .iter()
+        .flat_map(|(_, text)| {
+            text.lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .filter_map(pixi_task_called_on)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let unreached: Vec<&String> = tasks_that_run_tests
+        .iter()
+        .filter(|task| !called.contains(*task))
+        .collect();
+    assert!(
+        unreached.is_empty(),
+        "these pixi tasks run test binaries and no workflow calls them, so \
+         every binary they name is enrolled on paper and run nowhere — and the \
+         sweep above cannot tell, because it reads the manifest and trusts that \
+         something reaches it. Call the task from a workflow, or stop counting \
+         `pixi.toml` as a runner.\n  unreached: {unreached:?}\n  tasks a \
+         workflow calls: {called:?}"
+    );
+}
+
+/// A test binary's name is the one cargo derives from its path.
+///
+/// The walk above turns `tests/foo.rs` into the name `foo` and then looks for
+/// `--test foo`. That equivalence is auto-discovery's, not a rule of the
+/// language: a `[[test]]` table in the manifest can call any file anything, at
+/// which point a file this guard demands enrolment for is enrolled under a name
+/// it does not know, and a name the workflows use belongs to no file it can
+/// find. It would report both directions wrong at once. This repo declares no
+/// test targets by hand — there is nothing to configure that a file name does
+/// not already say — so the derivation is kept sound by keeping that true.
+#[test]
+fn a_test_binarys_name_is_the_one_cargo_derives_from_its_path() {
+    let manifest = repo_file("Cargo.toml");
+    let declared = manifest
+        .lines()
+        .map(str::trim)
+        .filter(|line| *line == "[[test]]")
+        .count();
+    assert!(
+        declared == 0,
+        "Cargo.toml declares {declared} test target(s) by hand. The walk in this file \
+         reads names off `tests/` and compares them to `--test` arguments, and \
+         a declared target parts those two: it can name `tests/a.rs` `b`, so \
+         `a` is demanded and never enrolled while `b` is enrolled and matches \
+         no file. Either drop the table and let auto-discovery name the target, \
+         or teach the walk to read the manifest first"
+    );
+}
+
+/// No live binary hides from the ignore walk in the directory form.
+///
+/// `live_sources` reads `tests/live_*.rs` and says in as many words that a
+/// `tests/live_x/main.rs` would sit outside it. That admission was the only
+/// thing standing between this repo and a live binary whose tests are
+/// unchecked for `#[ignore]` — and unchecked in the quiet direction, since the
+/// walk would report the file it cannot see as compliant. Now that the walk
+/// above enumerates the directory form, the admission can be enforced instead
+/// of merely written down: a live target in that shape fails here, naming the
+/// two choices.
+#[test]
+fn no_live_binary_hides_from_the_ignore_walk_in_the_directory_form() {
+    let scanned: BTreeSet<String> = live_sources()
+        .into_iter()
+        .map(|(name, _)| name.trim_end_matches(".rs").to_string())
+        .collect();
+    let unscanned: Vec<String> = test_targets()
+        .into_iter()
+        .filter(|target| target.starts_with("live_") && !scanned.contains(target))
+        .collect();
+    assert!(
+        unscanned.is_empty(),
+        "these live test binaries are directory-style targets, so the walk that \
+         checks every live test carries `#[ignore]` never opens them — and a \
+         file it never opens is a file it reports as gated. Flatten each to \
+         `tests/<name>.rs`, or teach `live_sources` to descend into \
+         `tests/<name>/`:\n  {}",
+        unscanned.join("\n  ")
+    );
+}
