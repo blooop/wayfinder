@@ -445,8 +445,8 @@ mod tests {
     /// list into a pin on the wrapping: rewording the `wf reap` paragraph — no
     /// capability changed, the same code, the same seven sites — failed the
     /// guard, and failed it with a message saying the file wrote `reap`
-    /// somewhere new, which was not true. Cutting the literal out leaves the
-    /// list five lines of code, which is what the guard is about.
+    /// somewhere new, which was not true. Cutting the literal out leaves
+    /// only lines of code in the list, which is what the guard is about.
     ///
     /// # Panics
     ///
@@ -585,7 +585,7 @@ mod tests {
                 "Invocation::Reap(ReapScope::Machine { yes, insist }) => reap::run(yes, insist).await,",
                 "Invocation::Reap(ReapScope::Finished(nodes)) => reap::cleanup(&nodes).await,",
             ],
-            "the lines of code in this file that write `reap` are no longer the five \
+            "the lines of code in this file that write `reap` are no longer the ones \
              listed here. A line that is not in the list is a way this binary reaches \
              `wf::reap::run`, which is a forced deletion when it is called with both \
              flags; a listed line that is gone means the list is stale. Read the diff \

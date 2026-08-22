@@ -548,9 +548,9 @@ pub async fn run_picker() -> Result<()> {
             // And record the conversation this launch is about to start, so a
             // later run can offer the way back into it (#35).
             //
-            // Written **here**, immediately before the terminal is restored
-            // and the image replaced, because this is the last moment `wf`
-            // exists — and written from the resolved launch rather than from
+            // Written **here**, after the terminal is restored and immediately
+            // before the image is replaced, because this is the last moment
+            // `wf` exists — and written from the resolved launch rather than from
             // the picker, so what is remembered is the tree the agent actually
             // gets. A creation records nothing: it has no node to key on until
             // its skill files one.
