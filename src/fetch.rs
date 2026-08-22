@@ -44,6 +44,13 @@ pub const MAP_LABEL: &str = "wayfinder:map";
 /// `pub(crate)` for one reason: [`reap`](crate::reap) selects a subset of these
 /// same fields into its own batched query, and the two are held to each other
 /// by a test rather than by a comment. Nothing outside that test may read it.
+///
+/// That tie is why the linked-PR rollup asks for `pageInfo { hasNextPage }`
+/// while nothing on the screen reads the answer yet: the reaper needs it (#183
+/// — a rollup it cannot see all of must not read as done-by-merge), the two
+/// selections are held byte-equal, so it lands here in the same breath. The
+/// screen's own use of it is its own change; an unread nullable field costs
+/// this query nothing and a divergent copy would cost it the guard.
 pub(crate) const MAP_QUERY: &str = "\
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -64,6 +71,7 @@ query($owner: String!, $name: String!, $number: Int!) {
               statusCheckRollup { state }
               repository { nameWithOwner }
             }
+            pageInfo { hasNextPage }
           }
         }
       }

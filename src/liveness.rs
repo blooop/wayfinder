@@ -324,6 +324,11 @@ mod tests {
             NodeFact::Superseded { pr: 1 },
             NodeFact::InFlight { pr: 1 },
             NodeFact::Unstarted,
+            // Nor is a rollup `wf` did not see all of (#183): a stall is a
+            // claim with nothing come of it, and this is the tracker declining
+            // to say what came of it — a reason to keep the workspace, not a
+            // reason to tell anyone the run died.
+            NodeFact::RollupTruncated,
         ] {
             let known = facts([(node(REPO, 133), fact.clone())]);
             assert_eq!(

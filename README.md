@@ -1161,12 +1161,23 @@ decides. Needs `dl` **0.0.21 or newer** for the JSON listing.
 Kept, always: workspaces `dl` did not create (they are not `wf`'s, whatever
 their branch looks like), branches that are not `wayfinder/<repo>-<n>` for that
 repo, tickets with an open or draft PR (in review is where review fixes happen),
-tickets someone has claimed that no PR has come of, and anything **running** — a
-ticket closing is no evidence that the session in the container ended.
+tickets someone has claimed that no PR has come of, tickets with more linked PRs
+than `wf` read, and anything **running** — a ticket closing is no evidence that
+the session in the container ended.
 
 The claim is the *last* thing read, not the first: it settles a ticket nothing
 has come of yet, and it does not outrank the PRs. A claimed ticket whose PR
 merged is finished work, and reap collects it like any other.
+
+**A ticket with more linked PRs than `wf` read is kept saying so.** The linked-PR
+rollup is asked for one bounded page and GitHub answers it oldest-first, so on a
+ticket with more references than the page holds the one that falls off is the
+newest — which on a `wf` ticket is the PR still open. Read from that page alone
+such a ticket is a row of merges and nothing in flight, which is exactly the
+reading that reaps. So `wf` asks whether the page was all of it, and a page that
+was not is not evidence at all: the row says there is more of this than it read
+and the workspace stays. It does not fetch the rest — a sixth PR on one ticket is
+rare, and a kept row costs a glance where a second round trip costs every run.
 
 **A `dl` that says nothing is not a `dl` saying nothing is at risk.** From
 devlaunch **0.0.24** the listing answers `unsaved` for every clone `dl` made,
