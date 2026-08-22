@@ -888,64 +888,150 @@ mod tests {
         assert!(!map.truncated);
     }
 
-    /// The brace-balanced block a named connection selects in `query` —
-    /// `field(…) { … }` from the first `{` to its close. Panics if the field
-    /// is missing or its braces never balance, because a guard that returns
-    /// `None` quietly is a guard that stops guarding when the query is
-    /// reworded.
-    fn connection_block<'q>(query: &'q str, field: &str) -> &'q str {
-        let from = query
-            .find(field)
-            .unwrap_or_else(|| panic!("the query no longer selects {field}"));
-        let mut depth = 0usize;
-        for (offset, ch) in query[from..].char_indices() {
+    /// One field of a GraphQL selection: the arguments it was called with, and
+    /// the fields selected under it — which is to say, the shape an answer to
+    /// that selection has.
+    #[derive(Default)]
+    struct Selected {
+        arguments: String,
+        fields: std::collections::BTreeMap<String, Selected>,
+    }
+
+    impl Selected {
+        /// The field reached by following `path` from here, or `None` if the
+        /// query does not select it *there*.
+        ///
+        /// Position is the whole point. The sub-issue block contains the
+        /// linked-PR block, whose own `pageInfo` (#183) would answer on behalf
+        /// of a connection that never asked if the question were "does this
+        /// name appear anywhere below".
+        fn at(&self, path: &[&str]) -> Option<&Selected> {
+            match path {
+                [] => Some(self),
+                [step, rest @ ..] => self.fields.get(*step)?.at(rest),
+            }
+        }
+
+        /// The field at `path`, created empty if the walk has not reached it
+        /// yet — how the parse below fills the tree in as it descends.
+        fn under(&mut self, path: &[String]) -> &mut Selected {
+            let mut at = self;
+            for step in path {
+                at = at.fields.entry(step.clone()).or_default();
+            }
+            at
+        }
+    }
+
+    /// Read the subset of GraphQL selection syntax [`MAP_QUERY`] is written in
+    /// — names, optional `(arguments)`, optional nested `{ blocks }` — as the
+    /// tree of fields it selects.
+    ///
+    /// Derived rather than matched, and that is the point of it. A guard that
+    /// searches the query text for a spelling is satisfied by any text carrying
+    /// that spelling: `pageInfo { endCursor }` passed a guard looking for
+    /// `pageInfo` while answering none of the questions the parse asks of it.
+    /// Walking the tree asks the parse's own question instead — is this field
+    /// selected at this path — which no rewording can answer by accident.
+    ///
+    /// Panics on unbalanced braces, because a guard that gives up quietly on a
+    /// query it cannot read is a guard that stops guarding the moment the query
+    /// is reworded.
+    fn selected(text: &str) -> Selected {
+        let mut root = Selected::default();
+        let mut path: Vec<String> = Vec::new();
+        let mut last: Option<String> = None;
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
             match ch {
-                '{' => depth += 1,
+                '{' => path.push(last.take().expect("a block follows the field it selects")),
                 '}' => {
-                    depth = depth
-                        .checked_sub(1)
-                        .unwrap_or_else(|| panic!("unbalanced braces in {query}"));
-                    if depth == 0 {
-                        return &query[from..=from + offset];
+                    path.pop().expect("a block was opened before it closed");
+                    last = None;
+                }
+                // Arguments say nothing about the shape of the answer, but they
+                // do say how much of it there is, which is its own assertion
+                // below.
+                '(' => {
+                    let mut arguments = String::new();
+                    for skipped in chars.by_ref() {
+                        if skipped == ')' {
+                            break;
+                        }
+                        arguments.push(skipped);
                     }
+                    let named = last
+                        .clone()
+                        .expect("arguments follow the field they qualify");
+                    root.under(&path).fields.entry(named).or_default().arguments = arguments;
+                }
+                ch if ch.is_alphanumeric() || ch == '_' => {
+                    let mut name = String::from(ch);
+                    while chars
+                        .peek()
+                        .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+                    {
+                        name.push(chars.next().expect("peeked"));
+                    }
+                    root.under(&path).fields.entry(name.clone()).or_default();
+                    last = Some(name);
                 }
                 _ => {}
             }
         }
-        panic!("{field}'s block never closes in {query}")
-    }
-
-    /// Whether `block` selects `pageInfo` on the connection itself — at brace
-    /// depth 1, not anywhere in the nested tree. Depth matters: the sub-issue
-    /// block *contains* the linked-PR block, whose own `pageInfo` (#183) would
-    /// otherwise satisfy this test on behalf of a connection that never asked.
-    fn asks_its_own_page_info(block: &str) -> bool {
-        let mut depth = 0usize;
-        let mut at = 0;
-        while let Some(found) = block[at..].find("pageInfo") {
-            depth += block[at..at + found].matches('{').count();
-            depth -= block[at..at + found].matches('}').count();
-            if depth == 1 {
-                return true;
-            }
-            at += found + "pageInfo".len();
-        }
-        false
+        assert!(path.is_empty(), "unbalanced braces in {text}");
+        root
     }
 
     #[test]
     fn the_query_asks_for_every_page_boundary_the_parse_reads() {
-        // The truncation tests above feed `parse_map` hand-written fixtures,
-        // so they cannot notice the live query never requesting the field —
-        // the same hole #132 closed for reap's batch, guarded the same way:
-        // against the query text. Drop `pageInfo` from either ticket-bearing
-        // connection and every map fetched live reads as complete forever,
-        // silently, which is exactly the pre-#184 behaviour.
-        for field in ["subIssues", "blockedBy"] {
-            let block = connection_block(MAP_QUERY, field);
+        // The truncation tests above feed `parse_map` hand-written fixtures, so
+        // they cannot notice the live query never requesting the field — the
+        // same hole #132 closed for reap's batch, guarded the same way: against
+        // the query text. Drop the boundary from any of these three and every
+        // map fetched live reads as complete forever, silently, which is
+        // exactly the pre-#184 behaviour.
+        //
+        // `hasNextPage` by name, at the path the parse reads it from, because
+        // that field *is* the answer: `Paged::page_info` and
+        // `PageInfo::has_next_page` both default, so a `pageInfo` block
+        // selecting anything else — `endCursor`, say — deserialises as a silent
+        // "no claim of more". Asserting the connection asks for `pageInfo` is
+        // not enough; that reword left all 443 tests green.
+        let query = selected(MAP_QUERY);
+        for path in [
+            &[
+                "query",
+                "repository",
+                "issue",
+                "labels",
+                "pageInfo",
+                "hasNextPage",
+            ][..],
+            &[
+                "query",
+                "repository",
+                "issue",
+                "subIssues",
+                "pageInfo",
+                "hasNextPage",
+            ][..],
+            &[
+                "query",
+                "repository",
+                "issue",
+                "subIssues",
+                "nodes",
+                "blockedBy",
+                "pageInfo",
+                "hasNextPage",
+            ][..],
+        ] {
             assert!(
-                asks_its_own_page_info(block),
-                "{field} no longer asks whether its page was all of it: {block}"
+                query.at(path).is_some(),
+                "the query no longer asks for {}, so nothing it fetches can \
+                 report a page cut short: {MAP_QUERY}",
+                path.join(".")
             );
         }
     }
@@ -955,16 +1041,17 @@ mod tests {
         // The other half of the un-mapping fix: the parse forgives a truncated
         // label page, and the query makes truncation implausible in the first
         // place — 100 is the GraphQL page maximum, five times the old cap that
-        // a label-heavy map actually overflowed. The first `labels` selection
-        // in the query is the map issue's own, the one re-verification reads.
-        let block = connection_block(MAP_QUERY, "labels");
-        assert!(
-            block.starts_with("labels(first: 100)"),
-            "the map's label page shrank below the tracker's maximum: {block}"
-        );
-        assert!(
-            asks_its_own_page_info(block),
-            "the label page no longer says whether it was all of it: {block}"
+        // a label-heavy map actually overflowed. Addressed by path rather than
+        // by "the first `labels` in the text", so the sub-issue labels selected
+        // further down cannot be mistaken for the map issue's own.
+        let query = selected(MAP_QUERY);
+        let labels = query
+            .at(&["query", "repository", "issue", "labels"])
+            .expect("the map query selects the map issue's own labels");
+        assert_eq!(
+            labels.arguments.trim(),
+            "first: 100",
+            "the map's label page shrank below the tracker's maximum: {MAP_QUERY}"
         );
     }
 
