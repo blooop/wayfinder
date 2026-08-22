@@ -1005,10 +1005,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     // as one char occupies two columns, so a char count hands the reclaim note
     // columns the line does not have and the tail falls off the right edge.
     let cols = |text: &str| Span::raw(text).width();
-    let spent = cols(&counts)
-        + 2
-        + parts.iter().map(|part| cols(part) + 1).sum::<usize>()
-        + cols(&notice);
+    let spent =
+        cols(&counts) + 2 + parts.iter().map(|part| cols(part) + 1).sum::<usize>() + cols(&notice);
     let mut left = (count_area.width as usize).saturating_sub(spent);
     // Stalls are laid down before the reclaim note, but not at any price: what
     // is held back for the reclaim note is exactly the width at which it stops

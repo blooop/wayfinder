@@ -186,7 +186,9 @@ impl Query {
             Utf32Str::Unicode(&self.buf)
         };
         let mut indices = Vec::new();
-        let score = self.pattern.indices(utf32, &mut self.matcher, &mut indices)?;
+        let score = self
+            .pattern
+            .indices(utf32, &mut self.matcher, &mut indices)?;
         // Nucleo makes no promise about order and can repeat an index across
         // atoms of a multi-atom pattern; both the tightness rule and the screen
         // walk these in step with the characters, so they have to be sorted and
