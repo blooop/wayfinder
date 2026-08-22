@@ -484,10 +484,11 @@ impl PrRollup<'_> {
 
 /// What the tracker says about one node, in the terms reap decides by.
 ///
-/// Six unconfusable values where a boolean "is it closed" used to be, so that
-/// "closed", "done by merge", "superseded", "in flight", "claimed" and
-/// "nothing has come of it" cannot be mistaken for each other, and so that
-/// every match site has to say out loud what it does with each.
+/// Seven unconfusable values where a boolean "is it closed" used to be, so
+/// that "closed", "done by merge", "superseded", "in flight", "claimed",
+/// "nothing has come of it" and "there was more of this than I read" cannot be
+/// mistaken for each other, and so that every match site has to say out loud
+/// what it does with each.
 ///
 /// Derived at every read from the batch the tracker just answered — never
 /// stored, so it cannot go stale, be orphaned, or outlive the workspace it
@@ -941,7 +942,7 @@ fn unrecoverable(unsaved: Option<&Unsaved>) -> Option<String> {
 /// tracker says open", so the step stops and hands both readings back.
 ///
 /// Finished means the two arms [`plan`] reaps on, and this says so in the same
-/// exhaustive shape: a seventh [`NodeFact`] fails to compile here until
+/// exhaustive shape: an eighth [`NodeFact`] fails to compile here until
 /// somebody decides what an unattended run does with it. `None` — a scoped node
 /// the tracker was not asked about — is a surprise too, and a louder one than
 /// [`plan`]'s keep for it: the fetch is never partial, so getting here means
@@ -3635,8 +3636,8 @@ mod tests {
         // `doomed`'s answer narrowed to the run's own nodes, never a second
         // reading of what "finished" means. Every fact that can reach a
         // workspace is in the listing, so a partition written twice here would
-        // have to agree with `doomed` on all six to pass.
-        let workspaces: Vec<Workspace> = (1..=6).map(|n| pushed(&format!("wf-{n}"), n)).collect();
+        // have to agree with `doomed` on all seven to pass.
+        let workspaces: Vec<Workspace> = (1..=7).map(|n| pushed(&format!("wf-{n}"), n)).collect();
         let known = facts([
             (node("blooop/wayfinder", 1), NodeFact::Closed),
             (
@@ -3647,10 +3648,11 @@ mod tests {
             (node("blooop/wayfinder", 4), NodeFact::Claimed),
             (node("blooop/wayfinder", 5), NodeFact::Superseded { pr: 13 }),
             (node("blooop/wayfinder", 6), NodeFact::Unstarted),
+            (node("blooop/wayfinder", 7), NodeFact::RollupTruncated),
         ]);
-        // Four of the six facts are the step's abort arm — everything the
+        // Five of the seven facts are the step's abort arm — everything the
         // tracker does not read as finished — so the scope that compares the
-        // two sets is the one without them. The other four workspaces stay in
+        // two sets is the one without them. The other five workspaces stay in
         // the listing, which is what makes this a claim about narrowing rather
         // than about a fixture with nothing else in it.
         let scope = [1, 2];
@@ -3675,7 +3677,7 @@ mod tests {
 
     /// Which arm of [`NodeFact`] this is, as an index.
     ///
-    /// An exhaustive match with no wildcard, so a seventh arm fails to compile
+    /// An exhaustive match with no wildcard, so an eighth arm fails to compile
     /// here — and the table below is then what says somebody decided what the
     /// *deleting* path does with it, rather than letting it inherit an outcome
     /// from whichever arm it was written next to. #132's second item found this
