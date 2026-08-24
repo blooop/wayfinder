@@ -24,7 +24,7 @@ async fn fetches_the_live_wayfinder_map() {
     // has. That an issue is a map at all is checked where it can be: `fetch_map`
     // refuses anything that is not an open `wayfinder:map` (#28).
     assert!(
-        !map.title.is_empty(),
+        map.map_title().is_some_and(|t| !t.is_empty()),
         "the map issue's title must come back"
     );
     assert!(
@@ -91,4 +91,73 @@ async fn fetches_the_live_wayfinder_map() {
     // (`open_unassigned_with_open_blockers_is_blocked`,
     // `closed_is_done_even_if_assigned_or_blocked`) and at the parse boundary
     // in `fetch::tests`. What only the live API can prove is above.
+}
+
+/// The inbox read against the real tracker: the one thing a fixture cannot
+/// prove is that the `search`-based GraphQL query is *valid* — a mistyped
+/// selection, a field GitHub renamed, or `blockedBy` not existing on a bare
+/// `Issue` all come back as a GraphQL error rather than a parse failure, and
+/// the whole feature would be an empty heading nobody could debug from a unit
+/// test.
+///
+/// Deliberately makes **no claim about what is in it**. Whose inbox this runs
+/// as depends on the token — a maintainer locally, `GH_TOKEN` in CI — and the
+/// unassigned half depends on whatever is untriaged today, so an empty answer
+/// is a correct answer and the assertions are about shape, not contents. The
+/// one thing asserted unconditionally is that both searches *ran*.
+#[tokio::test]
+#[ignore = "live: needs network + an authenticated gh"]
+async fn reads_the_live_inbox() {
+    let inbox = wf::fetch::fetch_inbox(&[common::THIS_REPO.to_string()])
+        .await
+        .unwrap_or_else(|e| panic!("live inbox read: {e:#}"));
+
+    for (repo, cluster) in &inbox {
+        assert_eq!(
+            repo,
+            common::THIS_REPO,
+            "only the repos asked for come back"
+        );
+        assert!(
+            cluster.map_title().is_none(),
+            "an inbox cluster has no map issue to be titled by"
+        );
+        assert!(
+            !cluster.tickets.is_empty(),
+            "a repo with nothing assigned is absent, never an empty heading"
+        );
+        for ticket in &cluster.tickets {
+            assert_eq!(ticket.repo, *repo, "each row carries its own repo");
+            // Both halves of the query ask `is:open`, so nothing here is done.
+            // Which of the other three a row is depends on which half found it
+            // — assigned is claimed, unassigned is frontier, or blocked when
+            // something open blocks it — and asserting one of them would only
+            // hold while the tracker happened to be in that state. What is
+            // asserted is the invariant the *query* guarantees.
+            assert_ne!(
+                ticket.status,
+                Status::Done,
+                "#{} came back done from an is:open search",
+                ticket.number
+            );
+        }
+        // A map is an open issue with nobody assigned, so `no:assignee` finds
+        // every map in every repo asked about. Live proof that the label drop
+        // works, since this repo always has an open map: without it every
+        // cluster header would also be a row of the inbox below it.
+        let maps = wf::fetch::find_maps(&[common::THIS_REPO.to_string()])
+            .await
+            .expect("the map search answers");
+        for id in &maps {
+            assert!(
+                !cluster.tickets.iter().any(|t| t.number == id.number),
+                "map #{} is a heading, not a row of the inbox",
+                id.number
+            );
+        }
+        assert!(
+            cluster.last_activity.is_some(),
+            "the live updatedAt selection must parse, or every inbox sorts as unknown"
+        );
+    }
 }

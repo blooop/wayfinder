@@ -17,7 +17,9 @@ use crate::app::{App, Overlay};
 use crate::filter;
 use crate::launch::{Agent, Candidate, Launch, Staged};
 use crate::liveness::Life;
-use crate::model::{Checks, Map, MapId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket};
+use crate::model::{
+    Checks, Cluster, ClusterId, PrLink, PrStatus, Review, RowGlyph, Stage, Status, Ticket,
+};
 use crate::reclaim::Reclaimable;
 use crate::view::{Branch, Fold, GroupKind, Item, Plan, ProjectRow};
 
@@ -36,8 +38,8 @@ fn glyph_style(glyph: RowGlyph) -> Style {
     }
 }
 
-/// The cluster header: `▌ <repo> · <map title>  ○n ◐n ◍n !n ●n ⊘n`. The counts
-/// are the whole map's, not the query's — they describe the cluster's shape,
+/// The cluster header: `▌ <repo> · <cluster title>  ○n ◐n ◍n !n ●n ⊘n`. The counts
+/// are the whole cluster's, not the query's — they describe the cluster's shape,
 /// and the group headers already carry `matched/total` while a query is live.
 ///
 /// They are **stage** counts (#78), tallied through the same [`RowGlyph`] the
@@ -45,7 +47,7 @@ fn glyph_style(glyph: RowGlyph) -> Style {
 /// header used to keep its own four-status tally with its own glyph array and
 /// its own colour table, which meant the same characters said different things
 /// a line apart: a node the row drew `!` was counted under `○`, and `◍`/`!`
-/// could not appear here at all. Glyphs the map has nobody in drop out rather
+/// could not appear here at all. Glyphs the cluster has nobody in drop out rather
 /// than showing a zero.
 ///
 /// The repo name carries the query's match on it (`lit`), because the repo is
@@ -53,8 +55,8 @@ fn glyph_style(glyph: RowGlyph) -> Style {
 /// typing a project name would otherwise sift the whole screen down to one
 /// cluster while underlining nothing anywhere.
 fn cluster_header(
-    id: &MapId,
-    map: &Map,
+    id: &ClusterId,
+    cluster: &Cluster,
     lit: &[usize],
     under_cursor: bool,
     marks: Marks,
@@ -65,12 +67,12 @@ fn cluster_header(
     // read as belonging to the first row rather than to the header (#96).
     let mut spans = vec![cursor_span(under_cursor), Span::styled("▌ ", cyan)];
     spans.extend(lit_spans(id.short_repo(), lit, cyan));
-    spans.push(Span::styled(format!(" · {}", map.title), cyan));
-    // A map is a node, so a charting session is as resumable as a build one,
-    // and a map's own workspace is as launchable — the header is the only place
+    spans.push(Span::styled(format!(" · {}", cluster.header_name()), cyan));
+    // A cluster is a node, so a charting session is as resumable as a build one,
+    // and a cluster's own workspace is as launchable — the header is the only place
     // the list can say either (#35).
     spans.extend(marks.spans());
-    for (glyph, count) in map.tally() {
+    for (glyph, count) in cluster.tally() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("{}{count}", glyph.char()),
@@ -91,7 +93,7 @@ fn cluster_header(
 /// identical.
 ///
 /// The tail says what is inside, and has three honest answers: the stage
-/// rollup once maps are on hand, `no map — enter to start one` once the search
+/// rollup once maps are on hand, `no cluster — enter to start one` once the search
 /// has answered and found none, and `loading…` in between. That third one is
 /// the whole reason [`ProjectRow::loaded`] exists — a repo whose maps are still
 /// in flight and a repo that has none are the same zero, and calling the first
@@ -338,7 +340,7 @@ fn ticket_line(
 }
 
 /// A context row on a sifted screen: the same row, dimmed whole. It is drawn to
-/// say where the matches under it live — which map, and which takeable ticket
+/// say where the matches under it live — which cluster, and which takeable ticket
 /// unlocks them — and nothing about it is actionable, so it carries no cursor
 /// marker, no `also needs`, and no rollup. Nothing lit, either, and not merely
 /// by omission: a row the query landed on is a match, and a match is drawn as
@@ -451,14 +453,23 @@ fn body_with_cursor(app: &App, plan: &Plan) -> (Vec<Line<'static>>, Option<usize
         let under_cursor = item.stop_at().is_some() && mark(&lines, &mut cursor_line);
         match item {
             Item::Header(id) => {
-                let map = &app.clusters[id];
-                let lit = query.as_mut().map(|q| q.in_repo(map)).unwrap_or_default();
+                let cluster = &app.clusters[id];
+                let lit = query
+                    .as_mut()
+                    .map(|q| q.in_repo(cluster))
+                    .unwrap_or_default();
                 lines.push(cluster_header(
                     id,
-                    map,
+                    cluster,
                     &lit,
                     under_cursor,
-                    Marks::of(app, &id.repo, id.number),
+                    // A map issue is a node, so it can carry a resume or a
+                    // running container; a loose cluster is not one, so there
+                    // is nothing about it to mark.
+                    match id {
+                        ClusterId::Map(map_id) => Marks::of(app, &map_id.repo, map_id.number),
+                        ClusterId::Inbox(_) => Marks::default(),
+                    },
                 ));
             }
             Item::Ticket {
@@ -522,7 +533,7 @@ fn key_hints(app: &App) -> &'static str {
 /// cache and needs no network, so the ambiguity the old heading had to
 /// disentangle is gone with the screen that had it: an empty list now means one
 /// thing (nothing registered) instead of three (still loading, every fetch
-/// failed, or genuinely none). A failed *map* fetch no longer empties this
+/// failed, or genuinely none). A failed *cluster* fetch no longer empties this
 /// screen at all — the projects are still listed — so it is named here only
 /// while it is the most interesting thing true, and on the count line
 /// ([`failure_note`]) in every case.
@@ -539,7 +550,7 @@ pub fn heading(app: &App) -> String {
     if projects.is_empty() {
         return "no projects — run wf inside a checkout to register it".to_string();
     }
-    // Naming the map is the whole value when there is one: "GitHub is
+    // Naming the cluster is the whole value when there is one: "GitHub is
     // unreachable" and "that project has nothing open" are different problems
     // with different fixes, and a bare count reads the same either way.
     //
@@ -547,7 +558,7 @@ pub fn heading(app: &App) -> String {
     // Naming a key that no longer exists is worse than saying nothing, and
     // saying nothing leaves the reader on a screen with a failure and no move
     // to make — so it names the move that is left. Restarting really is the
-    // retry now: each map is fetched once per run, and a warm start is ~0.6 s.
+    // retry now: each cluster is fetched once per run, and a warm start is ~0.6 s.
     if app.clusters.is_empty() && app.startup.is_loaded() {
         match app.failed.len() {
             0 => {}
@@ -586,21 +597,37 @@ pub fn failure_note(app: &App) -> String {
     }
 }
 
-/// The `· … truncated` segment on the count line (#184): a map the tracker
+/// The `· inbox unread` segment on the count line: the inbox query failed, so
+/// this screen is not the whole answer.
+///
+/// It exists because an empty inbox draws **nothing** — no heading, no rows —
+/// which makes a failed read indistinguishable from a tidy tracker. A failed
+/// map at least leaves a visible hole where its cluster was; this leaves a
+/// screen that looks finished. Worded as what the reader lost rather than as
+/// an error, because the maps beside it are perfectly good.
+pub fn inbox_note(app: &App) -> String {
+    if app.inbox_failed {
+        "· inbox unread".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// The `· … truncated` segment on the count line (#184): a cluster the tracker
 /// could not send all of — more sub-issues or blocking edges than one page
 /// holds, per [`Map`]'s `truncated` — named where the reader is, because the
 /// body draws a normal-looking tree either way and this line is the only
 /// place left to say the tree is partial.
 ///
 /// Shaped exactly like [`failure_note`], its nearest kin: both are persistent
-/// facts about a whole map that the rows cannot carry, one map is named, more
+/// facts about a whole cluster that the rows cannot carry, one cluster is named, more
 /// collapse to a count.
 pub fn truncated_note(app: &App) -> String {
-    let mut truncated = app.clusters.iter().filter(|(_, map)| map.truncated);
+    let mut truncated = app.clusters.iter().filter(|(_, cluster)| cluster.truncated);
     match (truncated.next(), truncated.count()) {
         (None, _) => String::new(),
-        (Some((id, _)), 0) => format!("· {}#{} truncated", id.repo, id.number),
-        (Some(_), more) => format!("· {} maps truncated", more + 1),
+        (Some((id, _)), 0) => format!("· {} truncated", id.label()),
+        (Some(_), more) => format!("· {} clusters truncated", more + 1),
     }
 }
 
@@ -629,8 +656,8 @@ pub fn reclaim_note(app: &App, width: usize) -> String {
 }
 
 /// The `· N idle maps hidden` segment on the count line (#51): the leverage
-/// view drops a map with nothing takeable from the body, and the count is the
-/// only trace of it — silence would read as the map not existing at all. The
+/// view drops a cluster with nothing takeable from the body, and the count is the
+/// only trace of it — silence would read as the cluster not existing at all. The
 /// forest (`tab`) shows the dropped maps in full.
 pub fn idle_note(plan: &Plan) -> String {
     match plan.idle_hidden {
@@ -997,6 +1024,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let mut parts: Vec<String> = [
         app.startup.hint(),
         failure_note(app),
+        inbox_note(app),
         truncated_note(app),
         idle_note(&plan),
     ]
@@ -1074,7 +1102,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{classify, Activity, Map, MapId, MapSet, Ticket, TicketType};
+    use crate::model::{classify, Activity, MapId, MapSet, Source, Ticket, TicketType};
     use crate::refresh::Startup;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1100,12 +1128,14 @@ mod tests {
         }
     }
 
-    fn wf_map() -> Map {
+    fn wf_map() -> Cluster {
         let t = |number, title: &str, open, assigned, needs: Vec<u64>| {
             ticket("blooop/wayfinder", number, title, open, assigned, needs)
         };
-        Map {
-            title: "Map: wf".to_string(),
+        Cluster {
+            source: Source::Map {
+                title: "Map: wf".to_string(),
+            },
             last_activity: None,
             truncated: false,
             tickets: vec![
@@ -1121,15 +1151,160 @@ mod tests {
     /// An app standing on `repo`'s screen. `App::new` opens on the project
     /// *list*, which draws no cluster at all, so a test about what a cluster
     /// looks like has to say which project's screen it is on.
-    fn app_on(repo: &str, clusters: BTreeMap<MapId, Map>) -> App {
+    fn app_on(repo: &str, clusters: BTreeMap<ClusterId, Cluster>) -> App {
         let mut app = App::new(clusters);
         app.enter(repo);
         app
     }
 
+    /// An app standing on wayfinder with one map and an inbox beside it.
+    fn with_inbox() -> App {
+        let mut clusters = BTreeMap::new();
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), wf_map());
+        clusters.insert(
+            ClusterId::Inbox("blooop/wayfinder".to_string()),
+            Cluster::inbox(
+                None,
+                vec![
+                    ticket(
+                        "blooop/wayfinder",
+                        91,
+                        "Widen the count line",
+                        true,
+                        true,
+                        vec![],
+                    ),
+                    ticket(
+                        "blooop/wayfinder",
+                        104,
+                        "Drop the dead flag",
+                        true,
+                        true,
+                        vec![],
+                    ),
+                ],
+                false,
+            ),
+        );
+        app_on("blooop/wayfinder", clusters)
+    }
+
+    #[test]
+    fn a_failed_inbox_read_says_so_because_an_empty_inbox_draws_nothing() {
+        // The case this segment exists for. A failed *map* leaves a visible
+        // hole where its cluster was; a failed inbox leaves a screen that
+        // looks finished, because "nothing assigned", "all of it claimed by a
+        // map" and "the query never answered" are the same blank screen.
+        let mut app = fixture_app();
+        let quiet = render(&app);
+        assert!(!quiet.contains("inbox"), "{quiet}");
+
+        app.inbox_failed = true;
+        let screen = render(&app);
+        assert!(screen.contains("· inbox unread"), "{screen}");
+        // The maps beside it are perfectly good, so the note says what was
+        // lost rather than announcing a broken screen.
+        assert!(screen.contains("▌ wayfinder · Map: wf"), "{screen}");
+    }
+
+    #[test]
+    fn an_inbox_that_answered_empty_is_silent() {
+        // Only a *failure* is worth a segment. A tidy tracker draws nothing
+        // and says nothing, which is the whole reason the failure needs to.
+        let mut app = with_inbox();
+        app.inbox_failed = false;
+        assert!(!render(&app).contains("inbox unread"));
+    }
+
+    #[test]
+    fn the_inbox_header_names_what_it_is_rather_than_a_map_it_has_not_got() {
+        let screen = render(&with_inbox());
+        assert!(
+            screen.contains("▌ wayfinder · yours or unclaimed"),
+            "{screen}"
+        );
+        // And it still carries stage counts in the same glyph vocabulary the
+        // rows below it use — both rows are assigned, so both are claimed.
+        assert!(
+            screen.contains("▌ wayfinder · yours or unclaimed  ◐2"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_inbox_draws_below_every_map() {
+        let screen = render(&with_inbox());
+        let lines: Vec<&str> = screen.lines().collect();
+        let map = lines
+            .iter()
+            .position(|l| l.contains("· Map: wf"))
+            .expect("the map header");
+        let inbox = lines
+            .iter()
+            .position(|l| l.contains("· yours or unclaimed"))
+            .expect("the inbox header");
+        assert!(map < inbox, "curated work leads: {screen}");
+    }
+
+    #[test]
+    fn the_project_row_counts_maps_and_leaves_the_inbox_out_of_its_rollup() {
+        // The project list is drawn before you enter anything and its glyphs
+        // say how much charted work is moving. An inbox of assigned issues
+        // would render `◐N` over every repo and drown that.
+        let screen = render(&with_inbox());
+        assert!(screen.contains("▌ blooop/wayfinder · 1 map"), "{screen}");
+        assert!(
+            !screen.contains("· 2 maps"),
+            "the inbox is not a second map: {screen}"
+        );
+    }
+
+    #[test]
+    fn an_inbox_row_is_findable_by_the_same_query_a_mapped_row_is() {
+        let mut app = with_inbox();
+        for c in "widen".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let screen = render(&app);
+        assert!(screen.contains("#91"), "the inbox row sifted in: {screen}");
+        assert!(
+            screen.contains("▌ wayfinder · yours or unclaimed"),
+            "and kept its header, like any sifted cluster: {screen}"
+        );
+        assert!(
+            !screen.contains("Re-entry breadcrumbs"),
+            "the map's non-matching rows left: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_inbox_is_named_as_the_inbox_and_not_as_an_issue_number() {
+        let mut clusters = BTreeMap::new();
+        clusters.insert(
+            ClusterId::Inbox("blooop/wayfinder".to_string()),
+            Cluster::inbox(
+                None,
+                vec![ticket(
+                    "blooop/wayfinder",
+                    91,
+                    "one row",
+                    true,
+                    true,
+                    vec![],
+                )],
+                true,
+            ),
+        );
+        let screen = render(&app_on("blooop/wayfinder", clusters));
+        assert!(
+            screen.contains("· blooop/wayfinder (yours or unclaimed) truncated"),
+            "a loose cluster has no issue number to borrow: {screen}"
+        );
+    }
+
     fn fixture_app() -> App {
         let mut clusters = BTreeMap::new();
-        clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), wf_map());
         app_on("blooop/wayfinder", clusters)
     }
 
@@ -1183,7 +1358,7 @@ mod tests {
     fn a_row_you_left_a_conversation_on_says_so_before_anything_is_fetched() {
         // The badge is drawn from the local cache, so it is on the *first*
         // frame — the same frame-zero rule the project list follows. Nothing
-        // asks `dl`, and nothing waits for the map search.
+        // asks `dl`, and nothing waits for the cluster search.
         let screen = render(&app_resuming(7));
         let row = screen
             .lines()
@@ -1200,7 +1375,7 @@ mod tests {
 
     #[test]
     fn a_map_you_have_charted_before_carries_the_badge_too() {
-        // A map is a node (#96) and its picker offers the resume row, so the
+        // A cluster is a node (#96) and its picker offers the resume row, so the
         // list has to say so — otherwise the only way to discover a charting
         // session is waiting is to press enter on every header.
         let screen = render(&app_resuming(1));
@@ -1278,8 +1453,9 @@ mod tests {
         // the header has to agree, because they are one vocabulary. Counting
         // statuses instead sweeps it back under `○`, and `◍`/`!` could never
         // appear in a header at all.
-        let mut map = wf_map();
-        map.tickets
+        let mut cluster = wf_map();
+        cluster
+            .tickets
             .iter_mut()
             .find(|t| t.number == 6)
             .expect("#6 in the fixture")
@@ -1293,7 +1469,8 @@ mod tests {
         }];
         // #9 is claimed with a passing, approved PR: in review — the other
         // stage the four-status header had no glyph for.
-        map.tickets
+        cluster
+            .tickets
             .iter_mut()
             .find(|t| t.number == 9)
             .expect("#9 in the fixture")
@@ -1306,9 +1483,9 @@ mod tests {
             },
         }];
         let mut clusters = BTreeMap::new();
-        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), cluster);
         let screen = render(&app_on("blooop/wayfinder", clusters));
-        // ○0 is not drawn: the counts name the stages the map is actually in.
+        // ○0 is not drawn: the counts name the stages the cluster is actually in.
         assert!(
             screen.contains("▌ wayfinder · Map: wf  ◍1  !1  ●1  ⊘2"),
             "{screen}"
@@ -1393,8 +1570,8 @@ mod tests {
 
     #[test]
     fn pr_badges_ride_their_ticket_row() {
-        let mut map = wf_map();
-        let t6 = map
+        let mut cluster = wf_map();
+        let t6 = cluster
             .tickets
             .iter_mut()
             .find(|t| t.number == 6)
@@ -1416,7 +1593,8 @@ mod tests {
             },
         ];
         // Nothing outstanding on #9's PR: checks pass, no review required.
-        map.tickets
+        cluster
+            .tickets
             .iter_mut()
             .find(|t| t.number == 9)
             .expect("#9 in the fixture")
@@ -1429,7 +1607,7 @@ mod tests {
             },
         }];
         let mut clusters = BTreeMap::new();
-        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), cluster);
         let app = app_on("blooop/wayfinder", clusters);
         let screen = render(&app);
         // Same-repo badge: `⇄ PR#n <state>` after the [type] suffix.
@@ -1449,8 +1627,9 @@ mod tests {
         // The status column *is* the stage column now (#61/#62): an approved
         // open PR reads ◍ in review, failing checks read ! needs attention —
         // whatever the ticket's own state says.
-        let mut map = wf_map();
-        map.tickets
+        let mut cluster = wf_map();
+        cluster
+            .tickets
             .iter_mut()
             .find(|t| t.number == 6)
             .expect("#6")
@@ -1462,7 +1641,8 @@ mod tests {
                 review: Review::Approved,
             },
         }];
-        map.tickets
+        cluster
+            .tickets
             .iter_mut()
             .find(|t| t.number == 9)
             .expect("#9")
@@ -1475,7 +1655,7 @@ mod tests {
             },
         }];
         let mut clusters = BTreeMap::new();
-        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), cluster);
         let screen = render(&app_on("blooop/wayfinder", clusters));
         assert!(screen.contains("◍ #6 Re-entry breadcrumbs"), "{screen}");
         assert!(screen.contains("! #9 Main screen design"), "{screen}");
@@ -1488,8 +1668,9 @@ mod tests {
         // Done ticket #2's PR is still open with pending checks: the shut
         // group says so as a glyph+count pair, so a closed-but-unlanded branch
         // is watched at a glance without opening it.
-        let mut map = wf_map();
-        map.tickets
+        let mut cluster = wf_map();
+        cluster
+            .tickets
             .iter_mut()
             .find(|t| t.number == 2)
             .expect("#2")
@@ -1502,7 +1683,7 @@ mod tests {
             },
         }];
         let mut clusters = BTreeMap::new();
-        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), cluster);
         let mut app = app_on("blooop/wayfinder", clusters);
         let screen = render(&app);
         assert!(screen.contains("● 1 done (hidden) ◐1"), "{screen}");
@@ -1522,8 +1703,9 @@ mod tests {
 
     #[test]
     fn an_in_flight_open_pr_gets_no_verdict_glyph() {
-        let mut map = wf_map();
-        map.tickets
+        let mut cluster = wf_map();
+        cluster
+            .tickets
             .iter_mut()
             .find(|t| t.number == 6)
             .expect("#6")
@@ -1536,7 +1718,7 @@ mod tests {
             },
         }];
         let mut clusters = BTreeMap::new();
-        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), cluster);
         let screen = render(&app_on("blooop/wayfinder", clusters));
         assert!(screen.contains("⇄ PR#14 open"), "{screen}");
         assert!(!screen.contains('✓'), "{screen}");
@@ -1615,7 +1797,7 @@ mod tests {
 
     /// A stall reaches the count line as well as the row, because the row is
     /// not always on screen: the project list has no ticket rows at all, and a
-    /// stalled node can be inside a fold or another map.
+    /// stalled node can be inside a fold or another cluster.
     #[test]
     fn the_count_line_names_what_stopped_moving() {
         let mut app = fixture_app();
@@ -1791,16 +1973,16 @@ mod tests {
         }
     }
 
-    /// A map the tracker could not send all of is named on the count line
+    /// A cluster the tracker could not send all of is named on the count line
     /// (#184): the body draws a perfectly normal tree either way, so this
     /// segment is the only trace that tickets — or the blocking edges their
     /// classification is drawn from — are missing from it.
     #[test]
     fn the_count_line_says_when_a_map_arrived_truncated() {
         let mut clusters = BTreeMap::new();
-        let mut map = wf_map();
-        map.truncated = true;
-        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        let mut cluster = wf_map();
+        cluster.truncated = true;
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), cluster);
         let app = app_on("blooop/wayfinder", clusters);
         let screen = render(&app);
         let line = screen
@@ -1809,12 +1991,12 @@ mod tests {
             .unwrap_or_else(|| panic!("no truncation segment: {screen}"));
         assert!(
             line.contains("blooop/wayfinder#1 truncated"),
-            "one truncated map is named, like one failed map is: {line}"
+            "one truncated cluster is named, like one failed cluster is: {line}"
         );
 
-        // A complete map says nothing — silence is the ordinary case.
+        // A complete cluster says nothing — silence is the ordinary case.
         let mut clusters = BTreeMap::new();
-        clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), wf_map());
         let app = app_on("blooop/wayfinder", clusters);
         assert!(!render(&app).contains("truncated"));
     }
@@ -1824,11 +2006,13 @@ mod tests {
         let mut clusters = BTreeMap::new();
         let mut first = wf_map();
         first.truncated = true;
-        clusters.insert(MapId::new("blooop/wayfinder", 1), first);
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), first);
         clusters.insert(
-            MapId::new("blooop/wayfinder", 47),
-            Map {
-                title: "Map: the selection view".to_string(),
+            ClusterId::Map(MapId::new("blooop/wayfinder", 47)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: the selection view".to_string(),
+                },
                 last_activity: None,
                 truncated: true,
                 tickets: vec![ticket(
@@ -1844,7 +2028,7 @@ mod tests {
         let app = app_on("blooop/wayfinder", clusters);
         let screen = render(&app);
         assert!(
-            screen.contains("· 2 maps truncated"),
+            screen.contains("· 2 clusters truncated"),
             "several collapse to a count, like failures do: {screen}"
         );
     }
@@ -1852,13 +2036,15 @@ mod tests {
     #[test]
     fn idle_maps_drop_to_the_count_line_and_tab_brings_them_back() {
         let mut clusters = BTreeMap::new();
-        clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
-        // A second map of the *same* project: a screen is one repo's, so an
-        // idle map has to be one of this repo's to be dropped from it.
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), wf_map());
+        // A second cluster of the *same* project: a screen is one repo's, so an
+        // idle cluster has to be one of this repo's to be dropped from it.
         clusters.insert(
-            MapId::new("blooop/wayfinder", 4),
-            Map {
-                title: "Map: the archive".to_string(),
+            ClusterId::Map(MapId::new("blooop/wayfinder", 4)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: the archive".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: vec![ticket(
@@ -1893,11 +2079,13 @@ mod tests {
         // The #50 acceptance case: two open maps on one repo are two clusters,
         // where the old lowest-number rule showed only one.
         let mut clusters = BTreeMap::new();
-        clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), wf_map());
         clusters.insert(
-            MapId::new("blooop/wayfinder", 47),
-            Map {
-                title: "Map: the selection view".to_string(),
+            ClusterId::Map(MapId::new("blooop/wayfinder", 47)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: the selection view".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: vec![ticket(
@@ -1914,10 +2102,10 @@ mod tests {
         let screen = render(&app);
         let first = screen
             .find("▌ wayfinder · Map: wf")
-            .expect("map #1's cluster");
+            .expect("cluster #1's cluster");
         let second = screen
             .find("▌ wayfinder · Map: the selection view")
-            .expect("map #47's cluster");
+            .expect("cluster #47's cluster");
         assert!(
             first < second,
             "equal activity falls back to (repo, number)"
@@ -1929,14 +2117,16 @@ mod tests {
 
     #[test]
     fn a_finished_map_renders_below_the_live_ones_however_recent_it_is() {
-        // The reported symptom: the finished map held the lowest issue number
+        // The reported symptom: the finished cluster held the lowest issue number
         // *and* the freshest activity, and so sat at the top of the tree. Both
         // of the keys that would have put it there are deliberately set here.
         let mut clusters = BTreeMap::new();
         clusters.insert(
-            MapId::new("blooop/wayfinder", 1),
-            Map {
-                title: "Map: the archive".to_string(),
+            ClusterId::Map(MapId::new("blooop/wayfinder", 1)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: the archive".to_string(),
+                },
                 last_activity: Activity::parse("2026-08-06T12:00:00Z"),
                 truncated: false,
                 tickets: vec![ticket(
@@ -1950,9 +2140,11 @@ mod tests {
             },
         );
         clusters.insert(
-            MapId::new("blooop/wayfinder", 47),
-            Map {
-                title: "Map: the selection view".to_string(),
+            ClusterId::Map(MapId::new("blooop/wayfinder", 47)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: the selection view".to_string(),
+                },
                 last_activity: Activity::parse("2026-08-01T12:00:00Z"),
                 truncated: false,
                 tickets: vec![ticket(
@@ -1966,7 +2158,7 @@ mod tests {
             },
         );
         let mut app = app_on("blooop/wayfinder", clusters);
-        // The forest, because that is the screen a finished map appears on at
+        // The forest, because that is the screen a finished cluster appears on at
         // all — leverage drops it as idle.
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let screen = render(&app);
@@ -2143,8 +2335,8 @@ mod tests {
         // Two done tickets, one of them matching: typing has to reach inside
         // the group that holds it, and the group has to stay honest about the
         // one it is still holding back.
-        let mut map = wf_map();
-        map.tickets.push(ticket(
+        let mut cluster = wf_map();
+        cluster.tickets.push(ticket(
             "blooop/wayfinder",
             3,
             "Stack the PRs",
@@ -2153,7 +2345,7 @@ mod tests {
             vec![],
         ));
         let mut clusters = BTreeMap::new();
-        clusters.insert(MapId::new("blooop/wayfinder", 1), map);
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), cluster);
         let mut app = app_on("blooop/wayfinder", clusters);
         type_str(&mut app, "choose");
         let screen = render(&app);
@@ -2205,7 +2397,7 @@ mod tests {
         assert_eq!(screen.matches('▶').count(), 1, "{screen}");
     }
 
-    /// The fixture map plus Build 4 launch inputs: two checkouts of the repo,
+    /// The fixture cluster plus Build 4 launch inputs: two checkouts of the repo,
     /// so `enter` opens the which-checkout picker.
     fn launchable_app() -> App {
         let checkout = |path: &str| {
@@ -2434,7 +2626,7 @@ mod tests {
         // list as no projects at all. Saying "no projects — run wf inside a
         // checkout" there sends the user to fix the one thing that is not
         // broken, so the failure has to win the heading — and it names the
-        // *map*, because with several on one repo the repo alone is ambiguous.
+        // *cluster*, because with several on one repo the repo alone is ambiguous.
         let mut app = App::empty().with_checkouts(vec![
             crate::projects::Checkout::new(
                 std::path::PathBuf::from("/data/proj/wayfinder"),
@@ -2464,7 +2656,7 @@ mod tests {
     #[test]
     fn a_partial_failure_is_visible_and_survives_the_next_keypress() {
         // The case that hides best: the clusters that did load look completely
-        // normal, so the count line is the only place left to say a map is
+        // normal, so the count line is the only place left to say a cluster is
         // missing — and `notice` cannot be that place, because `handle_key`
         // clears it on every keypress and nothing polls to re-announce it.
         let mut app = fixture_app();
@@ -2499,7 +2691,7 @@ mod tests {
 
     #[test]
     fn a_partial_load_shows_progress_beside_the_clusters_already_in() {
-        // One map of three has landed: the rows are real and fresh, and the
+        // One cluster of three has landed: the rows are real and fresh, and the
         // count line still says more is coming.
         let mut app = fixture_app();
         let found: MapSet = [
@@ -2528,9 +2720,11 @@ mod tests {
         // what `enter` would pick is broken.
         let mut clusters = BTreeMap::new();
         clusters.insert(
-            MapId::new("blooop/wayfinder", 1),
-            Map {
-                title: "Map: wf".to_string(),
+            ClusterId::Map(MapId::new("blooop/wayfinder", 1)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: wf".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: (1..=30)
@@ -2548,9 +2742,11 @@ mod tests {
             },
         );
         clusters.insert(
-            MapId::new("blooop/wayfinder", 47),
-            Map {
-                title: "Map: the selection view".to_string(),
+            ClusterId::Map(MapId::new("blooop/wayfinder", 47)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: the selection view".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: vec![ticket(
@@ -2587,7 +2783,7 @@ mod tests {
         // first, each saying how much is inside it in the same glyph vocabulary
         // the rows below use.
         let mut clusters = BTreeMap::new();
-        clusters.insert(MapId::new("blooop/wayfinder", 1), wf_map());
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), wf_map());
         let stamped = |path: &str, repo: &str, at: u64| crate::projects::Checkout {
             path: std::path::PathBuf::from(path),
             repo: repo.to_string(),
@@ -2615,7 +2811,7 @@ mod tests {
             .position(|l| l.contains("▌ blooop/newthing · no map — enter to start one"))
             .expect("the map-less project — a row here like any other");
         assert!(wayfinder < newthing, "most recently used first: {screen}");
-        // The counts are the map's, in the glyphs the rows use.
+        // The counts are the cluster's, in the glyphs the rows use.
         assert!(lines[wayfinder].contains("○1"), "{screen}");
         // And no ticket got onto this screen.
         assert!(!screen.contains("#6 Re-entry breadcrumbs"), "{screen}");

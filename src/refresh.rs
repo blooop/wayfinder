@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::fetch;
-use crate::model::{Map, MapId, MapSet};
+use crate::model::{Cluster, MapId, MapSet};
 use crate::projects::ProjectsCache;
 use crate::reclaim::Reading;
 
@@ -54,7 +54,7 @@ pub const RETRY_INTERVAL: Duration = Duration::from_secs(4);
 #[derive(Debug)]
 pub enum MapFetch {
     /// The map came back.
-    Loaded(Map),
+    Loaded(Cluster),
     /// The fetch failed (network, auth, parse); nothing to show for this map.
     Failed,
 }
@@ -73,6 +73,24 @@ pub enum LoadEvent {
     SearchFailed,
     /// One map's load reported.
     Fetched { id: MapId, outcome: MapFetch },
+    /// The inbox read returned: one cluster per repo holding whatever there is
+    /// no map for and nobody else on, keyed by repo slug. Empty is a real
+    /// answer — a tracker with nothing loose in it.
+    ///
+    /// Sent once. Unlike the map search this does not retry: the maps are the
+    /// screen and an empty one is a broken `wf`, whereas a missed inbox costs
+    /// one heading. But it is *not* silent — see [`LoadEvent::InboxFailed`].
+    Inbox(Vec<(String, Cluster)>),
+    /// The inbox read failed. Reported rather than swallowed, because the
+    /// three ways to have no inbox are indistinguishable on screen and only
+    /// one of them is a problem: nothing is assigned to you, everything
+    /// assigned is already claimed by a map, or the query never answered. An
+    /// empty inbox draws no heading at all, so without this the failure looks
+    /// exactly like a tidy tracker and there is nothing to act on.
+    ///
+    /// State, not a notice, for [`crate::app::App::failed`]'s reason: it has
+    /// to survive the next keypress, because it stays true for the whole run.
+    InboxFailed,
     /// The background reading landed (#137) — what a `wf reap` would claim,
     /// and what is running or has stopped.
     ///
@@ -346,6 +364,24 @@ pub fn spawn_discovery(
     })
 }
 
+/// Read the inbox once, off the path to the first frame: every open issue
+/// across the cached repos that is the viewer's or nobody's.
+///
+/// One shot and no retry, for the reason [`LoadEvent::Inbox`] gives — but a
+/// failure is reported ([`LoadEvent::InboxFailed`]) rather than swallowed.
+/// Its handle is returned like discovery's so the launch path can stop it and
+/// wait — it holds a `gh` child of its own, and the same reasoning as
+/// [`Loaders::shutdown`] applies.
+pub fn spawn_inbox(repos: Vec<String>, tx: mpsc::UnboundedSender<LoadEvent>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let event = match fetch::fetch_inbox(&repos).await {
+            Ok(found) => LoadEvent::Inbox(found),
+            Err(_) => LoadEvent::InboxFailed,
+        };
+        let _ = tx.send(event);
+    })
+}
+
 /// How long the map search waits after its `failures`-th consecutive miss.
 ///
 /// Doubles from [`RETRY_INTERVAL`] and stops growing at sixteen times it,
@@ -470,6 +506,7 @@ pub fn preserve_cursor<K: PartialEq>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ClusterId;
 
     #[test]
     fn discovery_retries_back_off_by_doubling() {
@@ -659,7 +696,7 @@ mod tests {
         // was in rather than jumping to the other map's copy of the ticket.
         // Against the real `RowKey`, since that is the K this is generic for.
         let on = |map: u64| crate::app::RowKey {
-            map: MapId::new("blooop/wayfinder", map),
+            cluster: ClusterId::Map(MapId::new("blooop/wayfinder", map)),
             ticket: 6,
         };
         let order = [on(1), on(47)];

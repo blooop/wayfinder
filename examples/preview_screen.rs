@@ -5,6 +5,10 @@
 //! Run: `cargo run --example preview_screen -- blooop/wayfinder 47 [more...]`
 //! Keys to replay come from $KEYS, e.g. KEYS="down right right" — one of
 //! down/up/left/right/tab/<char>.
+//!
+//! The inbox (`yours or unclaimed`) is read for the same repos and subtracted
+//! against the maps given, so the frame here is the frame `wf` draws once both
+//! reads have landed.
 
 use std::collections::BTreeMap;
 
@@ -34,6 +38,40 @@ fn press(app: &mut App, name: &str) {
     app.handle_key(KeyEvent::new(code, mods));
 }
 
+/// The inbox, subtracted against the maps that were fetched — the same
+/// derivation `picker`'s fold makes, so the frame this dumps is the frame `wf`
+/// draws once both reads have landed.
+async fn add_inbox(
+    clusters: &mut BTreeMap<wf::model::ClusterId, wf::model::Cluster>,
+    ids: &[MapId],
+    mapped: &BTreeMap<String, Vec<u64>>,
+) {
+    let repos: Vec<String> = ids.iter().map(|id| id.repo.clone()).collect();
+    let inbox = match wf::fetch::fetch_inbox(&repos).await {
+        Ok(inbox) => inbox,
+        Err(e) => {
+            eprintln!("inbox failed: {e}");
+            return;
+        }
+    };
+    for (repo, cluster) in inbox {
+        let claimed = mapped.get(&repo).cloned().unwrap_or_default();
+        let tickets: Vec<_> = cluster
+            .tickets
+            .iter()
+            .filter(|t| !claimed.contains(&t.number))
+            .cloned()
+            .collect();
+        if tickets.is_empty() {
+            continue;
+        }
+        clusters.insert(
+            wf::model::ClusterId::Inbox(repo),
+            wf::model::Cluster::inbox(cluster.last_activity, tickets, cluster.truncated),
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -46,14 +84,21 @@ async fn main() {
         .collect();
 
     let mut clusters = BTreeMap::new();
+    let mut mapped: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for id in &ids {
         match wf::fetch::fetch_map(id).await {
             Ok(map) => {
-                clusters.insert(id.clone(), map);
+                mapped
+                    .entry(id.repo.clone())
+                    .or_default()
+                    .extend(map.tickets.iter().map(|t| t.number));
+                clusters.insert(wf::model::ClusterId::Map(id.clone()), map);
             }
             Err(e) => eprintln!("{}#{} failed: {e}", id.repo, id.number),
         }
     }
+
+    add_inbox(&mut clusters, &ids, &mapped).await;
 
     let keys: Vec<String> = std::env::var("KEYS")
         .unwrap_or_default()
@@ -79,7 +124,7 @@ async fn main() {
     let stops = app.stops();
     let pos = app.cursor_pos();
     let label = |at: &wf::view::StopAt| match &at.stop {
-        wf::view::Stop::Map(id) => format!("map #{}", id.number),
+        wf::view::Stop::Cluster(id) => format!("cluster {}", id.label()),
         wf::view::Stop::Ticket(row) => format!("#{}", app.ticket(row).number),
         wf::view::Stop::Group(g) => format!("{:?}", g.kind),
         wf::view::Stop::Project(repo) => format!("project {repo}"),

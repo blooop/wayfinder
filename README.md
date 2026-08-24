@@ -254,6 +254,11 @@ maps as clusters beneath.
   ▌ wayfinder · the general dev-process tree  ○2  ◐1
     ○ #134 The manager hands pointers, never readings [build]
     ○ #133 The ctx handoff's guards don't yet guard   [build]
+
+  ▌ wayfinder · yours or unclaimed  ○1  ◍2
+    ○ #207 Widen the count line
+    ◍ #190 A red live or scheduled run files an issue [build]  ⇄ PR#202 open ✓
+    ◍ #191 Widths survive non-ASCII titles            [build]  ⇄ PR#203 open ✓
 ```
 
 **Outside one** it opens on the **project list** — every registered repo, most
@@ -316,8 +321,9 @@ pattern) is **one** project: they are two places it can run, and they share its
 maps, so the project's stamp is the newest of theirs.
 
 Every registered repo is a row on the project list, mapped or not. A repo with
-no open `wayfinder:map` simply has no clusters on its screen — its own row is
-still there, and is where its first map gets charted (see
+no open `wayfinder:map` has no *map* clusters on its screen — it may still have
+an [inbox](#the-inbox-issues-no-map-claims) — and its own
+row is still there, which is where its first map gets charted (see
 [Launching](#launching)).
 
 **Every open map renders as its own cluster** — a `▌ repo · map title` header
@@ -332,6 +338,69 @@ touched most recently sits at the top, and a map whose every ticket is done
 sinks to the bottom however fresh it is — it is history, not work. Maps with
 equal (or unreadable) timestamps fall back to `repo`, then map number, so the
 order never shuffles between frames.
+
+### The inbox: issues no map claims
+
+A repo's screen ends with one more cluster, `▌ repo · yours or unclaimed`,
+holding **every open issue in that repo that is yours or nobody's and is not on
+a map**. It is read once at startup alongside the map search, neither waiting
+on the other.
+
+**Yours or nobody's, not every open issue**, and that is the shape of the
+feature rather than a filter on it. A repo's whole open issue list is not
+curated — dependabot, other people's work in flight, stale requests — and
+pouring it in would not make a bigger `wf`, it would bury the charted maps
+under a worse `gh issue list`. Dropping *somebody else's* issues leaves the set
+you could actually pick up.
+
+The header is in the vocabulary the rows already use: an assigned issue is
+**claimed** (`◐`) and an unassigned one is on the **frontier** (`○`), so
+"unclaimed" is what this screen already means by an open issue nobody has
+taken. The heading says what is in the cluster, not how it was found.
+
+**It costs two searches and one round trip.** GitHub issue search has no `OR` —
+qualifiers `AND` together, so `assignee:@me no:assignee` is a contradiction
+matching nothing. So `assignee:@me` and `no:assignee` are two searches, aliased
+into a single GraphQL query sharing one fragment for the selection. They are
+disjoint by construction (an issue cannot be both), so nothing needs
+deduplicating between them, and a row's status comes from its own `assignees`
+field rather than from which half found it.
+
+**Map issues are dropped from it.** A map is an open issue with nobody
+assigned, so `no:assignee` finds every map in every repo asked about — and a
+map is a cluster *header* on this screen. Without that drop, every header would
+also appear as a row of the inbox below it.
+
+**It sorts after every map, however fresh it is** — below finished maps too.
+That is the one ordering key that is not about recency: a map is work somebody
+charted, the inbox is work that merely exists, and an issue touched this
+morning must not push the charted half of the screen down. Everything else
+about it is an ordinary cluster: the same stage glyphs, the same PR badges, the
+same fuzzy-find, the same `←`/`→` depth navigation.
+
+**A map claims its own rows out of it.** An issue you have claimed on a map
+matches `assignee:@me` too, so it is in both answers — and it belongs on the
+map, where its blockers and its leverage are. The inbox is therefore *derived*:
+the raw reading is kept and the maps are subtracted from it on every arrival,
+so a map landing late takes its rows with it, and a map whose fetch **failed**
+leaves its rows visible in the inbox rather than nowhere at all. An inbox left
+with no rows is dropped entirely — a heading over nothing says nothing.
+
+**A failed read says so.** Three things look identical on screen — nothing is
+assigned to you, everything assigned is already claimed by a map, and the query
+never answered — because an empty inbox draws no heading at all. So a failure
+puts `· inbox unread` on the count line. Nothing retries it: that is the final
+word for the run, and running `wf` again is the way to ask.
+
+**The header is a place to stand, not a node.** A map's header launches because
+there is an issue behind it; the inbox's is a heading over rows that each have
+their own issue, so `enter` on it says so instead of inventing a target.
+
+**The project list leaves the inbox out of its counts** — `· 2 maps` counts
+maps, and the stage rollup beside it is the maps' — because that list is drawn
+before you enter anything and its glyphs are there to say how much *charted*
+work is moving. An inbox of thirty assigned issues would render `◐30` over
+every repo and drown the two or three glyphs that were the point.
 
 **The default screen is the leverage view**: each cluster shows its takeable
 tickets (frontier and claimed), sorted by how many open tickets each one
@@ -721,6 +790,45 @@ there are no launch rows, and `enter` with an empty `task` field refuses on the
 count line rather than filing something blank. Which is why the creating default
 is safe: `enter enter` on a fresh screen does nothing at all.
 
+### Adopting: an inbox row gets a map of its own
+
+`enter` on a row of the [inbox](#the-inbox-issues-no-map-claims)
+offers exactly one thing:
+
+```
+┌ launch Claude · blooop/wayfinder · #191 Widths survive non-ASCII titles ┐
+│                                                                         │
+│  ▶ adopt         /wf-one   put it under a map of its own, then build it │
+│                                                                         │
+│    steer  █                                                             │
+│                                                                         │
+│  enter launch · ←/→ agent · ↑/↓ pick · type to fill · esc cancel        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+`wf-one` files a **map** and parents the existing issue under it, then runs the
+ordinary `wf-tdd` → gate → `wf-review` lifecycle on it. Nothing is created that
+you have to name — the issue already has a title, which is the whole difference
+between adopting and filing, and why this row takes no `task` field.
+
+**Why a map at all**, rather than launching the issue where it stands: the
+lifecycle needs somewhere to keep its breadcrumbs and its handoff, and every
+`/wf` route takes a map as its first argument. That requirement is not an
+accident to route around — it is what makes a run resumable across sessions. So
+adoption gives the issue the one thing it is missing and hands it to the path
+that already works, which is why `wf`'s launch contract needed no widening for
+any of this.
+
+**There is no mode axis on this row.** `wf-one` owns the whole of a
+single-ticket map's lifecycle and decides the small things alone, so "who
+decides" is already answered by the route rather than being a row to pick.
+
+The adoption runs in the issue's own per-node workspace —
+`wayfinder/<short-repo>-<n>`, exactly as any launch of that number would — so it
+prewarms like any node, resumes like any node, and
+[`wf reap`](#wf-reap--clearing-away-finished-tickets) clears it away like any
+node. Nothing downstream has to know a map was created along the way.
+
 ### `mid`: which questions are worth asking
 
 The mode rows are one axis — who decides — and its two ends were the only
@@ -851,6 +959,7 @@ on what was found — which is what makes the create path work on the first fram
 | anything | any unfinished stage | mid | `<sigil>wf-mid <map> [<n>]` |
 | anything | any unfinished stage | auto | `<sigil>wf-auto <map> [<n>]` |
 | anything | any unfinished stage | plain | the selected agent, with no skill; anything typed is the whole prompt |
+| an inbox row | any unfinished stage | adopt | `<sigil>wf-one adopt <n>` |
 | a project row | — | new task | `<sigil>wf-one <task>` |
 | a project row | — | new map | `<sigil>wf [<seed>]` |
 | a project row | — | new map, mid | `<sigil>wf-mid [<seed>]` |

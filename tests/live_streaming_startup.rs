@@ -57,7 +57,10 @@ async fn discovery_then_every_map_arrives_through_one_channel() {
             // error here and a decision someone makes — this file runs only
             // after a merge (`live.yml`), which would make a wildcard in it
             // the slowest-observed thing in the tree.
-            other @ (LoadEvent::Fetched { .. } | LoadEvent::Surveyed { .. }) => {
+            other @ (LoadEvent::Fetched { .. }
+            | LoadEvent::Inbox(_)
+            | LoadEvent::InboxFailed
+            | LoadEvent::Surveyed { .. }) => {
                 panic!("expected discovery first, got {other:?}")
             }
         }

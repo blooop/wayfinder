@@ -531,29 +531,187 @@ impl Activity {
     }
 }
 
-/// One map's cluster: the map issue plus its sub-issue tickets.
+/// Which cluster on screen — the identity every row, stop, group and load
+/// event is keyed by.
 ///
-/// Deliberately *without* its own [`MapId`]: a map is always held under its id
-/// (in the clusters the screen renders, in a load event), so carrying a second
-/// copy would let the two disagree.
+/// A sum rather than a [`MapId`] with an optional number, because the two
+/// kinds of cluster differ in what they *are* and not in whether a field was
+/// filled in: a map has an issue of its own (so its header launches, and its
+/// tickets are that issue's sub-issues), and a loose cluster does not (so its
+/// header is a place to stand and nothing more). Every site that decides
+/// something from the kind matches both arms with no wildcard, which is what
+/// makes a third kind of cluster a compile error rather than a silent
+/// misreading.
+///
+/// `Ord` puts every map before every loose cluster — the variant order does
+/// it, and [`crate::app::App::scoped_clusters`] leads on the same distinction
+/// rather than re-deriving it — so the curated work is always above the
+/// inbox, whatever either one's activity says.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ClusterId {
+    /// One open `wayfinder:map` issue and the sub-issues under it.
+    Map(MapId),
+    /// One repo's issues assigned to the viewer that no map claims. Keyed by
+    /// the full repo slug and nothing else: there is exactly one such cluster
+    /// per repo, because "mine, here" is not a thing there can be two of.
+    Inbox(String),
+}
+
+/// What the loose cluster's header calls itself. One constant rather than a
+/// literal at each site, because the screen text and the tests that assert on
+/// it must be the same string.
+///
+/// "Yours or unclaimed" rather than a description of the query, and in the
+/// vocabulary the rows below it already use: an assigned issue classifies as
+/// [`Status::Claimed`] and an unassigned one as [`Status::Frontier`], so
+/// "unclaimed" is the word this screen already means by an unassigned open
+/// issue. It says what is in the cluster, which is the question a heading
+/// answers — not `assignee:@me OR no:assignee`, which says how it was found.
+pub const INBOX_HEADER: &str = "yours or unclaimed";
+
+impl ClusterId {
+    /// The repo this cluster belongs to — what the project scope filters on,
+    /// and the only question both arms answer the same way.
+    pub fn repo(&self) -> &str {
+        match self {
+            ClusterId::Map(id) => &id.repo,
+            ClusterId::Inbox(repo) => repo,
+        }
+    }
+
+    /// The short repo name shown in the header (display only, never a key).
+    pub fn short_repo(&self) -> &str {
+        let repo = self.repo();
+        repo.split('/').next_back().unwrap_or(repo)
+    }
+
+    /// How a note on the count line names this cluster — the one place a
+    /// cluster is written out in prose, so the two kinds read differently
+    /// there rather than a loose cluster borrowing an issue number it has not
+    /// got.
+    pub fn label(&self) -> String {
+        match self {
+            ClusterId::Map(id) => format!("{}#{}", id.repo, id.number),
+            ClusterId::Inbox(repo) => format!("{repo} ({INBOX_HEADER})"),
+        }
+    }
+}
+
+/// What a cluster's rows were read from, and the one fact only one kind of
+/// cluster has: a map's title.
+///
+/// The title lives *in the variant* rather than beside a kind flag, so a
+/// loose cluster carrying a map title — or a map missing one — cannot be
+/// written down. The cluster's [`ClusterId`] says the same thing a second
+/// time, which is the one redundancy here: the two are paired at construction
+/// ([`Cluster::map`] and [`Cluster::inbox`] are the only ways in) and the
+/// pairing is asserted by [`Cluster::agrees_with`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// A map issue: these tickets are its sub-issues, and the header is the
+    /// map itself — launchable, because charting or driving a whole map is
+    /// something an agent can be aimed at.
+    Map {
+        /// Title of the map issue itself.
+        title: String,
+    },
+    /// The viewer's own assigned issues, claimed by no map. There is no issue
+    /// to be titled by and nothing to launch at the header: the rows are the
+    /// only things here an agent can be aimed at.
+    Inbox,
+}
+
+/// One cluster: where its rows came from, and the rows.
+///
+/// Deliberately *without* its own [`ClusterId`]: a cluster is always held
+/// under its id (in the clusters the screen renders, in a load event), so
+/// carrying a second copy would let the two disagree.
 #[derive(Debug, Clone)]
-pub struct Map {
-    /// Title of the map issue itself.
-    pub title: String,
-    /// When the map issue was last touched, if the tracker's timestamp parsed
-    /// ([`Activity`]) — the cluster sort key.
+pub struct Cluster {
+    /// What this cluster is, and a map's title if it is one.
+    pub source: Source,
+    /// When the cluster was last touched, if the tracker's timestamp parsed
+    /// ([`Activity`]) — the cluster sort key. For a map that is the map
+    /// issue's own `updatedAt`; for a loose cluster it is the newest of its
+    /// issues', because a pile of issues has no single thing that was updated.
     pub last_activity: Option<Activity>,
     pub tickets: Vec<Ticket>,
     /// The tracker said a ticket-bearing page was not all of it (#184): a
     /// 101st sub-issue or a 51st blocking edge did not fit the fetch, so
     /// `tickets` — and the classification drawn from the edges — is partial.
-    /// Carried on the map rather than swallowed, because the only honest
+    /// Carried on the cluster rather than swallowed, because the only honest
     /// render of a partial tree is one that says so; the count line is where
     /// it is said.
     pub truncated: bool,
 }
 
-impl Map {
+impl Cluster {
+    /// A map's cluster. One of the two constructors, so a cluster's
+    /// [`Source`] is always decided in the same breath as its rows.
+    pub fn map(
+        title: impl Into<String>,
+        last_activity: Option<Activity>,
+        tickets: Vec<Ticket>,
+        truncated: bool,
+    ) -> Cluster {
+        Cluster {
+            source: Source::Map {
+                title: title.into(),
+            },
+            last_activity,
+            tickets,
+            truncated,
+        }
+    }
+
+    /// A loose cluster of the viewer's own issues.
+    pub fn inbox(
+        last_activity: Option<Activity>,
+        tickets: Vec<Ticket>,
+        truncated: bool,
+    ) -> Cluster {
+        Cluster {
+            source: Source::Inbox,
+            last_activity,
+            tickets,
+            truncated,
+        }
+    }
+
+    /// Whether this cluster's [`Source`] is the kind `id` says it is — the
+    /// guard on the one redundancy [`Source`] documents.
+    ///
+    /// Read by the single place clusters are inserted, so a mispaired cluster
+    /// cannot reach the screen. A method rather than a `debug_assert` at that
+    /// call site, because a test can name it.
+    pub fn agrees_with(&self, id: &ClusterId) -> bool {
+        matches!(
+            (id, &self.source),
+            (ClusterId::Map(_), Source::Map { .. }) | (ClusterId::Inbox(_), Source::Inbox)
+        )
+    }
+
+    /// The map issue's title, for the header and the launch. `None` for a
+    /// loose cluster, which has no issue of its own — the caller is asking
+    /// "what is this map called", and there is no map.
+    pub fn map_title(&self) -> Option<&str> {
+        match &self.source {
+            Source::Map { title } => Some(title),
+            Source::Inbox => None,
+        }
+    }
+
+    /// What the header draws after the repo name. A map is named by its issue;
+    /// the loose cluster names what it *is*, because there is no issue to name
+    /// it after and "the rest" would say nothing about why these rows are
+    /// here.
+    pub fn header_name(&self) -> &str {
+        match &self.source {
+            Source::Map { title } => title,
+            Source::Inbox => INBOX_HEADER,
+        }
+    }
+
     /// Where `number`'s ticket sits in `tickets` — the row-index half of a
     /// [`crate::app::Row`]. `None` for a number that is not on this map (a
     /// blocking edge may name any issue).
@@ -573,17 +731,17 @@ impl Map {
             .collect()
     }
 
-    /// Whether any ticket on this map is still open — whether the map is work
-    /// or history. A map whose every ticket is done is *finished*, and so is a
-    /// map with no tickets at all: both have nothing left to do, which is the
-    /// one question the cluster order asks (finished maps sort last).
+    /// Whether any ticket here is still open — whether the cluster is work or
+    /// history. A cluster whose every ticket is done is *finished*, and so is
+    /// one with no tickets at all: both have nothing left to do, which is the
+    /// one question the cluster order asks (finished clusters sort last).
     pub fn has_open_work(&self) -> bool {
         self.tickets
             .iter()
             .any(|t| !matches!(t.status, Status::Done))
     }
 
-    /// The whole map tallied by glyph — the cluster header's counts (#78).
+    /// The whole cluster tallied by glyph — the header's counts (#78).
     /// Stages, through the same [`RowGlyph`] the rows are drawn from, so a
     /// ticket drawn `!` is counted under `!`.
     pub fn tally(&self) -> Vec<(RowGlyph, usize)> {
@@ -1070,15 +1228,19 @@ mod tests {
 
     #[test]
     fn a_map_has_open_work_until_every_ticket_is_done() {
-        let live = Map {
-            title: "Map: wf".to_string(),
+        let live = Cluster {
+            source: Source::Map {
+                title: "Map: wf".to_string(),
+            },
             last_activity: None,
             truncated: false,
             tickets: vec![ticket(2, false, vec![]), ticket(6, true, vec![])],
         };
         assert!(live.has_open_work());
-        let finished = Map {
-            title: "Map: wf".to_string(),
+        let finished = Cluster {
+            source: Source::Map {
+                title: "Map: wf".to_string(),
+            },
             last_activity: None,
             truncated: false,
             tickets: vec![ticket(2, false, vec![]), ticket(6, false, vec![])],
@@ -1086,8 +1248,10 @@ mod tests {
         assert!(!finished.has_open_work(), "every ticket done is finished");
         // A map with no tickets has nothing left to do either — the same answer
         // to the same question, not a third case.
-        let empty = Map {
-            title: "Map: wf".to_string(),
+        let empty = Cluster {
+            source: Source::Map {
+                title: "Map: wf".to_string(),
+            },
             last_activity: None,
             truncated: false,
             tickets: vec![],
@@ -1129,8 +1293,10 @@ mod tests {
     fn unblocks_is_the_local_inversion_of_the_full_edge_set() {
         // #50 → #51 and #50 → #52, with #48 closed but its edge kept: the DAG
         // survives the blocker closing, which is exactly why closed edges stay.
-        let map = Map {
-            title: "Map: selection view".to_string(),
+        let map = Cluster {
+            source: Source::Map {
+                title: "Map: selection view".to_string(),
+            },
             last_activity: None,
             truncated: false,
             tickets: vec![
@@ -1160,8 +1326,10 @@ mod tests {
         claimed.status = Status::Claimed;
         let mut blocked = ticket(7, true, vec![6]);
         blocked.status = Status::Blocked { needs: vec![6] };
-        let map = Map {
-            title: "Map: wf".to_string(),
+        let map = Cluster {
+            source: Source::Map {
+                title: "Map: wf".to_string(),
+            },
             last_activity: None,
             truncated: false,
             tickets: vec![ticket(6, true, vec![]), claimed, blocked, done],

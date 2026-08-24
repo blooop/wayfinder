@@ -681,6 +681,28 @@ fn the_context_section_states_the_fallback_and_the_live_read() {
     }
 }
 
+/// The word the binary puts in front of an adopted issue's number is the word
+/// `wf-one` documents reading.
+///
+/// The skills are part of this repo precisely so this cannot drift, and this is
+/// the pair that would drift silently: `wf` execs `wf-one adopt <n>` from the
+/// inbox, and a skill that never learned the subcommand would read `adopt 191`
+/// as a task description and file a *second* issue called "adopt 191" beside
+/// the one the human picked. Nothing anywhere would notice.
+#[test]
+fn the_adopt_argument_is_the_one_wf_one_documents() {
+    let doc = skill_doc("wf-one");
+    let arg = wf::launch::ADOPT_ARG;
+    assert!(
+        doc.contains(&format!("<sigil>wf-one {arg} <n>")),
+        "wf-one must show the `{arg}` form in its invocation grammar"
+    );
+    assert!(
+        doc.contains("Do not create a second issue for it"),
+        "wf-one must say that an adopted issue is the ticket, not a description of one"
+    );
+}
+
 /// Every shipped skill says where it stands on the block — a consumer that
 /// never learns of it would keep paying the discovery cost the block exists to
 /// remove.

@@ -31,7 +31,8 @@ use serde::Deserialize;
 use tokio::process::Command;
 
 use crate::model::{
-    classify, Activity, Checks, Map, MapId, MapSet, PrLink, PrStatus, Review, Ticket, TicketType,
+    classify, Activity, Checks, Cluster, MapId, MapSet, PrLink, PrStatus, Review, Ticket,
+    TicketType,
 };
 
 /// The label that makes an issue a map. Both the search that *finds* maps and
@@ -77,6 +78,61 @@ query($owner: String!, $name: String!, $number: Int!) {
         pageInfo { hasNextPage }
       }
     }
+  }
+}";
+
+/// The inbox read: every open issue in the cached repos that is **yours or
+/// nobody's**, in one round trip.
+///
+/// Two searches, not every open issue, and that is the shape of the feature
+/// rather than a filter on it. A repo's whole open issue list is not curated —
+/// dependabot, other people's work in flight, stale requests — and pouring it
+/// in would not make a bigger wayfinder, it would bury the charted maps under
+/// a worse `gh issue list`. What is left after dropping *somebody else's*
+/// issues is the set you could actually pick up.
+///
+/// **Two searches because GitHub issue search has no `OR`.** Qualifiers `AND`
+/// together, so `assignee:@me no:assignee` is a contradiction that matches
+/// nothing. The two sets are disjoint by construction — an issue cannot be
+/// both assigned to you and unassigned — so they need no dedup against each
+/// other, only the same subtraction against the maps that every inbox row
+/// gets. Aliased into one query rather than sent as two, so the cost stays one
+/// round trip and one rate-limit point.
+///
+/// The selection is deliberately the *same* one [`MAP_QUERY`] makes of a map's
+/// sub-issues, plus the two things a row outside a map has to carry itself:
+/// which repo it is in, and when it was touched. Same selection means
+/// [`parse_ticket`] reads both, so an issue cannot render one way in a map and
+/// another in the inbox. It is a GraphQL fragment for that reason — one
+/// selection written once, spread into both searches, so the two halves of the
+/// inbox cannot drift from each other either.
+///
+/// `is:issue` is in both query strings because GitHub's `type: ISSUE` search
+/// covers pull requests too, and a PR is not a ticket.
+const INBOX_QUERY: &str = "\
+fragment Row on Issue {
+  number title state updatedAt
+  repository { nameWithOwner }
+  labels(first: 10) { nodes { name } }
+  assignees(first: 5) { nodes { login } }
+  blockedBy(first: 50) { nodes { number state } pageInfo { hasNextPage } }
+  closedByPullRequestsReferences(first: 5, includeClosedPrs: true) {
+    nodes {
+      number state isDraft reviewDecision
+      statusCheckRollup { state }
+      repository { nameWithOwner }
+    }
+    pageInfo { hasNextPage }
+  }
+}
+query($mine: String!, $unassigned: String!) {
+  mine: search(query: $mine, type: ISSUE, first: 100) {
+    nodes { ...Row }
+    pageInfo { hasNextPage }
+  }
+  unassigned: search(query: $unassigned, type: ISSUE, first: 100) {
+    nodes { ...Row }
+    pageInfo { hasNextPage }
   }
 }";
 
@@ -305,7 +361,7 @@ pub(crate) fn is_open(state: &str) -> bool {
 /// thing to the caller — the cluster for this map does not arrive — and
 /// [`refresh`](crate::refresh) turns it into the failure note on screen rather
 /// than an exit.
-pub async fn fetch_map(id: &MapId) -> Result<Map> {
+pub async fn fetch_map(id: &MapId) -> Result<Cluster> {
     let (owner, name) = id
         .repo
         .split_once('/')
@@ -339,11 +395,11 @@ pub async fn fetch_map(id: &MapId) -> Result<Map> {
     parse_map(&output.stdout, id)
 }
 
-/// Turn one `gh api graphql` response body into a [`Map`] — the whole parse
+/// Turn one `gh api graphql` response body into a [`Cluster`] — the whole parse
 /// boundary, kept apart from the process call so it is testable without the
 /// network. Every raw tracker string a ticket is derived from (state,
 /// assignees, blocker states, labels) is interpreted exactly here.
-fn parse_map(body: &[u8], id: &MapId) -> Result<Map> {
+fn parse_map(body: &[u8], id: &MapId) -> Result<Cluster> {
     let resp: GraphQlResponse<ResponseData> =
         serde_json::from_slice(body).context("unparseable GraphQL response from gh")?;
     if let Some(err) = resp.errors.first() {
@@ -388,48 +444,191 @@ fn parse_map(body: &[u8], id: &MapId) -> Result<Map> {
         .into_iter()
         .map(|sub| {
             truncated |= sub.blocked_by.page_info.has_next_page;
-            // One pass over the same edges yields both facts: the open subset
-            // is status, the whole set is structure (#50).
-            let open_blockers: Vec<u64> = sub
-                .blocked_by
-                .nodes
-                .iter()
-                .filter(|b| is_open(&b.state))
-                .map(|b| b.number)
-                .collect();
-            let blocked_by: Vec<u64> = sub.blocked_by.nodes.iter().map(|b| b.number).collect();
-            let prs: Vec<PrLink> = sub
-                .closed_by_prs
-                .nodes
-                .iter()
-                .filter_map(parse_pr)
-                .collect();
-            Ticket {
-                repo: id.repo.clone(),
-                number: sub.number,
-                title: sub.title,
-                status: classify(
-                    is_open(&sub.state),
-                    !sub.assignees.nodes.is_empty(),
-                    open_blockers,
-                ),
-                ticket_type: TicketType::from_labels(
-                    sub.labels.nodes.iter().map(|l| l.name.as_str()),
-                ),
-                blocked_by,
-                prs,
-            }
+            parse_ticket(sub, &id.repo)
         })
         .collect();
     tickets.sort_by_key(|t| t.number);
 
-    Ok(Map {
-        title: issue.title,
+    Ok(Cluster::map(
+        issue.title,
         // Interpreted here and nowhere inward, like every other tracker string.
-        last_activity: issue.updated_at.as_deref().and_then(Activity::parse),
+        issue.updated_at.as_deref().and_then(Activity::parse),
         tickets,
         truncated,
-    })
+    ))
+}
+
+/// The two aliased searches, as the response carries them.
+#[derive(Deserialize)]
+struct InboxData {
+    mine: Paged<InboxIssue>,
+    unassigned: Paged<InboxIssue>,
+}
+
+/// One inbox row as the search answers: an ordinary issue selection plus the
+/// two facts a row outside a map cannot borrow from one.
+#[derive(Deserialize)]
+struct InboxIssue {
+    #[serde(flatten)]
+    issue: SubIssue,
+    /// Defaulted for the same reason every other optional selection here is:
+    /// a response without it reads as "activity unknown" rather than failing
+    /// the whole inbox.
+    #[serde(rename = "updatedAt", default)]
+    updated_at: Option<String>,
+    repository: RepoRef,
+}
+
+/// Fetch the inbox live: every open issue across `repos` that is assigned to
+/// the viewer or to nobody, grouped into one [`Cluster`] per repo — one
+/// `gh api graphql` round trip.
+///
+/// Repos with nothing to show are simply absent, so a machine with a clean
+/// inbox renders no inbox clusters at all rather than a row of empty headings.
+///
+/// Map issues themselves are dropped here: a `wayfinder:map` issue is a cluster
+/// header on this screen, and listing it as a row of the inbox would draw the
+/// same issue twice in two different meanings. Its *tickets* are dropped
+/// elsewhere and deliberately so — see the fold in `picker`, which subtracts
+/// them as the maps land, because this query cannot know which issues a map
+/// has claimed.
+///
+/// # Errors
+///
+/// A `gh` that is missing or unauthenticated, a network failure, or a response
+/// that does not parse. An empty `repos` is not an error — it is an empty
+/// inbox, which is what a machine with nothing discovered yet has.
+pub async fn fetch_inbox(repos: &[String]) -> Result<Vec<(String, Cluster)>> {
+    if repos.is_empty() {
+        return Ok(Vec::new());
+    }
+    let scope: Vec<String> = repos.iter().map(|r| format!("repo:{r}")).collect();
+    // The two halves differ in exactly one qualifier, so they are built from
+    // one string: a scope that drifted between them would silently make the
+    // inbox mean two different things in its two halves.
+    let scoped = |who: &str| format!("{who} is:issue is:open {}", scope.join(" "));
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "graphql",
+            "-f",
+            &format!("mine={}", scoped("assignee:@me")),
+            "-f",
+            &format!("unassigned={}", scoped("no:assignee")),
+            "-f",
+            &format!("query={INBOX_QUERY}"),
+        ])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("failed to run `gh` for the inbox")?;
+    if !output.status.success() {
+        bail!(
+            "`gh api graphql` failed for the inbox: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_inbox(&output.stdout)
+}
+
+/// Turn one inbox response into one cluster per repo — the whole parse
+/// boundary, kept apart from the process call so it is testable without the
+/// network.
+///
+/// Truncation is per repo and folds the same way a map's does: the search page
+/// being cut short means *every* repo's rows may be partial, because one page
+/// spans them all and there is no way to tell which repo lost rows. Saying so
+/// on all of them is the honest answer; picking one would be a guess.
+fn parse_inbox(body: &[u8]) -> Result<Vec<(String, Cluster)>> {
+    let resp: GraphQlResponse<InboxData> =
+        serde_json::from_slice(body).context("unparseable GraphQL response from gh")?;
+    if let Some(err) = resp.errors.first() {
+        bail!("GraphQL error: {}", err.message);
+    }
+    let data = resp.data.context("no data in the inbox response")?;
+    // Either half being cut short means rows are missing, and neither says
+    // which repo lost them — so both halves fold into one claim, the same way
+    // one search's page already does across the repos it spans.
+    let page_cut_short =
+        data.mine.page_info.has_next_page || data.unassigned.page_info.has_next_page;
+
+    let mut by_repo: std::collections::BTreeMap<String, (Vec<Ticket>, Option<Activity>, bool)> =
+        std::collections::BTreeMap::new();
+    // Concatenated rather than merged: the two searches are disjoint by
+    // construction — an issue is assigned to you or it is assigned to nobody,
+    // never both — so there is nothing here to deduplicate. What each row
+    // *is* still comes from its own `assignees` selection through
+    // `parse_ticket`, not from which half it arrived in, so a row does not
+    // depend on the query that found it.
+    for node in data.mine.nodes.into_iter().chain(data.unassigned.nodes) {
+        // A map is a heading here, not a row.
+        if node.issue.labels.nodes.iter().any(|l| l.name == MAP_LABEL) {
+            continue;
+        }
+        let repo = node.repository.name_with_owner.clone();
+        let activity = node.updated_at.as_deref().and_then(Activity::parse);
+        let blockers_cut_short = node.issue.blocked_by.page_info.has_next_page;
+        let ticket = parse_ticket(node.issue, &repo);
+        let entry = by_repo
+            .entry(repo)
+            .or_insert((Vec::new(), None, page_cut_short));
+        entry.0.push(ticket);
+        // The cluster's stamp is the newest of its rows': a pile of issues has
+        // no single thing that was updated, and the order the screen wants is
+        // "where has something happened".
+        entry.1 = entry.1.max(activity);
+        entry.2 |= blockers_cut_short;
+    }
+
+    Ok(by_repo
+        .into_iter()
+        .map(|(repo, (mut tickets, activity, truncated))| {
+            tickets.sort_by_key(|t| t.number);
+            (repo, Cluster::inbox(activity, tickets, truncated))
+        })
+        .collect())
+}
+
+/// Turn one issue selection into a [`Ticket`] — the only place the tracker's
+/// raw strings for an issue become a ticket, whether that issue arrived as a
+/// map's sub-issue or as a row of the inbox.
+///
+/// One function rather than one per caller: the two reads select the same
+/// fields, and a second copy of this is how the inbox and a map would come to
+/// disagree about the same issue's status. `repo` is passed in because the two
+/// callers know it differently — a sub-issue takes its map's repo, an inbox
+/// row carries its own.
+fn parse_ticket(sub: SubIssue, repo: &str) -> Ticket {
+    // One pass over the same edges yields both facts: the open subset
+    // is status, the whole set is structure (#50).
+    let open_blockers: Vec<u64> = sub
+        .blocked_by
+        .nodes
+        .iter()
+        .filter(|b| is_open(&b.state))
+        .map(|b| b.number)
+        .collect();
+    let blocked_by: Vec<u64> = sub.blocked_by.nodes.iter().map(|b| b.number).collect();
+    let prs: Vec<PrLink> = sub
+        .closed_by_prs
+        .nodes
+        .iter()
+        .filter_map(parse_pr)
+        .collect();
+    Ticket {
+        repo: repo.to_string(),
+        number: sub.number,
+        title: sub.title,
+        status: classify(
+            is_open(&sub.state),
+            !sub.assignees.nodes.is_empty(),
+            open_blockers,
+        ),
+        ticket_type: TicketType::from_labels(sub.labels.nodes.iter().map(|l| l.name.as_str())),
+        blocked_by,
+        prs,
+    }
 }
 
 /// One item of a `search/issues` response — just what map detection needs.
@@ -509,6 +708,240 @@ fn parse_map_search(body: &[u8]) -> Result<MapSet> {
 mod tests {
     use super::*;
     use crate::model::Status;
+
+    /// One inbox response, shaped exactly like the live one: both aliased
+    /// searches, two repos, a `wayfinder:map` issue that must not become a row,
+    /// and a blocker page the tracker cut short.
+    ///
+    /// The `unassigned` half deliberately carries a map issue, because that is
+    /// what the live one carries: a map is an open issue nobody is assigned to,
+    /// so `no:assignee` finds every map in every repo asked about.
+    const INBOX_RESPONSE: &str = r#"{"data": {
+      "mine": {
+        "nodes": [
+          {"number": 191, "title": "Non-ASCII titles", "state": "OPEN",
+           "updatedAt": "2026-08-22T16:06:12Z",
+           "repository": {"nameWithOwner": "blooop/wayfinder"},
+           "labels": {"nodes": [{"name": "wayfinder:build"}]},
+           "assignees": {"nodes": [{"login": "blooop"}]},
+           "blockedBy": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+           "closedByPullRequestsReferences": {
+             "nodes": [{"number": 203, "state": "OPEN", "isDraft": false,
+                        "reviewDecision": null,
+                        "statusCheckRollup": {"state": "SUCCESS"},
+                        "repository": {"nameWithOwner": "blooop/wayfinder"}}],
+             "pageInfo": {"hasNextPage": false}}},
+          {"number": 190, "title": "A red run files an issue", "state": "OPEN",
+           "updatedAt": "2026-08-24T09:00:00Z",
+           "repository": {"nameWithOwner": "blooop/wayfinder"},
+           "labels": {"nodes": []},
+           "assignees": {"nodes": [{"login": "blooop"}]},
+           "blockedBy": {"nodes": [{"number": 12, "state": "OPEN"}],
+                         "pageInfo": {"hasNextPage": true}},
+           "closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": false}}},
+          {"number": 4, "title": "Pin the toolchain", "state": "OPEN",
+           "updatedAt": "2026-08-20T00:00:00Z",
+           "repository": {"nameWithOwner": "blooop/dotfiles"},
+           "labels": {"nodes": []},
+           "assignees": {"nodes": [{"login": "blooop"}]},
+           "blockedBy": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+           "closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": false}}}
+        ],
+        "pageInfo": {"hasNextPage": false}
+      },
+      "unassigned": {
+        "nodes": [
+          {"number": 207, "title": "test ticket", "state": "OPEN",
+           "updatedAt": "2026-08-24T10:00:00Z",
+           "repository": {"nameWithOwner": "blooop/wayfinder"},
+           "labels": {"nodes": []},
+           "assignees": {"nodes": []},
+           "blockedBy": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+           "closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": false}}},
+          {"number": 7, "title": "Map: the other project", "state": "OPEN",
+           "updatedAt": "2026-08-23T00:00:00Z",
+           "repository": {"nameWithOwner": "blooop/dotfiles"},
+           "labels": {"nodes": [{"name": "wayfinder:map"}]},
+           "assignees": {"nodes": []},
+           "blockedBy": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+           "closedByPullRequestsReferences": {"nodes": [], "pageInfo": {"hasNextPage": false}}}
+        ],
+        "pageInfo": {"hasNextPage": false}
+      }
+    }}"#;
+
+    #[test]
+    fn the_inbox_holds_what_is_yours_and_what_is_nobodys_in_one_cluster() {
+        // The two searches exist only because GitHub issue search has no `OR`;
+        // downstream there is one inbox per repo, and which half a row arrived
+        // in is not a fact anything keeps.
+        let inbox = parse_inbox(INBOX_RESPONSE.as_bytes()).expect("parse");
+        let wayfinder = &inbox
+            .iter()
+            .find(|(repo, _)| repo == "blooop/wayfinder")
+            .expect("wayfinder has rows")
+            .1;
+        let numbers: Vec<u64> = wayfinder.tickets.iter().map(|t| t.number).collect();
+        assert_eq!(
+            numbers,
+            vec![190, 191, 207],
+            "both halves land in one cluster, sorted by number like a map's"
+        );
+    }
+
+    #[test]
+    fn an_inbox_rows_status_comes_from_its_assignees_not_from_which_search_found_it() {
+        // The reason both halves go through `parse_ticket`: an unassigned issue
+        // is a *frontier* row and an assigned one is *claimed*, and that is the
+        // difference the glyph column draws. Deriving it from the alias would
+        // work today and be wrong the moment either query changes.
+        let inbox = parse_inbox(INBOX_RESPONSE.as_bytes()).expect("parse");
+        let by_number = |n: u64| {
+            inbox
+                .iter()
+                .flat_map(|(_, cluster)| &cluster.tickets)
+                .find(|t| t.number == n)
+                .unwrap_or_else(|| panic!("#{n} is in the inbox"))
+                .clone()
+        };
+        assert_eq!(by_number(191).status, Status::Claimed, "assigned to me");
+        assert_eq!(
+            by_number(207).status,
+            Status::Frontier,
+            "assigned to nobody"
+        );
+    }
+
+    #[test]
+    fn the_inbox_groups_by_repo_and_orders_each_cluster_by_its_newest_row() {
+        let inbox = parse_inbox(INBOX_RESPONSE.as_bytes()).expect("parse");
+        let repos: Vec<&str> = inbox.iter().map(|(repo, _)| repo.as_str()).collect();
+        assert_eq!(repos, vec!["blooop/dotfiles", "blooop/wayfinder"]);
+
+        let wayfinder = &inbox[1].1;
+        // The cluster's stamp is the newest of its rows, whichever half that
+        // row came from: #207 (unassigned, 10:00) was touched after #190
+        // (mine, 09:00), and the cluster is ordered by where something
+        // happened.
+        assert_eq!(
+            wayfinder.last_activity,
+            Activity::parse("2026-08-24T10:00:00Z"),
+        );
+    }
+
+    #[test]
+    fn a_map_issue_is_a_heading_and_never_a_row_of_the_inbox() {
+        // Sharper now than when the query was `assignee:@me`: a map is an open
+        // issue with nobody assigned, so `no:assignee` finds *every* map in
+        // every repo asked about, and without this every cluster header would
+        // also be a row of the inbox below it.
+        let inbox = parse_inbox(INBOX_RESPONSE.as_bytes()).expect("parse");
+        let dotfiles = &inbox
+            .iter()
+            .find(|(repo, _)| repo == "blooop/dotfiles")
+            .expect("dotfiles has an assigned issue")
+            .1;
+        let numbers: Vec<u64> = dotfiles.tickets.iter().map(|t| t.number).collect();
+        assert_eq!(
+            numbers,
+            vec![4],
+            "map issue #7 is drawn as a cluster, not listed under one"
+        );
+    }
+
+    #[test]
+    fn the_inbox_reads_an_issue_exactly_as_a_map_reads_its_sub_issue() {
+        let inbox = parse_inbox(INBOX_RESPONSE.as_bytes()).expect("parse");
+        let ticket = &inbox[1].1.tickets[1];
+        assert_eq!(ticket.number, 191);
+        assert_eq!(ticket.repo, "blooop/wayfinder", "its own repo, not a map's");
+        assert_eq!(ticket.ticket_type, TicketType::Build, "labels still parse");
+        assert_eq!(ticket.status, Status::Claimed, "this one is assigned");
+        assert_eq!(ticket.prs.len(), 1, "the linked PR rides along");
+        assert_eq!(ticket.prs[0].number, 203);
+    }
+
+    #[test]
+    fn a_blocker_page_cut_short_makes_its_repos_inbox_partial() {
+        let inbox = parse_inbox(INBOX_RESPONSE.as_bytes()).expect("parse");
+        let wayfinder = &inbox[1].1;
+        assert!(
+            wayfinder.truncated,
+            "#190's blocker page said there was more"
+        );
+        let dotfiles = &inbox[0].1;
+        assert!(
+            !dotfiles.truncated,
+            "and the other repo's rows are not made partial by it"
+        );
+    }
+
+    /// The same fixture with one search's *own* page flag flipped — not a
+    /// blocker page's, and not the other half's.
+    ///
+    /// Anchored inside the named alias rather than by a global replace, which
+    /// is the mistake this helper exists to make impossible: `replacen(.., 1)`
+    /// always finds `mine`'s flag first, so a loop over both halves using it
+    /// tests `mine` twice and passes while proving half of what it claims.
+    fn with_page_cut_short(half: &str) -> String {
+        const FLAG: &str = "],\n        \"pageInfo\": {\"hasNextPage\": false}";
+        let alias = format!("\"{half}\": {{\n        \"nodes\"");
+        let at = INBOX_RESPONSE
+            .find(&alias)
+            .unwrap_or_else(|| panic!("the fixture's `{half}` alias moved"));
+        let rel = INBOX_RESPONSE[at..]
+            .find(FLAG)
+            .unwrap_or_else(|| panic!("the fixture's `{half}` page flag moved"));
+        let cut = at + rel;
+        format!(
+            "{}{}{}",
+            &INBOX_RESPONSE[..cut],
+            FLAG.replace("false", "true"),
+            &INBOX_RESPONSE[cut + FLAG.len()..]
+        )
+    }
+
+    #[test]
+    fn either_search_page_cut_short_makes_every_repos_inbox_partial() {
+        // One page spans every repo, so a cut-short page cannot say which of
+        // them lost rows — and with two searches it cannot say which *half*
+        // either. Saying so on every cluster is the honest answer; picking one
+        // would be a guess.
+        //
+        // Both halves are checked, because the rule reached by only one of
+        // them is the rule half-implemented.
+        for half in ["mine", "unassigned"] {
+            let cut = with_page_cut_short(half);
+            assert_ne!(cut, INBOX_RESPONSE, "the `{half}` flag did not move");
+            let inbox = parse_inbox(cut.as_bytes()).expect("parse");
+            assert!(
+                inbox.iter().all(|(_, cluster)| cluster.truncated),
+                "a cut-short `{half}` page makes every repo say its rows may be partial"
+            );
+        }
+        // And the two really are different bytes — the guard on the helper
+        // above, since both edits produce a response that parses.
+        assert_ne!(
+            with_page_cut_short("mine"),
+            with_page_cut_short("unassigned"),
+            "each half's own flag is what moved"
+        );
+    }
+
+    #[test]
+    fn an_empty_inbox_is_an_answer_and_not_an_error() {
+        let body = r#"{"data": {
+            "mine": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+            "unassigned": {"nodes": [], "pageInfo": {"hasNextPage": false}}
+        }}"#;
+        assert!(parse_inbox(body.as_bytes()).expect("parse").is_empty());
+    }
+
+    #[test]
+    fn a_graphql_error_fails_the_inbox_rather_than_reading_as_empty() {
+        let body = r#"{"errors": [{"message": "Bad credentials"}]}"#;
+        assert!(parse_inbox(body.as_bytes()).is_err());
+    }
 
     #[test]
     fn map_search_keeps_every_open_map_including_several_on_one_repo() {
@@ -631,7 +1064,7 @@ mod tests {
     #[test]
     fn the_map_parse_carries_each_sub_issues_type_through_from_its_labels() {
         let map = parse_map(MAP_RESPONSE.as_bytes(), &wf_map_id()).expect("parse");
-        assert_eq!(map.title, "Map: wf");
+        assert_eq!(map.map_title(), Some("Map: wf"));
         let types: Vec<(u64, TicketType)> = map
             .tickets
             .iter()
@@ -725,7 +1158,11 @@ mod tests {
         );
         let map = parse_map(body.as_bytes(), &wf_map_id())
             .expect("a label page the tracker cut short cannot prove the label is gone");
-        assert_eq!(map.title, "Map: wf", "the map renders as itself");
+        assert_eq!(
+            map.map_title(),
+            Some("Map: wf"),
+            "the map renders as itself"
+        );
 
         // And the label page being cut short is not the *tree* being cut
         // short: nothing ticket-bearing was truncated here.

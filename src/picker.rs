@@ -89,7 +89,7 @@
 //! terminal, *then* exec, because after the exec there is no `wf` left to
 //! restore anything.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -102,7 +102,7 @@ use tokio::task::JoinHandle;
 
 use wf::app::{App, Outcome};
 use wf::launch::{Agent, Handoff, Launch};
-use wf::model::{Map, MapId};
+use wf::model::{Cluster, ClusterId, MapId, Ticket};
 use wf::projects::{self, ProjectsCache};
 use wf::refresh::{LoadEvent, Loaders, MapFetch, Startup, Survey};
 use wf::skills;
@@ -192,7 +192,22 @@ enum Ending {
 /// drive the *assembly* instead of handing a value straight to [`fold`].
 struct Picker {
     app: App,
-    clusters: BTreeMap<MapId, Map>,
+    /// The maps in hand, keyed by map — **not** by [`ClusterId`], because this
+    /// container holds maps and nothing else. The inbox is not a map and lives
+    /// beside it; what the screen draws is the two combined by [`rendered`].
+    clusters: BTreeMap<MapId, Cluster>,
+    /// The inbox **as it was read**, before any map claimed a row of it.
+    ///
+    /// Kept raw and re-derived rather than folded straight into `clusters`,
+    /// because the two reads race by design: the inbox is one query, the maps
+    /// are one per map, and each lands when it lands. An issue you have
+    /// claimed on a map is in both answers — that is what `assignee:@me`
+    /// means — so which cluster it belongs in is not knowable until that map
+    /// has arrived. Subtracting at render time makes the inbox *derived*: a
+    /// map landing moves its rows out of the inbox with nothing to undo, and a
+    /// map whose fetch failed leaves its rows visible in the inbox rather than
+    /// nowhere at all.
+    inbox: Vec<(String, Cluster)>,
     loaders: Loaders,
     /// The sending end, kept because a fold can start further loads.
     tx: UnboundedSender<LoadEvent>,
@@ -216,6 +231,7 @@ impl Picker {
         Self {
             app,
             clusters: BTreeMap::new(),
+            inbox: Vec::new(),
             loaders,
             tx,
             updates,
@@ -239,6 +255,7 @@ impl Picker {
                 event,
                 &mut self.app,
                 &mut self.clusters,
+                &mut self.inbox,
                 &mut self.loaders,
                 &self.tx,
             );
@@ -246,6 +263,56 @@ impl Picker {
         terminal.draw(|frame| wf::ui::draw(frame, &self.app))?;
         Ok(())
     }
+}
+
+/// What the screen draws: every map in hand, plus what is left of the inbox
+/// once the maps have claimed their own rows.
+///
+/// The subtraction is the whole function. An issue assigned to you that sits
+/// on a map is in both reads, and it belongs on the map — that is where its
+/// blockers, its leverage and its lifecycle are. Left in both it would draw
+/// twice, once as a node in its tree and once as a loose row, and the second
+/// drawing would offer to adopt an issue that already has a map.
+///
+/// Derived on every arrival rather than applied once, because the maps stream:
+/// a map landing later must take its rows out of the inbox, and there is no
+/// point in the sequence where the answer is final. The cost is that a row can
+/// move out of the inbox mid-session, and a cursor sitting on it is carried by
+/// position rather than identity when it does — a map arriving is already the
+/// event [`App::replace_clusters`] is built to absorb, and this is one more
+/// row it moves.
+///
+/// An inbox cluster left with no rows is dropped entirely: a heading over
+/// nothing says nothing.
+fn rendered(
+    clusters: &BTreeMap<MapId, Cluster>,
+    inbox: &[(String, Cluster)],
+) -> BTreeMap<ClusterId, Cluster> {
+    let mut rendered: BTreeMap<ClusterId, Cluster> = clusters
+        .iter()
+        .map(|(id, cluster)| (ClusterId::Map(id.clone()), cluster.clone()))
+        .collect();
+    for (repo, cluster) in inbox {
+        let mapped: BTreeSet<u64> = clusters
+            .iter()
+            .filter(|(id, _)| &id.repo == repo)
+            .flat_map(|(_, cluster)| cluster.tickets.iter().map(|t| t.number))
+            .collect();
+        let tickets: Vec<Ticket> = cluster
+            .tickets
+            .iter()
+            .filter(|t| !mapped.contains(&t.number))
+            .cloned()
+            .collect();
+        if tickets.is_empty() {
+            continue;
+        }
+        rendered.insert(
+            ClusterId::Inbox(repo.clone()),
+            Cluster::inbox(cluster.last_activity, tickets, cluster.truncated),
+        );
+    }
+    rendered
 }
 
 /// Fold one arrival into what the screen draws.
@@ -270,7 +337,8 @@ impl Picker {
 fn fold(
     event: LoadEvent,
     app: &mut App,
-    clusters: &mut BTreeMap<MapId, Map>,
+    clusters: &mut BTreeMap<MapId, Cluster>,
+    inbox: &mut Vec<(String, Cluster)>,
     loaders: &mut Loaders,
     tx: &UnboundedSender<LoadEvent>,
 ) {
@@ -294,7 +362,7 @@ fn fold(
             clusters.retain(|id, _| found.contains(id));
             app.failed.retain(|id| found.contains(id));
             app.open_maps = found;
-            app.replace_clusters(clusters.clone());
+            app.replace_clusters(rendered(clusters, inbox));
         }
         // Discovery retries, so this is a status report and not an end
         // state: `wf` stays on screen and recovers when the search does.
@@ -307,7 +375,7 @@ fn fold(
                 MapFetch::Loaded(new_map) => {
                     app.failed.remove(&id);
                     clusters.insert(id, new_map);
-                    app.replace_clusters(clusters.clone());
+                    app.replace_clusters(rendered(clusters, inbox));
                 }
                 // Nothing polls any more, so a failed load is not a blip
                 // the next cycle papers over — it is the final word on
@@ -318,6 +386,20 @@ fn fold(
                     app.failed.insert(id);
                 }
             }
+        }
+        // The inbox landed. It does not replace anything the maps put on
+        // screen: it is subtracted against them, and re-subtracted every time
+        // a map arrives, which is why the raw reading is what gets stored.
+        LoadEvent::Inbox(found) => {
+            app.inbox_failed = false;
+            *inbox = found;
+            app.replace_clusters(rendered(clusters, inbox));
+        }
+        // Nothing retries it, so this is the final word for the run — recorded
+        // as state rather than announced as a notice, exactly like a failed
+        // map, because a notice is gone on the next keypress and this is not.
+        LoadEvent::InboxFailed => {
+            app.inbox_failed = true;
         }
         // The background reading landed (#137). A plain state write on
         // a screen that has been up and answering keys the whole time.
@@ -362,9 +444,13 @@ fn spawn_reading(tx: &UnboundedSender<LoadEvent>) -> Survey {
 /// make on both at once. Nothing after this point can be drawn, and the process
 /// is about to be replaced — an in-flight `gh` or `dl` that outlives the `exec`
 /// is inherited by the agent as a child holding the terminal it just took over.
-async fn stop_background(discovery: JoinHandle<()>, survey: Survey) {
+async fn stop_background(discovery: JoinHandle<()>, inbox: JoinHandle<()>, survey: Survey) {
     discovery.abort();
     let _ = discovery.await;
+    // The inbox read holds a `gh` of its own, for exactly the same reason and
+    // with exactly the same cost if it outlives the exec.
+    inbox.abort();
+    let _ = inbox.await;
     // The reading holds a `dl` and a `gh` of its own, and the same reasoning
     // applies — [`Survey::stop`] is where the waiting is spelt out.
     survey.stop().await;
@@ -394,6 +480,7 @@ async fn run<B: Backend, K: Keys>(
     keys: &mut K,
     mut picker: Picker,
     discovery: JoinHandle<()>,
+    inbox: JoinHandle<()>,
     survey: Survey,
 ) -> Result<Ending> {
     loop {
@@ -419,7 +506,7 @@ async fn run<B: Backend, K: Keys>(
                 // fold in the human, who was still choosing a mode.
                 let handoff = Handoff::now(picker.app.prewarm_fired(&launch));
                 picker.loaders.shutdown().await;
-                stop_background(discovery, survey).await;
+                stop_background(discovery, inbox, survey).await;
                 return Ok(Ending::Handover(launch, handoff));
             }
             Outcome::Continue => {}
@@ -444,10 +531,14 @@ async fn session<B: Backend, K: Keys>(
     cache_path: PathBuf,
 ) -> Result<Ending> {
     let (tx, updates) = mpsc::unbounded_channel();
+    // Both reads go out at once and neither waits on the other: the maps are
+    // the screen and the inbox is beside it, so a slow inbox never holds up a
+    // map and a slow map never holds up the inbox.
+    let inbox = wf::refresh::spawn_inbox(repos.clone(), tx.clone());
     let discovery = wf::refresh::spawn_discovery(repos, cache_path, tx.clone());
     let survey = spawn_reading(&tx);
     let picker = Picker::new(app, tx, updates);
-    run(terminal, keys, picker, discovery, survey).await
+    run(terminal, keys, picker, discovery, inbox, survey).await
 }
 
 /// Everything `wf` with no arguments does: register the checkout, put the
@@ -629,6 +720,241 @@ mod tests {
     use super::*;
     use crate::probe;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+    /// One inbox row, claimed the way `assignee:@me` guarantees.
+    fn assigned(repo: &str, number: u64) -> Ticket {
+        Ticket {
+            repo: repo.to_string(),
+            number,
+            title: format!("issue {number}"),
+            status: wf::model::classify(true, true, vec![]),
+            ticket_type: wf::model::TicketType::Untyped,
+            blocked_by: vec![],
+            prs: vec![],
+        }
+    }
+
+    /// A map holding exactly `numbers`.
+    fn map_of(repo: &str, numbers: &[u64]) -> Cluster {
+        Cluster::map(
+            "Map: fixture",
+            None,
+            numbers.iter().map(|n| assigned(repo, *n)).collect(),
+            false,
+        )
+    }
+
+    #[test]
+    fn a_map_claims_its_rows_out_of_the_inbox() {
+        // #190 is on the map and also assigned, which is exactly what claiming
+        // a ticket does. It must draw once, on the map.
+        let maps = BTreeMap::from([(
+            MapId::new("blooop/wayfinder", 1),
+            map_of("blooop/wayfinder", &[190]),
+        )]);
+        let inbox = vec![(
+            "blooop/wayfinder".to_string(),
+            Cluster::inbox(
+                None,
+                vec![
+                    assigned("blooop/wayfinder", 190),
+                    assigned("blooop/wayfinder", 42),
+                ],
+                false,
+            ),
+        )];
+        let rendered = rendered(&maps, &inbox);
+        let left: Vec<u64> = rendered[&ClusterId::Inbox("blooop/wayfinder".to_string())]
+            .tickets
+            .iter()
+            .map(|t| t.number)
+            .collect();
+        assert_eq!(left, vec![42], "#190 belongs to its map, not the inbox");
+    }
+
+    #[test]
+    fn a_map_that_has_not_landed_leaves_its_rows_in_the_inbox() {
+        // The honest answer while a map is still in flight — or has failed.
+        // The alternative is a row that is nowhere, which is worse than a row
+        // that is in the inbox until its map says otherwise.
+        let inbox = vec![(
+            "blooop/wayfinder".to_string(),
+            Cluster::inbox(None, vec![assigned("blooop/wayfinder", 190)], false),
+        )];
+        let rendered = rendered(&BTreeMap::new(), &inbox);
+        assert_eq!(
+            rendered[&ClusterId::Inbox("blooop/wayfinder".to_string())]
+                .tickets
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_inbox_a_map_emptied_leaves_the_screen_rather_than_heading_nothing() {
+        let maps = BTreeMap::from([(
+            MapId::new("blooop/wayfinder", 1),
+            map_of("blooop/wayfinder", &[190]),
+        )]);
+        let inbox = vec![(
+            "blooop/wayfinder".to_string(),
+            Cluster::inbox(None, vec![assigned("blooop/wayfinder", 190)], false),
+        )];
+        let rendered = rendered(&maps, &inbox);
+        assert!(
+            !rendered.contains_key(&ClusterId::Inbox("blooop/wayfinder".to_string())),
+            "a heading over no rows says nothing"
+        );
+        assert_eq!(rendered.len(), 1, "the map is still there");
+    }
+
+    #[test]
+    fn one_repos_map_never_claims_another_repos_inbox_row() {
+        // The subtraction is per repo: issue numbers are only unique inside
+        // one, so matching on number alone would have dotfiles#4 vanish
+        // because wayfinder#4 is on a map.
+        let maps = BTreeMap::from([(
+            MapId::new("blooop/wayfinder", 1),
+            map_of("blooop/wayfinder", &[4]),
+        )]);
+        let inbox = vec![(
+            "blooop/dotfiles".to_string(),
+            Cluster::inbox(None, vec![assigned("blooop/dotfiles", 4)], false),
+        )];
+        let rendered = rendered(&maps, &inbox);
+        assert_eq!(
+            rendered[&ClusterId::Inbox("blooop/dotfiles".to_string())]
+                .tickets
+                .len(),
+            1,
+            "dotfiles#4 is not wayfinder#4"
+        );
+    }
+
+    #[test]
+    fn the_inbox_arrival_is_folded_against_the_maps_already_in_hand() {
+        // The fold, not just the helper: an inbox landing after a map must be
+        // subtracted on the way in rather than replacing what is on screen.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::empty();
+        app.enter("blooop/wayfinder");
+        let mut clusters = BTreeMap::new();
+        let mut inbox = Vec::new();
+        let mut loaders = Loaders::new();
+        fold(
+            LoadEvent::Fetched {
+                id: MapId::new("blooop/wayfinder", 1),
+                outcome: MapFetch::Loaded(map_of("blooop/wayfinder", &[190])),
+            },
+            &mut app,
+            &mut clusters,
+            &mut inbox,
+            &mut loaders,
+            &tx,
+        );
+        fold(
+            LoadEvent::Inbox(vec![(
+                "blooop/wayfinder".to_string(),
+                Cluster::inbox(
+                    None,
+                    vec![
+                        assigned("blooop/wayfinder", 190),
+                        assigned("blooop/wayfinder", 42),
+                    ],
+                    false,
+                ),
+            )]),
+            &mut app,
+            &mut clusters,
+            &mut inbox,
+            &mut loaders,
+            &tx,
+        );
+        let inbox_rows: Vec<u64> = app.clusters[&ClusterId::Inbox("blooop/wayfinder".to_string())]
+            .tickets
+            .iter()
+            .map(|t| t.number)
+            .collect();
+        assert_eq!(inbox_rows, vec![42]);
+        assert!(
+            app.clusters
+                .contains_key(&ClusterId::Map(MapId::new("blooop/wayfinder", 1))),
+            "the map is still on screen"
+        );
+    }
+
+    #[test]
+    fn a_map_landing_after_the_inbox_takes_its_rows_out_of_it() {
+        // The other order, which is the one that races: the inbox is one query
+        // and lands early, each map lands when it lands.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::empty();
+        app.enter("blooop/wayfinder");
+        let mut clusters = BTreeMap::new();
+        let mut inbox = Vec::new();
+        let mut loaders = Loaders::new();
+        fold(
+            LoadEvent::Inbox(vec![(
+                "blooop/wayfinder".to_string(),
+                Cluster::inbox(
+                    None,
+                    vec![
+                        assigned("blooop/wayfinder", 190),
+                        assigned("blooop/wayfinder", 42),
+                    ],
+                    false,
+                ),
+            )]),
+            &mut app,
+            &mut clusters,
+            &mut inbox,
+            &mut loaders,
+            &tx,
+        );
+        assert_eq!(
+            app.clusters[&ClusterId::Inbox("blooop/wayfinder".to_string())]
+                .tickets
+                .len(),
+            2,
+            "both rows are the inbox's until a map claims one"
+        );
+        fold(
+            LoadEvent::Fetched {
+                id: MapId::new("blooop/wayfinder", 1),
+                outcome: MapFetch::Loaded(map_of("blooop/wayfinder", &[190])),
+            },
+            &mut app,
+            &mut clusters,
+            &mut inbox,
+            &mut loaders,
+            &tx,
+        );
+        let inbox_rows: Vec<u64> = app.clusters[&ClusterId::Inbox("blooop/wayfinder".to_string())]
+            .tickets
+            .iter()
+            .map(|t| t.number)
+            .collect();
+        assert_eq!(inbox_rows, vec![42], "the map took #190 with it");
+    }
+
+    #[test]
+    fn a_failed_inbox_read_is_recorded_as_state_and_a_later_answer_clears_it() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::empty();
+        let mut clusters = BTreeMap::new();
+        let mut inbox = Vec::new();
+        let mut loaders = Loaders::new();
+        let mut feed = |event, app: &mut App| {
+            fold(event, app, &mut clusters, &mut inbox, &mut loaders, &tx);
+        };
+        feed(LoadEvent::InboxFailed, &mut app);
+        assert!(app.inbox_failed, "the count line has something to say");
+        // Nothing retries it in a real run, so this is the final word — but
+        // the clearing arm exists so the flag cannot outlive an answer that
+        // did arrive.
+        feed(LoadEvent::Inbox(Vec::new()), &mut app);
+        assert!(!app.inbox_failed);
+    }
 
     /// How long the probe waits after each thing it does — after the reading
     /// reaches the screen, after each key it types, and after the session ends.
@@ -1325,7 +1651,15 @@ mod tests {
             },
             tx,
         );
-        stop_background(discovery, survey).await;
+        // A pending task stands in for the inbox read: what is being proved is
+        // that `stop_background` waits for everything it was handed, and an
+        // inbox that never answers is the shape that would outlive the exec.
+        let for_inbox = witness.clone();
+        let inbox = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(for_inbox);
+        });
+        stop_background(discovery, inbox, survey).await;
         assert_eq!(
             std::sync::Arc::strong_count(&witness),
             1,

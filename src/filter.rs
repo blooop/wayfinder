@@ -24,7 +24,7 @@ use std::fmt;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-use crate::model::{Map, Ticket};
+use crate::model::{Cluster, Ticket};
 
 /// The part of the haystack the row itself draws: `#n title`. Public because
 /// the screen underlines characters *by index* into it — the string drawn and
@@ -190,12 +190,13 @@ impl Query {
     }
 
     /// Where the query landed in a cluster's repo name, taken from whichever of
-    /// its tickets matched best. Every ticket in a map shares one repo name but
+    /// its tickets matched best. Every ticket in a cluster shares one repo name but
     /// not one match — `wf6` can reach the repo through one row and not
     /// another — and the header is drawn once, so it answers for the row the
     /// query liked most, which is the row it put at the top.
-    pub fn in_repo(&mut self, map: &Map) -> Vec<usize> {
-        map.tickets
+    pub fn in_repo(&mut self, cluster: &Cluster) -> Vec<usize> {
+        cluster
+            .tickets
             .iter()
             .filter_map(|ticket| self.hit(ticket))
             .max_by_key(|hit| hit.score)
