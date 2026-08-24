@@ -559,7 +559,15 @@ pub fn heading(app: &App) -> String {
     // saying nothing leaves the reader on a screen with a failure and no move
     // to make — so it names the move that is left. Restarting really is the
     // retry now: each cluster is fetched once per run, and a warm start is ~0.6 s.
-    if app.clusters.is_empty() && app.startup.is_loaded() {
+    // No *map* arrived, rather than no cluster: the inbox is a cluster too and
+    // comes from a different query, so one loose row would otherwise make
+    // "every map failed" read as an ordinary screen. The failure this heading
+    // exists for is a failure to fetch maps, and only maps can answer for it.
+    let no_maps = !app
+        .clusters
+        .keys()
+        .any(|id| matches!(id, ClusterId::Map(_)));
+    if no_maps && app.startup.is_loaded() {
         match app.failed.len() {
             0 => {}
             1 => {
@@ -1187,6 +1195,43 @@ mod tests {
             ),
         );
         app_on("blooop/wayfinder", clusters)
+    }
+
+    #[test]
+    fn an_inbox_does_not_hide_the_every_map_failed_heading() {
+        // The heading says "GitHub is unreachable" rather than "nothing open",
+        // and it only speaks when no cluster arrived. The inbox is a cluster
+        // now, and it arrives from a *different* query — so one loose row was
+        // enough to make every map failing read as an ordinary project list.
+        //
+        // On the list rather than a project screen, because that is the screen
+        // this heading is drawn on.
+        let mut app = App::empty().with_checkouts(vec![crate::projects::Checkout::new(
+            std::path::PathBuf::from("/data/proj/wayfinder"),
+            "blooop/wayfinder".to_string(),
+        )]);
+        app.startup = Startup::loaded();
+        app.failed.insert(MapId::new("blooop/wayfinder", 1));
+        app.replace_clusters(BTreeMap::from([(
+            ClusterId::Inbox("blooop/wayfinder".to_string()),
+            Cluster::inbox(
+                None,
+                vec![ticket(
+                    "blooop/wayfinder",
+                    91,
+                    "one row",
+                    true,
+                    true,
+                    vec![],
+                )],
+                false,
+            ),
+        )]));
+        let screen = render(&app);
+        assert!(
+            screen.contains("blooop/wayfinder#1 — fetch failed, run wf again"),
+            "{screen}"
+        );
     }
 
     #[test]
