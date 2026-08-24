@@ -24,6 +24,7 @@
 //! zombie it will never reap: aborting the task drops the `Child`, and only
 //! `kill_on_drop` turns that into a signal.
 
+use std::cmp::Reverse;
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
@@ -506,7 +507,17 @@ pub async fn fetch_inbox(repos: &[String]) -> Result<Vec<(String, Cluster)>> {
     // The two halves differ in exactly one qualifier, so they are built from
     // one string: a scope that drifted between them would silently make the
     // inbox mean two different things in its two halves.
-    let scoped = |who: &str| format!("{who} is:issue is:open {}", scope.join(" "));
+    // `sort:updated-desc` is what makes the page cap survivable: one page of
+    // 100 spans every repo asked about, so without an order *which* rows fall
+    // off it is arbitrary — and the rows worth having are the ones something
+    // just happened to. It also means the order the screen wants is the order
+    // the tracker already ranked, rather than something recovered afterwards.
+    let scoped = |who: &str| {
+        format!(
+            "{who} is:issue is:open sort:updated-desc {}",
+            scope.join(" ")
+        )
+    };
     let output = Command::new("gh")
         .args([
             "api",
@@ -553,8 +564,14 @@ fn parse_inbox(body: &[u8]) -> Result<Vec<(String, Cluster)>> {
     let page_cut_short =
         data.mine.page_info.has_next_page || data.unassigned.page_info.has_next_page;
 
-    let mut by_repo: std::collections::BTreeMap<String, (Vec<Ticket>, Option<Activity>, bool)> =
-        std::collections::BTreeMap::new();
+    // Each row is kept beside its own stamp, because the inbox is ordered by
+    // *when something happened* and a [`Ticket`] carries no time of its own —
+    // a map's rows are numbered in the order its author charted them, so a
+    // ticket has never needed one.
+    let mut by_repo: std::collections::BTreeMap<
+        String,
+        (Vec<(Option<Activity>, Ticket)>, Option<Activity>, bool),
+    > = std::collections::BTreeMap::new();
     // Concatenated rather than merged: the two searches are disjoint by
     // construction — an issue is assigned to you or it is assigned to nobody,
     // never both — so there is nothing here to deduplicate. What each row
@@ -573,7 +590,7 @@ fn parse_inbox(body: &[u8]) -> Result<Vec<(String, Cluster)>> {
         let entry = by_repo
             .entry(repo)
             .or_insert((Vec::new(), None, page_cut_short));
-        entry.0.push(ticket);
+        entry.0.push((activity, ticket));
         // The cluster's stamp is the newest of its rows': a pile of issues has
         // no single thing that was updated, and the order the screen wants is
         // "where has something happened".
@@ -583,8 +600,18 @@ fn parse_inbox(body: &[u8]) -> Result<Vec<(String, Cluster)>> {
 
     Ok(by_repo
         .into_iter()
-        .map(|(repo, (mut tickets, activity, truncated))| {
-            tickets.sort_by_key(|t| t.number);
+        .map(|(repo, (mut rows, activity, truncated))| {
+            // Newest first, and **not** by number: ascending number order puts
+            // the oldest issue in the repo at the top, which is the inversion
+            // of what an inbox is for. A stamp that did not parse sorts last
+            // rather than being guessed into place — `None < Some` reversed —
+            // the same answer the cluster order gives an unreadable map stamp.
+            //
+            // The number breaks ties newest-first too, so two issues touched in
+            // the same second do not render in an order that shifts between
+            // frames.
+            rows.sort_by_key(|(stamp, ticket)| (Reverse(*stamp), Reverse(ticket.number)));
+            let tickets = rows.into_iter().map(|(_, ticket)| ticket).collect();
             (repo, Cluster::inbox(activity, tickets, truncated))
         })
         .collect())
@@ -784,9 +811,50 @@ mod tests {
         let numbers: Vec<u64> = wayfinder.tickets.iter().map(|t| t.number).collect();
         assert_eq!(
             numbers,
-            vec![190, 191, 207],
-            "both halves land in one cluster, sorted by number like a map's"
+            vec![207, 190, 191],
+            "both halves land in one cluster, newest first"
         );
+    }
+
+    #[test]
+    fn inbox_rows_come_back_newest_first() {
+        // The inbox is ordered by *when something happened*, not by issue
+        // number. A map's rows are numbered in the order its author charted
+        // them, so number order is meaningful there; an inbox is a pile with no
+        // author, and ascending number order puts the oldest thing in the repo
+        // at the top — the exact inversion of what an inbox is for.
+        let inbox = parse_inbox(INBOX_RESPONSE.as_bytes()).expect("parse");
+        let wayfinder = &inbox
+            .iter()
+            .find(|(repo, _)| repo == "blooop/wayfinder")
+            .expect("wayfinder has rows")
+            .1;
+        let numbers: Vec<u64> = wayfinder.tickets.iter().map(|t| t.number).collect();
+        // #207 10:00 > #190 09:00 > #191 (two days earlier).
+        assert_eq!(numbers, vec![207, 190, 191]);
+    }
+
+    #[test]
+    fn an_inbox_row_whose_stamp_did_not_parse_sorts_last_rather_than_first() {
+        // Unknown activity is not guessed into place — the same answer the
+        // cluster order gives a map whose stamp did not parse. Sorting it first
+        // would put whatever the tracker garbled at the top of the inbox.
+        let body = INBOX_RESPONSE.replace(
+            r#""updatedAt": "2026-08-24T10:00:00Z""#,
+            r#""updatedAt": "not a timestamp""#,
+        );
+        assert_ne!(body, INBOX_RESPONSE, "the fixture's #207 stamp moved");
+        let inbox = parse_inbox(body.as_bytes()).expect("parse");
+        let numbers: Vec<u64> = inbox
+            .iter()
+            .find(|(repo, _)| repo == "blooop/wayfinder")
+            .expect("wayfinder has rows")
+            .1
+            .tickets
+            .iter()
+            .map(|t| t.number)
+            .collect();
+        assert_eq!(numbers, vec![190, 191, 207], "#207's stamp is unreadable");
     }
 
     #[test]
@@ -852,7 +920,7 @@ mod tests {
     #[test]
     fn the_inbox_reads_an_issue_exactly_as_a_map_reads_its_sub_issue() {
         let inbox = parse_inbox(INBOX_RESPONSE.as_bytes()).expect("parse");
-        let ticket = &inbox[1].1.tickets[1];
+        let ticket = &inbox[1].1.tickets[2];
         assert_eq!(ticket.number, 191);
         assert_eq!(ticket.repo, "blooop/wayfinder", "its own repo, not a map's");
         assert_eq!(ticket.ticket_type, TicketType::Build, "labels still parse");

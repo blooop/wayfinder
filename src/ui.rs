@@ -1232,6 +1232,57 @@ mod tests {
     }
 
     #[test]
+    fn inbox_rows_draw_newest_first_and_map_rows_still_draw_by_number() {
+        // The parse orders the inbox by activity; this is the half that proves
+        // the *screen* keeps that order, because both lenses re-sort their
+        // roots and the tie-break used to be the issue number.
+        let mut clusters = BTreeMap::new();
+        clusters.insert(ClusterId::Map(MapId::new("blooop/wayfinder", 1)), wf_map());
+        clusters.insert(
+            ClusterId::Inbox("blooop/wayfinder".to_string()),
+            Cluster::inbox(
+                None,
+                // Already in the order the parse produced: newest first, which
+                // is deliberately *not* ascending number order.
+                vec![
+                    ticket("blooop/wayfinder", 207, "newest", true, false, vec![]),
+                    ticket("blooop/wayfinder", 104, "middle", true, false, vec![]),
+                    ticket("blooop/wayfinder", 190, "oldest", true, false, vec![]),
+                ],
+                false,
+            ),
+        );
+        let app = app_on("blooop/wayfinder", clusters);
+        let drawn: Vec<&str> = body_lines(&app)
+            .iter()
+            .filter_map(|line| {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                ["#207", "#104", "#190", "#6", "#7"]
+                    .into_iter()
+                    .find(|n| text.contains(*n))
+            })
+            .collect();
+        let inbox_rows: Vec<&str> = drawn
+            .iter()
+            .copied()
+            .filter(|n| ["#207", "#104", "#190"].contains(n))
+            .collect();
+        assert_eq!(
+            inbox_rows,
+            vec!["#207", "#104", "#190"],
+            "the cluster's own order survives the lens: {drawn:?}"
+        );
+        // And the map beside it is untouched — its rows are number-ordered
+        // because that is what its parse produced.
+        let map_rows: Vec<&str> = drawn
+            .iter()
+            .copied()
+            .filter(|n| ["#6", "#7"].contains(n))
+            .collect();
+        assert_eq!(map_rows, vec!["#6", "#7"], "{drawn:?}");
+    }
+
+    #[test]
     fn the_inbox_draws_below_every_map() {
         let screen = render(&with_inbox());
         let lines: Vec<&str> = screen.lines().collect();

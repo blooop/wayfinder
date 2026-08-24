@@ -869,7 +869,18 @@ fn leverage(clusters: &[(&ClusterId, &Cluster)], expanded: &Expanded, sieve: &Si
             plan.idle_hidden += 1;
             continue;
         }
-        roots.sort_by_key(|t| (Reverse(open_unblocks(cluster, t.number).len()), t.number));
+        // The tie-break is the row's **place in its cluster**, not its number.
+        // A map's tickets are number-sorted at the parse boundary, so for a map
+        // the two are the same order; an inbox's are activity-sorted, and
+        // keying on the number there would re-impose oldest-first on rows that
+        // were deliberately ordered by when something happened. One rule, and
+        // each cluster's parse decides what its own order means.
+        roots.sort_by_key(|t| {
+            (
+                Reverse(open_unblocks(cluster, t.number).len()),
+                cluster.index_of(t.number),
+            )
+        });
 
         let mut tree = Vec::new();
         let mut reached = BTreeSet::new();
@@ -1019,7 +1030,9 @@ fn forest(clusters: &[(&ClusterId, &Cluster)], sieve: &Sieve) -> Plan {
                 None => roots.push(t.number),
             }
         }
-        roots.sort_unstable();
+        // In cluster order, for [`leverage`]'s reason: the same order a map
+        // gets from its numbers and an inbox from its activity.
+        roots.sort_by_key(|n| cluster.index_of(*n));
 
         let mut visited = BTreeSet::new();
         for &root in &roots {
