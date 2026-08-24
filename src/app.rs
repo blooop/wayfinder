@@ -277,7 +277,8 @@ impl Pinned {
 
 #[derive(Debug)]
 pub struct App {
-    /// The clusters on screen: every open map that has arrived, keyed by id.
+    /// The clusters on screen, keyed by id: every open map that has arrived,
+    /// and each repo's inbox once its own read has landed.
     /// Render order is *not* this map's key order — it is decided by
     /// [`App::scoped_clusters`], which leads on activity.
     pub clusters: BTreeMap<ClusterId, Cluster>,

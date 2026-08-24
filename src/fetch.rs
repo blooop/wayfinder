@@ -550,6 +550,19 @@ pub async fn fetch_inbox(repos: &[String]) -> Result<Vec<(String, Cluster)>> {
     parse_inbox(&output.stdout)
 }
 
+/// One repo's inbox mid-build.
+///
+/// Each row is kept beside its **own** stamp, because the inbox is ordered by
+/// when something happened and a [`Ticket`] carries no time of its own — a
+/// map's rows are numbered in the order its author charted them, so a ticket
+/// has never needed one. `activity` is the cluster's stamp (the newest of the
+/// rows'), which is a different question from any one row's.
+struct Building {
+    rows: Vec<(Option<Activity>, Ticket)>,
+    activity: Option<Activity>,
+    truncated: bool,
+}
+
 /// Turn one inbox response into one cluster per repo — the whole parse
 /// boundary, kept apart from the process call so it is testable without the
 /// network.
@@ -571,14 +584,8 @@ fn parse_inbox(body: &[u8]) -> Result<Vec<(String, Cluster)>> {
     let page_cut_short =
         data.mine.page_info.has_next_page || data.unassigned.page_info.has_next_page;
 
-    // Each row is kept beside its own stamp, because the inbox is ordered by
-    // *when something happened* and a [`Ticket`] carries no time of its own —
-    // a map's rows are numbered in the order its author charted them, so a
-    // ticket has never needed one.
-    let mut by_repo: std::collections::BTreeMap<
-        String,
-        (Vec<(Option<Activity>, Ticket)>, Option<Activity>, bool),
-    > = std::collections::BTreeMap::new();
+    let mut by_repo: std::collections::BTreeMap<String, Building> =
+        std::collections::BTreeMap::new();
     // Concatenated rather than merged: the two searches are disjoint by
     // construction — an issue is assigned to you or it is assigned to nobody,
     // never both — so there is nothing here to deduplicate. What each row
@@ -605,33 +612,44 @@ fn parse_inbox(body: &[u8]) -> Result<Vec<(String, Cluster)>> {
         let activity = node.updated_at.as_deref().and_then(Activity::parse);
         let blockers_cut_short = node.issue.blocked_by.page_info.has_next_page;
         let ticket = parse_ticket(node.issue, &repo);
-        let entry = by_repo
-            .entry(repo)
-            .or_insert((Vec::new(), None, page_cut_short));
-        entry.0.push((activity, ticket));
+        let entry = by_repo.entry(repo).or_insert_with(|| Building {
+            rows: Vec::new(),
+            activity: None,
+            truncated: page_cut_short,
+        });
+        entry.rows.push((activity, ticket));
         // The cluster's stamp is the newest of its rows': a pile of issues has
         // no single thing that was updated, and the order the screen wants is
         // "where has something happened".
-        entry.1 = entry.1.max(activity);
-        entry.2 |= blockers_cut_short;
+        entry.activity = entry.activity.max(activity);
+        entry.truncated |= blockers_cut_short;
     }
 
     Ok(by_repo
         .into_iter()
-        .map(|(repo, (mut rows, activity, truncated))| {
-            // Newest first, and **not** by number: ascending number order puts
-            // the oldest issue in the repo at the top, which is the inversion
-            // of what an inbox is for. A stamp that did not parse sorts last
-            // rather than being guessed into place — `None < Some` reversed —
-            // the same answer the cluster order gives an unreadable map stamp.
-            //
-            // The number breaks ties newest-first too, so two issues touched in
-            // the same second do not render in an order that shifts between
-            // frames.
-            rows.sort_by_key(|(stamp, ticket)| (Reverse(*stamp), Reverse(ticket.number)));
-            let tickets = rows.into_iter().map(|(_, ticket)| ticket).collect();
-            (repo, Cluster::inbox(activity, tickets, truncated))
-        })
+        .map(
+            |(
+                repo,
+                Building {
+                    mut rows,
+                    activity,
+                    truncated,
+                },
+            )| {
+                // Newest first, and **not** by number: ascending number order puts
+                // the oldest issue in the repo at the top, which is the inversion
+                // of what an inbox is for. A stamp that did not parse sorts last
+                // rather than being guessed into place — `None < Some` reversed —
+                // the same answer the cluster order gives an unreadable map stamp.
+                //
+                // The number breaks ties newest-first too, so two issues touched in
+                // the same second do not render in an order that shifts between
+                // frames.
+                rows.sort_by_key(|(stamp, ticket)| (Reverse(*stamp), Reverse(ticket.number)));
+                let tickets = rows.into_iter().map(|(_, ticket)| ticket).collect();
+                (repo, Cluster::inbox(activity, tickets, truncated))
+            },
+        )
         .collect())
 }
 

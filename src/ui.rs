@@ -93,7 +93,7 @@ fn cluster_header(
 /// identical.
 ///
 /// The tail says what is inside, and has three honest answers: the stage
-/// rollup once maps are on hand, `no cluster — enter to start one` once the search
+/// rollup once maps are on hand, `no map — enter to start one` once the search
 /// has answered and found none, and `loading…` in between. That third one is
 /// the whole reason [`ProjectRow::loaded`] exists — a repo whose maps are still
 /// in flight and a repo that has none are the same zero, and calling the first
@@ -623,7 +623,7 @@ pub fn inbox_note(app: &App) -> String {
 
 /// The `· … truncated` segment on the count line (#184): a cluster the tracker
 /// could not send all of — more sub-issues or blocking edges than one page
-/// holds, per [`Map`]'s `truncated` — named where the reader is, because the
+/// holds, per [`Cluster`]'s `truncated` — named where the reader is, because the
 /// body draws a normal-looking tree either way and this line is the only
 /// place left to say the tree is partial.
 ///

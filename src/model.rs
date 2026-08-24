@@ -480,7 +480,7 @@ pub struct Ticket {
     /// [`Status::Blocked::needs`] is *status*: `needs` is the open subset at
     /// fetch time, and both are parsed once from the same `gh` response rather
     /// than one being re-derived from the other. Reverse (unblocks) edges are
-    /// derived locally by inversion ([`Map::unblocks`]); the numbers may name
+    /// derived locally by inversion ([`Cluster::unblocks`]); the numbers may name
     /// issues outside the map, which inversion simply never visits.
     pub blocked_by: Vec<u64>,
     /// The PRs linked to this ticket (#52), in the tracker's order.

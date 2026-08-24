@@ -159,8 +159,9 @@ pub struct ProjectRow {
     pub maps: usize,
     /// Stage counts across them, in display order — empty when none are.
     pub rollup: Vec<(RowGlyph, usize)>,
-    /// Whether the cluster search has answered, so `maps: 0` can be read as "no
-    /// cluster" rather than "not yet".
+    /// Whether the **map** search has answered, so `maps: 0` can be read as
+    /// "no map" rather than "not yet". The inbox has its own read and does not
+    /// speak for this — `maps` deliberately excludes it.
     pub loaded: bool,
     /// Where a live query landed in the slug, in char indices — what the row
     /// underlines. Empty on the structured screen, which has no query.
