@@ -19,7 +19,15 @@ Two issues, not one: wf's cluster header is a map and headers are not cursor sto
 
 **`<sigil>wf-one adopt <n>`** — issue `<n>` already exists and no map claims it. `wf` draws it in the *yours or unclaimed* cluster and `enter` sends it here. **Do not create a second issue for it.** File the map, parent the existing issue under it, and pick up at **Run it** — everything after setup is identical, which is the whole reason adoption routes here rather than to a skill of its own.
 
-Read the issue first (`gh issue view <n> --repo "$REPO"`) — its title and body are the ticket, already written by whoever filed it. Do not retitle or rewrite it to look like something you filed; you are giving it a map, not taking it over. Type labels are the one thing to add if it has none: `wayfinder:build` for code, `wayfinder:task` for other doing, so the row's stage starts deriving from its PRs.
+**Check it has no parent first, and stop if it has.** `wf` offers adoption from a reading that can be stale — a map whose fetch failed, a search page cut short, a map opened a second ago — and an issue may have only **one** parent, so parenting an already-mapped ticket takes it off the map it was charted on. That is somebody's map quietly losing a ticket, and nothing would report it.
+
+```bash
+gh api "repos/$REPO/issues/<n>/parent" --jq .number 2>/dev/null
+```
+
+An answer means it is already on a map: **do not adopt it**. Say which map it is on and stop — the human wanted that ticket, so hand them `wf` on it rather than a second map. Only silence here is a loose issue.
+
+Read the issue next (`gh issue view <n> --repo "$REPO"`) — its title and body are the ticket, already written by whoever filed it. Do not retitle or rewrite it to look like something you filed; you are giving it a map, not taking it over. Type labels are the one thing to add if it has none: `wayfinder:build` for code, `wayfinder:task` for other doing, so the row's stage starts deriving from its PRs.
 
 If the issue turns out to be too big for one ticket, that is the same signal the **Don't let it fan out** section below describes, and it has the same answer: say so, leave a `### handoff`, and hand it to `wf`. Do not chart around it.
 

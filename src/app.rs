@@ -1007,6 +1007,39 @@ impl App {
         }
     }
 
+    /// Why adoption must not be offered for a row in `repo` right now, if it
+    /// must not.
+    ///
+    /// The inbox is what is left of the read once the maps in hand have claimed
+    /// their own rows, so it is only as trustworthy as the maps are complete.
+    /// A row a *missing* map would have claimed is still drawn — deliberately,
+    /// because a row that is nowhere is worse than a row in the wrong
+    /// place — but drawing it and acting on it are different things. Adoption
+    /// files a map and parents the issue under it, and an issue may have only
+    /// one parent, so adopting a ticket that already has a map takes it off the
+    /// map it was charted on. That is tracker data loss, and it is invisible
+    /// from here.
+    ///
+    /// So the refusal is keyed on what `wf` does not know rather than on what
+    /// it has seen: any map of this repo still out, or any that failed, and
+    /// adoption waits. `wf` cannot tell "loose" from "early" until then. The
+    /// launched skill checks the same thing again against the live tracker,
+    /// because this reading can be stale for reasons no local state shows —
+    /// a search page cut short, a map opened a second ago.
+    fn adoption_refusal(&self, repo: &str) -> Option<String> {
+        if !self.startup.is_loaded() {
+            return Some(format!(
+                "still loading {repo}'s maps — adoption waits until they have all reported"
+            ));
+        }
+        let failed: Vec<&MapId> = self.failed.iter().filter(|id| id.repo == repo).collect();
+        let first = failed.first()?;
+        Some(format!(
+            "{}#{} did not load, so a row here may already be on it — adoption waits",
+            first.repo, first.number
+        ))
+    }
+
     /// The header half of [`App::request_launch`]: a map header launches the
     /// map, and the loose cluster's header launches nothing.
     ///
@@ -1057,7 +1090,13 @@ impl App {
         // ordinary mapped path, which is why the launch contract is left alone.
         let staged = match self.map_ref(&row.cluster) {
             Some(map) => Staged::ticket(ticket, &map, stage(&ticket.prs, &ticket.status)),
-            None => (!matches!(ticket.status, Status::Done)).then(|| Staged::loose(ticket)),
+            None => match self.adoption_refusal(&ticket.repo) {
+                Some(why) => {
+                    self.notice = Some(why);
+                    return Outcome::Continue;
+                }
+                None => (!matches!(ticket.status, Status::Done)).then(|| Staged::loose(ticket)),
+            },
         };
         let number = ticket.number;
         match staged {
@@ -1734,6 +1773,70 @@ mod tests {
             staged.candidates(),
             vec![Candidate::Adopt],
             "one way forward, and no mode axis: `/wf-one` owns the lifecycle"
+        );
+    }
+
+    #[test]
+    fn adoption_is_refused_while_this_repos_map_picture_is_incomplete() {
+        // The inbox keeps showing rows a map that failed to load would have
+        // claimed — deliberately, because a row that is nowhere is worse. But
+        // *visible* and *actionable* are different things: adopting a ticket
+        // that already has a map files a second map and reparents the issue
+        // off its real one, and GitHub allows an issue only one parent, so the
+        // map it was charted on silently loses it.
+        let clusters: BTreeMap<_, _> = [inbox(PROJECT, &[91], None)].into_iter().collect();
+        let mut app = app_on(PROJECT, clusters);
+        app.failed.insert(MapId::new(PROJECT, 1));
+        go_to(&mut app, "#91");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert!(
+            !matches!(app.overlay, Overlay::PickLaunch { .. }),
+            "no picker: {:?}",
+            app.overlay
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("did not load")),
+            "{:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn adoption_is_refused_while_the_maps_are_still_arriving() {
+        // The same hole for the whole startup window rather than only after a
+        // failure: the inbox is one query and the maps stream, so until every
+        // map for this repo has reported there is no way to know whether a row
+        // is loose or merely early.
+        let clusters: BTreeMap<_, _> = [inbox(PROJECT, &[91], None)].into_iter().collect();
+        let mut app = app_on(PROJECT, clusters);
+        app.startup = Startup::seeded(&[MapId::new(PROJECT, 1)].into_iter().collect());
+        go_to(&mut app, "#91");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert!(!matches!(app.overlay, Overlay::PickLaunch { .. }));
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("still loading")),
+            "{:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn a_failed_map_in_another_repo_does_not_refuse_this_repos_adoption() {
+        // The refusal is per repo: a map that failed in `dotfiles` says nothing
+        // about whether a wayfinder issue is loose.
+        let clusters: BTreeMap<_, _> = [inbox(PROJECT, &[91], None)].into_iter().collect();
+        let mut app = app_on(PROJECT, clusters);
+        app.failed.insert(MapId::new("blooop/dotfiles", 4));
+        go_to(&mut app, "#91");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert!(
+            matches!(app.overlay, Overlay::PickLaunch { .. }),
+            "adoption is still offered: {:?}",
+            app.notice
         );
     }
 

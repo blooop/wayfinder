@@ -701,6 +701,21 @@ fn the_adopt_argument_is_the_one_wf_one_documents() {
         doc.contains("Do not create a second issue for it"),
         "wf-one must say that an adopted issue is the ticket, not a description of one"
     );
+    // The guard `wf` cannot enforce from here. Its own refusal keys on what it
+    // does not know (a map still out, a map that failed), and that is not the
+    // whole of what can be stale: a label page cut short, a map opened a
+    // second ago. An issue may have one parent, so adopting an already-mapped
+    // ticket takes it off the map it was charted on — silently, on somebody
+    // else's map. The skill is the only reader with a live tracker in front of
+    // it, so the check has to be written down where it runs.
+    assert!(
+        doc.contains("/parent"),
+        "wf-one must check the issue has no parent before adopting it"
+    );
+    assert!(
+        doc.contains("do not adopt it"),
+        "wf-one must refuse an issue that already has a map, not reparent it"
+    );
 }
 
 /// Every shipped skill says where it stands on the block — a consumer that
