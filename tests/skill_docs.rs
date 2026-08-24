@@ -681,6 +681,43 @@ fn the_context_section_states_the_fallback_and_the_live_read() {
     }
 }
 
+/// The word the binary puts in front of an adopted issue's number is the word
+/// `wf-one` documents reading.
+///
+/// The skills are part of this repo precisely so this cannot drift, and this is
+/// the pair that would drift silently: `wf` execs `wf-one adopt <n>` from the
+/// inbox, and a skill that never learned the subcommand would read `adopt 191`
+/// as a task description and file a *second* issue called "adopt 191" beside
+/// the one the human picked. Nothing anywhere would notice.
+#[test]
+fn the_adopt_argument_is_the_one_wf_one_documents() {
+    let doc = skill_doc("wf-one");
+    let arg = wf::launch::ADOPT_ARG;
+    assert!(
+        doc.contains(&format!("<sigil>wf-one {arg} <n>")),
+        "wf-one must show the `{arg}` form in its invocation grammar"
+    );
+    assert!(
+        doc.contains("Do not create a second issue for it"),
+        "wf-one must say that an adopted issue is the ticket, not a description of one"
+    );
+    // The guard `wf` cannot enforce from here. Its own refusal keys on what it
+    // does not know (a map still out, a map that failed), and that is not the
+    // whole of what can be stale: a label page cut short, a map opened a
+    // second ago. An issue may have one parent, so adopting an already-mapped
+    // ticket takes it off the map it was charted on — silently, on somebody
+    // else's map. The skill is the only reader with a live tracker in front of
+    // it, so the check has to be written down where it runs.
+    assert!(
+        doc.contains("/parent"),
+        "wf-one must check the issue has no parent before adopting it"
+    );
+    assert!(
+        doc.contains("do not adopt it"),
+        "wf-one must refuse an issue that already has a map, not reparent it"
+    );
+}
+
 /// Every shipped skill says where it stands on the block — a consumer that
 /// never learns of it would keep paying the discovery cost the block exists to
 /// remove.

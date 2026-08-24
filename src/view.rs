@@ -8,10 +8,10 @@
 //! - **Leverage** (the default): per cluster, the takeable tickets (frontier +
 //!   claimed) sorted most-open-dependents-first, each with the subtree of open
 //!   tickets it unblocks. Done collapses to a [`Item::Group`] line, as do
-//!   blocked tickets no subtree reaches; a map with nothing takeable leaves the
+//!   blocked tickets no subtree reaches; a cluster with nothing takeable leaves the
 //!   body entirely and is only counted ([`Plan::idle_hidden`]).
 //! - **Forest** (`tab`): the whole DAG, done dimmed in place. Tree parent =
-//!   lowest-numbered in-map blocker; the other in-map blockers annotate the row
+//!   lowest-numbered in-cluster blocker; the other in-cluster blockers annotate the row
 //!   (`⤷ also needs #n`).
 //! - **Sifted** (a live query): whichever of those two trees is toggled, pruned
 //!   to the rows that matched. Clearing the query restores it whole.
@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::app::Row;
 use crate::filter;
-use crate::model::{Map, MapId, RowGlyph, Status, Ticket};
+use crate::model::{Cluster, ClusterId, RowGlyph, Status, Ticket};
 
 /// The structural screen `tab` toggles between — the half of the view state
 /// that is *stored*. The other half (whether a query is sifting the body) is
@@ -102,7 +102,7 @@ pub enum GroupKind {
 /// key and half of the cursor's anchor.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GroupId {
-    pub map: MapId,
+    pub cluster: ClusterId,
     pub kind: GroupKind,
 }
 
@@ -113,18 +113,21 @@ pub type Expanded = BTreeSet<GroupId>;
 /// What the cursor is on. Since #57 that is no longer always a ticket: a
 /// collapsed group is a stop too, because opening one is an action the cursor
 /// has to be able to name — and since #96 so is a cluster header, because a
-/// map is a thing you can launch an agent at.
+/// cluster is a thing you can launch an agent at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stop {
-    /// A cluster header: the whole map, launched as one.
-    Map(MapId),
+    /// A cluster header. A cluster's header launches — charting or driving a whole
+    /// cluster is something an agent can be aimed at — and a loose cluster's is a
+    /// place to stand and nothing more, which is a difference the
+    /// [`ClusterId`] carries rather than a second field here.
+    Cluster(ClusterId),
     Ticket(Row),
     Group(GroupId),
     /// A whole project, by full slug — a row of the project list, and the row
     /// the project screen opens on.
     ///
-    /// The one stop that names a repo rather than something in a map, which is
-    /// why creation lives here: starting a map or a task is an act on a repo,
+    /// The one stop that names a repo rather than something in a cluster, which is
+    /// why creation lives here: starting a cluster or a task is an act on a repo,
     /// and this is the only stop that *is* one. What `enter` does to it
     /// depends on which screen drew it — enter the project, or create in it —
     /// and that is the whole of the two-level navigation.
@@ -144,12 +147,21 @@ pub enum Stop {
 pub struct ProjectRow {
     /// Full slug, `owner/name`.
     pub repo: String,
-    /// How many of this repo's open maps are on hand.
+    /// How many of this repo's open **maps** are on hand — the inbox is not
+    /// one of them.
+    ///
+    /// Counting clusters here instead was the tempting shortcut and is a lie
+    /// the row cannot recover from: a repo with two maps and an inbox would
+    /// read "3 maps", and a repo with *only* an inbox would stop reading "no
+    /// map — enter to start one" exactly when that sentence is the one thing
+    /// the row has to say. The inbox is not work somebody charted, and this
+    /// number is how much charted work there is.
     pub maps: usize,
     /// Stage counts across them, in display order — empty when none are.
     pub rollup: Vec<(RowGlyph, usize)>,
-    /// Whether the map search has answered, so `maps: 0` can be read as "no
-    /// map" rather than "not yet".
+    /// Whether the **map** search has answered, so `maps: 0` can be read as
+    /// "no map" rather than "not yet". The inbox has its own read and does not
+    /// speak for this — `maps` deliberately excludes it.
     pub loaded: bool,
     /// Where a live query landed in the slug, in char indices — what the row
     /// underlines. Empty on the structured screen, which has no query.
@@ -157,18 +169,31 @@ pub struct ProjectRow {
 }
 
 impl ProjectRow {
-    /// The row for `repo`, tallied from whichever of its maps have arrived.
+    /// The row for `repo`, tallied from whichever of its **maps** have
+    /// arrived.
     ///
     /// Takes every cluster rather than the repo's, so the caller cannot hand it
     /// a filtered set and get a rollup that quietly means something narrower
     /// than the row says.
+    ///
+    /// The inbox is excluded from both halves, and from the rollup for a
+    /// sharper reason than the count: the project list is drawn before you
+    /// enter anything, and its glyphs are there to say how much charted work
+    /// is moving. An inbox of thirty assigned issues would render `◐30` over
+    /// every repo — assigned issues classify as claimed — and drown the two or
+    /// three glyphs that were the point. The inbox is a thing you go and look
+    /// at, not a thing the summary is about.
     #[must_use]
-    pub fn new(repo: &str, clusters: &BTreeMap<MapId, Map>, loaded: bool) -> ProjectRow {
-        let mine = || clusters.iter().filter(|(id, _)| id.repo == repo);
+    pub fn new(repo: &str, clusters: &BTreeMap<ClusterId, Cluster>, loaded: bool) -> ProjectRow {
+        let maps = || {
+            clusters
+                .iter()
+                .filter(|(id, _)| id.repo() == repo && matches!(id, ClusterId::Map(_)))
+        };
         ProjectRow {
             repo: repo.to_string(),
-            maps: mine().count(),
-            rollup: RowGlyph::tally(mine().flat_map(|(_, map)| &map.tickets)),
+            maps: maps().count(),
+            rollup: RowGlyph::tally(maps().flat_map(|(_, cluster)| &cluster.tickets)),
             loaded,
             lit: Vec::new(),
         }
@@ -187,8 +212,8 @@ pub struct StopAt {
 /// the rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
-    /// A cluster header — the map this and the following lines belong to.
-    Header(MapId),
+    /// A cluster header — the cluster this and the following lines belong to.
+    Header(ClusterId),
     /// A project row: the body of the project list, and the first line of a
     /// project's own screen.
     Project(ProjectRow),
@@ -200,7 +225,7 @@ pub enum Item {
         /// branch. On a sifted screen it places a match that navigation still
         /// treats as depth 0, and a `⋯` in it marks an elided ancestor.
         prefix: String,
-        /// Forest only: in-map blockers beyond the primary parent.
+        /// Forest only: in-cluster blockers beyond the primary parent.
         also_needs: Vec<u64>,
         /// Whether this row heads a branch, and what is in it.
         branch: Branch,
@@ -239,7 +264,7 @@ impl Item {
             // walk and a header is not something you descend *into* — `←` from
             // a top-level row already steps back to it as the previous stop.
             Item::Header(id) => Some(StopAt {
-                stop: Stop::Map(id.clone()),
+                stop: Stop::Cluster(id.clone()),
                 depth: 0,
             }),
             Item::Project(project) => Some(StopAt {
@@ -358,7 +383,7 @@ impl Plan {
 /// Matching what is on screen is the rule both screens are keeping.
 pub fn projects(
     repos: &[String],
-    clusters: &BTreeMap<MapId, Map>,
+    clusters: &BTreeMap<ClusterId, Cluster>,
     loaded: bool,
     query: &str,
 ) -> Plan {
@@ -403,7 +428,7 @@ pub fn projects(
 /// screen starts something in this repo, and reaching a ticket is one `↓` down
 /// into the maps below.
 pub fn plan(
-    clusters: &[(&MapId, &Map)],
+    clusters: &[(&ClusterId, &Cluster)],
     screen: Screen<'_>,
     expanded: &Expanded,
     project: Option<ProjectRow>,
@@ -456,17 +481,20 @@ enum Sieve {
 }
 
 impl Sieve {
-    fn new(clusters: &[(&MapId, &Map)], screen: Screen<'_>) -> Sieve {
+    fn new(clusters: &[(&ClusterId, &Cluster)], screen: Screen<'_>) -> Sieve {
         let Screen::Sifted { query, .. } = screen else {
             return Sieve::Everything;
         };
         let mut kept = BTreeMap::new();
-        for (id, map) in clusters {
-            for (index, score) in filter::scores(&map.tickets, query).into_iter().enumerate() {
+        for (id, cluster) in clusters {
+            for (index, score) in filter::scores(&cluster.tickets, query)
+                .into_iter()
+                .enumerate()
+            {
                 if let Some(score) = score {
                     kept.insert(
                         Row {
-                            map: (*id).clone(),
+                            cluster: (*id).clone(),
                             index,
                         },
                         score,
@@ -495,14 +523,14 @@ impl Sieve {
 /// clusters that match equally well (or not at all — they are about to leave
 /// the body) keep the order they came in.
 fn best_first<'a>(
-    clusters: &[(&'a MapId, &'a Map)],
+    clusters: &[(&'a ClusterId, &'a Cluster)],
     kept: &BTreeMap<Row, u32>,
-) -> Vec<(&'a MapId, &'a Map)> {
+) -> Vec<(&'a ClusterId, &'a Cluster)> {
     let mut ordered = clusters.to_vec();
     ordered.sort_by_key(|(id, _)| {
         Reverse(
             kept.iter()
-                .filter(|(row, _)| &row.map == *id)
+                .filter(|(row, _)| &row.cluster == *id)
                 .map(|(_, score)| *score)
                 .max(),
         )
@@ -671,8 +699,8 @@ fn prune_tree(tree: &[Item], kept: &BTreeMap<Row, u32>) -> Vec<Item> {
 /// once however many times the walk drew it. A header, a spacer, or a group
 /// line closes the open branch: the rows a group holds hang from the group,
 /// not from the last ticket above it.
-fn attach_rollups(items: &mut [Item], clusters: &[(&MapId, &Map)]) {
-    let maps: BTreeMap<&MapId, &Map> = clusters.iter().copied().collect();
+fn attach_rollups(items: &mut [Item], clusters: &[(&ClusterId, &Cluster)]) {
+    let by_id: BTreeMap<&ClusterId, &Cluster> = clusters.iter().copied().collect();
     let mut branches: Vec<(usize, Vec<Row>)> = Vec::new();
     let mut open: Option<(usize, Vec<Row>)> = None;
     for (i, item) in items.iter().enumerate() {
@@ -704,7 +732,11 @@ fn attach_rollups(items: &mut [Item], clusters: &[(&MapId, &Map)]) {
         if beneath.is_empty() {
             continue;
         }
-        let rollup = RowGlyph::tally(beneath.iter().map(|row| &maps[&row.map].tickets[row.index]));
+        let rollup = RowGlyph::tally(
+            beneath
+                .iter()
+                .map(|row| &by_id[&row.cluster].tickets[row.index]),
+        );
         if let Item::Ticket { branch, .. } = &mut items[i] {
             *branch = Branch::Root { rollup };
         }
@@ -722,15 +754,20 @@ fn is_open(t: &Ticket) -> bool {
 /// Open direct dependents of `number`, ascending — the subtree children in the
 /// leverage view, and the leverage sort key at the roots (done dependents are
 /// not leverage: they are already unlocked).
-fn open_unblocks(map: &Map, number: u64) -> Vec<u64> {
-    map.unblocks(number)
+fn open_unblocks(cluster: &Cluster, number: u64) -> Vec<u64> {
+    cluster
+        .unblocks(number)
         .into_iter()
-        .filter(|&n| map.index_of(n).is_some_and(|i| is_open(&map.tickets[i])))
+        .filter(|&n| {
+            cluster
+                .index_of(n)
+                .is_some_and(|i| is_open(&cluster.tickets[i]))
+        })
         .collect()
 }
 
 fn ticket_item(
-    id: &MapId,
+    id: &ClusterId,
     index: usize,
     depth: usize,
     prefix: String,
@@ -738,7 +775,7 @@ fn ticket_item(
 ) -> Item {
     Item::Ticket {
         row: Row {
-            map: id.clone(),
+            cluster: id.clone(),
             index,
         },
         depth,
@@ -762,8 +799,8 @@ fn ticket_item(
 /// matching does not render at all.
 fn push_group(
     items: &mut Vec<Item>,
-    id: &MapId,
-    map: &Map,
+    id: &ClusterId,
+    cluster: &Cluster,
     kind: GroupKind,
     held: &[usize],
     expanded: &Expanded,
@@ -773,7 +810,7 @@ fn push_group(
         return;
     }
     let group = GroupId {
-        map: (*id).clone(),
+        cluster: (*id).clone(),
         kind,
     };
     let (fold, shown, depth) = match sieve {
@@ -782,7 +819,7 @@ fn push_group(
                 .iter()
                 .filter_map(|&index| {
                     let row = Row {
-                        map: (*id).clone(),
+                        cluster: (*id).clone(),
                         index,
                     };
                     kept.get(&row).map(|&score| (index, score))
@@ -791,7 +828,7 @@ fn push_group(
             if matched.is_empty() {
                 return;
             }
-            // Stable, so held rows that score alike keep the map's own order.
+            // Stable, so held rows that score alike keep the cluster's own order.
             matched.sort_by_key(|&(_, score)| Reverse(score));
             (
                 Fold::Sifted {
@@ -804,7 +841,7 @@ fn push_group(
         Sieve::Everything if expanded.contains(&group) => (Fold::Open, held.to_vec(), 1),
         Sieve::Everything => (
             Fold::Shut {
-                rollup: RowGlyph::tally(held.iter().map(|&index| &map.tickets[index])),
+                rollup: RowGlyph::tally(held.iter().map(|&index| &cluster.tickets[index])),
             },
             vec![],
             1,
@@ -821,11 +858,11 @@ fn push_group(
     }
 }
 
-fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded, sieve: &Sieve) -> Plan {
+fn leverage(clusters: &[(&ClusterId, &Cluster)], expanded: &Expanded, sieve: &Sieve) -> Plan {
     let mut plan = Plan::default();
-    for (id, map) in clusters {
-        let mut roots: Vec<&Ticket> = map.tickets.iter().filter(|t| takeable(t)).collect();
-        // A map with nothing takeable leaves the leverage body and is only
+    for (id, cluster) in clusters {
+        let mut roots: Vec<&Ticket> = cluster.tickets.iter().filter(|t| takeable(t)).collect();
+        // A cluster with nothing takeable leaves the leverage body and is only
         // counted. Not while a query is live, though: its done and blocked work
         // is exactly as findable by typing as anyone else's, so the cluster is
         // built anyway and the sieve decides whether any of it survives.
@@ -833,18 +870,29 @@ fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded, sieve: &Sieve) -> 
             plan.idle_hidden += 1;
             continue;
         }
-        roots.sort_by_key(|t| (Reverse(open_unblocks(map, t.number).len()), t.number));
+        // The tie-break is the row's **place in its cluster**, not its number.
+        // A map's tickets are number-sorted at the parse boundary, so for a map
+        // the two are the same order; an inbox's are activity-sorted, and
+        // keying on the number there would re-impose oldest-first on rows that
+        // were deliberately ordered by when something happened. One rule, and
+        // each cluster's parse decides what its own order means.
+        roots.sort_by_key(|t| {
+            (
+                Reverse(open_unblocks(cluster, t.number).len()),
+                cluster.index_of(t.number),
+            )
+        });
 
         let mut tree = Vec::new();
         let mut reached = BTreeSet::new();
         for root in roots {
-            let index = map
+            let index = cluster
                 .index_of(root.number)
-                .expect("root is one of map.tickets");
+                .expect("root is one of cluster.tickets");
             tree.push(ticket_item(id, index, 0, String::new(), vec![]));
             let mut path = vec![root.number];
             walk_unblocks(
-                map,
+                cluster,
                 id,
                 root.number,
                 1,
@@ -861,7 +909,7 @@ fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded, sieve: &Sieve) -> 
         // what it is not showing, and a way to look. Reached-ness is read off
         // the whole walk, before the sieve, so a query cannot push a ticket
         // into this group by pruning the branch that reached it.
-        let deeper: Vec<usize> = map
+        let deeper: Vec<usize> = cluster
             .tickets
             .iter()
             .enumerate()
@@ -873,23 +921,31 @@ fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded, sieve: &Sieve) -> 
         push_group(
             &mut body,
             id,
-            map,
+            cluster,
             GroupKind::BlockedDeeper,
             &deeper,
             expanded,
             sieve,
         );
 
-        let done: Vec<usize> = map
+        let done: Vec<usize> = cluster
             .tickets
             .iter()
             .enumerate()
             .filter(|(_, t)| !is_open(t))
             .map(|(i, _)| i)
             .collect();
-        push_group(&mut body, id, map, GroupKind::Done, &done, expanded, sieve);
+        push_group(
+            &mut body,
+            id,
+            cluster,
+            GroupKind::Done,
+            &done,
+            expanded,
+            sieve,
+        );
 
-        // Only a sift can empty a cluster — a map with a takeable root always
+        // Only a sift can empty a cluster — a cluster with a takeable root always
         // has a row — and a cluster a query emptied leaves the body header and
         // all, the way filtering is expected to work.
         if body.is_empty() {
@@ -909,8 +965,8 @@ fn leverage(clusters: &[(&MapId, &Map)], expanded: &Expanded, sieve: &Sieve) -> 
 /// cycle and is skipped rather than recursed into.
 #[allow(clippy::too_many_arguments)]
 fn walk_unblocks(
-    map: &Map,
-    id: &MapId,
+    cluster: &Cluster,
+    id: &ClusterId,
     number: u64,
     depth: usize,
     stem: &str,
@@ -918,14 +974,14 @@ fn walk_unblocks(
     reached: &mut BTreeSet<u64>,
     items: &mut Vec<Item>,
 ) {
-    let children: Vec<u64> = open_unblocks(map, number)
+    let children: Vec<u64> = open_unblocks(cluster, number)
         .into_iter()
         .filter(|n| !path.contains(n))
         .collect();
     for (i, &child) in children.iter().enumerate() {
-        let index = map
+        let index = cluster
             .index_of(child)
-            .expect("dependent is one of map.tickets");
+            .expect("dependent is one of cluster.tickets");
         let (branch, continuation) = link(i + 1 == children.len(), false);
         items.push(ticket_item(
             id,
@@ -937,7 +993,7 @@ fn walk_unblocks(
         reached.insert(child);
         path.push(child);
         walk_unblocks(
-            map,
+            cluster,
             id,
             child,
             depth + 1,
@@ -950,37 +1006,39 @@ fn walk_unblocks(
     }
 }
 
-fn forest(clusters: &[(&MapId, &Map)], sieve: &Sieve) -> Plan {
+fn forest(clusters: &[(&ClusterId, &Cluster)], sieve: &Sieve) -> Plan {
     let mut plan = Plan::default();
-    for (id, map) in clusters {
+    for (id, cluster) in clusters {
         let mut tree = Vec::new();
 
-        // Primary parent = lowest-numbered in-map blocker; everything else on
+        // Primary parent = lowest-numbered in-cluster blocker; everything else on
         // the edge list annotates the row.
         let in_map_blockers = |t: &Ticket| -> Vec<u64> {
             let mut blockers: Vec<u64> = t
                 .blocked_by
                 .iter()
                 .copied()
-                .filter(|&b| map.index_of(b).is_some())
+                .filter(|&b| cluster.index_of(b).is_some())
                 .collect();
             blockers.sort_unstable();
             blockers
         };
         let mut children: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
         let mut roots: Vec<u64> = vec![];
-        for t in &map.tickets {
+        for t in &cluster.tickets {
             match in_map_blockers(t).first() {
                 Some(&parent) => children.entry(parent).or_default().push(t.number),
                 None => roots.push(t.number),
             }
         }
-        roots.sort_unstable();
+        // In cluster order, for [`leverage`]'s reason: the same order a map
+        // gets from its numbers and an inbox from its activity.
+        roots.sort_by_key(|n| cluster.index_of(*n));
 
         let mut visited = BTreeSet::new();
         for &root in &roots {
             walk_forest(
-                map,
+                cluster,
                 id,
                 root,
                 0,
@@ -994,15 +1052,15 @@ fn forest(clusters: &[(&MapId, &Map)], sieve: &Sieve) -> Plan {
         }
         // A blocking cycle leaves its members parented to each other and
         // reachable from no root; sweep them in as roots so the forest stays
-        // total — every ticket of the map is a row.
-        while let Some(orphan) = map
+        // total — every ticket of the cluster is a row.
+        while let Some(orphan) = cluster
             .tickets
             .iter()
             .map(|t| t.number)
             .find(|n| !visited.contains(n))
         {
             walk_forest(
-                map,
+                cluster,
                 id,
                 orphan,
                 0,
@@ -1016,7 +1074,7 @@ fn forest(clusters: &[(&MapId, &Map)], sieve: &Sieve) -> Plan {
         }
         let mut body = sieve.sift(tree);
         // The forest is total, so an empty cluster here is always a query's
-        // doing: nothing in this map matched, and the cluster goes with it.
+        // doing: nothing in this cluster matched, and the cluster goes with it.
         if body.is_empty() {
             continue;
         }
@@ -1037,8 +1095,8 @@ fn forest(clusters: &[(&MapId, &Map)], sieve: &Sieve) -> Plan {
 /// belong to different depths.
 #[allow(clippy::too_many_arguments)]
 fn walk_forest(
-    map: &Map,
-    id: &MapId,
+    cluster: &Cluster,
+    id: &ClusterId,
     number: u64,
     depth: usize,
     prefix: &str,
@@ -1051,10 +1109,10 @@ fn walk_forest(
     if !visited.insert(number) {
         return;
     }
-    let index = map
+    let index = cluster
         .index_of(number)
-        .expect("forest node is one of map.tickets");
-    let also_needs: Vec<u64> = in_map_blockers(&map.tickets[index])
+        .expect("forest node is one of cluster.tickets");
+    let also_needs: Vec<u64> = in_map_blockers(&cluster.tickets[index])
         .into_iter()
         .skip(1)
         .collect();
@@ -1072,7 +1130,7 @@ fn walk_forest(
         // space; every earlier child keeps the vertical bar running past it.
         let (branch, continuation) = link(i + 1 == kids.len(), false);
         walk_forest(
-            map,
+            cluster,
             id,
             kid,
             depth + 1,
@@ -1089,12 +1147,14 @@ fn walk_forest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{classify, Checks, PrLink, PrStatus, Review, Stage, TicketType};
+    use crate::model::{
+        classify, Checks, MapId, PrLink, PrStatus, Review, Source, Stage, TicketType,
+    };
 
     /// The body without a project row — the case every test below but the
     /// project row's own is about. Shadows [`super::plan`] so those tests read as
     /// what they are testing rather than trailing a `None` each.
-    fn plan(clusters: &[(&MapId, &Map)], screen: Screen<'_>, expanded: &Expanded) -> Plan {
+    fn plan(clusters: &[(&ClusterId, &Cluster)], screen: Screen<'_>, expanded: &Expanded) -> Plan {
         super::plan(clusters, screen, expanded, None)
     }
 
@@ -1112,9 +1172,9 @@ mod tests {
     }
 
     /// Blocked status honestly derived: a blocker is "open" iff it is an open
-    /// ticket of this map (fixtures never blocked on out-of-map issues unless
+    /// ticket of this map (fixtures never blocked on out-of-cluster issues unless
     /// the test says so).
-    fn map(tickets: Vec<Ticket>) -> Map {
+    fn map(tickets: Vec<Ticket>) -> Cluster {
         let open: BTreeSet<u64> = tickets
             .iter()
             .filter(|t| is_open(t))
@@ -1135,16 +1195,18 @@ mod tests {
                 t
             })
             .collect();
-        Map {
-            title: "Map: fixture".to_string(),
+        Cluster {
+            source: Source::Map {
+                title: "Map: fixture".to_string(),
+            },
             last_activity: None,
             truncated: false,
             tickets,
         }
     }
 
-    /// Ticket numbers of the plan's ticket rows, resolved against `map`.
-    fn stops(plan: &Plan, m: &Map) -> Vec<u64> {
+    /// Ticket numbers of the plan's ticket rows, resolved against `cluster`.
+    fn stops(plan: &Plan, m: &Cluster) -> Vec<u64> {
         plan.rows()
             .iter()
             .map(|r| m.tickets[r.index].number)
@@ -1152,20 +1214,21 @@ mod tests {
     }
 
     /// Every cursor stop as (what it is, depth) — tickets by number, maps by
-    /// `map #n`, groups by kind. This is the navigation surface, so it is what
+    /// `cluster #n`, groups by kind. This is the navigation surface, so it is what
     /// the tests assert on.
     /// The cluster header's stop, which every plan below opens with since #96.
     /// Named once so the assertions stay about the rows under it.
     fn header() -> (String, usize) {
-        ("map #47".to_string(), 0)
+        ("cluster #47".to_string(), 0)
     }
 
-    fn nav(plan: &Plan, m: &Map) -> Vec<(String, usize)> {
+    fn nav(plan: &Plan, m: &Cluster) -> Vec<(String, usize)> {
         plan.stops()
             .into_iter()
             .map(|at| {
                 let label = match at.stop {
-                    Stop::Map(id) => format!("map #{}", id.number),
+                    Stop::Cluster(ClusterId::Map(id)) => format!("cluster #{}", id.number),
+                    Stop::Cluster(ClusterId::Inbox(repo)) => format!("inbox {repo}"),
                     Stop::Ticket(row) => format!("#{}", m.tickets[row.index].number),
                     Stop::Group(g) => format!("{:?}", g.kind),
                     Stop::Project(repo) => format!("project {repo}"),
@@ -1177,7 +1240,7 @@ mod tests {
 
     /// Every top-level ticket row as (number, what it heads) — the branch
     /// roots and what each says about the subtree drawn beneath it.
-    fn roots(plan: &Plan, m: &Map) -> Vec<(u64, Branch)> {
+    fn roots(plan: &Plan, m: &Cluster) -> Vec<(u64, Branch)> {
         plan.items
             .iter()
             .filter_map(|item| match item {
@@ -1192,8 +1255,8 @@ mod tests {
             .collect()
     }
 
-    fn id() -> MapId {
-        MapId::new("blooop/wayfinder", 47)
+    fn id() -> ClusterId {
+        ClusterId::Map(MapId::new("blooop/wayfinder", 47))
     }
 
     fn nothing() -> Expanded {
@@ -1253,7 +1316,7 @@ mod tests {
             .filter(|(_, depth)| *depth == 0)
             .map(|(label, _)| label)
             .collect();
-        assert_eq!(top, vec!["map #47", "#6", "#9", "Done"]);
+        assert_eq!(top, vec!["cluster #47", "#6", "#9", "Done"]);
     }
 
     #[test]
@@ -1265,7 +1328,7 @@ mod tests {
         ]);
         let binding = id();
         let open: Expanded = [GroupId {
-            map: binding.clone(),
+            cluster: binding.clone(),
             kind: GroupKind::Done,
         }]
         .into_iter()
@@ -1314,22 +1377,22 @@ mod tests {
 
     #[test]
     fn every_cluster_opens_with_its_header_as_a_stop() {
-        // #96: a map is a thing you can launch an agent at, so the cursor has
+        // #96: a cluster is a thing you can launch an agent at, so the cursor has
         // to be able to name it. One stop per cluster, at the front of it and
         // at depth 0 — context rows and spacers stay unreachable.
         let m = map(vec![ticket(6, true, false, vec![])]);
-        let other = MapId::new("blooop/dotfiles", 4);
+        let other = ClusterId::Map(MapId::new("blooop/dotfiles", 4));
         let binding = id();
         let plan = plan(
             &[(&binding, &m), (&other, &m)],
             Screen::Structured(Lens::Leverage),
             &nothing(),
         );
-        let headers: Vec<MapId> = plan
+        let headers: Vec<ClusterId> = plan
             .stops()
             .into_iter()
             .filter_map(|at| match at.stop {
-                Stop::Map(id) => Some(id),
+                Stop::Cluster(id) => Some(id),
                 Stop::Ticket(_) | Stop::Group(_) | Stop::Project(_) => None,
             })
             .collect();
@@ -1396,7 +1459,7 @@ mod tests {
         // Open, the rows are right there — the rollup only exists while shut,
         // so a rollup on an expanded row is unrepresentable, not just unshown.
         let open: Expanded = [GroupId {
-            map: binding.clone(),
+            cluster: binding.clone(),
             kind: GroupKind::Done,
         }]
         .into_iter()
@@ -1470,8 +1533,10 @@ mod tests {
     fn the_blocked_deeper_rollup_reads_blocked_not_stage() {
         // A held-back blocked ticket rolls up as ⊘ — its stage is unactionable
         // and the override carries into the counts (#62).
-        let m = Map {
-            title: "Map: fixture".to_string(),
+        let m = Cluster {
+            source: Source::Map {
+                title: "Map: fixture".to_string(),
+            },
             last_activity: None,
             truncated: false,
             tickets: vec![
@@ -1578,15 +1643,15 @@ mod tests {
     #[test]
     fn expansion_is_per_cluster_not_global() {
         // Two clusters both holding done work: opening one must not open the
-        // other, which is why the key carries the map.
+        // other, which is why the key carries the cluster.
         let m = map(vec![
             ticket(2, false, false, vec![]),
             ticket(6, true, false, vec![]),
         ]);
-        let a = MapId::new("blooop/wayfinder", 47);
-        let b = MapId::new("blooop/dotfiles", 4);
+        let a = ClusterId::Map(MapId::new("blooop/wayfinder", 47));
+        let b = ClusterId::Map(MapId::new("blooop/dotfiles", 4));
         let open: Expanded = [GroupId {
-            map: b.clone(),
+            cluster: b.clone(),
             kind: GroupKind::Done,
         }]
         .into_iter()
@@ -1609,12 +1674,14 @@ mod tests {
 
     #[test]
     fn leverage_holds_back_what_no_subtree_reaches() {
-        // #7 blocked only by an out-of-map issue: no root's subtree reaches it,
+        // #7 blocked only by an out-of-cluster issue: no root's subtree reaches it,
         // so it is held behind the blocked group rather than silently dropped.
-        // Built without the `map` helper — that helper derives blocked status
-        // from in-map blockers, and this blocker is deliberately not one.
-        let m = Map {
-            title: "Map: fixture".to_string(),
+        // Built without the `cluster` helper — that helper derives blocked status
+        // from in-cluster blockers, and this blocker is deliberately not one.
+        let m = Cluster {
+            source: Source::Map {
+                title: "Map: fixture".to_string(),
+            },
             last_activity: None,
             truncated: false,
             tickets: vec![
@@ -1642,7 +1709,7 @@ mod tests {
     fn leverage_drops_idle_maps_and_counts_them() {
         let idle = map(vec![ticket(2, false, false, vec![])]);
         let live = map(vec![ticket(6, true, false, vec![])]);
-        let idle_id = MapId::new("blooop/dotfiles", 4);
+        let idle_id = ClusterId::Map(MapId::new("blooop/dotfiles", 4));
         let live_id = id();
         let plan = plan(
             &[(&idle_id, &idle), (&live_id, &live)],
@@ -1756,7 +1823,7 @@ mod tests {
 
     #[test]
     fn forest_furniture_stays_aligned_three_levels_deep() {
-        // The shape the live wf map exposed: a root with two children, the
+        // The shape the live wf cluster exposed: a root with two children, the
         // *first* of which has a child of its own. The grandchild must hang
         // from its parent's running bar (`│ └─`) — a node's own line and its
         // children's lines are different depths, and deriving one from the
@@ -1824,7 +1891,7 @@ mod tests {
 
     /// The body as one string per line, furniture included: this is a test
     /// about the *shape* a query leaves behind, so the shape is what it reads.
-    fn shape(plan: &Plan, m: &Map) -> Vec<String> {
+    fn shape(plan: &Plan, m: &Cluster) -> Vec<String> {
         let number = |row: &Row| m.tickets[row.index].number;
         plan.items
             .iter()
@@ -1927,7 +1994,7 @@ mod tests {
         // order the multi-project screen is otherwise built on.
         let loose = map(vec![titled(103, "a-l-p-h-a spelled out", true, vec![])]);
         let exact = map(vec![titled(6, "alpha", true, vec![])]);
-        let loose_id = MapId::new("blooop/dotfiles", 4);
+        let loose_id = ClusterId::Map(MapId::new("blooop/dotfiles", 4));
         let exact_id = id();
         let plan = plan(
             &[(&loose_id, &loose), (&exact_id, &exact)],
@@ -1947,7 +2014,7 @@ mod tests {
         let hit = map(vec![titled(6, "alpha", true, vec![])]);
         let miss = map(vec![titled(103, "nothing like it", true, vec![])]);
         let hit_id = id();
-        let miss_id = MapId::new("blooop/dotfiles", 4);
+        let miss_id = ClusterId::Map(MapId::new("blooop/dotfiles", 4));
         let plan = plan(
             &[(&miss_id, &miss), (&hit_id, &hit)],
             sifted("alpha"),
@@ -1959,7 +2026,7 @@ mod tests {
                 Item::Header(hit_id.clone()),
                 Item::Ticket {
                     row: Row {
-                        map: hit_id,
+                        cluster: hit_id,
                         index: 0
                     },
                     depth: 0,
@@ -1991,9 +2058,9 @@ mod tests {
 
     #[test]
     fn a_query_reaches_into_a_map_the_leverage_screen_drops() {
-        // A map with nothing takeable is not on the leverage screen at all —
+        // A cluster with nothing takeable is not on the leverage screen at all —
         // but its finished work is exactly as findable by typing as anyone
-        // else's, so the sieve gets to look before the map is dropped.
+        // else's, so the sieve gets to look before the cluster is dropped.
         let m = map(vec![titled(2, "alpha", false, vec![])]);
         let binding = id();
         let idle = plan(
@@ -2008,7 +2075,7 @@ mod tests {
         assert_eq!(shape(&found, &m), vec!["▌ wayfinder", "Done 1/1", "└─#2"]);
         assert_eq!(
             found.idle_hidden, 0,
-            "the map is on screen, so there is nothing to say it is hidden"
+            "the cluster is on screen, so there is nothing to say it is hidden"
         );
     }
 

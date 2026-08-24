@@ -170,6 +170,13 @@ pub enum Route {
     Plain,
 }
 
+/// The word that tells `/wf-one` its ticket already exists.
+///
+/// A subcommand-shaped argument rather than a bare number, because `/wf-one`'s
+/// other argument is free text: `wf-one 42` is a task called "42", and this
+/// keeps the two readings apart at the skill's own front door.
+pub const ADOPT_ARG: &str = "adopt";
+
 impl Route {
     /// The bundled skill this route invokes, without the selected agent's
     /// sigil. [`Route::Plain`] invokes no skill.
@@ -476,6 +483,14 @@ pub enum Candidate {
     Launch { mode: Mode, route: Route },
     /// Start something new in the staged node's repo.
     Create(CreationKind),
+    /// Put a loose issue under a map of its own and work it — `/wf-one`'s
+    /// route, reached from the inbox rather than from a project row.
+    ///
+    /// Its own variant rather than a [`CreationKind`], because nothing is
+    /// being created that the human has to name: the issue already exists and
+    /// already has a title, so this row takes no text field. That is the whole
+    /// difference between adopting and filing.
+    Adopt,
     /// Rejoin the conversation a previous launch of this node left on this
     /// machine (#35) — no skill, no context block, no fresh session.
     ///
@@ -493,6 +508,7 @@ impl Candidate {
         match self {
             Candidate::Launch { mode, .. } => mode.label(),
             Candidate::Create(kind) => kind.label(),
+            Candidate::Adopt => "adopt",
             Candidate::Resume { .. } => "resume",
         }
     }
@@ -502,6 +518,7 @@ impl Candidate {
         match self {
             Candidate::Launch { mode, .. } => mode.blurb(),
             Candidate::Create(kind) => kind.blurb(),
+            Candidate::Adopt => "put it under a map of its own, then build it",
             // Says what it does, not how long ago: the age is a fact about
             // *this* record and is drawn from it, beside the row.
             Candidate::Resume { .. } => "pick the conversation back up where you left it",
@@ -517,7 +534,7 @@ impl Candidate {
     /// that runs Claude.
     pub fn agent(self, picked: Agent) -> Agent {
         match self {
-            Candidate::Launch { .. } | Candidate::Create(_) => picked,
+            Candidate::Launch { .. } | Candidate::Create(_) | Candidate::Adopt => picked,
             Candidate::Resume { agent } => agent,
         }
     }
@@ -534,6 +551,7 @@ impl Candidate {
         match self {
             Candidate::Launch { route, .. } => route.invocation(agent),
             Candidate::Create(kind) => kind.route().invocation(agent),
+            Candidate::Adopt => Route::One.invocation(agent),
             Candidate::Resume { .. } => {
                 format!("{} {}", agent.program(), agent.resume_argv().join(" "))
             }
@@ -546,7 +564,7 @@ impl Candidate {
     /// their resume flag.
     pub fn field(self) -> &'static str {
         match self {
-            Candidate::Launch { .. } | Candidate::Resume { .. } => "steer",
+            Candidate::Launch { .. } | Candidate::Resume { .. } | Candidate::Adopt => "steer",
             Candidate::Create(kind) => kind.field(),
         }
     }
@@ -878,6 +896,33 @@ pub enum StagedAt {
         /// launched cannot be offered one.
         resume: Option<Resume>,
     },
+    /// An issue the tracker knows about that **no map claims** — a row of the
+    /// loose "yours or unclaimed" cluster.
+    ///
+    /// A third arm rather than a [`StagedAt::Node`] whose `map` is optional,
+    /// for the reason the whole cluster split exists: a mapped node and a
+    /// loose one differ in what can be *done* with them, not in whether a
+    /// field was filled in. A node launches into its map's lifecycle; a loose
+    /// issue has to be adopted into a map before that lifecycle has anywhere
+    /// to keep its breadcrumbs. Making `map` an `Option` would push that
+    /// difference into every route arm and every reader of the launch context.
+    ///
+    /// Deliberately carries no `Aim` and no stage. Adoption is one act with
+    /// one route whatever the issue's type or PR state — the map does not
+    /// exist yet, so there is no lifecycle to be at a stage of — and the
+    /// skill it hands off to reads the issue itself.
+    Loose {
+        /// The issue's own number: what adoption parents under a new map, and
+        /// what the per-node workspace is named after, exactly as a mapped
+        /// node's is.
+        number: u64,
+        /// The issue title, as the picker showed it.
+        title: String,
+        /// The conversation a previous adoption of this issue left on this
+        /// machine, if there is one. An adopted issue keeps its number, so its
+        /// workspace and its session record are the ones any node would have.
+        resume: Option<Resume>,
+    },
     /// A whole project: the repo-level stop every project screen opens on,
     /// and the only stop creation hangs off.
     Project,
@@ -930,17 +975,51 @@ impl Staged {
     /// dropped.
     #[must_use]
     pub fn with_resume(mut self, resume: Resume) -> Staged {
-        if let StagedAt::Node { resume: slot, .. } = &mut self.at {
-            *slot = Some(resume);
+        match &mut self.at {
+            StagedAt::Node { resume: slot, .. } | StagedAt::Loose { resume: slot, .. } => {
+                *slot = Some(resume);
+            }
+            StagedAt::Project => {}
         }
         self
+    }
+
+    /// The issue adoption would adopt — `None` on every stop that is not a
+    /// loose one, which is every stop the picker never drew an adopt row on.
+    ///
+    /// Shaped like [`Staged::resume`] and for the same reason: the picker's row
+    /// and the act the second enter performs read the same field, so a row
+    /// that could be drawn without something to act on cannot exist.
+    pub fn adoptable(&self) -> Option<u64> {
+        match &self.at {
+            StagedAt::Loose { number, .. } => Some(*number),
+            StagedAt::Node { .. } | StagedAt::Project => None,
+        }
     }
 
     /// The conversation this stop can be resumed into, if any.
     pub fn resume(&self) -> Option<&Resume> {
         match &self.at {
-            StagedAt::Node { resume, .. } => resume.as_ref(),
+            StagedAt::Node { resume, .. } | StagedAt::Loose { resume, .. } => resume.as_ref(),
             StagedAt::Project => None,
+        }
+    }
+
+    /// Stage the adoption of a loose issue — a row of the inbox cluster.
+    ///
+    /// Total where [`Staged::ticket`] refuses: a finished issue has no
+    /// launchable *stage*, but adoption has no stages to be past. Nothing is
+    /// gained by refusing to put a closed issue under a map, and the caller
+    /// keeps its own refusal (a done row is not offered) without this needing
+    /// to restate it.
+    pub fn loose(ticket: &Ticket) -> Staged {
+        Staged {
+            repo: ticket.repo.clone(),
+            at: StagedAt::Loose {
+                number: ticket.number,
+                title: ticket.title.clone(),
+                resume: None,
+            },
         }
     }
 
@@ -964,7 +1043,8 @@ impl Staged {
             StagedAt::Node {
                 aim: Aim::Ticket { title, .. },
                 ..
-            } => title,
+            }
+            | StagedAt::Loose { title, .. } => title,
             StagedAt::Node {
                 aim: Aim::Map, map, ..
             } => &map.title,
@@ -981,7 +1061,10 @@ impl Staged {
     pub fn route(&self, mode: Mode) -> Option<Route> {
         match &self.at {
             StagedAt::Node { aim, .. } => Some(route(aim, mode)),
-            StagedAt::Project => None,
+            // Adoption's route is fixed (`/wf-one`) and does not read the mode
+            // axis, so answering here would be answering a question this stop
+            // does not have — see [`StagedAt::Loose`].
+            StagedAt::Loose { .. } | StagedAt::Project => None,
         }
     }
 
@@ -1032,6 +1115,16 @@ impl Staged {
                     route: route(aim, mode),
                 }))
                 .collect(),
+            // An issue no map claims offers exactly one way forward, plus the
+            // conversation a previous adoption left. There is no mode axis:
+            // `wf-one` owns the whole of a single-ticket map's lifecycle and
+            // decides the small things alone, so "who decides" is already
+            // answered by the route rather than being a row to pick.
+            StagedAt::Loose { resume, .. } => resume
+                .iter()
+                .map(|r| Candidate::Resume { agent: r.agent })
+                .chain([Candidate::Adopt])
+                .collect(),
             // A project names nothing that exists yet, so there is nothing to
             // launch — only the ways to start something.
             StagedAt::Project => CreationKind::all()
@@ -1052,7 +1145,8 @@ impl Staged {
             StagedAt::Node {
                 aim: Aim::Ticket { number, .. },
                 ..
-            } => format!("#{number}"),
+            }
+            | StagedAt::Loose { number, .. } => format!("#{number}"),
             StagedAt::Project => "+new".to_string(),
         }
     }
@@ -1079,6 +1173,11 @@ impl Staged {
     ///   as backing out.
     pub fn node_workspace(&self) -> Option<String> {
         match &self.at {
+            // An adoption runs in the issue's own per-node workspace, the same
+            // one any launch of that number would use, so it prewarms like any
+            // node — the map it is about to be given does not change where the
+            // work happens.
+            StagedAt::Loose { number, .. } => Some(node_workspace_name(&self.repo, *number)),
             StagedAt::Node { aim, map, .. } => Some(node_workspace_name(
                 &self.repo,
                 match aim {
@@ -1613,6 +1712,21 @@ enum Job {
     },
     /// Start something new in the repo — the skill files the issues.
     Create { creation: Creation, agent: Agent },
+    /// Adopt an existing issue: the skill files the *map* and parents the
+    /// issue under it, then works it as that map's only ticket.
+    ///
+    /// Half a creation and half a node, which is why it is neither. Like a
+    /// creation it hands the agent no [`LaunchContext`] — there is no map yet
+    /// for `wf` to have read, and a synthesized block would be a claim about
+    /// tracker state nobody looked at. Like a node it has a number, so it runs
+    /// in the per-node workspace and reaps like anything else.
+    Adopt {
+        /// The issue being adopted.
+        number: u64,
+        /// What the launch picker settled on. Only the agent and the steering
+        /// text are read: adoption's route is fixed.
+        mode: LaunchMode,
+    },
     /// Rejoin the conversation a previous launch of this node left (#35).
     ///
     /// Carries the node's number so [`Launch::workspace`] resolves to the same
@@ -1644,7 +1758,7 @@ impl Job {
                 Aim::Ticket { number, .. } => *number,
             }),
             Job::Create { .. } => None,
-            Job::Resume { number, .. } => Some(*number),
+            Job::Adopt { number, .. } | Job::Resume { number, .. } => Some(*number),
         }
     }
 
@@ -1652,7 +1766,7 @@ impl Job {
     /// creation nor resume has a launch mode of its own.
     fn agent(&self) -> Agent {
         match self {
-            Job::Node { mode, .. } => mode.agent(),
+            Job::Node { mode, .. } | Job::Adopt { mode, .. } => mode.agent(),
             Job::Create { agent, .. } | Job::Resume { agent, .. } => *agent,
         }
     }
@@ -1728,6 +1842,10 @@ impl Launch {
             Job::Node { .. } => self.key(),
             // A creation has no `#n` to name yet, so the notice names the act.
             Job::Create { creation, .. } => creation.kind().label().to_string(),
+            // An adoption has a number *and* is starting something, so it
+            // names both: what is being adopted, and that adoption is what is
+            // happening to it rather than an ordinary launch.
+            Job::Adopt { .. } => format!("adopt {}", self.key()),
             // A resume has a number, so it names the node *and* says that it
             // is going back rather than starting: the two are one keystroke
             // apart in the picker and the notice is the last chance to see
@@ -1758,6 +1876,14 @@ impl Launch {
         let prompt = match &self.job {
             Job::Node { mode, .. } => mode.opening_prompt(self.skill_invocation()),
             Job::Create { creation, .. } => Some(creation.invocation(agent)),
+            // Steered like a node — an adoption is a session someone may want
+            // to point at something — but invoked like a creation: the number
+            // is the skill's argument, not a `ctx:` block, because there is no
+            // map for `wf` to have read yet.
+            Job::Adopt { number, mode } => mode.opening_prompt(Some(format!(
+                "{} {ADOPT_ARG} {number}",
+                Route::One.invocation(agent)
+            ))),
             Job::Resume { prompt, .. } => {
                 let mut argv = vec![agent.program().to_string()];
                 argv.extend(agent.resume_argv().iter().map(|a| (*a).to_string()));
@@ -2243,6 +2369,25 @@ pub fn plan(checkouts: &[Checkout], staged: &Staged, route: Route, mode: &Launch
     )
 }
 
+/// Resolve an adoption against the projects cache — the same rules as
+/// [`plan`], and for the same reason: the question is only *where* the agent
+/// runs, and zero or one candidate checkout never prompts.
+///
+/// Separate from [`plan`] because an adoption is not a node launch: there is
+/// no aim, no map and no route to pass in. Separate from [`plan_create`]
+/// because it has a number, and the number is what puts it in the per-node
+/// workspace rather than the repo's bare one.
+pub fn plan_adopt(checkouts: &[Checkout], repo: &str, number: u64, mode: &LaunchMode) -> Targets {
+    resolve(
+        checkouts,
+        repo,
+        &Job::Adopt {
+            number,
+            mode: mode.clone(),
+        },
+    )
+}
+
 /// Resolve a creation against the projects cache — the same rules as [`plan`]:
 /// zero or one candidate checkout never prompts. The creation arrives already
 /// complete ([`CreationKind::with_text`] refused the empty task), so this
@@ -2285,10 +2430,14 @@ pub fn resume_launch(staged: &Staged, steer: &str) -> Option<Launch> {
         StagedAt::Node {
             aim: Aim::Map, map, ..
         } => map.id.number,
+        // An adopted issue's conversation is keyed by the issue's own number,
+        // which is what its workspace was named after — the map it was given
+        // is not part of the way back in, and is why these two are one arm.
         StagedAt::Node {
             aim: Aim::Ticket { number, .. },
             ..
-        } => *number,
+        }
+        | StagedAt::Loose { number, .. } => *number,
         // Unreachable: `Staged::resume` already answered `None` here.
         StagedAt::Project => return None,
     };
@@ -3642,6 +3791,116 @@ mod tests {
             isolation: Isolation::Host,
         };
         assert_eq!(one.agent_argv().last().map(String::as_str), Some("/wf-one"));
+    }
+
+    /// A loose issue in the wayfinder checkout — an inbox row.
+    fn loose(number: u64) -> Ticket {
+        Ticket {
+            repo: "blooop/wayfinder".to_string(),
+            number,
+            title: "Widths survive non-ASCII titles".to_string(),
+            status: classify(true, true, vec![]),
+            ticket_type: TicketType::Untyped,
+            blocked_by: vec![],
+            prs: vec![],
+        }
+    }
+
+    fn adopt_launch(mode: &LaunchMode) -> Launch {
+        match plan_adopt(&cache(), "blooop/wayfinder", 191, mode) {
+            Targets::One(l) => l,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn adoption_invokes_wf_one_on_the_issue_and_carries_no_context_block() {
+        // The number is the skill's *argument*, not a `ctx:` block: there is no
+        // map for `wf` to have read yet, and a synthesized block would be a
+        // claim about tracker state nobody looked at. `wf-one`'s own doc says
+        // its line never carries one.
+        let prompt = adopt_launch(&interactive(""))
+            .agent_argv()
+            .last()
+            .expect("a prompt")
+            .clone();
+        assert_eq!(prompt, "/wf-one adopt 191");
+        assert!(!prompt.contains("ctx:"), "{prompt}");
+    }
+
+    #[test]
+    fn adoption_still_takes_steering_text() {
+        // Steered like a node — it is a session someone may want to point at
+        // something — even though it is invoked like a creation.
+        let prompt = adopt_launch(&interactive("keep the existing title"))
+            .agent_argv()
+            .last()
+            .expect("a prompt")
+            .clone();
+        assert_eq!(prompt, "/wf-one adopt 191 steer: keep the existing title");
+    }
+
+    #[test]
+    fn an_adoption_runs_in_the_issues_own_per_node_workspace() {
+        // Which is what makes it reap like anything else: the branch `wf` mints
+        // is named after the number, and the number is the issue's, so nothing
+        // downstream has to know a map was created along the way.
+        let launch = adopt_launch(&interactive(""));
+        let workspace = "blooop/wayfinder@wayfinder/wayfinder-191";
+        assert_eq!(launch.workspace(), workspace);
+        assert_eq!(launch.key(), "wayfinder#191");
+        // And the prewarm warms that same workspace, known at stage time —
+        // which is what lets `enter enter` on an inbox row start the container
+        // while the picker is still up.
+        assert_eq!(
+            Staged::loose(&loose(191)).node_workspace(),
+            Some(workspace.to_string())
+        );
+    }
+
+    #[test]
+    fn the_notice_says_adoption_rather_than_an_ordinary_launch() {
+        // One keystroke apart in the picker from a mapped launch, so the notice
+        // is the last chance to see which one was taken.
+        let described = adopt_launch(&interactive("")).describe();
+        assert!(described.contains("adopt wayfinder#191"), "{described}");
+    }
+
+    #[test]
+    fn an_inbox_row_offers_adoption_and_a_resume_and_no_mode_rows() {
+        let staged = Staged::loose(&loose(191));
+        assert_eq!(staged.candidates(), vec![Candidate::Adopt]);
+        assert_eq!(staged.key(), "#191");
+        assert_eq!(staged.title(), "Widths survive non-ASCII titles");
+        // The mode axis has nothing to say here: `/wf-one` owns the whole of a
+        // single-ticket map's lifecycle, so who decides is already answered.
+        assert_eq!(staged.route(Mode::Interactive), None);
+        assert_eq!(staged.route(Mode::Auto), None);
+
+        // A previous adoption's conversation leads, exactly as it does on a
+        // mapped node — an adopted issue keeps its number, so its session
+        // record is the one any node would have.
+        let with_resume = staged.with_resume(resume(Agent::Codex));
+        assert_eq!(
+            with_resume.candidates(),
+            vec![
+                Candidate::Resume {
+                    agent: Agent::Codex
+                },
+                Candidate::Adopt
+            ]
+        );
+        assert_eq!(with_resume.adoptable(), Some(191));
+    }
+
+    #[test]
+    fn the_adopt_row_names_the_skill_it_execs() {
+        assert_eq!(Candidate::Adopt.label(), "adopt");
+        assert_eq!(Candidate::Adopt.invocation(Agent::Claude), "/wf-one");
+        assert_eq!(Candidate::Adopt.invocation(Agent::Codex), "$wf-one");
+        // It takes steering text, not a task: the issue already has a title,
+        // which is the whole difference between adopting and filing.
+        assert_eq!(Candidate::Adopt.field(), "steer");
     }
 
     #[test]

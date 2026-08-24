@@ -13,9 +13,13 @@ use std::time::SystemTime;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::launch::{self, Agent, Candidate, Launch, LaunchMode, MapRef, Route, Staged, Targets};
+use crate::launch::{
+    self, Agent, Candidate, Launch, LaunchMode, MapRef, Mode, Route, Staged, Targets,
+};
 use crate::liveness::Liveness;
-use crate::model::{stage, Activity, Map, MapId, MapSet, Status, Ticket};
+use crate::model::{
+    stage, Activity, Cluster, ClusterId, MapId, MapSet, Status, Ticket, INBOX_HEADER,
+};
 use crate::projects::{self, Checkout, Resume, Session};
 use crate::reclaim::Reclaimable;
 use crate::refresh::Startup;
@@ -148,7 +152,7 @@ fn next_agent(agent: Agent) -> Agent {
 /// sifted view looks a row's query score up by.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Row {
-    pub map: MapId,
+    pub cluster: ClusterId,
     /// Index into that cluster's `tickets`.
     pub index: usize,
 }
@@ -158,7 +162,7 @@ pub struct Row {
 /// [`Row`] this survives a refetch, which is the whole reason both exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowKey {
-    pub map: MapId,
+    pub cluster: ClusterId,
     pub ticket: u64,
 }
 
@@ -167,7 +171,7 @@ pub struct RowKey {
 /// [`GroupId`] already names a map and a kind rather than any index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopKey {
-    Map(MapId),
+    Cluster(ClusterId),
     /// A ticket row, plus **which drawing of it** — the leverage lens
     /// deliberately draws one ticket under every root that unblocks it, so on
     /// a DAG diamond the [`RowKey`] alone names two stops. Without the
@@ -273,10 +277,11 @@ impl Pinned {
 
 #[derive(Debug)]
 pub struct App {
-    /// The clusters on screen: every open map that has arrived, keyed by id.
+    /// The clusters on screen, keyed by id: every open map that has arrived,
+    /// and each repo's inbox once its own read has landed.
     /// Render order is *not* this map's key order — it is decided by
     /// [`App::scoped_clusters`], which leads on activity.
-    pub clusters: BTreeMap<MapId, Map>,
+    pub clusters: BTreeMap<ClusterId, Cluster>,
     /// The maps believed open — the cached seed until the search answers, the
     /// search's answer afterwards. This is the set the loaders are reconciled
     /// against, and with one load per run the search's answer is the last word
@@ -294,6 +299,15 @@ pub struct App {
     /// The other half of that handoff (#35): the conversations previous
     /// launches left here, at most one per node.
     pub sessions: Vec<Session>,
+    /// The inbox read failed — **state, not a message**, for the same reason
+    /// `failed` below is.
+    ///
+    /// Its own flag rather than a member of `failed`, which is keyed by map:
+    /// there is no map here to name, and the reader needs to be told a
+    /// different thing. A failed map leaves a hole where a cluster was; a
+    /// failed inbox leaves a screen that looks finished, because an empty
+    /// inbox draws nothing at all.
+    pub inbox_failed: bool,
     /// Maps whose last fetch failed — **state, not a message.**
     ///
     /// A failure has to be drawn on every frame, and the one-shot `notice` is
@@ -372,7 +386,7 @@ enum Prewarmed {
 
 impl App {
     /// An app over clusters already in hand — so nothing is being waited on.
-    pub fn new(clusters: BTreeMap<MapId, Map>) -> Self {
+    pub fn new(clusters: BTreeMap<ClusterId, Cluster>) -> Self {
         Self {
             clusters,
             open_maps: MapSet::new(),
@@ -382,6 +396,7 @@ impl App {
             checkouts: Vec::new(),
             sessions: Vec::new(),
             failed: BTreeSet::new(),
+            inbox_failed: false,
             startup: Startup::loaded(),
             reclaimable: None,
             liveness: Liveness::default(),
@@ -484,37 +499,47 @@ impl App {
         self.point_at(&key);
     }
 
-    fn in_scope(&self, id: &MapId) -> bool {
-        self.current_repo() == Some(id.repo.as_str())
+    fn in_scope(&self, id: &ClusterId) -> bool {
+        self.current_repo() == Some(id.repo())
     }
 
-    /// The clusters currently in scope, in render order: **work before
-    /// history, most recently active first.**
+    /// The clusters currently in scope, in render order: **maps before the
+    /// inbox, work before history, most recently active first.**
     ///
-    /// Three keys, in this order:
+    /// Four keys, in this order:
     ///
-    /// 1. Whether the map still has open work ([`Map::has_open_work`]). A
-    ///    finished map is history, and history belongs at the bottom however
-    ///    recently it was finished — otherwise a map completed this morning
-    ///    outranks every live one, which is the exact inversion this order
-    ///    exists to fix.
-    /// 2. Last activity, newest first. `None` (a timestamp that did not parse)
+    /// 1. Whether it is the loose "yours or unclaimed" cluster. Maps lead
+    ///    unconditionally, whatever either side's activity says: a map is work
+    ///    somebody charted, the inbox is work that merely exists, and an issue
+    ///    touched this morning outranking a charted map would bury the curated
+    ///    half of the screen under the uncurated one. This is the one key that
+    ///    is not about recency, and it is first for that reason.
+    /// 2. Whether the cluster still has open work
+    ///    ([`Cluster::has_open_work`]). A finished map is history, and history
+    ///    belongs at the bottom however recently it was finished — otherwise a
+    ///    map completed this morning outranks every live one, which is the
+    ///    exact inversion this order exists to fix.
+    /// 3. Last activity, newest first. `None` (a timestamp that did not parse)
     ///    sorts after every known one rather than being guessed into place.
-    /// 3. The [`MapId`] — (repo, number), the stable tie-break, so equal
-    ///    activity never renders in an arbitrary order that shifts between
-    ///    frames.
-    pub fn scoped_clusters(&self) -> Vec<(&MapId, &Map)> {
+    /// 4. The [`ClusterId`] — the stable tie-break, so equal activity never
+    ///    renders in an arbitrary order that shifts between frames.
+    pub fn scoped_clusters(&self) -> Vec<(&ClusterId, &Cluster)> {
         // `!has_open_work` so `false` (live) sorts before `true` (finished), and
         // `Reverse` so the newest activity leads — with `None` last, since
         // `None < Some` reversed puts the unknown stamps at the end. Declared
         // before the first statement: an item after one is `clippy::pedantic`'s
         // `items_after_statements`, which CI escalates to an error.
         fn key<'a>(
-            (id, map): &(&'a MapId, &'a Map),
-        ) -> (bool, Reverse<Option<Activity>>, &'a MapId) {
-            (!map.has_open_work(), Reverse(map.last_activity), *id)
+            (id, cluster): &(&'a ClusterId, &'a Cluster),
+        ) -> (bool, bool, Reverse<Option<Activity>>, &'a ClusterId) {
+            (
+                matches!(id, ClusterId::Inbox(_)),
+                !cluster.has_open_work(),
+                Reverse(cluster.last_activity),
+                *id,
+            )
         }
-        let mut clusters: Vec<(&MapId, &Map)> = self
+        let mut clusters: Vec<(&ClusterId, &Cluster)> = self
             .clusters
             .iter()
             .filter(|(id, _)| self.in_scope(id))
@@ -529,7 +554,7 @@ impl App {
             .into_iter()
             .flat_map(|(id, map)| {
                 (0..map.tickets.len()).map(|index| Row {
-                    map: id.clone(),
+                    cluster: id.clone(),
                     index,
                 })
             })
@@ -620,25 +645,40 @@ impl App {
                 projects::mru_repos(&self.checkouts).len(),
             ),
             Level::Project { .. } => {
-                let shown: BTreeSet<(MapId, usize)> = self
+                let shown: BTreeSet<(ClusterId, usize)> = self
                     .visible()
                     .into_iter()
-                    .map(|row| (row.map, row.index))
+                    .map(|row| (row.cluster, row.index))
                     .collect();
                 (shown.len(), self.scoped().len())
             }
         }
     }
 
+    /// The map this cluster *is*, when it is one: the (id, title) pair a
+    /// launch needs, read as a single fact.
+    ///
+    /// `None` for the loose cluster, which has no map issue — and the reason
+    /// this is one lookup rather than two is the redundancy [`Source`]
+    /// documents: taking the number from the key and the title from the value
+    /// separately is what would let a launch aim at a map that is not the
+    /// cluster it was picked in.
+    fn map_ref(&self, id: &ClusterId) -> Option<MapRef> {
+        match (id, self.clusters.get(id)?.map_title()) {
+            (ClusterId::Map(map_id), Some(title)) => Some(MapRef::new(map_id, title)),
+            (ClusterId::Map(_), None) | (ClusterId::Inbox(_), _) => None,
+        }
+    }
+
     /// The ticket a row names.
     pub fn ticket(&self, row: &Row) -> &Ticket {
-        &self.clusters[&row.map].tickets[row.index]
+        &self.clusters[&row.cluster].tickets[row.index]
     }
 
     /// A row's durable identity — the anchor a refetch preserves.
     pub fn row_key(&self, row: &Row) -> RowKey {
         RowKey {
-            map: row.map.clone(),
+            cluster: row.cluster.clone(),
             ticket: self.ticket(row).number,
         }
     }
@@ -655,7 +695,7 @@ impl App {
         let mut keys: Vec<StopKey> = Vec::new();
         for at in self.stops() {
             let key = match &at.stop {
-                Stop::Map(id) => StopKey::Map(id.clone()),
+                Stop::Cluster(id) => StopKey::Cluster(id.clone()),
                 Stop::Ticket(row) => {
                     let row_key = self.row_key(row);
                     let occurrence = keys
@@ -689,7 +729,7 @@ impl App {
             Cursor::Untouched => self
                 .stops()
                 .iter()
-                .position(|at| !matches!(at.stop, Stop::Map(_)))
+                .position(|at| !matches!(at.stop, Stop::Cluster(_)))
                 .unwrap_or(0),
             Cursor::Chosen(pos) => pos.min(self.stops().len().saturating_sub(1)),
         }
@@ -707,15 +747,15 @@ impl App {
     pub fn cursor_row(&self) -> Option<Row> {
         match self.cursor_stop() {
             Some(Stop::Ticket(row)) => Some(row),
-            Some(Stop::Map(_) | Stop::Group(_) | Stop::Project(_)) | None => None,
+            Some(Stop::Cluster(_) | Stop::Group(_) | Stop::Project(_)) | None => None,
         }
     }
 
     /// The ticket under the cursor, if the cursor is on one.
     pub fn cursor_ticket(&self) -> Option<&Ticket> {
         self.cursor_row().map(|row| {
-            let map: &Map = &self.clusters[&row.map];
-            &map.tickets[row.index]
+            let cluster: &Cluster = &self.clusters[&row.cluster];
+            &cluster.tickets[row.index]
         })
     }
 
@@ -899,7 +939,7 @@ impl App {
     /// time and the order leads on activity, so anchoring the start position too
     /// would let the first map to land drag the cursor downwards the moment a
     /// busier map sorted above it.
-    pub fn replace_clusters(&mut self, clusters: BTreeMap<MapId, Map>) {
+    pub fn replace_clusters(&mut self, clusters: BTreeMap<ClusterId, Cluster>) {
         let pinned = match self.cursor {
             Cursor::Untouched => None,
             Cursor::Chosen(_) => Some(match self.cursor_key() {
@@ -941,15 +981,7 @@ impl App {
                 }
                 Outcome::Continue
             }
-            Some(Stop::Map(id)) => {
-                let staged = Staged::map(&MapRef::new(&id, &self.clusters[&id].title));
-                // A map is a node (#96), so a charting session is as
-                // resumable as a build one — and rather more worth resuming.
-                let staged = self.resumable(staged, id.number);
-                self.prewarm(&staged);
-                self.open_launch_picker(staged);
-                Outcome::Continue
-            }
+            Some(Stop::Cluster(id)) => self.request_cluster_launch(&id),
             // One stop, two screens, and the screen decides — which is the
             // only place in the key handler that is true, and is what makes
             // the level a level rather than a filter.
@@ -976,6 +1008,63 @@ impl App {
         }
     }
 
+    /// Why adoption must not be offered for a row in `repo` right now, if it
+    /// must not.
+    ///
+    /// The inbox is what is left of the read once the maps in hand have claimed
+    /// their own rows, so it is only as trustworthy as the maps are complete.
+    /// A row a *missing* map would have claimed is still drawn — deliberately,
+    /// because a row that is nowhere is worse than a row in the wrong
+    /// place — but drawing it and acting on it are different things. Adoption
+    /// files a map and parents the issue under it, and an issue may have only
+    /// one parent, so adopting a ticket that already has a map takes it off the
+    /// map it was charted on. That is tracker data loss, and it is invisible
+    /// from here.
+    ///
+    /// So the refusal is keyed on what `wf` does not know rather than on what
+    /// it has seen: any map of this repo still out, or any that failed, and
+    /// adoption waits. `wf` cannot tell "loose" from "early" until then. The
+    /// launched skill checks the same thing again against the live tracker,
+    /// because this reading can be stale for reasons no local state shows —
+    /// a search page cut short, a map opened a second ago.
+    fn adoption_refusal(&self, repo: &str) -> Option<String> {
+        if !self.startup.is_loaded() {
+            return Some(format!(
+                "still loading {repo}'s maps — adoption waits until they have all reported"
+            ));
+        }
+        let failed: Vec<&MapId> = self.failed.iter().filter(|id| id.repo == repo).collect();
+        let first = failed.first()?;
+        Some(format!(
+            "{}#{} did not load, so a row here may already be on it — adoption waits",
+            first.repo, first.number
+        ))
+    }
+
+    /// The header half of [`App::request_launch`]: a map header launches the
+    /// map, and the loose cluster's header launches nothing.
+    ///
+    /// The loose refusal is not a missing feature. A map header is a node —
+    /// there is an issue behind it that an agent can be told to chart or drive
+    /// — and the inbox header is the absence of one: it is a heading over rows
+    /// that each have their own issue. Aiming an agent at it would have to
+    /// invent a target.
+    fn request_cluster_launch(&mut self, id: &ClusterId) -> Outcome {
+        let Some(map) = self.map_ref(id) else {
+            self.notice = Some(format!(
+                "{INBOX_HEADER} is a heading, not a node — pick an issue under it"
+            ));
+            return Outcome::Continue;
+        };
+        let staged = Staged::map(&map);
+        // A map is a node (#96), so a charting session is as
+        // resumable as a build one — and rather more worth resuming.
+        let staged = self.resumable(staged, map.id.number);
+        self.prewarm(&staged);
+        self.open_launch_picker(staged);
+        Outcome::Continue
+    }
+
     /// The ticket half of [`App::request_launch`], split out so the two
     /// refusals sit together and the stop match above stays readable.
     fn request_ticket_launch(&mut self, row: &Row) -> Outcome {
@@ -989,17 +1078,35 @@ impl App {
             ));
             return Outcome::Continue;
         }
-        // The map the row was picked in, carried whole: a ticket can sit on a
-        // map in another repo, and a bare number would name the wrong issue
-        // there (#124).
-        let map = MapRef::new(&row.map, &self.clusters[&row.map].title);
-        match Staged::ticket(ticket, &map, stage(&ticket.prs, &ticket.status)) {
+        // Two stagings, one refusal. A mapped row carries the map whole — a
+        // ticket can sit on a map in another repo, and a bare number would
+        // name the wrong issue there (#124) — and its launchable stage is what
+        // decides whether there is anything to do.
+        //
+        // A row in the loose cluster has no map, and that is what adoption is
+        // for: the issue exists, so there is nothing to file — only a map to
+        // put it under. Adoption has no stages to be past, so the one thing
+        // that would make it pointless is asked here instead: an issue already
+        // closed does not want a map. Everything downstream of adoption is the
+        // ordinary mapped path, which is why the launch contract is left alone.
+        let staged = match self.map_ref(&row.cluster) {
+            Some(map) => Staged::ticket(ticket, &map, stage(&ticket.prs, &ticket.status)),
+            None => match self.adoption_refusal(&ticket.repo) {
+                Some(why) => {
+                    self.notice = Some(why);
+                    return Outcome::Continue;
+                }
+                None => (!matches!(ticket.status, Status::Done)).then(|| Staged::loose(ticket)),
+            },
+        };
+        let number = ticket.number;
+        match staged {
             None => {
-                self.notice = Some(format!("#{} is done — nothing to launch", ticket.number));
+                self.notice = Some(format!("#{number} is done — nothing to launch"));
                 Outcome::Continue
             }
             Some(staged) => {
-                let staged = self.resumable(staged, ticket.number);
+                let staged = self.resumable(staged, number);
                 self.prewarm(&staged);
                 self.open_launch_picker(staged);
                 Outcome::Continue
@@ -1133,6 +1240,13 @@ impl App {
         self.act_on(targets, repo, "+new")
     }
 
+    /// Resolve an adoption: the issue exists, so there is nothing to type and
+    /// nothing to refuse — only where the agent runs.
+    fn resolve_adoption(&mut self, repo: &str, number: u64, mode: &LaunchMode) -> Outcome {
+        let targets = launch::plan_adopt(&self.checkouts, repo, number, mode);
+        self.act_on(targets, repo, &format!("#{number}"))
+    }
+
     /// What a resolved [`Targets`] does to the screen: launch, prompt for the
     /// tree, or say there is none. Shared by both resolutions so a creation
     /// cannot drift into reporting its checkouts differently from a node.
@@ -1206,6 +1320,21 @@ impl App {
                     // Unreachable: the row is built from the record, so a
                     // resume row without one cannot be drawn to be picked.
                     self.notice = Some("nothing to resume here".to_string());
+                }
+                // No text to complete and no refusal: adoption names an issue
+                // that already exists, so the only thing the second enter
+                // still decides is which checkout it runs in.
+                Candidate::Adopt => {
+                    if let Some(number) = staged.adoptable() {
+                        return self.resolve_adoption(
+                            &staged.repo,
+                            number,
+                            &LaunchMode::picked(agent, Mode::Interactive, &steer),
+                        );
+                    }
+                    // Unreachable: the row is only offered on a loose stop,
+                    // which is the one stop built from an issue number.
+                    self.notice = Some("nothing to adopt here".to_string());
                 }
                 Candidate::Create(kind) => match kind.with_text(&steer) {
                     Some(creation) => return self.resolve_creation(&staged.repo, &creation, agent),
@@ -1415,7 +1544,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::launch::{CreationKind, Isolation, Mode, Route};
-    use crate::model::{classify, Checks, PrLink, PrStatus, Review, TicketType};
+    use crate::model::{classify, Checks, PrLink, PrStatus, Review, Source, TicketType};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1453,7 +1582,7 @@ mod tests {
     /// about. `App::new` opens on the project *list*, which is what `wf` run
     /// outside a checkout shows and which draws no cluster at all, so a test
     /// about clusters has to say which project's it means.
-    fn app_on(repo: &str, clusters: BTreeMap<MapId, Map>) -> App {
+    fn app_on(repo: &str, clusters: BTreeMap<ClusterId, Cluster>) -> App {
         let mut app = App::new(clusters);
         app.enter(repo);
         app
@@ -1465,9 +1594,11 @@ mod tests {
     fn fixture_app() -> App {
         let mut clusters = BTreeMap::new();
         clusters.insert(
-            MapId::new("blooop/wayfinder", 1),
-            Map {
-                title: "Map: wf".to_string(),
+            ClusterId::Map(MapId::new("blooop/wayfinder", 1)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: wf".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: vec![
@@ -1507,9 +1638,11 @@ mod tests {
             },
         );
         clusters.insert(
-            MapId::new("blooop/dotfiles", 4),
-            Map {
-                title: "Map: dotfiles".to_string(),
+            ClusterId::Map(MapId::new("blooop/dotfiles", 4)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: dotfiles".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: vec![ticket(
@@ -1526,11 +1659,13 @@ mod tests {
     }
 
     /// A one-ticket cluster with a given last-activity stamp, open or finished.
-    fn cluster(repo: &str, number: u64, stamp: Option<&str>, open: bool) -> (MapId, Map) {
+    fn cluster(repo: &str, number: u64, stamp: Option<&str>, open: bool) -> (ClusterId, Cluster) {
         (
-            MapId::new(repo, number),
-            Map {
-                title: format!("Map: {repo}"),
+            ClusterId::Map(MapId::new(repo, number)),
+            Cluster {
+                source: Source::Map {
+                    title: format!("Map: {repo}"),
+                },
                 last_activity: stamp.map(|s| Activity::parse(s).expect("fixture stamp parses")),
                 truncated: false,
                 tickets: vec![ticket(repo, 1, "only ticket", open, false, vec![])],
@@ -1538,11 +1673,234 @@ mod tests {
         )
     }
 
-    fn cluster_order(app: &App) -> Vec<MapId> {
+    fn cluster_order(app: &App) -> Vec<ClusterId> {
         app.scoped_clusters()
             .into_iter()
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// The inbox cluster for `repo`, holding `numbers` — every row assigned,
+    /// which is what puts a row in the inbox at all.
+    fn inbox(repo: &str, numbers: &[u64], stamp: Option<&str>) -> (ClusterId, Cluster) {
+        (
+            ClusterId::Inbox(repo.to_string()),
+            Cluster::inbox(
+                stamp.map(|s| Activity::parse(s).expect("fixture stamp parses")),
+                numbers
+                    .iter()
+                    .map(|n| ticket(repo, *n, "yours or unclaimed", true, true, vec![]))
+                    .collect(),
+                false,
+            ),
+        )
+    }
+
+    #[test]
+    fn the_inbox_sorts_after_every_map_however_fresh_it_is() {
+        // The one ordering key that is not about recency. A map is work
+        // somebody charted; the inbox is work that merely exists, and an issue
+        // touched this morning must not bury the charted half of the screen.
+        let clusters: BTreeMap<_, _> = [
+            inbox(PROJECT, &[91], Some("2026-08-24T12:00:00Z")),
+            cluster(PROJECT, 1, Some("2026-08-01T00:00:00Z"), true),
+            cluster(PROJECT, 2, Some("2026-08-02T00:00:00Z"), true),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            cluster_order(&app_on(PROJECT, clusters)),
+            vec![
+                ClusterId::Map(MapId::new(PROJECT, 2)),
+                ClusterId::Map(MapId::new(PROJECT, 1)),
+                ClusterId::Inbox(PROJECT.to_string()),
+            ],
+            "the freshest map leads and the fresher inbox still trails"
+        );
+    }
+
+    #[test]
+    fn the_inbox_sorts_after_a_finished_map_too() {
+        // Finished maps are history and already sort last among maps. The
+        // inbox is below history: the key that separates them is first.
+        let clusters: BTreeMap<_, _> = [
+            inbox(PROJECT, &[91], Some("2026-08-24T12:00:00Z")),
+            cluster(PROJECT, 1, Some("2026-01-01T00:00:00Z"), false),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            cluster_order(&app_on(PROJECT, clusters)),
+            vec![
+                ClusterId::Map(MapId::new(PROJECT, 1)),
+                ClusterId::Inbox(PROJECT.to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn the_inbox_header_is_a_place_to_stand_and_not_a_node() {
+        // A map header launches because there is an issue behind it. The inbox
+        // header is a heading over rows that each have their own issue, so
+        // aiming an agent at it would have to invent a target.
+        let clusters: BTreeMap<_, _> = [inbox(PROJECT, &[91], None)].into_iter().collect();
+        let mut app = app_on(PROJECT, clusters);
+        go_to(&mut app, "inbox blooop/wayfinder");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert!(
+            !matches!(app.overlay, Overlay::PickLaunch { .. }),
+            "no picker"
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("not a node")),
+            "{:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn an_inbox_row_stages_adoption_rather_than_a_mapped_launch() {
+        let clusters: BTreeMap<_, _> = [inbox(PROJECT, &[91], None)].into_iter().collect();
+        let mut app = app_on(PROJECT, clusters);
+        go_to(&mut app, "#91");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        let Overlay::PickLaunch { staged, .. } = &app.overlay else {
+            panic!("the launch picker is up: {:?}", app.overlay);
+        };
+        assert_eq!(staged.adoptable(), Some(91));
+        assert_eq!(
+            staged.candidates(),
+            vec![Candidate::Adopt],
+            "one way forward, and no mode axis: `/wf-one` owns the lifecycle"
+        );
+    }
+
+    #[test]
+    fn adoption_is_refused_while_this_repos_map_picture_is_incomplete() {
+        // The inbox keeps showing rows a map that failed to load would have
+        // claimed — deliberately, because a row that is nowhere is worse. But
+        // *visible* and *actionable* are different things: adopting a ticket
+        // that already has a map files a second map and reparents the issue
+        // off its real one, and GitHub allows an issue only one parent, so the
+        // map it was charted on silently loses it.
+        let clusters: BTreeMap<_, _> = [inbox(PROJECT, &[91], None)].into_iter().collect();
+        let mut app = app_on(PROJECT, clusters);
+        app.failed.insert(MapId::new(PROJECT, 1));
+        go_to(&mut app, "#91");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert!(
+            !matches!(app.overlay, Overlay::PickLaunch { .. }),
+            "no picker: {:?}",
+            app.overlay
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("did not load")),
+            "{:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn adoption_is_refused_while_the_maps_are_still_arriving() {
+        // The same hole for the whole startup window rather than only after a
+        // failure: the inbox is one query and the maps stream, so until every
+        // map for this repo has reported there is no way to know whether a row
+        // is loose or merely early.
+        let clusters: BTreeMap<_, _> = [inbox(PROJECT, &[91], None)].into_iter().collect();
+        let mut app = app_on(PROJECT, clusters);
+        app.startup = Startup::seeded(&[MapId::new(PROJECT, 1)].into_iter().collect());
+        go_to(&mut app, "#91");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert!(!matches!(app.overlay, Overlay::PickLaunch { .. }));
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("still loading")),
+            "{:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn a_failed_map_in_another_repo_does_not_refuse_this_repos_adoption() {
+        // The refusal is per repo: a map that failed in `dotfiles` says nothing
+        // about whether a wayfinder issue is loose.
+        let clusters: BTreeMap<_, _> = [inbox(PROJECT, &[91], None)].into_iter().collect();
+        let mut app = app_on(PROJECT, clusters);
+        app.failed.insert(MapId::new("blooop/dotfiles", 4));
+        go_to(&mut app, "#91");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert!(
+            matches!(app.overlay, Overlay::PickLaunch { .. }),
+            "adoption is still offered: {:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn a_closed_inbox_row_is_refused_the_way_a_done_ticket_is() {
+        // Adoption has no stages to be past, so the one thing that would make
+        // it pointless is asked where the mapped refusal already lives.
+        //
+        // Reached through the forest lens, which is the only place a done row
+        // is a stop — and the honest statement of how reachable this is at all:
+        // the inbox read asks for `is:open`, so a closed row can only be one
+        // the tracker closed after answering. The guard is totality, not a
+        // path a human walks.
+        let clusters: BTreeMap<_, _> = [(
+            ClusterId::Inbox(PROJECT.to_string()),
+            Cluster::inbox(
+                None,
+                vec![ticket(PROJECT, 91, "already closed", false, true, vec![])],
+                false,
+            ),
+        )]
+        .into_iter()
+        .collect();
+        let mut app = app_on(PROJECT, clusters);
+        app.handle_key(key(KeyCode::Tab));
+        go_to(&mut app, "#91");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        assert!(!matches!(app.overlay, Overlay::PickLaunch { .. }));
+        assert!(
+            app.notice.as_deref().is_some_and(|n| n.contains("is done")),
+            "{:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn a_mapped_row_still_stages_a_mapped_launch_beside_an_inbox() {
+        // The other half of the fork: an inbox on screen changes nothing about
+        // what a map's own row does.
+        let clusters: BTreeMap<_, _> = [
+            inbox(PROJECT, &[91], None),
+            cluster(PROJECT, 1, Some("2026-08-01T00:00:00Z"), true),
+        ]
+        .into_iter()
+        .collect();
+        let mut app = app_on(PROJECT, clusters);
+        go_to(&mut app, "#1");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Continue);
+        let Overlay::PickLaunch { staged, .. } = &app.overlay else {
+            panic!("the launch picker is up: {:?}", app.overlay);
+        };
+        assert_eq!(staged.adoptable(), None, "a mapped row is not adopted");
+        assert!(
+            staged.candidates().iter().any(|c| matches!(
+                c,
+                Candidate::Launch {
+                    mode: Mode::Interactive,
+                    ..
+                }
+            )),
+            "the mode rows are untouched: {:?}",
+            staged.candidates()
+        );
     }
 
     #[test]
@@ -1550,7 +1908,7 @@ mod tests {
         // The bug this fixes: `blooop/finished` is both the lowest id *and* the
         // most recently touched, and it still belongs at the bottom — a map with
         // nothing left to do is history, however fresh.
-        let clusters: BTreeMap<MapId, Map> = [
+        let clusters: BTreeMap<ClusterId, Cluster> = [
             cluster(PROJECT, 1, Some("2026-08-06T12:00:00Z"), false),
             cluster(PROJECT, 2, Some("2026-08-01T09:00:00Z"), true),
             cluster(PROJECT, 3, Some("2026-08-05T09:00:00Z"), true),
@@ -1561,13 +1919,13 @@ mod tests {
         assert_eq!(
             cluster_order(&app_on(PROJECT, clusters)),
             vec![
-                MapId::new(PROJECT, 3),
-                MapId::new(PROJECT, 2),
+                ClusterId::Map(MapId::new(PROJECT, 3)),
+                ClusterId::Map(MapId::new(PROJECT, 2)),
                 // An unparsed stamp is not guessed into the middle of the live
                 // maps: it sorts after every dated one…
-                MapId::new(PROJECT, 4),
+                ClusterId::Map(MapId::new(PROJECT, 4)),
                 // …and the finished map is still below it.
-                MapId::new(PROJECT, 1),
+                ClusterId::Map(MapId::new(PROJECT, 1)),
             ]
         );
     }
@@ -1579,7 +1937,7 @@ mod tests {
         // tie-break is the whole `MapId`; on one project's screen — the only
         // kind there is — that is the map number.
         let stamp = Some("2026-08-06T12:00:00Z");
-        let clusters: BTreeMap<MapId, Map> = [
+        let clusters: BTreeMap<ClusterId, Cluster> = [
             cluster(PROJECT, 47, stamp, true),
             cluster(PROJECT, 4, stamp, true),
             cluster(PROJECT, 1, stamp, true),
@@ -1589,9 +1947,9 @@ mod tests {
         assert_eq!(
             cluster_order(&app_on(PROJECT, clusters)),
             vec![
-                MapId::new(PROJECT, 1),
-                MapId::new(PROJECT, 4),
-                MapId::new(PROJECT, 47),
+                ClusterId::Map(MapId::new(PROJECT, 1)),
+                ClusterId::Map(MapId::new(PROJECT, 4)),
+                ClusterId::Map(MapId::new(PROJECT, 47)),
             ]
         );
     }
@@ -1623,7 +1981,7 @@ mod tests {
     /// Two live maps of one project, the second of them older, so a map fresher
     /// than both sorts above the pair and pushes every existing stop down by
     /// two — its header and its row (#96).
-    fn streaming_pair() -> BTreeMap<MapId, Map> {
+    fn streaming_pair() -> BTreeMap<ClusterId, Cluster> {
         [
             cluster(PROJECT, 1, Some("2026-08-01T00:00:00Z"), true),
             cluster(PROJECT, 3, Some("2026-07-01T00:00:00Z"), true),
@@ -1634,7 +1992,7 @@ mod tests {
 
     /// The pair with a fresher map added — it renders first, so every original
     /// stop moves down two.
-    fn streaming_trio() -> BTreeMap<MapId, Map> {
+    fn streaming_trio() -> BTreeMap<ClusterId, Cluster> {
         let mut all = streaming_pair();
         all.extend([cluster(PROJECT, 2, Some("2026-08-07T00:00:00Z"), true)]);
         all
@@ -1652,16 +2010,16 @@ mod tests {
         }
         assert_eq!(app.cursor_pos(), 4);
         assert_eq!(
-            app.cursor_row().map(|row| row.map),
-            Some(MapId::new(PROJECT, 3))
+            app.cursor_row().map(|row| row.cluster),
+            Some(ClusterId::Map(MapId::new(PROJECT, 3)))
         );
 
         app.replace_clusters(streaming_trio());
 
         assert_eq!(app.cursor_pos(), 6, "the fresher map pushed the row down");
         assert_eq!(
-            app.cursor_row().map(|row| row.map),
-            Some(MapId::new(PROJECT, 3)),
+            app.cursor_row().map(|row| row.cluster),
+            Some(ClusterId::Map(MapId::new(PROJECT, 3))),
             "still the row they chose"
         );
     }
@@ -1678,15 +2036,15 @@ mod tests {
         }
         assert_eq!(app.cursor_pos(), 2);
         assert_eq!(
-            app.cursor_row().map(|row| row.map),
-            Some(MapId::new(PROJECT, 1))
+            app.cursor_row().map(|row| row.cluster),
+            Some(ClusterId::Map(MapId::new(PROJECT, 1)))
         );
 
         app.replace_clusters(streaming_trio());
 
         assert_eq!(
-            app.cursor_row().map(|row| row.map),
-            Some(MapId::new(PROJECT, 1)),
+            app.cursor_row().map(|row| row.cluster),
+            Some(ClusterId::Map(MapId::new(PROJECT, 1))),
             "their stop, not whatever is on top now"
         );
         assert_eq!(app.cursor_pos(), 4);
@@ -1710,11 +2068,13 @@ mod tests {
     /// One map with finished work in it, so the leverage lens gives it a `Done`
     /// group line — a stop the forest lens, which has no group lines at all, does
     /// not have.
-    fn map_with_a_done_group() -> BTreeMap<MapId, Map> {
+    fn map_with_a_done_group() -> BTreeMap<ClusterId, Cluster> {
         BTreeMap::from([(
-            MapId::new(PROJECT, 1),
-            Map {
-                title: "Map: the slow one".to_string(),
+            ClusterId::Map(MapId::new(PROJECT, 1)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: the slow one".to_string(),
+                },
                 last_activity: Some(
                     Activity::parse("2026-08-01T00:00:00Z").expect("fixture stamp parses"),
                 ),
@@ -1780,9 +2140,11 @@ mod tests {
 
         let mut fresher = app.clusters.clone();
         fresher.insert(
-            MapId::new(PROJECT, 99),
-            Map {
-                title: "Map: late arrival".to_string(),
+            ClusterId::Map(MapId::new(PROJECT, 99)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: late arrival".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: vec![ticket(PROJECT, 200, "zzz sleeper", true, false, vec![])],
@@ -1814,9 +2176,11 @@ mod tests {
 
         let mut fresher = app.clusters.clone();
         fresher.insert(
-            MapId::new(PROJECT, 99),
-            Map {
-                title: "Map: fresher".to_string(),
+            ClusterId::Map(MapId::new(PROJECT, 99)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: fresher".to_string(),
+                },
                 last_activity: Some(
                     Activity::parse("2026-08-07T00:00:00Z").expect("fixture stamp parses"),
                 ),
@@ -1849,7 +2213,8 @@ mod tests {
     /// `map #n`, a group by kind. Reads like the screen does.
     fn at(app: &App) -> String {
         match app.cursor_stop() {
-            Some(Stop::Map(id)) => format!("map #{}", id.number),
+            Some(Stop::Cluster(ClusterId::Map(id))) => format!("map #{}", id.number),
+            Some(Stop::Cluster(ClusterId::Inbox(repo))) => format!("inbox {repo}"),
             Some(Stop::Ticket(row)) => format!("#{}", app.ticket(&row).number),
             Some(Stop::Group(g)) => format!("{:?}", g.kind),
             Some(Stop::Project(repo)) => format!("project {repo}"),
@@ -1933,9 +2298,11 @@ mod tests {
         // them and stops at the last rather than leaking back out to depth 0.
         let mut clusters = BTreeMap::new();
         clusters.insert(
-            MapId::new("blooop/wayfinder", 1),
-            Map {
-                title: "Map: wf".to_string(),
+            ClusterId::Map(MapId::new("blooop/wayfinder", 1)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: wf".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: vec![
@@ -1966,9 +2333,11 @@ mod tests {
     fn knotty_app() -> App {
         let mut clusters = BTreeMap::new();
         clusters.insert(
-            MapId::new("blooop/bencher", 1064),
-            Map {
-                title: "Map: endgame".to_string(),
+            ClusterId::Map(MapId::new("blooop/bencher", 1064)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: endgame".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: vec![
@@ -2104,9 +2473,11 @@ mod tests {
         // there — every stop must stay reachable by them alone.
         let mut clusters = BTreeMap::new();
         clusters.insert(
-            MapId::new("blooop/bencher", 1064),
-            Map {
-                title: "Map: endgame".to_string(),
+            ClusterId::Map(MapId::new("blooop/bencher", 1064)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: endgame".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: vec![
@@ -2510,9 +2881,11 @@ mod tests {
         let mut clusters = BTreeMap::new();
         for map_number in [1u64, 47] {
             clusters.insert(
-                MapId::new("blooop/wayfinder", map_number),
-                Map {
-                    title: format!("Map: {map_number}"),
+                ClusterId::Map(MapId::new("blooop/wayfinder", map_number)),
+                Cluster {
+                    source: Source::Map {
+                        title: format!("Map: {map_number}"),
+                    },
                     last_activity: None,
                     truncated: false,
                     tickets: vec![ticket(
@@ -2779,7 +3152,7 @@ mod tests {
             app.handle_key(key(KeyCode::Down)); // …to the auto row
             app
         };
-        let wf = MapId::new("blooop/wayfinder", 1);
+        let wf = ClusterId::Map(MapId::new("blooop/wayfinder", 1));
 
         // Reordered: #6's old index now names #9.
         let mut app = staged();
@@ -2819,9 +3192,9 @@ mod tests {
         let mut app = staged();
         let mut shrunk = BTreeMap::new();
         shrunk.insert(
-            MapId::new("blooop/dotfiles", 4),
+            ClusterId::Map(MapId::new("blooop/dotfiles", 4)),
             app.clusters
-                .get(&MapId::new("blooop/dotfiles", 4))
+                .get(&ClusterId::Map(MapId::new("blooop/dotfiles", 4)))
                 .expect("the dotfiles map")
                 .clone(),
         );
@@ -3086,7 +3459,7 @@ mod tests {
             Some(&Stop::Project("blooop/wayfinder".to_string()))
         );
         assert!(
-            stops.iter().any(|s| matches!(s, Stop::Map(_))),
+            stops.iter().any(|s| matches!(s, Stop::Cluster(_))),
             "the clusters still follow it: {stops:?}"
         );
     }
@@ -3323,9 +3696,11 @@ mod tests {
             t.prs = prs;
             let mut clusters = BTreeMap::new();
             clusters.insert(
-                MapId::new("blooop/wayfinder", 59),
-                Map {
-                    title: "Map: the spine".to_string(),
+                ClusterId::Map(MapId::new("blooop/wayfinder", 59)),
+                Cluster {
+                    source: Source::Map {
+                        title: "Map: the spine".to_string(),
+                    },
                     last_activity: None,
                     truncated: false,
                     tickets: vec![t],
@@ -3427,27 +3802,33 @@ mod tests {
         // shows both — and the other repo's map is on another screen entirely.
         let mut clusters = BTreeMap::new();
         clusters.insert(
-            MapId::new("blooop/wayfinder", 1),
-            Map {
-                title: "Map: wf".to_string(),
+            ClusterId::Map(MapId::new("blooop/wayfinder", 1)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: wf".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: vec![ticket("blooop/wayfinder", 6, "t6", true, false, vec![])],
             },
         );
         clusters.insert(
-            MapId::new("blooop/wayfinder", 47),
-            Map {
-                title: "Map: selection view".to_string(),
+            ClusterId::Map(MapId::new("blooop/wayfinder", 47)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: selection view".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: vec![ticket("blooop/wayfinder", 50, "t50", true, false, vec![])],
             },
         );
         clusters.insert(
-            MapId::new("blooop/dotfiles", 4),
-            Map {
-                title: "Map: dotfiles".to_string(),
+            ClusterId::Map(MapId::new("blooop/dotfiles", 4)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: dotfiles".to_string(),
+                },
                 last_activity: None,
                 truncated: false,
                 tickets: vec![ticket("blooop/dotfiles", 103, "t103", true, false, vec![])],
@@ -3456,7 +3837,9 @@ mod tests {
         let app = app_on("blooop/wayfinder", clusters);
         let visible = app.visible();
         assert_eq!(visible.len(), 2, "both wayfinder maps are on this screen");
-        assert!(visible.iter().all(|row| row.map.repo == "blooop/wayfinder"));
+        assert!(visible
+            .iter()
+            .all(|row| row.cluster.repo() == "blooop/wayfinder"));
     }
 
     #[test]
@@ -3466,9 +3849,11 @@ mod tests {
         let mut clusters = BTreeMap::new();
         for owner in ["blooop", "upstream"] {
             clusters.insert(
-                MapId::new(format!("{owner}/dotfiles"), 1),
-                Map {
-                    title: "Map: dotfiles".to_string(),
+                ClusterId::Map(MapId::new(format!("{owner}/dotfiles"), 1)),
+                Cluster {
+                    source: Source::Map {
+                        title: "Map: dotfiles".to_string(),
+                    },
                     last_activity: None,
                     truncated: false,
                     tickets: vec![ticket(
@@ -3488,7 +3873,7 @@ mod tests {
             1,
             "the fork's identically-numbered row must not show"
         );
-        assert_eq!(app.visible()[0].map.repo, "upstream/dotfiles");
+        assert_eq!(app.visible()[0].cluster.repo(), "upstream/dotfiles");
     }
 
     #[test]
@@ -3541,9 +3926,11 @@ mod tests {
     fn diamond_app() -> App {
         let mut clusters = BTreeMap::new();
         clusters.insert(
-            MapId::new(PROJECT, 1),
-            Map {
-                title: "Map: diamond".to_string(),
+            ClusterId::Map(MapId::new(PROJECT, 1)),
+            Cluster {
+                source: Source::Map {
+                    title: "Map: diamond".to_string(),
+                },
                 last_activity: None,
                 tickets: vec![
                     ticket(PROJECT, 2, "Choose the stack", false, true, vec![]),
@@ -3620,7 +4007,7 @@ mod tests {
         app.cursor = Cursor::Chosen(drawings[1]);
         let mut swapped = app.clusters.clone();
         let map = swapped
-            .get_mut(&MapId::new(PROJECT, 1))
+            .get_mut(&ClusterId::Map(MapId::new(PROJECT, 1)))
             .expect("the diamond map");
         map.tickets[2] = ticket(PROJECT, 9, "Main screen design", false, true, vec![]);
         app.replace_clusters(swapped);
@@ -3743,7 +4130,7 @@ mod tests {
         go_to(&mut app, "#6"); // position 2: the project row and the header
         let mut smaller = app.clusters.clone();
         smaller
-            .get_mut(&MapId::new("blooop/wayfinder", 1))
+            .get_mut(&ClusterId::Map(MapId::new("blooop/wayfinder", 1)))
             .unwrap()
             .tickets
             .retain(|t| t.number != 6);
