@@ -378,6 +378,15 @@ morning must not push the charted half of the screen down. Everything else
 about it is an ordinary cluster: the same stage glyphs, the same PR badges, the
 same fuzzy-find, the same `←`/`→` depth navigation.
 
+**Its rows are in date order, newest first** — where a map's rows are ordered
+by what taking them unlocks and then by number. A map's numbers are the order
+its author charted it in, so they mean something; an inbox is a pile with no
+author, and ascending number order would put the oldest issue in the repo at
+the top. A row whose timestamp did not parse sorts last rather than being
+guessed into place. `sort:updated-desc` is on both searches for the same
+reason: one page of 100 spans every repo, so the rows worth keeping are the
+ones something just happened to.
+
 **A map claims its own rows out of it.** An issue you have claimed on a map
 matches `assignee:@me` too, so it is in both answers — and it belongs on the
 map, where its blockers and its leverage are. The inbox is therefore *derived*:
@@ -395,6 +404,16 @@ word for the run, and running `wf` again is the way to ask.
 **The header is a place to stand, not a node.** A map's header launches because
 there is an issue behind it; the inbox's is a heading over rows that each have
 their own issue, so `enter` on it says so instead of inventing a target.
+
+**Adoption waits while the map picture is incomplete.** The inbox is only as
+trustworthy as the maps are complete, and a row a *missing* map would have
+claimed is still drawn — so while any map of that repo is still out, or any
+failed, `enter` on a loose row refuses and says which. Adopting a ticket that
+already has a map would file a second one and reparent the issue under it, and
+GitHub allows an issue exactly one parent, so the map it was charted on would
+silently lose it. `wf-one adopt` asks the tracker for the issue's parent before
+filing anything, because this reading can be stale for reasons no local state
+shows.
 
 **The project list leaves the inbox out of its counts** — `· 2 maps` counts
 maps, and the stage rollup beside it is the maps' — because that list is drawn
