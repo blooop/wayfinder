@@ -114,7 +114,7 @@ const INBOX_QUERY: &str = "\
 fragment Row on Issue {
   number title state updatedAt
   repository { nameWithOwner }
-  labels(first: 10) { nodes { name } }
+  labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
   assignees(first: 5) { nodes { login } }
   blockedBy(first: 50) { nodes { number state } pageInfo { hasNextPage } }
   closedByPullRequestsReferences(first: 5, includeClosedPrs: true) {
@@ -214,7 +214,14 @@ struct SubIssue {
     number: u64,
     title: String,
     state: String,
-    labels: Nodes<Label>,
+    /// Paged rather than bare nodes because the *inbox* reads the page flag:
+    /// there, the map label's **absence** is what keeps a map issue out of its
+    /// own inbox, and a page cut short cannot prove an absence (#184). A map's
+    /// own sub-issues are read from the same struct and do not consult it — a
+    /// label page cut short there costs a `[type]` suffix, not a row drawn
+    /// twice — which is why [`MAP_QUERY`] does not ask for the flag and
+    /// `Paged`'s default reads it as "no claim of more".
+    labels: Paged<Label>,
     assignees: Nodes<Assignee>,
     #[serde(rename = "blockedBy")]
     blocked_by: Paged<Blocker>,
@@ -579,8 +586,19 @@ fn parse_inbox(body: &[u8]) -> Result<Vec<(String, Cluster)>> {
     // `parse_ticket`, not from which half it arrived in, so a row does not
     // depend on the query that found it.
     for node in data.mine.nodes.into_iter().chain(data.unassigned.nodes) {
-        // A map is a heading here, not a row.
-        if node.issue.labels.nodes.iter().any(|l| l.name == MAP_LABEL) {
+        // A map is a heading on this screen, not a row — and a map is an open
+        // issue nobody is assigned to, so `no:assignee` finds every one of
+        // them. This is the only thing keeping them out.
+        //
+        // So the *absence* of the label has to be proven, not assumed (#184):
+        // a page the tracker cut short cannot prove a label is gone, and a map
+        // drawn as a row is a row offering to adopt a map. Unproven means
+        // dropped, which costs at worst one heavily-labelled issue that has to
+        // be reached from its own map — where a wrongly-drawn map row would
+        // cost a reparenting.
+        let not_a_map = !node.issue.labels.nodes.iter().any(|l| l.name == MAP_LABEL)
+            && !node.issue.labels.page_info.has_next_page;
+        if !not_a_map {
             continue;
         }
         let repo = node.repository.name_with_owner.clone();
@@ -796,6 +814,52 @@ mod tests {
         "pageInfo": {"hasNextPage": false}
       }
     }}"#;
+
+    #[test]
+    fn a_map_wearing_more_labels_than_one_page_holds_is_still_not_a_row() {
+        // The #184 shape, on the inbox side. A map is an open issue nobody is
+        // assigned to, so `no:assignee` finds every one of them, and the only
+        // thing keeping a map out of its own inbox is the label check. A label
+        // page cut short cannot prove the label is gone — so it does not get to
+        // — and the row is dropped rather than drawn as an issue offering to
+        // adopt a map.
+        let body = INBOX_RESPONSE.replace(
+            r#""labels": {"nodes": [{"name": "wayfinder:map"}]}"#,
+            r#""labels": {"nodes": [{"name": "bug"}], "pageInfo": {"hasNextPage": true}}"#,
+        );
+        assert_ne!(body, INBOX_RESPONSE, "the fixture's map label moved");
+        let inbox = parse_inbox(body.as_bytes()).expect("parse");
+        let dotfiles = inbox.iter().find(|(repo, _)| repo == "blooop/dotfiles");
+        let numbers: Vec<u64> = dotfiles
+            .map(|(_, cluster)| cluster.tickets.iter().map(|t| t.number).collect())
+            .unwrap_or_default();
+        assert!(
+            !numbers.contains(&7),
+            "#7's label page was cut short, so it cannot be proven not to be a map: {numbers:?}"
+        );
+    }
+
+    #[test]
+    fn a_complete_label_page_without_the_map_label_is_an_ordinary_row() {
+        // The other half, so the rule above is not just "drop anything with
+        // more labels than we asked for": a page the tracker says is all of it,
+        // with no map label on it, is proof.
+        let body = INBOX_RESPONSE.replace(
+            r#""labels": {"nodes": [{"name": "wayfinder:map"}]}"#,
+            r#""labels": {"nodes": [{"name": "bug"}], "pageInfo": {"hasNextPage": false}}"#,
+        );
+        let inbox = parse_inbox(body.as_bytes()).expect("parse");
+        let numbers: Vec<u64> = inbox
+            .iter()
+            .find(|(repo, _)| repo == "blooop/dotfiles")
+            .expect("dotfiles has rows")
+            .1
+            .tickets
+            .iter()
+            .map(|t| t.number)
+            .collect();
+        assert!(numbers.contains(&7), "{numbers:?}");
+    }
 
     #[test]
     fn the_inbox_holds_what_is_yours_and_what_is_nobodys_in_one_cluster() {

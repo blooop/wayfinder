@@ -293,10 +293,17 @@ fn rendered(
         .map(|(id, cluster)| (ClusterId::Map(id.clone()), cluster.clone()))
         .collect();
     for (repo, cluster) in inbox {
+        // A map's tickets, and the map issue's own number. The label check in
+        // `parse_inbox` already keeps maps out, but it reads a label page and
+        // this reads the identity of a map `wf` actually fetched — authoritative
+        // where a page can be cut short. Belt and braces on the one confusion
+        // that costs a reparenting: a map drawn as a row offering to adopt it.
         let mapped: BTreeSet<u64> = clusters
             .iter()
             .filter(|(id, _)| &id.repo == repo)
-            .flat_map(|(_, cluster)| cluster.tickets.iter().map(|t| t.number))
+            .flat_map(|(id, cluster)| {
+                std::iter::once(id.number).chain(cluster.tickets.iter().map(|t| t.number))
+            })
             .collect();
         let tickets: Vec<Ticket> = cluster
             .tickets
@@ -770,6 +777,37 @@ mod tests {
             .map(|t| t.number)
             .collect();
         assert_eq!(left, vec![42], "#190 belongs to its map, not the inbox");
+    }
+
+    #[test]
+    fn a_map_issue_itself_never_survives_into_the_inbox() {
+        // The label check in `parse_inbox` is the first guard and reads a page
+        // that can be cut short. This one reads the identity of a map `wf`
+        // fetched, so it cannot be blinded the same way — and the row it stops
+        // is the one that costs a reparenting, since adopting a map would
+        // parent a map under a map.
+        let maps = BTreeMap::from([(
+            MapId::new("blooop/wayfinder", 182),
+            map_of("blooop/wayfinder", &[190]),
+        )]);
+        let inbox = vec![(
+            "blooop/wayfinder".to_string(),
+            Cluster::inbox(
+                None,
+                vec![
+                    assigned("blooop/wayfinder", 182),
+                    assigned("blooop/wayfinder", 42),
+                ],
+                false,
+            ),
+        )];
+        let rendered = rendered(&maps, &inbox);
+        let left: Vec<u64> = rendered[&ClusterId::Inbox("blooop/wayfinder".to_string())]
+            .tickets
+            .iter()
+            .map(|t| t.number)
+            .collect();
+        assert_eq!(left, vec![42], "#182 is a heading, not a row");
     }
 
     #[test]
