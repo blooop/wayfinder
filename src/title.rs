@@ -16,7 +16,7 @@
 //! first: the name a launch wrote is gone inside a second. Naming the terminal
 //! and leaving the agent to name it too is therefore not half a feature, it is
 //! none of one — which is what blooop/devlaunch#436 measured on `dl`'s own
-//! title, and what the variable in [`crate::launch::Agent::quiet_title_var`]
+//! title, and what the variable in `Agent::quiet_title_var` (`crate::launch`)
 //! settles.
 //!
 //! That is why one value decides both halves here. A [`TerminalTitle::Off`]
@@ -30,7 +30,7 @@
 //! blooop/devlaunch#436 (`dl` 0.14.0) — exports the same suppression into the
 //! container's login profile, so an escape from `wf` there would be replaced
 //! within the second and a suppression from `wf` would be a second mechanism
-//! for one job. See [`crate::launch::Launch::terminal_title`], and the README
+//! for one job. See `Launch::terminal_title` in `crate::launch`, and the README
 //! for the two `dl`-side cases that leaves alone.
 //!
 //! ## `WF_NO_TITLE`
@@ -64,7 +64,7 @@ pub const DISABLE_VAR: &str = "WF_NO_TITLE";
 const FALSEY: [&str; 4] = ["", "0", "false", "no"];
 
 /// One complete OSC 2 sequence — `ESC ] 2 ; <name> BEL` — built from a name
-/// [`sanitize`] has already filtered.
+/// `sanitize` has already filtered.
 ///
 /// A newtype with a private field, so [`TerminalTitle::named`] is the only way
 /// to have one. The variant used to carry a bare `String` whose doc comment
@@ -119,7 +119,7 @@ impl TerminalTitle {
     }
 
     /// The rule: name the terminal unless the variable says not to, there is no
-    /// terminal to name, or nothing survives [`sanitize`].
+    /// terminal to name, or nothing survives `sanitize`.
     ///
     /// `terminal` is stderr's, because stderr is the stream the escape is
     /// written to — `wf > log` is still a session in a window, and `wf` piped
