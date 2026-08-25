@@ -182,6 +182,7 @@ impl Scratch {
         // the wrong child, or left an inherited one on a probe, is invisible in
         // an argv. Always written, empty when unset, so "the variable is not
         // here" is a value this file can read rather than a missing line.
+
         let record = |report: &Path| {
             format!(
                 "line=$({{ echo \"{INVOCATION}\"; echo \"pid=$$\"; echo \"cwd=$PWD\"; \
@@ -836,6 +837,27 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
         "wf never made the cursor visible again before handing over — \
          the agent inherits an invisible cursor"
     );
+
+    // Claim 3c: the terminal came back with a *name* on it — the node that was
+    // launched — written by `wf` and by nothing else here.
+    //
+    // Asserted on `handover`, the stream up to the agent's own first byte,
+    // which is what makes it `wf`'s escape rather than something the shim or
+    // the shell could have written. On a real launch `dl` writes its own name
+    // over this one a moment later; the shim writes none, so what is observable
+    // here is exactly `wf`'s half.
+    let named = format!("\x1b]2;wayfinder#{workspace_ticket}\x07");
+    assert!(
+        contains(handover, named.as_bytes()),
+        "wf must name the terminal after the node it launched, expected {named:?}"
+    );
+    // The other half of the feature is not `wf`'s on this arm and so is not
+    // observable here: inside a container the agent's own titling is quieted
+    // from the login profile `dl` writes, which every `bash -lc` payload reads
+    // (devlaunch#436). What `wf` does on the *host* arm — the same variable, set
+    // on the child it becomes — has no container and no `dl` in it, so it is
+    // pinned in the library instead
+    // (`a_host_launch_is_the_one_that_has_to_quiet_the_agent_itself`).
 
     // Claim 4: the agent can actually *run* the skill it was just handed. The
     // prompt is a slash command, so a link the agent cannot resolve is not an

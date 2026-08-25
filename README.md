@@ -1245,6 +1245,60 @@ a hand-over measured from a keystroke hours old. The same clearing covers every
 up`, and `wf reap`'s listing and removals — because `wf` run inside a workspace
 starts with the stamps of the launch that built it already in its environment.
 
+### The name on the terminal
+
+A launch is a session you switch away from: five tickets are five terminals, and
+from outside the only thing telling them apart is the window — or multiplexer
+tab — name. So a launch **names it after the node it launched**, `wayfinder#191`,
+the same key the picker's row and the launch notice show. One OSC 2 escape,
+written to stderr as the last thing before the process is replaced.
+
+**And it tells the agent to leave that name alone.** Claude Code rewrites the
+terminal title continuously while it runs, from its own read of what the session
+is doing, and a terminal takes the last writer's word for it — so the escape `wf`
+writes and the agent's are not two signals but one contest, and `wf` loses it
+within a second of handing over. A launch therefore sets
+`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` for the agent it starts, which is Claude
+Code's own variable and the same one `aid` sets on the `claude` it starts
+(blooop/devlaunch#436).
+
+**Only on the host arm**, because that is the only arm where `wf` is the thing
+that could do it. A host launch execs the agent itself, so the variable goes on
+that process. An isolated launch becomes `dl` — whose environment no container
+shell inherits, since a container's is built on the far side of an ssh — and
+since devlaunch#436 (`dl` 0.14.0) `dl`'s title stage exports the same variable
+into the container's login profile, which every `dl <ws> -- <cmd>` payload reads,
+because those run under `bash -lc`. That is the fix for a `claude` *you* type at
+a workspace prompt, and it covers a `claude` `wf` starts there for the same
+reason. `wf` could carry it in the payload instead — `env
+CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude …`, spelt with `env` because `exec
+VAR=1 claude` is bash hunting for a program called `VAR=1` — and deliberately
+does not: it is a second mechanism for a job the container arm already does, and
+the half that owns the container owns what its shells export.
+
+The name is `dl`'s there too: it writes the workspace spec,
+`blooop/wayfinder@wayfinder/wayfinder-191`, over `wf`'s a moment later, which is
+its call to make about a terminal it is taking over. `wf` writes its own name
+anyway rather than guessing — if `dl`'s titling is switched off, `wf`'s is the
+name that stands, and the window is never left wearing what some session hours
+ago called it.
+
+**`WF_NO_TITLE`** turns the whole thing off — the escape and the quieting
+together, since a name nobody wrote is a name nothing has to protect, and an
+agent silenced with nothing put in its place is the stale-title case above.
+Anything set is off, including a value this list never anticipated; `0`, `false`,
+`no` and the empty string are how you turn it back on without unsetting it. That
+is the opposite reading to `WF_PREWARM`'s allowlist, and deliberately: the cost
+of being wrong here is one escape sequence nobody wanted, where there it would be
+clones and containers nobody asked for. `dl`'s own `DEVLAUNCH_NO_TITLE` is not
+consulted — it governs `dl`'s escape, and somebody who turned that off has said
+nothing about whether `wf` may name the terminal it is handing over.
+
+**Codex is left to name the terminal however it likes.** Whether `codex` writes
+titles, and what it would read if it does, is not something this repo has a
+source for — and a guessed variable name is worse than the gap, because it looks
+like a fix. devlaunch#436 leaves `codex` and `gemini` open for the same reason.
+
 ### `wf reap` — clearing away finished tickets
 
 A workspace per ticket means workspaces accumulate as fast as tickets are

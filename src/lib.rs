@@ -53,5 +53,6 @@ pub mod reap;
 pub mod reclaim;
 pub mod refresh;
 pub mod skills;
+pub mod title;
 pub mod ui;
 pub mod view;
