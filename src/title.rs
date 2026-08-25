@@ -62,16 +62,36 @@ pub const DISABLE_VAR: &str = "WF_NO_TITLE";
 /// anticipated, turns it off.
 const FALSEY: [&str; 4] = ["", "0", "false", "no"];
 
+/// One complete OSC 2 sequence — `ESC ] 2 ; <name> BEL` — built from a name
+/// [`sanitize`] has already filtered.
+///
+/// A newtype with a private field, so [`TerminalTitle::named`] is the only way
+/// to have one. The variant used to carry a bare `String` whose doc comment
+/// *said* "a complete OSC 2 sequence": a claim about a payload anything in the
+/// crate could fill with anything, which put the module's one guarantee — that
+/// no name reaches a terminal carrying escapes of its own — in a comment rather
+/// than in the types. The arms themselves stay public because callers construct
+/// [`TerminalTitle::Off`] to mean "not titling".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Osc(String);
+
+impl Osc {
+    /// The bytes to write.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// What this launch has to say about the terminal's name.
 ///
-/// Two arms rather than an `Option<String>` so the type says what it is at
+/// Two arms rather than an `Option<Osc>` so the type says what it is at
 /// every site that carries it, including the one that only asks whether
 /// anything is named at all ([`TerminalTitle::is_named`], which is how the
 /// quieting decision is taken from the same value as the escape).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalTitle {
-    /// Write exactly this — a complete OSC 2 sequence, terminator and all.
-    Write(String),
+    /// Write exactly this, terminator and all — see [`Osc`].
+    Write(Osc),
     /// Write nothing, and let the agent name the terminal however it likes.
     Off,
 }
@@ -109,7 +129,7 @@ impl TerminalTitle {
             return TerminalTitle::Off;
         }
         match sanitize(name) {
-            Some(text) => TerminalTitle::Write(format!("\x1b]2;{text}\x07")),
+            Some(text) => TerminalTitle::Write(Osc(format!("\x1b]2;{text}\x07"))),
             None => TerminalTitle::Off,
         }
     }
@@ -118,7 +138,7 @@ impl TerminalTitle {
     /// it.
     pub fn osc(&self) -> Option<&str> {
         match self {
-            TerminalTitle::Write(osc) => Some(osc),
+            TerminalTitle::Write(osc) => Some(osc.as_str()),
             TerminalTitle::Off => None,
         }
     }
@@ -215,7 +235,7 @@ mod tests {
         // an undecodable value as "unset" would name their terminal anyway and
         // silence their agent against their wish.
         use std::os::unix::ffi::OsStrExt;
-        let raw = std::ffi::OsStr::from_bytes(b"\xff1");
+        let raw = OsStr::from_bytes(b"\xff1");
         assert_eq!(
             TerminalTitle::named("wayfinder#191", Some(raw), true),
             TerminalTitle::Off
