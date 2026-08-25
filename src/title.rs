@@ -48,6 +48,7 @@
 //! and somebody who turned that off has said nothing about whether `wf` may
 //! name the terminal it is handing over.
 
+use std::ffi::OsStr;
 use std::io::{IsTerminal, Write};
 
 /// `WF_NO_TITLE`: do not name the terminal after the launch, and leave the
@@ -82,10 +83,16 @@ impl TerminalTitle {
     /// The only impure entry point, and it does nothing but gather the two
     /// inputs [`TerminalTitle::named`] decides from — so every rule is testable
     /// without mutating an environment the rest of the suite shares.
+    ///
+    /// `var_os` rather than `var`: an environment variable is bytes, and a
+    /// `var().ok()` reads one that is not UTF-8 as *unset*, which for an
+    /// opt-out means honouring `WF_NO_TITLE=$'\xff1'` by titling anyway. The
+    /// undecodable case belongs to whichever answer is safe, and here that is
+    /// "they asked for it off".
     pub fn wanted(name: &str) -> TerminalTitle {
         TerminalTitle::named(
             name,
-            std::env::var(DISABLE_VAR).ok().as_deref(),
+            std::env::var_os(DISABLE_VAR).as_deref(),
             std::io::stderr().is_terminal(),
         )
     }
@@ -97,7 +104,7 @@ impl TerminalTitle {
     /// written to — `wf > log` is still a session in a window, and `wf` piped
     /// into something is not a launch at all, since the picker cannot be driven
     /// without a tty.
-    pub fn named(name: &str, no_title: Option<&str>, terminal: bool) -> TerminalTitle {
+    pub fn named(name: &str, no_title: Option<&OsStr>, terminal: bool) -> TerminalTitle {
         if switched_off(no_title) || !terminal {
             return TerminalTitle::Off;
         }
@@ -139,10 +146,17 @@ impl TerminalTitle {
 
 /// Whether a value of [`DISABLE_VAR`] turns the feature off. Set to anything
 /// but a [`FALSEY`] spelling, trimmed and case-folded.
-fn switched_off(value: Option<&str>) -> bool {
+///
+/// Lossy rather than fallible, for the reason [`TerminalTitle::wanted`] reads
+/// bytes: a value that does not decode is a value somebody set, and every
+/// spelling that leaves the feature on is plain ASCII, so no lossy replacement
+/// can turn one of those into something else.
+fn switched_off(value: Option<&OsStr>) -> bool {
     match value {
         None => false,
-        Some(value) => !FALSEY.contains(&value.trim().to_ascii_lowercase().as_str()),
+        Some(value) => {
+            !FALSEY.contains(&value.to_string_lossy().trim().to_ascii_lowercase().as_str())
+        }
     }
 }
 
@@ -194,6 +208,21 @@ mod tests {
     }
 
     #[test]
+    fn a_value_no_encoding_could_read_still_turns_the_title_off() {
+        // The direction the rule is *for*, applied to the one value that is not
+        // a string: `WF_NO_TITLE=$'\xff1'`. An opt-out asked for by somebody
+        // whose shell put a stray byte in it is still an opt-out, and reading
+        // an undecodable value as "unset" would name their terminal anyway and
+        // silence their agent against their wish.
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"\xff1");
+        assert_eq!(
+            TerminalTitle::named("wayfinder#191", Some(raw), true),
+            TerminalTitle::Off
+        );
+    }
+
+    #[test]
     fn the_disable_variable_is_an_opt_out_and_unrecognised_means_off() {
         // The direction that matters: anything set is "off", because the cost
         // of reading a value nobody anticipated as off is one title, while
@@ -202,7 +231,7 @@ mod tests {
         // is not a request to keep titling.
         for set in ["1", "true", "yes", "on", "please", "  1  "] {
             assert_eq!(
-                TerminalTitle::named("wayfinder#191", Some(set), true),
+                TerminalTitle::named("wayfinder#191", Some(OsStr::new(set)), true),
                 TerminalTitle::Off,
                 "{set:?} must turn the title off"
             );
@@ -213,7 +242,7 @@ mod tests {
         // by accident, and exporting nothing must not disable a feature.
         for unset in ["", "0", "false", "no", "FALSE", " no "] {
             assert!(
-                TerminalTitle::named("wayfinder#191", Some(unset), true).is_named(),
+                TerminalTitle::named("wayfinder#191", Some(OsStr::new(unset)), true).is_named(),
                 "{unset:?} must leave the title on"
             );
         }
