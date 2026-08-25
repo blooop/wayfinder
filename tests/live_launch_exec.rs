@@ -91,6 +91,13 @@ const COOKED: [&str; 4] = ["echo", "icanon", "isig", "opost"];
 /// the records are told apart.
 const INVOCATION: &str = "--- shim invocation ---";
 
+/// A `dl` that is installed and **below** [`wf::launch::DEVLAUNCH_FLOOR`], which
+/// is what sends a launch to the host arm (#80) without taking anybody's real
+/// `dl` off PATH. Far below rather than one patch below, for the same reason
+/// [`DL_SHIM_VERSION`] is far above: the floor's own rule is unit-tested, and
+/// this file should not need editing when it moves.
+const DL_STALE_VERSION: &str = "0.0.1";
+
 /// What the `dl` shim answers `--version` with. See `write_shims`.
 const DL_SHIM_VERSION: &str = "9999.0.0";
 
@@ -157,6 +164,19 @@ impl Scratch {
     /// the spawned `wf` to `claude`, and the shell that parses the quoted
     /// command is a genuine one rather than this test's idea of one.
     fn write_shims(&self) {
+        self.write_shims_reporting(DL_SHIM_VERSION);
+    }
+
+    /// The same pair, with `dl --version` answering whatever is asked for.
+    ///
+    /// One caller wants a `dl` above any floor and one wants a `dl` below it:
+    /// [`DL_STALE_VERSION`] is how the host-arm test reaches the host arm on a
+    /// machine that has a real `dl` installed. Shadowing rather than removing —
+    /// the scratch bin leads PATH, so the version this answers with is the
+    /// version `wf` sees, and no directory of the developer's toolchain has to
+    /// be taken away to arrange it (`scripts/without-dl.sh` says at length why
+    /// dropping PATH entries is the wrong tool).
+    fn write_shims_reporting(&self, version: &str) {
         // **Appended, one record per invocation**, rather than a file each
         // shim overwrites. A shim is called more than once per run — `wf` asks
         // `dl --version` before it will trust it with a launch — and the
@@ -182,11 +202,18 @@ impl Scratch {
         // the wrong child, or left an inherited one on a probe, is invisible in
         // an argv. Always written, empty when unset, so "the variable is not
         // here" is a value this file can read rather than a missing line.
+        //
+        // `notitle` is the variable that stops the agent renaming the terminal
+        // a launch just named, and it is read the same way and for the same
+        // reason: on the host arm `wf` sets it on the process it becomes, which
+        // is invisible in an argv, and the host test starts `wf` with it
+        // *removed* so a `1` here can only have come from `wf`.
         let record = |report: &Path| {
             format!(
                 "line=$({{ echo \"{INVOCATION}\"; echo \"pid=$$\"; echo \"cwd=$PWD\"; \
                  echo \"argv=$*\"; echo \"handoff=$DEVLAUNCH_HANDOFF_T0\"; \
-                 echo \"prewarm=$DEVLAUNCH_PREWARM_FIRED_AT\"; stty -a; }} 2>&1)\n\
+                 echo \"prewarm=$DEVLAUNCH_PREWARM_FIRED_AT\"; \
+                 echo \"notitle=$CLAUDE_CODE_DISABLE_TERMINAL_TITLE\"; stty -a; }} 2>&1)\n\
                  printf '%s\\n' \"$line\" >> {}\n",
                 report.display()
             )
@@ -208,7 +235,7 @@ impl Scratch {
         // for, and this test should not have to be edited every time it moves.
         let dl = format!(
             "#!/usr/bin/env bash\n{}\
-             if [ \"$1\" = \"--version\" ]; then printf 'dl {DL_SHIM_VERSION}\\n'; exit 0; fi\n\
+             if [ \"$1\" = \"--version\" ]; then printf 'dl {version}\\n'; exit 0; fi\n\
              exec bash -c \"exec $3\"\n",
             record(&self.dl_report())
         );
@@ -837,6 +864,22 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
          the agent inherits an invisible cursor"
     );
 
+    // Claim 3c: `wf` wrote no name on this arm, and that is the rule rather
+    // than an omission. `dl` names the terminal it is taking over — the
+    // workspace spec, and its own `PS1` line keeps it — and quiets the agent
+    // from the container's login profile (devlaunch#436), so an escape from
+    // `wf` here would be replaced within the second or left to an agent that
+    // renames it continuously. A name only goes where the same launch can keep
+    // it, which is the host arm, and
+    // `the_host_arm_names_the_terminal_and_keeps_the_name` drives that one.
+    //
+    // Asserted on `handover`, the stream up to the agent's own first byte,
+    // because the shim writes no title of its own: any OSC 2 in there is `wf`'s.
+    assert!(
+        !contains(handover, b"\x1b]2;"),
+        "an isolated launch must leave the terminal's name to dl"
+    );
+
     // Claim 4: the agent can actually *run* the skill it was just handed. The
     // prompt is a slash command, so a link the agent cannot resolve is not an
     // error anywhere near here — it is `Unknown command: /wf-tdd` inside the
@@ -904,6 +947,131 @@ fn enter_execs_the_agent_into_a_per_ticket_workspace_and_leaves_no_wf_behind() {
             "only a launch is stamped, and this is not one:\n{aside}"
         );
     }
+}
+
+/// The host arm: `wf` names the terminal after the node it launched, and the
+/// agent it hands over to is told to leave that name alone.
+///
+/// The arm where both halves are `wf`'s, and the only arm where either is. An
+/// isolated launch hands the terminal to `dl`, which writes its own name over
+/// anything `wf` wrote and quiets the agent from the container's login profile
+/// (blooop/devlaunch#436) — so on that arm `wf` deliberately writes nothing, and
+/// the test above asserts exactly that. Here there is no container, no profile
+/// and no `dl` in the picture at all: what happens to the window is `wf`'s doing
+/// or nobody's.
+///
+/// Reached by a `dl` **below the version floor** rather than by an absent one.
+/// The scratch bin leads PATH, so the shim's `0.0.1` is the version `wf` sees
+/// whatever the developer has installed, and #80's rule sends the launch to the
+/// host. Dropping PATH entries would have been the other way, and the wrong one:
+/// `dl` is installed beside `gh` by the same `pixi global install`, so the
+/// obvious filter takes the tracker with it (`scripts/without-dl.sh`).
+///
+/// Both claims are only observable on a real launch. The escape is a byte fact
+/// about the stream before the agent's first output, and the variable is a fact
+/// about the environment `execvp` handed over — neither is in an argv, and the
+/// library can only assert the decision, not the handover.
+#[test]
+#[ignore = "live: needs network, gh, a blooop/wayfinder checkout, and a pty"]
+fn the_host_arm_names_the_terminal_and_keeps_the_name() {
+    let scratch = Scratch::new("host-title");
+    scratch.write_shims_reporting(DL_STALE_VERSION);
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let (master, slave) = openpty_sized(40, 120);
+    let path = format!(
+        "{}:{}",
+        scratch.bin().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = unsafe {
+        Command::new(env!("CARGO_BIN_EXE_wf"))
+            .current_dir(repo)
+            .env("PATH", &path)
+            .env("XDG_CACHE_HOME", scratch.cache())
+            .env("CLAUDE_CONFIG_DIR", scratch.claude())
+            .env("TERM", "xterm-256color")
+            // The claim about the variable is a claim about `wf` only if `wf`
+            // did not inherit it: an agent session run by `aid` or inside a
+            // provisioned workspace has it set already, and this suite is
+            // routinely run from one. Removed, so a `1` in the shim's record
+            // has exactly one possible author.
+            .env_remove("CLAUDE_CODE_DISABLE_TERMINAL_TITLE")
+            .stdin(Stdio::from(slave.try_clone().expect("dup slave")))
+            .stdout(Stdio::from(slave.try_clone().expect("dup slave")))
+            .stderr(Stdio::from(slave.try_clone().expect("dup slave")))
+            .pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .spawn()
+            .expect("spawn wf under a pty")
+    };
+    let mut keys = std::fs::File::from(master.try_clone().expect("dup master"));
+    drop(slave);
+    let seen = spawn_reader(master);
+
+    launch_the_first_ticket(&mut keys, &seen, "▶ interactive");
+    let stream = wait_for(&seen, RAN, Duration::from_secs(30), "the agent to run");
+    let screen = String::from_utf8_lossy(&stream).into_owned();
+    let status = child.wait().expect("wait for the exec'd agent");
+    assert!(status.success(), "the agent exited {status}\n{screen}");
+
+    let claude_report =
+        std::fs::read_to_string(scratch.report()).expect("the claude shim's report");
+    let report = invocation(&claude_report, "claude", 0, 1);
+
+    // The arm, asserted rather than assumed: a `dl` this old is asked its
+    // version and then never used, so a launch record here would mean the floor
+    // let it through and this test is measuring the other arm.
+    let dl_report = std::fs::read_to_string(scratch.dl_report()).expect("the dl shim's report");
+    assert!(
+        dl_launches(&dl_report).is_empty(),
+        "a `dl` below the floor must not be handed the launch:\n{dl_report}"
+    );
+    assert_eq!(
+        Path::new(field(report, "cwd=")).canonicalize().ok(),
+        repo.canonicalize().ok(),
+        "a host launch runs the agent in the picked checkout"
+    );
+
+    // Which node this run happened to take is the live tracker's business, so
+    // the name is checked against the prompt rather than against a number this
+    // file chose: the last numeric argument of the skill invocation is the node
+    // (`/wf <map> <n>`, `/wf-tdd <n>`), and the terminal has to be wearing that
+    // one. Same source of truth as the workspace check in the test above, which
+    // is the point — the row, the prompt and the window name all say one node.
+    let argv = field(report, "argv=");
+    let (_, prompt) = argv.split_once(' ').expect("a switch and a prompt");
+    let invocation = prompt.split(" ctx: ").next().expect("a skill invocation");
+    let node = invocation
+        .split_whitespace()
+        .next_back()
+        .expect("an argument");
+    assert!(
+        node.chars().all(|c| c.is_ascii_digit()) && !node.is_empty(),
+        "the last argument of {invocation:?} is the node"
+    );
+    let handover = &stream[..stream
+        .windows(RAN.len())
+        .position(|w| w == RAN.as_bytes())
+        .expect("the marker is in the stream")];
+    let named = format!("\x1b]2;wayfinder#{node}\x07");
+    assert!(
+        contains(handover, named.as_bytes()),
+        "wf must name the terminal after the node it launched, expected {named:?}"
+    );
+    assert_eq!(
+        field(report, "notitle="),
+        "1",
+        "the agent must be told to leave that name alone, or it is gone within \
+         a second of the session starting"
+    );
 }
 
 /// Spawn `wf` under a fresh pty in `scratch`, returning the child, a handle to

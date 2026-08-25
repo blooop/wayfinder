@@ -1245,6 +1245,68 @@ a hand-over measured from a keystroke hours old. The same clearing covers every
 up`, and `wf reap`'s listing and removals — because `wf` run inside a workspace
 starts with the stamps of the launch that built it already in its environment.
 
+### The name on the terminal
+
+A launch is a session you switch away from: five tickets are five terminals, and
+from outside the only thing telling them apart is the window — or multiplexer
+tab — name. So a launch **names it after the node it launched**, `wayfinder#191`,
+the same key the picker's row and the launch notice show. One OSC 2 escape,
+written to stderr as the last thing before the process is replaced.
+
+**And it tells the agent to leave that name alone.** Claude Code rewrites the
+terminal title continuously while it runs, from its own read of what the session
+is doing, and a terminal takes the last writer's word for it — so the escape `wf`
+writes and the agent's are not two signals but one contest, and `wf` loses it
+within a second of handing over. A launch therefore sets
+`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` for the agent it starts, which is Claude
+Code's own variable and the same one `aid` sets on the `claude` it starts
+(blooop/devlaunch#436).
+
+**Both halves are the host arm's, and neither happens anywhere else.** That is
+one rule rather than two decisions: a name is written only where the same launch
+can keep it. On the host arm `wf` execs the agent itself, so it writes the escape
+and sets the variable on that process, and nothing else is involved — no
+container, no login profile, no setup stage.
+
+**An isolated launch writes nothing and sets nothing, because the terminal is
+`dl`'s from the moment `wf` hands it over.** `dl` names it after the workspace
+spec — `blooop/wayfinder@wayfinder/wayfinder-191` — and repaints that at every
+prompt, and since devlaunch#436 (`dl` 0.14.0) the same title stage exports the
+suppression into the container's login profile, which a `dl <ws> -- <cmd>`
+payload reads because those run under `bash -lc`. An escape from `wf` there would
+be replaced within the second; and a `wf` that quieted the agent would be a
+second mechanism for a job the half that owns the container already does. (`wf`
+could carry it in the payload as `env CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 claude
+…` — spelt with `env` because `exec VAR=1 claude` is bash hunting for a program
+called `VAR=1` — and did until 0.14.0 shipped.)
+
+**Two container cases that leaves alone, both `dl`-side and stated rather than
+implied.** The profile line exists only in a workspace that has been through a
+`dl` ≥ 0.14.0 `up`: an attach to a container that is already running provisions
+nothing, so a workspace last set up by an older `dl` keeps titling as it did
+until it next cycles. And `DEVLAUNCH_NO_TITLE` governs all three of `dl`'s pieces
+together, the export included — so with it set, a container session is claude's
+to name, exactly as before any of this. `wf` does not read that variable and does
+not paper over either case: on that arm `wf` is not the writer, and a name it
+could not keep is a name it should not write.
+
+**`WF_NO_TITLE`** turns the whole thing off — the escape and the quieting
+together, since a name nobody wrote is a name nothing has to protect, and an
+agent silenced with nothing put in its place is the stale-title case above.
+Anything set is off, including a value this list never anticipated and one no
+encoding can read; `0`, `false`, `no` and the empty string are how you turn it
+back on without unsetting it. That
+is the opposite reading to `WF_PREWARM`'s allowlist, and deliberately: the cost
+of being wrong here is one escape sequence nobody wanted, where there it would be
+clones and containers nobody asked for. `dl`'s own `DEVLAUNCH_NO_TITLE` is not
+consulted — it governs `dl`'s escape, and somebody who turned that off has said
+nothing about whether `wf` may name the terminal it is handing over.
+
+**Codex is left to name the terminal however it likes.** Whether `codex` writes
+titles, and what it would read if it does, is not something this repo has a
+source for — and a guessed variable name is worse than the gap, because it looks
+like a fix. devlaunch#436 leaves `codex` and `gemini` open for the same reason.
+
 ### `wf reap` — clearing away finished tickets
 
 A workspace per ticket means workspaces accumulate as fast as tickets are

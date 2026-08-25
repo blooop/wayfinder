@@ -26,6 +26,10 @@
 //! The checkout keeps two jobs: declaring the devcontainer, and hosting
 //! host-mode launches.
 //!
+//! The terminal a launch hands over is also **named** after the node it
+//! launched, and the agent is told to leave that name alone — [`crate::title`]
+//! for both halves and why either alone is worth nothing.
+//!
 //! The one thing that can go wrong is ordering: the terminal must be restored
 //! *before* the image is replaced, because after that there is no `wf` left to
 //! do it. So this module never restores anything and never `exec`s itself off
@@ -42,6 +46,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{MapId, PrLink, Stage, Ticket, TicketType};
 use crate::projects::{Checkout, Resume, Session};
+use crate::title::TerminalTitle;
+
+/// What Claude Code reads to leave the terminal's name alone — the name being
+/// the one a launch just wrote ([`crate::title`]).
+///
+/// Claude Code's own variable, not `wf`'s to spell differently: `wf` is a
+/// writer of it and a writer that invented its own name would be setting
+/// nothing. `aid` sets the same variable on the `claude` it starts
+/// (blooop/devlaunch#436), and the two agree because they are the same fix
+/// applied by whoever started the agent.
+const CLAUDE_QUIET_TITLE_VAR: &str = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE";
 
 /// Which interactive coding agent `wf` becomes after a launch.
 ///
@@ -118,6 +133,29 @@ impl Agent {
         match self {
             Agent::Claude => "--dangerously-skip-permissions",
             Agent::Codex => "--dangerously-bypass-approvals-and-sandbox",
+        }
+    }
+
+    /// The variable that stops this CLI from renaming the terminal a launch
+    /// has just named, or `None` for one with no such variable.
+    ///
+    /// Claude Code writes the title continuously while it runs, so it and the
+    /// escape a launch writes are one contest rather than two signals, and the
+    /// agent wins every round after the first
+    /// ([`crate::title`], blooop/devlaunch#436). Setting this is what makes
+    /// naming the terminal worth doing at all.
+    ///
+    /// **Codex gets `None`, and that is a gap rather than a claim.** Whether
+    /// `codex` writes titles, and what it would read if it does, is not
+    /// something this repo has a source for — and a guessed variable name is
+    /// worse than an unfixed gap, because it looks like a fix. A Codex launch
+    /// therefore names the terminal and lets `codex` rename it, which is the
+    /// same thing that happens today. devlaunch#436 leaves `codex` and
+    /// `gemini` open for the same reason.
+    fn quiet_title_var(self) -> Option<&'static str> {
+        match self {
+            Agent::Claude => Some(CLAUDE_QUIET_TITLE_VAR),
+            Agent::Codex => None,
         }
     }
 
@@ -1992,6 +2030,64 @@ impl Launch {
         }
     }
 
+    /// What this launch is about to call the terminal, if anything.
+    ///
+    /// **The host arm's, and only the host arm's.** An isolated launch writes
+    /// nothing, because there is nothing a name written here could survive:
+    /// `dl` writes its own escape — the workspace spec — over anything `wf` put
+    /// there a moment earlier, and where `dl`'s titling is switched off
+    /// (`DEVLAUNCH_NO_TITLE`) the title stage is what does not run, which is
+    /// also the stage that exports claude's suppression
+    /// ([`Launch::quiet_title_var`]). So on that arm the name is either
+    /// replaced within the second or left to an agent that renames it
+    /// continuously, and in both cases what `wf` wrote is gone. Writing it
+    /// anyway would break the one rule this feature holds: a name is written
+    /// only where the same launch can keep it.
+    ///
+    /// The host arm is the arm with nothing else in it — no container, no login
+    /// profile, no setup stage — so there `wf` is both the only writer and the
+    /// only thing that can keep what it wrote.
+    fn terminal_title(&self) -> TerminalTitle {
+        match self.isolation {
+            Isolation::Host => TerminalTitle::wanted(&self.key()),
+            Isolation::Devlaunch => TerminalTitle::Off,
+        }
+    }
+
+    /// The variable this launch sets on the process it becomes so the terminal
+    /// keeps the name it just wrote, or `None` where there is nothing to set.
+    ///
+    /// Two ways to get `None`. Nothing is being named — which on an isolated
+    /// launch is always ([`Self::terminal_title`]), and on a host launch is
+    /// `WF_NO_TITLE` or a stderr that is not a terminal. Or the agent has no
+    /// such variable ([`Agent::quiet_title_var`]).
+    ///
+    /// One question behind both halves of the feature, which is what keeps
+    /// either from happening without the other: an escape overwritten a second
+    /// later is a feature that does not work, and an agent silenced with
+    /// nothing put in its place leaves the window wearing what some session
+    /// hours ago called it.
+    ///
+    /// Inside a container this is `dl`'s job and not `wf`'s. Nothing `wf` sets
+    /// here would reach the agent anyway — the process this becomes is `dl`, and
+    /// a container's environment is built on the far side of an ssh — and since
+    /// blooop/devlaunch#436 (`dl` 0.14.0) the title stage exports the same
+    /// variable into the container's login profile, which every
+    /// `dl <ws> -- <cmd>` payload reads, because those run under `bash -lc`.
+    /// `wf` could carry it in the payload instead (`env VAR=1 claude …`, since
+    /// `exec VAR=1 claude` is bash hunting for a program called `VAR=1`), and
+    /// did until `dl` 0.14.0 shipped: it is a second mechanism for a job the
+    /// half that owns the container already does. What that leaves uncovered is
+    /// stated in the README rather than implied here — a workspace last
+    /// provisioned by an older `dl`, and a `DEVLAUNCH_NO_TITLE` that takes the
+    /// export with it.
+    fn quiet_title_var(&self, title: &TerminalTitle) -> Option<&'static str> {
+        if !title.is_named() {
+            return None;
+        }
+        self.agent().quiet_title_var()
+    }
+
     /// What this launch tells the process it is about to become about the
     /// keystroke it came from ([`Handoff`]) — one entry per seam variable, in
     /// the published order, and `None` for one this launch has nothing to say
@@ -2044,6 +2140,11 @@ impl Launch {
     /// literally and always starts it with the program name, so the split below
     /// cannot come up empty. The `expect` is there to say so.
     pub fn exec(&self, handoff: &Handoff) -> anyhow::Error {
+        // What this terminal is about to be called, decided once and read
+        // twice: the escape written below, and the quieting that keeps it
+        // ([`Launch::quiet_title_var`]). One value behind both, so a launch
+        // cannot write a name it then lets the agent overwrite.
+        let title = self.terminal_title();
         let argv = self.agent_argv();
         let (program, rest) = argv.split_first().expect("agent argv is never empty");
 
@@ -2082,6 +2183,19 @@ impl Launch {
                 None => command.env_remove(var),
             };
         }
+        // What keeps the name written below from being renamed a second later,
+        // on the one arm where `wf` is the only thing that could set it — see
+        // [`Launch::quiet_title_var`] for why an isolated launch sets nothing.
+        // Set, never removed: a `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` somebody
+        // exported themselves is their setting, and turning `wf`'s titling off
+        // is not a licence to undo it.
+        if let Some(var) = self.quiet_title_var(&title) {
+            command.env(var, "1");
+        }
+        // Last, and after every check that could still turn this into an error
+        // rather than a launch: a `wf` that failed to resolve the agent has not
+        // handed the terminal to anything, so it has no business renaming it.
+        title.write();
         // `CommandExt::exec` only ever returns on failure.
         let err = command.exec();
         // Quoted, so the prompt reads as the single argument it is — the whole
@@ -4599,6 +4713,121 @@ mod tests {
         assert_eq!(
             changed, expected,
             "a `dl` that is not the launch clears both stamps and sets neither"
+        );
+    }
+
+    /// A terminal that is being named — what [`TerminalTitle::wanted`] returns
+    /// on a tty with `WF_NO_TITLE` unset, spelled here as a literal so these
+    /// tests decide nothing from the environment they run in.
+    fn named() -> TerminalTitle {
+        let title = TerminalTitle::named("wayfinder#80", None, true);
+        assert!(title.is_named(), "the fixture is a named terminal");
+        title
+    }
+
+    #[test]
+    fn an_isolated_launch_names_nothing_because_nothing_it_wrote_would_last() {
+        // The rule the feature holds: a name is written only where the same
+        // launch can keep it. On this arm `dl` replaces `wf`'s escape with the
+        // workspace spec within the second, and where `dl`'s titling is off it
+        // is the title stage that does not run — the same stage that exports
+        // claude's suppression — so an escape from `wf` would be overwritten
+        // either by `dl` or by the agent. Both halves therefore say nothing
+        // here, and this is asserted on the arm rather than on the environment:
+        // `terminal_title` cannot ask about `WF_NO_TITLE` or a tty and reach
+        // any other answer.
+        let launch = isolated(Route::Tdd, interactive(""));
+        assert_eq!(launch.terminal_title(), TerminalTitle::Off);
+        assert_eq!(launch.quiet_title_var(&launch.terminal_title()), None);
+    }
+
+    #[test]
+    fn an_isolated_launch_leaves_the_quieting_to_dl() {
+        // Nothing is prefixed onto the payload either — the arm sets nothing
+        // *and* carries nothing. Two reasons, either alone enough: the process
+        // this launch becomes is `dl`, whose environment no container shell
+        // inherits, and `dl` 0.14.0 exports the same variable from the
+        // container's login profile, which every `dl <ws> -- <cmd>` reads since
+        // those run under `bash -lc` (blooop/devlaunch#436). The decision
+        // itself is pinned above, on the launch's own title.
+        let launch = isolated(Route::Tdd, interactive(""));
+        let argv = launch.agent_argv();
+        assert_eq!(argv.first().map(String::as_str), Some(DEVLAUNCH));
+        assert!(
+            argv.last()
+                .expect("a payload")
+                .starts_with("'claude' '--dangerously-skip-permissions'"),
+            "the payload is the agent's own command and nothing in front of it: \
+             {argv:?}"
+        );
+    }
+
+    #[test]
+    fn a_host_launch_is_the_one_that_has_to_quiet_the_agent_itself() {
+        // The arm with nothing else in it: no container, no profile, no stage.
+        // `wf` execs the agent, so `wf` is the only thing that can name that
+        // terminal — and the only thing that can stop the agent renaming it.
+        // The variable goes on the child, never into the argv: there is no
+        // shell there to read an assignment, and an `env` in front of the
+        // program would make the process `wf` becomes an `env`.
+        let launch = on_the_host(Route::Tdd, interactive(""));
+        assert_eq!(
+            launch.quiet_title_var(&named()),
+            Some("CLAUDE_CODE_DISABLE_TERMINAL_TITLE"),
+        );
+        assert_eq!(
+            launch.agent_argv().first().map(String::as_str),
+            Some("claude"),
+            "the process `wf` becomes is the agent itself"
+        );
+    }
+
+    #[test]
+    fn a_terminal_nobody_is_naming_quiets_nothing() {
+        // One value over both halves ([`crate::title`]): with the titling off
+        // there is no name to protect, and an agent silenced with nothing put
+        // in its place leaves the window wearing what a session hours ago
+        // called it.
+        assert_eq!(
+            on_the_host(Route::Tdd, interactive("")).quiet_title_var(&TerminalTitle::Off),
+            None
+        );
+        assert_eq!(
+            isolated(Route::Tdd, interactive("")).quiet_title_var(&TerminalTitle::Off),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_is_left_to_name_the_terminal_however_it_likes() {
+        // A gap stated rather than papered over: nothing here has a source for
+        // what `codex` would read, and a guessed variable name is worse than
+        // an unfixed gap because it looks like a fix (devlaunch#436 leaves
+        // `codex` and `gemini` open for the same reason). So a Codex launch
+        // names the terminal and takes its chances.
+        //
+        // On the host, which is where a Codex launch actually goes
+        // (`codex_stays_on_the_host_even_when_the_checkout_declares_a_devcontainer`)
+        // and so the one arm where a variable would have been set.
+        let codex = LaunchMode::picked(Agent::Codex, Mode::Interactive, "");
+        assert_eq!(
+            on_the_host(Route::Tdd, codex).quiet_title_var(&named()),
+            None
+        );
+        assert_eq!(Agent::Codex.quiet_title_var(), None);
+    }
+
+    #[test]
+    fn the_terminal_is_named_after_the_node_that_was_launched() {
+        // The name is the key the picker draws and the notice says
+        // (`Launch::key`) rather than a third spelling of the same node: a tab
+        // called something no screen ever showed is a tab nobody can match up
+        // to what they launched.
+        let launch = isolated_ticket(191, Route::Tdd, interactive(""));
+        assert_eq!(launch.key(), "wayfinder#191");
+        assert_eq!(
+            TerminalTitle::named(&launch.key(), None, true).osc(),
+            Some("\x1b]2;wayfinder#191\x07")
         );
     }
 
