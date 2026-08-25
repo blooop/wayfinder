@@ -25,11 +25,13 @@
 //! its place leaves the window wearing whatever a session hours ago called it,
 //! which is worse than a name that moves.
 //!
-//! The quieting is the **host arm's** alone. An isolated launch becomes `dl`,
-//! and since blooop/devlaunch#436 (`dl` 0.14.0) `dl` exports the same variable
-//! into the container's login profile, which every `dl <ws> -- <cmd>` payload
-//! reads — so there the job is done by the half that owns the container. See
-//! [`crate::launch::Launch::quiet_title_var`].
+//! Both halves are the **host arm's** alone. An isolated launch hands the
+//! terminal to `dl`, which names it after the workspace and — since
+//! blooop/devlaunch#436 (`dl` 0.14.0) — exports the same suppression into the
+//! container's login profile, so an escape from `wf` there would be replaced
+//! within the second and a suppression from `wf` would be a second mechanism
+//! for one job. See [`crate::launch::Launch::terminal_title`], and the README
+//! for the two `dl`-side cases that leaves alone.
 //!
 //! ## `WF_NO_TITLE`
 //!
@@ -43,10 +45,9 @@
 //!
 //! `dl` has the same switch over its own three pieces (`DEVLAUNCH_NO_TITLE`:
 //! its escape, the `PS1` line, and the profile export above), and `wf`
-//! deliberately does not read it. It is `dl`'s variable for `dl`'s escape:
-//! on an isolated launch `dl` writes its own name over this one a moment later,
-//! and somebody who turned that off has said nothing about whether `wf` may
-//! name the terminal it is handing over.
+//! deliberately does not read it — it governs a terminal `dl` has taken over,
+//! and this one governs the arm `wf` keeps. With it set, a container session is
+//! the agent's to name, which is what it was before any of this.
 
 use std::ffi::OsStr;
 use std::io::{IsTerminal, Write};

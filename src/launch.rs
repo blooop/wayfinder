@@ -2030,41 +2030,62 @@ impl Launch {
         }
     }
 
+    /// What this launch is about to call the terminal, if anything.
+    ///
+    /// **The host arm's, and only the host arm's.** An isolated launch writes
+    /// nothing, because there is nothing a name written here could survive:
+    /// `dl` writes its own escape — the workspace spec — over anything `wf` put
+    /// there a moment earlier, and where `dl`'s titling is switched off
+    /// (`DEVLAUNCH_NO_TITLE`) the title stage is what does not run, which is
+    /// also the stage that exports claude's suppression
+    /// ([`Launch::quiet_title_var`]). So on that arm the name is either
+    /// replaced within the second or left to an agent that renames it
+    /// continuously, and in both cases what `wf` wrote is gone. Writing it
+    /// anyway would break the one rule this feature holds: a name is written
+    /// only where the same launch can keep it.
+    ///
+    /// The host arm is the arm with nothing else in it — no container, no login
+    /// profile, no setup stage — so there `wf` is both the only writer and the
+    /// only thing that can keep what it wrote.
+    fn terminal_title(&self) -> TerminalTitle {
+        match self.isolation {
+            Isolation::Host => TerminalTitle::wanted(&self.key()),
+            Isolation::Devlaunch => TerminalTitle::Off,
+        }
+    }
+
     /// The variable this launch sets on the process it becomes so the terminal
     /// keeps the name it just wrote, or `None` where there is nothing to set.
     ///
-    /// Three ways to get `None`, and the third is the interesting one:
+    /// Two ways to get `None`. Nothing is being named — which on an isolated
+    /// launch is always ([`Self::terminal_title`]), and on a host launch is
+    /// `WF_NO_TITLE` or a stderr that is not a terminal. Or the agent has no
+    /// such variable ([`Agent::quiet_title_var`]).
     ///
-    /// - nothing is being named ([`TerminalTitle::Off`]), so there is no name
-    ///   to protect. Both halves of the feature ask this one question, which is
-    ///   what keeps either from happening without the other: an escape
-    ///   overwritten a second later is a feature that does not work, and an
-    ///   agent silenced with nothing put in its place leaves the window wearing
-    ///   what some session hours ago called it.
-    /// - the agent has no such variable ([`Agent::quiet_title_var`]).
-    /// - **the launch is isolated, where this is `dl`'s job and not `wf`'s.**
-    ///   Nothing `wf` sets here would reach the agent anyway — the process this
-    ///   becomes is `dl`, and a container's environment is built on the far
-    ///   side of an ssh — and since blooop/devlaunch#436 (`dl` 0.14.0) the
-    ///   title stage exports the same variable into the container's login
-    ///   profile, which every `dl <ws> -- <cmd>` payload reads, because those
-    ///   run under `bash -lc`. `wf` could carry it in the payload instead
-    ///   (`env VAR=1 claude …`, since `exec VAR=1 claude` is bash hunting for a
-    ///   program called `VAR=1`), and did until this was measured: it is a
-    ///   second mechanism for a job the container arm already does, and the arm
-    ///   that owns the container is the honest owner of what its shells export.
+    /// One question behind both halves of the feature, which is what keeps
+    /// either from happening without the other: an escape overwritten a second
+    /// later is a feature that does not work, and an agent silenced with
+    /// nothing put in its place leaves the window wearing what some session
+    /// hours ago called it.
     ///
-    /// So the host arm is what is left, and it is the arm with nothing else in
-    /// it: no container, no profile, no stage — `wf` execs the agent itself, so
-    /// `wf` is the only thing that can name that terminal or keep the name.
+    /// Inside a container this is `dl`'s job and not `wf`'s. Nothing `wf` sets
+    /// here would reach the agent anyway — the process this becomes is `dl`, and
+    /// a container's environment is built on the far side of an ssh — and since
+    /// blooop/devlaunch#436 (`dl` 0.14.0) the title stage exports the same
+    /// variable into the container's login profile, which every
+    /// `dl <ws> -- <cmd>` payload reads, because those run under `bash -lc`.
+    /// `wf` could carry it in the payload instead (`env VAR=1 claude …`, since
+    /// `exec VAR=1 claude` is bash hunting for a program called `VAR=1`), and
+    /// did until `dl` 0.14.0 shipped: it is a second mechanism for a job the
+    /// half that owns the container already does. What that leaves uncovered is
+    /// stated in the README rather than implied here — a workspace last
+    /// provisioned by an older `dl`, and a `DEVLAUNCH_NO_TITLE` that takes the
+    /// export with it.
     fn quiet_title_var(&self, title: &TerminalTitle) -> Option<&'static str> {
         if !title.is_named() {
             return None;
         }
-        match self.isolation {
-            Isolation::Host => self.agent().quiet_title_var(),
-            Isolation::Devlaunch => None,
-        }
+        self.agent().quiet_title_var()
     }
 
     /// What this launch tells the process it is about to become about the
@@ -2123,7 +2144,7 @@ impl Launch {
         // twice: the escape written below, and the quieting that keeps it
         // ([`Launch::quiet_title_var`]). One value behind both, so a launch
         // cannot write a name it then lets the agent overwrite.
-        let title = TerminalTitle::wanted(&self.key());
+        let title = self.terminal_title();
         let argv = self.agent_argv();
         let (program, rest) = argv.split_first().expect("agent argv is never empty");
 
@@ -2174,9 +2195,6 @@ impl Launch {
         // Last, and after every check that could still turn this into an error
         // rather than a launch: a `wf` that failed to resolve the agent has not
         // handed the terminal to anything, so it has no business renaming it.
-        // On the container arm `dl` writes its own name over this one a moment
-        // later — see [`crate::title`] for why writing it anyway is the point
-        // rather than waste.
         title.write();
         // `CommandExt::exec` only ever returns on failure.
         let err = command.exec();
@@ -4708,15 +4726,31 @@ mod tests {
     }
 
     #[test]
-    fn an_isolated_launch_leaves_the_quieting_to_dl() {
-        // The container arm sets nothing and prefixes nothing. Two reasons, and
-        // either alone would be enough: the process this launch becomes is
-        // `dl`, whose environment no container shell inherits, and `dl` 0.14.0
-        // exports the same variable from the container's login profile — which
-        // every `dl <ws> -- <cmd>` reads, since those run under `bash -lc`
-        // (blooop/devlaunch#436).
+    fn an_isolated_launch_names_nothing_because_nothing_it_wrote_would_last() {
+        // The rule the feature holds: a name is written only where the same
+        // launch can keep it. On this arm `dl` replaces `wf`'s escape with the
+        // workspace spec within the second, and where `dl`'s titling is off it
+        // is the title stage that does not run — the same stage that exports
+        // claude's suppression — so an escape from `wf` would be overwritten
+        // either by `dl` or by the agent. Both halves therefore say nothing
+        // here, and this is asserted on the arm rather than on the environment:
+        // `terminal_title` cannot ask about `WF_NO_TITLE` or a tty and reach
+        // any other answer.
         let launch = isolated(Route::Tdd, interactive(""));
-        assert_eq!(launch.quiet_title_var(&named()), None);
+        assert_eq!(launch.terminal_title(), TerminalTitle::Off);
+        assert_eq!(launch.quiet_title_var(&launch.terminal_title()), None);
+    }
+
+    #[test]
+    fn an_isolated_launch_leaves_the_quieting_to_dl() {
+        // Nothing is prefixed onto the payload either — the arm sets nothing
+        // *and* carries nothing. Two reasons, either alone enough: the process
+        // this launch becomes is `dl`, whose environment no container shell
+        // inherits, and `dl` 0.14.0 exports the same variable from the
+        // container's login profile, which every `dl <ws> -- <cmd>` reads since
+        // those run under `bash -lc` (blooop/devlaunch#436). The decision
+        // itself is pinned above, on the launch's own title.
+        let launch = isolated(Route::Tdd, interactive(""));
         let argv = launch.agent_argv();
         assert_eq!(argv.first().map(String::as_str), Some(DEVLAUNCH));
         assert!(
