@@ -37,6 +37,24 @@ pub fn emit(text: &str) {
     let _ = std::io::stdout().write_all(text.as_bytes());
 }
 
+/// How many terminal columns `text` occupies.
+///
+/// The one metric anything sizing itself against the screen may use. A count
+/// of chars is not it and never was: a CJK or emoji char is one char and two
+/// columns, so a char count hands a neighbouring segment columns the line does
+/// not have and something falls off the right edge. Titles and repo names come
+/// from GitHub, so this is arbitrary text and the difference is not exotic.
+///
+/// Here, beside [`emit`], for the same reason: the budget is *decided* in
+/// `ui`, but the segments that fit themselves to it live in [`liveness`] and
+/// [`reclaim`], which are not UI modules and must not reach for a ratatui
+/// `Span` to ask how wide a string is. One function, so a measurement and the
+/// render it is a prediction of cannot come to disagree — this is exactly the
+/// same table ratatui itself measures with.
+pub fn cols(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
 pub mod app;
 pub mod fetch;
 pub mod filter;
