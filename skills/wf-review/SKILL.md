@@ -30,7 +30,7 @@ A launch from `wf` adds a `ctx: <json>` block after the number, and it carries t
 
 Run both as **parallel subagents** so they don't pollute each other's context. Each axis reports at most ~400 words. Do **not** merge or rerank findings across axes — code that follows every standard but implements the wrong thing must fail Spec while passing Standards, and vice versa.
 
-- **`## Standards`** — repo-documented standards first (**the repo overrides**), plus the fixed Fowler 12-smell baseline: Mysterious Name, Duplicated Code, Feature Envy, Data Clumps, Primitive Obsession, Repeated Switches, Shotgun Surgery, Divergent Change, Speculative Generality, Message Chains, Middle Man, Refused Bequest. Always a judgement call; skip anything tooling already enforces. This axis owns the refactoring conversation `wf-tdd` refused to have.
+- **`## Standards`** — repo-documented standards first (**the repo overrides**), plus the fixed Fowler 12-smell baseline: Mysterious Name, Duplicated Code, Feature Envy, Data Clumps, Primitive Obsession, Repeated Switches, Shotgun Surgery, Divergent Change, Speculative Generality, Message Chains, Middle Man, Refused Bequest. Also the PR body, against `wf-tdd`'s **The PR body**: a reviewer who has read neither the ticket nor the map must get the why and the change from it alone, and it must describe the code at this head. Always a judgement call; skip anything tooling already enforces. This axis owns the refactoring conversation `wf-tdd` refused to have.
 - **`## Spec`** — the diff against the ticket's stated behavior and acceptance criteria. Every Spec finding quotes a line of the spec. With no spec available, say so instead of listing requirements inferred from the code.
 
 ## Output — posted, so the gate is checkable
