@@ -52,8 +52,22 @@ Done means, in order:
 
 1. Full test suite green locally.
 2. Branch pushed **by name** to the pinned remote (never a bare `git push`).
-3. PR opened against the default branch, its body linking the ticket (`Closes #<n>` so the PR↔ticket edge exists for stage derivation).
+3. PR opened against the default branch, its body written for a reviewer — see **The PR body** below.
 4. A final breadcrumb on the ticket: PR number, one-line summary of the slice.
+
+### The PR body
+
+The ticket is your spec, but the PR's reader is a reviewer who has read neither the ticket nor the map. A body that opens with "slice 2 of #N, as decided in #M on map #K" makes them open four issues to learn why the PR exists, and that is the body reviewers complain about.
+
+- **Use the host's PR skill when it has one** (`pr` in Claude Code, with `--no-review`: review is `wf-review`'s stage, not yours). It owns the body's shape; the rules below still hold.
+- **The why first, in your own words**, one or two sentences, before any link. A link is where a reader goes for more, never where they go for the reason.
+- **No map vocabulary** — slice, node, seam, stage, manager, prototype, or a term the ticket trail coined — unless the diff itself uses it. Say what the code does in the repo's own terms.
+- **What changed**, one bullet per change the reviewer will see in the diff. Decisions settled on the ticket appear as their result, not as their history.
+- **How you checked it**: the test that failed before and passes now, then the commands you ran, and what you did not run.
+- **Merge danger**: whether a revert undoes it, and what breaks for whom if it is wrong.
+- **`Closes #<n>` on its own line at the end** — it is what makes the PR↔ticket edge exist for stage derivation, so it is never optional, but it is not the opening line.
+
+**On every return to this stage from `needs attention`, rewrite the body against the code as it now is**, before you push the fix. A body that describes the first round's code is wrong from the second round on.
 
 Then **stop**. Do not review your own work, do not merge, do not continue into the next stage — the manager (see the `wf` skill's LIFECYCLE.md) or the human launches `wf-review` in a fresh context. If CI fails after push, fixing it is still this stage: fix, push, and only then stop.
 
