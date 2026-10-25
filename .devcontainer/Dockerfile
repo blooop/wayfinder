@@ -89,6 +89,17 @@ RUN set -eux; \
     rm -rf "$tmp"; \
     gh --version; zellij --version; pixi --version
 
+# The base image's CA bundle still trusts emSign ECC Root CA - G3, whose
+# intermediates had their private keys cracked in October 2026
+# (CVE-2026-111943). Debian removed it in ca-certificates 20250419~deb12u2. The
+# `test` fails the build if the mirror has not caught up, rather than shipping
+# the root with the build still green.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends --only-upgrade ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
+    test ! -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem
+
 # The agent CLI installs per-user into ~/.local/bin, so it is installed as the
 # user that will run it. `~/.claude` is a bind mount from the host (see
 # devcontainer.json) and is deliberately *not* what this writes to — the binary
