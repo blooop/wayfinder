@@ -414,11 +414,12 @@ fn the_workflow_publishes_exactly_the_reference_the_default_config_boots_from() 
 ///
 /// Three facts are held, each against a failure that stays green without it:
 /// the version is a pinned literal (a floating install drifts on rebuild, which
-/// is what every other pin in that file exists to prevent); the download URL
-/// embeds the pin (the gh/zellij pattern — a wrong version cannot resolve, so
-/// the pin cannot silently buy nothing); and the binary lands in
-/// `/usr/local/bin` (a home-directory install would be shadowed by, and
-/// confusable with, the dotfiles prefix this test exists to stop depending on).
+/// is what every other pin in that file exists to prevent); the build compares
+/// the pin against the pixi it ships (the agent-CLI pattern — the shared base
+/// image supplies the binary, so a pin that was never compared would buy
+/// nothing when the base moves); and the binary is the one in `/usr/local/bin`
+/// (a home-directory install would be shadowed by, and confusable with, the
+/// dotfiles prefix this test exists to stop depending on).
 #[test]
 fn the_image_carries_a_pinned_pixi_so_a_workspace_can_run_the_pr_gates() {
     let dockerfile = repo_file(".devcontainer/Dockerfile");
@@ -433,9 +434,9 @@ fn the_image_carries_a_pinned_pixi_so_a_workspace_can_run_the_pr_gates() {
     );
 
     assert!(
-        dockerfile.contains("releases/download/v${PIXI_VERSION}/pixi-"),
-        "the download URL embeds the pin, so a wrong version fails the build \
-         instead of resolving to something else"
+        dockerfile.contains("grep -qwF \"$PIXI_VERSION\""),
+        "the build compares the pin against the pixi it ships, so a base \
+         image that moved pixi fails the build instead of changing it quietly"
     );
 
     assert!(

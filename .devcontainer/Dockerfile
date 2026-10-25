@@ -9,7 +9,9 @@
 # could save. If that number ever grows into the minutes, this is the file to
 # revisit — see blooop/wayfinder#39 for the measurements.
 #
-# What it *does* carry is four binaries, for three different reasons.
+# What it *does* carry on top of its base is a Rust toolchain manager and three
+# binaries, for different reasons; a fourth, `pixi`, comes with the base and is
+# checked rather than downloaded again.
 #
 # `gh` and the agent CLI are things `wf` itself shells out to and discovers on
 # PATH, so a workspace without them cannot run `wf` at all. They are not here
@@ -28,14 +30,12 @@
 # machine and impossible on the next, with nothing saying why.
 # `tests/devcontainer_prebuild.rs` holds the pin and the install location.
 #
-# It is the largest single binary in here and the number belongs next to the
-# decision: 78 MB, taking the tool layer from 93 MB to 171 MB, measured against
-# the published image on 2026-08-22. The paragraph at the top of this file
-# rejects cargo-chef and sccache on exactly this ground, so this download has to
-# answer that argument rather than sidestep it — and it does, because what the
-# rejected mechanisms would have bought was 9 seconds, while what this buys is a
-# PR-blocking check being runnable at all on a machine whose dotfiles happen not
-# to carry pixi.
+# It used to be the largest download in here (78 MB, taking the tool layer from
+# 93 MB to 171 MB, measured 2026-08-22), and the paragraph at the top of this
+# file rejects cargo-chef and sccache on exactly that ground. The shared base
+# below now ships it in /usr/local/bin, so this file pins the version and
+# compares it against what the base carries instead of paying for a second
+# copy: a base that moves pixi fails this build instead of changing it quietly.
 #
 # `zellij` is here for a different reason and it is worth saying so, because
 # this comment used to justify it by a test file that no longer exists: `wf`
@@ -43,7 +43,20 @@
 # names it now. It stays for interactive use — a workspace is somewhere a
 # person works, and splitting the terminal inside one is worth carrying a
 # single static binary for.
-FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
+#
+# The base is the owner's shared devcontainer image, not a Rust image. It is
+# Ubuntu 26.04 with a CA bundle that no longer trusts emSign ECC Root CA - G3
+# (CVE-2026-111943), and it already carries pixi, git-lfs, a C toolchain and
+# the `vscode` user, so every repo of the owner's opens on the same patched
+# system. `mcr.microsoft.com/devcontainers/rust:1-bookworm` was Debian 12 and
+# needed its own CA upgrade layer. Rust is not in the base, so rustup is
+# installed below — rustup and not pixi, because `rust-toolchain.toml` is the
+# one place the compiler is named and rustup is what reads it (see `pixi.toml`
+# for why pixi does not build this crate).
+FROM ghcr.io/blooop/python_template/devcontainer:latest
+
+# The base image ends as `vscode`; the system-wide installs below need root.
+USER root
 
 # Pinned rather than "latest" so an image rebuild is a deliberate version bump
 # and not a silent one. `gh` and `zellij` are plain static binaries with no build
@@ -57,7 +70,7 @@ FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
 # that two workspaces created from the same image *start* from the same version.
 ARG GH_VERSION=2.97.0
 ARG ZELLIJ_VERSION=0.44.3
-ARG PIXI_VERSION=0.77.0
+ARG PIXI_VERSION=0.83.0
 ARG CLAUDE_VERSION=2.1.223
 
 # One layer, and the tarballs are deleted in it: an unpacked tarball left behind
@@ -79,26 +92,45 @@ RUN set -eux; \
       "https://github.com/zellij-org/zellij/releases/download/v${ZELLIJ_VERSION}/zellij-${musl_arch}.tar.gz"; \
     tar -xzf "$tmp/zellij.tar.gz" -C "$tmp"; \
     install -Dm755 "$tmp/zellij" /usr/local/bin/zellij; \
-    # pixi publishes the bare binary beside its tarball; taking it directly is
-    # one fewer unpack in the layer. /usr/local/bin, not ~/.pixi/bin: the image
-    # must not squat on the prefix a developer's own dotfiles may populate, and
-    # the tests distinguish the two by exactly that path.
-    curl -fsSL -o "$tmp/pixi" \
-      "https://github.com/prefix-dev/pixi/releases/download/v${PIXI_VERSION}/pixi-${musl_arch}"; \
-    install -Dm755 "$tmp/pixi" /usr/local/bin/pixi; \
     rm -rf "$tmp"; \
-    gh --version; zellij --version; pixi --version
+    gh --version; zellij --version
 
-# The base image's CA bundle still trusts emSign ECC Root CA - G3, whose
+# pixi comes from the base, at /usr/local/bin/pixi — on PATH for every user,
+# and not ~/.pixi/bin: the image must not squat on the prefix a developer's own
+# dotfiles may populate, and the tests distinguish the two by exactly that path.
+# The pin above is compared, not trusted, for the same reason the agent CLI's
+# is below: a base that moved pixi would otherwise change the PR gates' tool
+# with this build still green. Matched on a word boundary (see the agent CLI
+# note for why not a substring).
+#
+# The base's CA bundle no longer trusts emSign ECC Root CA - G3, whose
 # intermediates had their private keys cracked in October 2026
-# (CVE-2026-111943). Debian removed it in ca-certificates 20250419~deb12u2. The
-# `test` fails the build if the mirror has not caught up, rather than shipping
-# the root with the build still green.
+# (CVE-2026-111943); Ubuntu removed it in ca-certificates
+# 20260816ubuntu0.26.04.1. The `test` fails the build if a base rebuild ever
+# brings the root back, rather than shipping it with the build still green.
 RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends --only-upgrade ca-certificates; \
-    rm -rf /var/lib/apt/lists/*; \
+    installed="$(/usr/local/bin/pixi --version)"; \
+    printf '%s' "$installed" | grep -qwF "$PIXI_VERSION" \
+      || { echo "pinned PIXI_VERSION=$PIXI_VERSION but the base carries: $installed" >&2; exit 1; }; \
     test ! -e /etc/ssl/certs/emSign_ECC_Root_CA_-_G3.pem
+
+# rustup, with no toolchain of its own. `rust-toolchain.toml` names the
+# compiler and nothing else may (tests/toolchain_pin.rs), and this build cannot
+# read that file — its context is `.devcontainer`, see the workflow. So the
+# first cargo command in the checkout installs the pinned toolchain, exactly as
+# it does on the GitHub runners. The old Rust base image behaved the same way
+# whenever its floating `1` tag and the pin disagreed, which was most of the
+# time. System-wide under /usr/local, as that image had it, and owned by
+# `vscode` so the toolchain install needs no sudo; not ~/.cargo, for the same
+# dotfiles reason as pixi above.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN set -eux; \
+    install -d -o vscode -g vscode "$RUSTUP_HOME" "$CARGO_HOME"; \
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+      | su vscode -c "RUSTUP_HOME=$RUSTUP_HOME CARGO_HOME=$CARGO_HOME sh -s -- -y --no-modify-path --profile minimal --default-toolchain none"; \
+    rustup --version
 
 # The agent CLI installs per-user into ~/.local/bin, so it is installed as the
 # user that will run it. `~/.claude` is a bind mount from the host (see
@@ -127,4 +159,4 @@ RUN set -eux; \
     printf '%s' "$installed" | grep -qwF "$CLAUDE_VERSION" \
       || { echo "pinned CLAUDE_VERSION=$CLAUDE_VERSION but installed: $installed" >&2; exit 1; }
 ENV PATH=/home/vscode/.local/bin:$PATH
-USER root
+# Left as `vscode`, which is how the base image ends.
